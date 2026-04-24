@@ -1407,6 +1407,20 @@ class LineTarget(PunchTarget):
         segs = []
         neon_i: int | None = None
 
+        # ── Pre-pass: có khối nào đang shrink (vẫn còn thấy) không? ──────
+        # Nếu có, các khối phía sau sẽ KHÔNG nhận trạng thái neon; chỉ sau
+        # khi khối trước biến mất hoàn toàn thì khối kế tiếp mới lên neon.
+        has_shrink = False
+        for k in range(self.n_cubes):
+            fa_k = cur_frame - (self.hit_frame + k * D)
+            if 0 <= fa_k < D and hz * (1.0 - fa_k / D) > 0.005:
+                has_shrink = True
+                break
+
+        # Theo dõi back-Z của khối thấy được gần nhất (phía trước) để khối
+        # đang approach kế sau không xuyên/vượt qua đuôi khối shrink.
+        prev_back_z: float | None = None
+
         for i in range(self.n_cubes):
             wy_f = _seg_wy(i)
             wy_b = _seg_wy(i + 1)          # back Y always = next block's front Y
@@ -1419,14 +1433,21 @@ class LineTarget(PunchTarget):
                 z_norm_i = (-frames_ago) / travel
                 if z_norm_i > 1.0:
                     continue
-                if neon_i is None:
+                # Chỉ gán neon khi không còn khối nào đang shrink phía trước.
+                if not has_shrink and neon_i is None:
                     neon_i = i
                 wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
-                segs.append((
-                    max(wz_i - hz, cam.Z_NEAR + 0.01),
-                    min(wz_i + hz, cam.Z_FAR  - 0.01),
-                    wy_f, wy_b, i == neon_i, i, 0.0
-                ))
+                fz_i = max(wz_i - hz, cam.Z_NEAR + 0.01)
+                bz_i = min(wz_i + hz, cam.Z_FAR  - 0.01)
+                # Docking: front không được vượt qua đuôi khối phía trước.
+                if prev_back_z is not None and fz_i < prev_back_z + 0.005:
+                    fz_i = prev_back_z + 0.005
+                    if bz_i < fz_i + 0.01:
+                        # Sẽ co về 0 → bỏ qua để tránh artifact.
+                        continue
+                segs.append((fz_i, bz_i, wy_f, wy_b,
+                             i == neon_i, i, 0.0))
+                prev_back_z = bz_i
 
             elif frames_ago < D:
                 # ── Shrinking ─────────────────────────────────────────────
@@ -1441,6 +1462,7 @@ class LineTarget(PunchTarget):
                 wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
                 segs.append((fz_fixed, bz_now, wy_f, wy_b_now,
                              False, i, shrink_t))
+                prev_back_z = bz_now
             # else: fully collapsed, skip
 
         if not segs:
@@ -1478,6 +1500,18 @@ class LineTarget(PunchTarget):
                 edge_col = tuple(int(c * fade) for c in rim_col)
                 side_lw  = 2
                 front_lw = 3
+            elif shrink_t > 0:
+                # Khối đã được punch: mặt trước giữ neon 100%, cả 3 mặt (front +
+                # side + cap) bắt đầu bằng style neon đầy đủ (khớp với pha
+                # approach-neon), phần thân (side/cap) tắt dần theo body_fade
+                # khi chiều sâu rút về 0; mặt trước sáng tối đa cho đến khi
+                # chiều sâu bằng 0 thì mới biến mất.
+                body_fade = 1.0 - shrink_t
+                s_bright  = 0.82 * body_fade
+                f_bright  = 1.00
+                edge_col  = rim_col
+                side_lw   = 2
+                front_lw  = 3
             else:
                 s_bright = 0.18 * fade
                 f_bright = 0.22 * fade
