@@ -1434,32 +1434,51 @@ class LineTarget(PunchTarget):
             self.block_hit_frames = [self.hit_frame + i * D
                                      for i in range(self.n_cubes)]
 
-        # Per-block shrink duration.  When the scheduler derives
-        # durations from the waveform (rise → descent-midpoint per
-        # column) each block shrinks in lockstep with its own column.
-        # Otherwise fallback to the median intra-block gap so the
-        # legacy uniform-spacing behaviour is preserved.
+        # ── Time-anchored block geometry ──────────────────────────────────
+        # Each block spans a TIME interval [front_f, back_f]:
+        #   • front_f = block_hit_frames[i]   (when front face reaches punch)
+        #   • back_f  = block_hit_frames[i+1] (when back face reaches punch,
+        #                                     i.e. when next block arrives)
+        # For the LAST block there is no "next block" so we fall back to
+        # the wave-column width (block_shrink_frames[-1]) or, if absent,
+        # the median intra-block gap.  Because consecutive blocks share
+        # the EXACT SAME Z at the junction (block i's back and block
+        # i+1's front both map to z_from_norm((t_{i+1}-cur)/travel)),
+        # the chain is visually seamless at every frame — blocks slide
+        # into the punch plane end-to-end with zero gap.
+        if len(self.block_hit_frames) >= 2:
+            _diffs = np.diff(np.asarray(self.block_hit_frames, dtype=np.int64))
+            _med = max(1, int(np.median(_diffs)))
+        else:
+            _med = max(1, int(round(self.hold_frames)))
+
+        # Width of the LAST block in frames (its shrink duration).  Use
+        # the caller-supplied waveform width if available, otherwise the
+        # median gap so the chain tail has a natural length.
         if (block_shrink_frames is not None
                 and len(block_shrink_frames) >= self.n_cubes):
-            self.block_shrink_dur = [max(1, int(v))
-                                     for v in block_shrink_frames[:self.n_cubes]]
+            last_width = max(1, int(block_shrink_frames[self.n_cubes - 1]))
         else:
-            if len(self.block_hit_frames) >= 2:
-                _diffs = np.diff(np.asarray(self.block_hit_frames,
-                                            dtype=np.int64))
-                _med = max(1, int(np.median(_diffs)))
+            last_width = _med
+
+        self.block_back_frames: list[int] = []
+        for i in range(self.n_cubes):
+            if i < self.n_cubes - 1:
+                back_f = int(self.block_hit_frames[i + 1])
             else:
-                _med = max(1, int(round(self.hold_frames)))
-            # Last block gets the median gap (or the gap before it)
-            # since there's no "next block" to infer from.
-            self.block_shrink_dur = []
-            for i in range(self.n_cubes):
-                if i < self.n_cubes - 1:
-                    d = int(self.block_hit_frames[i + 1]
-                            - self.block_hit_frames[i])
-                else:
-                    d = _med
-                self.block_shrink_dur.append(max(1, d))
+                back_f = int(self.block_hit_frames[i] + last_width)
+            if back_f <= self.block_hit_frames[i]:
+                back_f = self.block_hit_frames[i] + 1
+            self.block_back_frames.append(back_f)
+
+        # Shrink duration = back arrival − front arrival.  For middle
+        # blocks this equals the gap to the next block, so the block
+        # is already fully compressed by the time its successor lands
+        # at the punch plane (no visual overlap, no visible gap).
+        self.block_shrink_dur = [
+            max(1, int(self.block_back_frames[i] - self.block_hit_frames[i]))
+            for i in range(self.n_cubes)
+        ]
 
         # Baseline _D kept for any legacy inspector; use the median of
         # per-block durations so "chain life" heuristics still work.
@@ -1488,11 +1507,12 @@ class LineTarget(PunchTarget):
     def is_dead(self, cur_frame: int) -> bool:
         if self.hit_exec_f < 0:
             return False
-        # Wait for the LAST block's own shrink animation to finish
-        # (each block now has its own wave-derived duration).
-        last_dur = (self.block_shrink_dur[-1]
-                    if self.block_shrink_dur else self._D)
-        if cur_frame > self.final_hit_frame + last_dur + 1:
+        # Chain ends when the LAST block's back face has reached the
+        # punch plane (that's when the final block fully collapses).
+        last_back = (self.block_back_frames[-1]
+                     if self.block_back_frames
+                     else self.final_hit_frame + self._D)
+        if cur_frame > last_back + 1:
             self.state = 'hit'
             return True
         return False
@@ -1508,11 +1528,6 @@ class LineTarget(PunchTarget):
             return canvas
 
         travel = max(1, self.hit_frame - self.spawn_frame)
-        # Median block-duration drives the chain's visual scale (hz);
-        # individual per-block shrink durations drive the ANIMATION
-        # clock (so short waveform columns shrink fast, long columns
-        # shrink slowly) while the physical size stays consistent.
-        D = self._D
 
         hx = PunchTarget.CUBE_HALF
         yaw = 0.18 if self.is_left else -0.18
@@ -1522,78 +1537,90 @@ class LineTarget(PunchTarget):
         freeze_frame    = self.freeze_frame
         final_hit_frame = self.final_hit_frame
 
-        # ── Derive hz for exact touching (median-D based) ────────────────
-        velocity = (cam.Z_FAR - cam.Z_NEAR) / travel   # wu / frame
-        D_z      = D * velocity                          # wu between centres
-        hz       = D_z * 0.42                            # slight gap between blocks
-
         def _seg_wy(idx: int) -> float:
             """Y centre for segment idx: even=below-horizon, odd=above."""
             return (wy + hx) if (idx % 2 == 0) else (wy - hx)
 
-        # ── Build segment list ─────────────────────────────────────────────
-        # Each block is a TILTED prism:
-        #   wy_f = front-face Y centre = _seg_wy(i)
-        #   wy_b = back-face  Y centre = _seg_wy(i+1)
+        # ── Time-anchored geometry ────────────────────────────────────────
+        # Block i's front face arrives at the punch plane at frame
+        # `block_hit_frames[i]` and its back face arrives at
+        # `block_back_frames[i]` (= next block's rise_f, or own column
+        # width for the last block).  At any time `cur`:
+        #
+        #     z_at(t_target) = cam.z_from_norm( (t_target - cur) / travel )
+        #
+        # gives the world-Z of a point that is DUE to reach the punch
+        # plane at frame t_target.  So block i's FRONT is at
+        # z_at(front_f) and its BACK at z_at(back_f).  Because block i+1
+        # uses the same `t_back[i]` as its own `t_front[i+1]`, the two
+        # blocks always share Z at that instant → seamless chain.
+        def _z_at(t_target: int) -> float:
+            dn = (t_target - cur_frame) / float(travel)
+            dn = min(1.0, max(0.0, dn))
+            return cam.z_from_norm(dn)
+
         # Format: (fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t)
         segs = []
         neon_i: int | None = None
 
-        # ── Pre-pass: có khối nào đang shrink (vẫn còn thấy) không? ──────
+        # Pre-pass: is any block currently shrinking (front past punch,
+        # back still in front of punch)?  If so, no other block may
+        # claim the neon highlight — only one bright "hero" at a time.
         has_shrink = False
         for k in range(self.n_cubes):
-            D_k  = self.block_shrink_dur[k]
-            fa_k = cur_frame - self.block_hit_frames[k]
-            if 0 <= fa_k < D_k and hz * (1.0 - fa_k / D_k) > 0.005:
+            t_fk = self.block_hit_frames[k]
+            t_bk = self.block_back_frames[k]
+            if t_fk <= cur_frame < t_bk:
                 has_shrink = True
                 break
 
-        # Theo dõi back-Z của khối thấy được gần nhất (phía trước) để khối
-        # đang approach kế sau không xuyên/vượt qua đuôi khối shrink.
-        prev_back_z: float | None = None
-
         for i in range(self.n_cubes):
             wy_f = _seg_wy(i)
-            wy_b = _seg_wy(i + 1)          # back Y always = next block's front Y
+            wy_b = _seg_wy(i + 1)   # back Y always = next block's front Y
 
-            eff_hit_i  = self.block_hit_frames[i]
-            frames_ago = cur_frame - eff_hit_i
+            t_front = self.block_hit_frames[i]
+            t_back  = self.block_back_frames[i]
+            D_i     = max(1, t_back - t_front)
 
-            if frames_ago < 0:
-                # ── Approaching ──────────────────────────────────────────
-                z_norm_i = (-frames_ago) / travel
-                if z_norm_i > 1.0:
+            # Block fully gone once its back has reached the punch plane.
+            if cur_frame >= t_back:
+                continue
+
+            # Front face Z.  While approaching (cur < t_front) it slides
+            # inward; once the front reaches the punch plane it freezes.
+            if cur_frame < t_front:
+                z_norm_f = (t_front - cur_frame) / float(travel)
+                if z_norm_f > 1.0:
+                    # Block's front hasn't entered the frustum yet.
                     continue
-                # Chỉ gán neon khi không còn khối nào đang shrink phía trước.
-                if not has_shrink and neon_i is None:
-                    neon_i = i
-                wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
-                fz_i = max(wz_i - hz, cam.Z_NEAR + 0.01)
-                bz_i = min(wz_i + hz, cam.Z_FAR  - 0.01)
-                # Docking: front không được vượt qua đuôi khối phía trước.
-                if prev_back_z is not None and fz_i < prev_back_z + 0.005:
-                    fz_i = prev_back_z + 0.005
-                    if bz_i < fz_i + 0.01:
-                        # Sẽ co về 0 → bỏ qua để tránh artifact.
-                        continue
-                segs.append((fz_i, bz_i, wy_f, wy_b,
-                             i == neon_i, i, 0.0))
-                prev_back_z = bz_i
-
+                fz = cam.z_from_norm(z_norm_f)
             else:
-                # ── Shrinking (per-block wave-driven duration) ────────────
-                D_i      = self.block_shrink_dur[i]
-                if frames_ago >= D_i:
-                    continue   # fully collapsed, skip
-                shrink_t = frames_ago / float(D_i)
-                fz_fixed = cam.Z_NEAR + 0.01
-                bz_now   = fz_fixed + hz * (1.0 - shrink_t)
-                if bz_now <= fz_fixed + 0.005:
-                    continue
-                wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
-                segs.append((fz_fixed, bz_now, wy_f, wy_b_now,
-                             False, i, shrink_t))
-                prev_back_z = bz_now
+                fz = cam.Z_NEAR + 0.01
+
+            # Back face Z.  Moves inward at the same velocity as the
+            # front.  At cur == t_back it reaches the punch plane and
+            # the block disappears.
+            bz = _z_at(t_back)
+            if bz <= fz + 0.005:
+                continue
+
+            # Shrink parameter — drives Y collapse and side/cap fade.
+            if cur_frame >= t_front:
+                shrink_t = min(1.0, max(0.0,
+                                        (cur_frame - t_front) / float(D_i)))
+            else:
+                shrink_t = 0.0
+            wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
+
+            # Neon only on APPROACHING blocks, and only when nothing is
+            # currently shrinking.  This keeps a single "hero" highlight
+            # on the front-most approaching block until it lands.
+            is_neon = False
+            if cur_frame < t_front and not has_shrink and neon_i is None:
+                neon_i = i
+                is_neon = True
+
+            segs.append((fz, bz, wy_f, wy_b_now, is_neon, i, shrink_t))
 
         if not segs:
             return canvas
@@ -2941,13 +2968,12 @@ class GameManager:
             self.targets.append(t)
             last_spawn_on[chosen_lane] = spawn_f
             if isinstance(t, LineTarget):
-                # Chain life = last block's hit - first block's hit
-                # + last block's wave-derived shrink duration + a small
-                # buffer.  This keeps the next chain from overlapping.
-                hold_eff   = int(t.final_hit_frame - t.hit_frame)
-                last_dur   = (t.block_shrink_dur[-1]
-                              if t.block_shrink_dur else t._D)
-                chain_life = hold_eff + last_dur + 3
+                # Chain life = time from first-block arrival (bf) until
+                # the LAST block's back face hits the punch plane (+1
+                # buffer frame so a new chain never starts exactly
+                # atop the tail of the previous one).
+                last_back  = int(t.block_back_frames[-1])
+                chain_life = max(1, last_back - int(t.hit_frame)) + 2
                 line_busy_until[chosen_lane] = bf + chain_life
                 line_global_busy_until       = bf + chain_life
             next_side = 1 - chosen_side
