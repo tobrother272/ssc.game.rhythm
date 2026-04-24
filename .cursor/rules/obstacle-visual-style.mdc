@@ -1,0 +1,73 @@
+---
+description: Visual design standard for all obstacles in relax/rhythm mode — colors, 3D style, stripe rules
+globs: src/rhythm.py
+alwaysApply: false
+---
+
+# Obstacle Visual Style — Neon 3D Brick
+
+All obstacles drawn in `rhythm.py` (current and future) MUST follow this design system.
+
+## Color Palette
+
+| Role | BGR value | Description |
+|---|---|---|
+| Front face fill | `CLR_WALL_PINK` ≈ `(255, 60, 255)` | Bright magenta — primary neon color |
+| Top face fill | `(140, 25, 190)` | Darker warm purple — tonal step creates depth |
+| Stripe / rib color | `(15, 5, 25)` | Near-black — used on BOTH top ribs and front stripes |
+| Side/end face | `(70, 25, 95)` | Dark plum — muted version of top color |
+
+No white or light-colored outlines. No rim highlight lines separating faces.
+
+## 3D Construction Rules
+
+1. **Two visible faces minimum**: front (facing camera) + top (or bottom for HIGH blocks).
+2. **Back face** uses a `z_off_back` depth offset of **0.10** (LOW blocks) so the top surface is tall enough to show ribs.
+3. **No `cv2.polylines` outline** around any face — edges read from tonal contrast between faces.
+
+## Stripe / Rib System
+
+- **Fixed count: 24 lines per face** (`N_STRIPES = 24`).
+- Same count on EVERY face of the same block — top diagonal ribs and front vertical stripes are numerically identical.
+- Each top rib and its matching front stripe share the same `sxf` x-coordinate, forming a continuous groove wrapping the front-top edge.
+- Line width: `rib_w = max(2, int(2.4 * scale))` — scales with distance.
+- Color: `top_edge_col = (15, 5, 25)` on all faces.
+
+### Implementation pattern
+
+```python
+N_STRIPES = 24
+rib_w = max(2, int(2.4 * scale))
+
+# Compute once, reuse on both faces
+strip_xs = []
+for i in range(1, N_STRIPES):
+    f = i / N_STRIPES
+    sxf = int(x_l  + (x_r  - x_l)  * f)
+    sxb = int(x_lb + (x_rb - x_lb) * f)
+    strip_xs.append((sxf, sxb))
+
+# TOP face ribs
+for sxf, sxb in strip_xs:
+    cv2.line(canvas, (sxf, y_t), (sxb, y_tb), top_edge_col, rib_w, cv2.LINE_AA)
+
+# FRONT face fill first, then clip stripes to rounded mask
+cv2.fillPoly(canvas, [front_pts], front_col)
+mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+cv2.fillPoly(mask, [front_pts], 255)
+temp = canvas.copy()
+for sxf, _ in strip_xs:
+    cv2.line(temp, (sxf, y_t), (sxf, y_b), top_edge_col, rib_w, cv2.LINE_AA)
+canvas[mask > 0] = temp[mask > 0]
+```
+
+## Front Face Shape
+
+- Rounded rectangle via `_rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)`.
+- Corner radius: `r = max(3, int(min(width, height) * 0.22))`.
+- Stripes are clipped to the rounded silhouette — they must NOT extend past the rounded corners.
+
+## Face Separation
+
+Faces are separated by tonal contrast + the shared dark grooves continuing across the edge.
+**Do NOT add** a bright/white rim highlight line (`cv2.polylines`) between the top and front face.

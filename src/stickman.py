@@ -240,6 +240,30 @@ _PUNCH_POSES: dict[str, dict] = {
     'SWEEP_R_LEFT':  dict(la_u=305, la_f=170, ra_u=225, ra_f=225,
                           ll_u=330, ll_f=348, rl_u= 38, rl_f= 15,
                           lean=-4, drop=0, punch='R'),
+
+    # ── RELAX poses ──────────────────────────────────────────────────
+    # Used by the 'relax' action (dodge-style obstacles).  The player-
+    # avatar either LEAPS over a low ground slab or SQUATS under a
+    # hanging bar.  Camera Y is nudged up/down in rhythm.py to reinforce
+    # the motion on the scene as well.
+    #
+    # RELAX_STAND : neutral idle (arms at sides, legs together) —
+    #               matches the clean silhouette of the reference video.
+    # RELAX_JUMP  : airborne — arms raised overhead, knees pulled up
+    #               under the body (tucked legs), drop = -18 so the
+    #               whole figure floats upward inside the HUD frame.
+    # RELAX_SQUAT : deep squat — thighs splay wide, shins fold back
+    #               toward centre (strongly bent knees), hands rest on
+    #               the hips, drop = +20 so the body sinks downward.
+    'RELAX_STAND': dict(la_u=350, la_f=355, ra_u= 10, ra_f=  5,
+                        ll_u=355, ll_f=  5, rl_u=  5, rl_f=355,
+                        lean= 0, drop=0),
+    'RELAX_JUMP':  dict(la_u=175, la_f=175, ra_u=185, ra_f=185,
+                        ll_u=340, ll_f= 25, rl_u= 20, rl_f=335,
+                        lean= 0, drop=-18),
+    'RELAX_SQUAT': dict(la_u=310, la_f=200, ra_u= 50, ra_f=160,
+                        ll_u=312, ll_f= 28, rl_u= 48, rl_f=332,
+                        lean= 0, drop=22),
 }
 
 
@@ -270,6 +294,31 @@ ACTIONS: dict[str, dict] = {
 # the bar's pass-through — ``set_beat_events`` reads the 4th tuple element
 # (``sustain`` seconds) from the scheduler and keeps the ``HOLD_L``/``HOLD_R``
 # pose held for that long before lowering into the recover waypoint.
+# ── 'relax' action — dodge-style jump / squat obstacles ────────────────────
+#
+# Pairs with rhythm.py --mode relax.  Each beat the scheduler emits one
+# of two strike kinds:
+#   'JP' — ground slab obstacle incoming: leap over it (RELAX_JUMP).
+#   'SQ' — overhead bar obstacle incoming: duck under it (RELAX_SQUAT).
+# Both strikes hold their pose for the sustain window (while the
+# obstacle is visually passing over/under the camera), then recover
+# to RELAX_STAND before the next beat.  No L/R side cycling — these
+# are full-tunnel obstacles.
+ACTIONS['relax'] = {
+    'poses':         _PUNCH_POSES,
+    'intro':         ['INTRO_WAVE', 'RELAX_STAND'],
+    'guard_default': 'RELAX_STAND',
+    'strikes': {
+        'JP': ['RELAX_JUMP'],
+        'SQ': ['RELAX_SQUAT'],
+    },
+    'recover': {
+        'JP': 'RELAX_STAND',
+        'SQ': 'RELAX_STAND',
+    },
+}
+
+
 ACTIONS['line'] = {
     'poses':         _PUNCH_POSES,
     'intro':         ['INTRO_WAVE', 'READY', 'GUARD_BOTH'],
@@ -531,6 +580,12 @@ ACTIONS['combo'] = {
         # start-of-block-N+1 pose).
         'ZSLR': ['SWEEP_L_LEFT'],
         'ZSRL': ['SWEEP_L_RIGHT'],
+        # Relax-beat strikes (JP = jump over ground obstacle, SQ =
+        # squat under floating obstacle).  These are full-avatar
+        # dodges — no L/R splitting — and pair with combo modes like
+        # --mode punch,relax or --mode dance,relax.
+        'JP': ['RELAX_JUMP'],
+        'SQ': ['RELAX_SQUAT'],
     },
     'holds_end': {
         'ZSLR': 'SWEEP_L_RIGHT',
@@ -556,6 +611,8 @@ ACTIONS['combo'] = {
         'ZRU': 'GUARD_R', 'ZRD': 'GUARD_R',
         # Both sweeps use the LEFT arm → recover toward GUARD_L.
         'ZSLR': 'GUARD_L', 'ZSRL': 'GUARD_L',
+        # Relax dodges recover to the neutral combo guard.
+        'JP': 'GUARD_BOTH', 'SQ': 'GUARD_BOTH',
     },
 }
 
@@ -859,8 +916,24 @@ class StickmanHUD:
             # frozen pose for the whole duration — i.e. a true HOLD —
             # regardless of ``tween`` / ``hold``.  Non-hold strikes
             # skip this and fall through to the normal recover.
+            next_t = normalized[idx + 1][0] if idx + 1 < len(normalized) else None
             if sustain > 0.0:
                 t_hold_end = t_hit + sustain
+                # If the NEXT event fires before this block's hold
+                # window ends (e.g. a SQUAT whose sustain extends
+                # past the next JUMP's dodge_frame on a tight
+                # cadence), cap the hold so the two pose waypoints
+                # don't interleave after the final time-sort — that
+                # produces a SQ → JP → SQ → JP flicker as the tween
+                # engine walks the out-of-order keyframes.  We cap
+                # at ``next_t - 2*tween`` so the retract waypoint
+                # (which fires ``tween`` after hold_end) AND its
+                # tween into the next strike can both fit — this
+                # keeps the avatar bouncing through RELAX_STAND
+                # between consecutive dodges even on tight cadences.
+                if next_t is not None and t_hold_end > next_t - 2.2 * tween:
+                    t_hold_end = max(t_hit + tween * 0.5,
+                                     next_t - 2.2 * tween)
                 # If the action library declares a SEPARATE end pose for
                 # this kind, use it so the tween engine animates the
                 # strike → end pose transition across the sustain window
@@ -877,7 +950,6 @@ class StickmanHUD:
                 # Insert retract (recovery) waypoint so the arm visibly
                 # lowers.
                 t_rec = t_hit + hold
-            next_t = normalized[idx + 1][0] if idx + 1 < len(normalized) else None
             recov_pose = recover.get(kind, guard_def)
             if next_t is None:
                 tl.append((t_rec, recov_pose))
