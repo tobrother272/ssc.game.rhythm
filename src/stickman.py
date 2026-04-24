@@ -1650,18 +1650,22 @@ def schedule_events(beat_frames: list[int],
                 skipped_stacked += 1
                 continue
             # Emit one event per block: head (i=0) first, tails after.
-            # Mirrors rhythm.py's per-block event emission exactly.
-            # even i (0,2) = DOWN, odd i (1,3) = UP.
-            _CHAIN_D  = 6                              # must match LineTarget.CHAIN_D
-            _n_cubes  = min(4, max(2, line_hold_frames // _CHAIN_D + 1))
+            # Mirrors LineTarget.__init__ exactly: 8th-note subdivision
+            # (2 blocks per beat), D derived so chain spans line_hold.
+            _n_cubes  = min(8, max(2, 2 * line_beats))
+            _CHAIN_D  = max(1, int(round(line_hold_frames /
+                                         max(1, _n_cubes - 1))))
             _per_sus  = _CHAIN_D / float(fps)
             for _i in range(_n_cubes):
                 _t_i  = (bf + _i * _CHAIN_D) / fps
                 _vert = 'D' if (_i % 2 == 0) else 'U'
                 events.append((_t_i, 'Z' + side_tag + _vert,
                                lean_scale, _per_sus))
-            line_busy_until[chosen_lane] = bf + line_hold_frames + 2
-            line_global_busy_until = bf + line_hold_frames + 2
+            # Lock next chain until current chain fully dies (past last
+            # block's shrink), matching LineTarget.is_dead.
+            _chain_life = line_hold_frames + _CHAIN_D + 3
+            line_busy_until[chosen_lane] = bf + _chain_life
+            line_global_busy_until       = bf + _chain_life
         else:
             # In combo mode prefix the kind with the sub-mode letter
             # ('P' or 'D') so the combo action knows whether to punch

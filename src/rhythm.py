@@ -1292,10 +1292,12 @@ class LineTarget(PunchTarget):
     - ``CHAIN_D = 3`` → more visible "brick" separation
     """
 
-    # Frames between consecutive cube CENTRES.  Must be ≥ 1.
-    # 6 = 8th-note spacing at ~152 BPM / 30 fps (beat≈12f / 2 subdivisions).
-    # With hz = D_z/2 this gives depth = D_z = 2× the original touching depth.
-    CHAIN_D: int = 6
+    # Legacy default; no longer used at runtime.  The actual per-block
+    # spacing self._D is now derived in __init__ from hold_frames /
+    # (n_cubes-1) so the chain lines up with the song's beat grid
+    # (n_cubes = line_beats → 1 block per beat).  Kept as a class
+    # attribute for any external code that still inspects it.
+    CHAIN_D: int = 10
     CORNER_RADIUS: float = 0.12
     # World-Z where the head cube centre freezes.
     # Set so front_z = HEAD_Z_CLAMP − hz ≈ Z_NEAR → fills ~20 % of frame.
@@ -1311,11 +1313,20 @@ class LineTarget(PunchTarget):
         super().__init__(spawn_frame, hit_frame, lane, is_left)
         self.hold_frames = max(1, int(hold_frames))
         self.line_beats  = max(1, int(line_beats))
-        D = max(1, int(self.CHAIN_D))
+        # n_cubes is anchored to the *musical* beat count at 8th-note
+        # subdivision (2 blocks per beat), matching the CapCut reference
+        # video look.  So a 2-beat hold → 4 blocks, 4-beat hold → 8
+        # (clamped to 8).  This keeps chain length tied to music rather
+        # than per-frame spacing.
+        self.n_cubes = min(8, max(2, 2 * self.line_beats))
+        # D (frames between consecutive cube centres & shrink duration)
+        # is derived so n_cubes blocks exactly span `hold_frames`:
+        # block 0 hits at hit_frame, block n-1 hits at hit_frame + hold.
+        # This keeps each block's arrival on-beat and lets the shrink
+        # pacing auto-scale with song tempo.
+        D = max(1, int(round(self.hold_frames /
+                             max(1, self.n_cubes - 1))))
         self._D = D
-        # N cubes fill the hold window end-to-end.  +1 so the last
-        # cube's back face sits exactly at hit_frame + hold_frames.
-        self.n_cubes = min(4, max(2, self.hold_frames // D + 1))
         # hit_frame      = frame when the HEAD cube reaches the hit zone
         #                  and FREEZES (stops moving).
         # final_hit_frame= frame when the HEAD cube is punched LAST,
@@ -2708,12 +2719,14 @@ class GameManager:
             self.targets.append(t)
             last_spawn_on[chosen_lane] = spawn_f
             if isinstance(t, LineTarget):
-                # Block this lane until the bar has fully slid past
-                # the camera (hit + hold, plus a 2-frame buffer).
-                line_busy_until[chosen_lane] = bf + line_hold_frames + 2
-                # Also set the global chain lock so the NEXT line
-                # beat (on any lane) only fires after this chain ends.
-                line_global_busy_until = bf + line_hold_frames + 2
+                # Block this lane (and ALL lanes globally) until the
+                # chain has fully died, i.e. past the last block's
+                # shrink animation.  Chain final death frame =
+                # hit_frame + hold_frames + D + 1 (see is_dead).  Add
+                # a small buffer so there's no spatial overlap.
+                chain_life = line_hold_frames + t._D + 3
+                line_busy_until[chosen_lane] = bf + chain_life
+                line_global_busy_until       = bf + chain_life
             next_side = 1 - chosen_side
             last_bf = bf
             emit_idx += 1
