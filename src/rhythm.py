@@ -234,7 +234,7 @@ def _parse_lanes(spec: str | None, n_lanes: int) -> set[int] | None:
 TARGET_TRAVEL_FRAMES = 40    # how many frames a target takes to cross from z=1 → z=0
 SPAWN_COOLDOWN       = 3
 ONSET_SPAWN_THRESH   = 0.35
-WALL_SPAWN_PROB      = 0.12
+WALL_SPAWN_PROB      = 0.0   # punch mode no longer spawns full-tunnel walls
 HIT_Z_THRESHOLD      = 0.08  # z below this is considered "at hit zone"
 
 
@@ -2932,19 +2932,6 @@ class GameManager:
             # would be impossible to render as a real hit.
             if bf < 0:
                 skipped_early += 1
-                continue
-
-            # target type
-            b = float(bass_arr[min(bf, len(bass_arr) - 1)])
-            r = self.rng.random()
-            if b > 0.60 and r < WALL_SPAWN_PROB:
-                # Full-tunnel wall spanning every lane.
-                center_lane = (n_lanes - 1) / 2.0
-                t = WallTarget(spawn_f, bf, lane=center_lane,
-                               is_left=False, span=n_lanes)
-                self.targets.append(t)
-                last_bf = bf
-                emit_idx += 1
                 continue
 
             target_cls = _target_cls_for(cur_mode)
