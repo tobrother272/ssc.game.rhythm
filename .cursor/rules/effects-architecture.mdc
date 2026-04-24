@@ -1,0 +1,41 @@
+---
+description: Shared architecture for audio-reactive visual effects (rhythm, stickman, lightle, visible)
+globs: src/*.py
+alwaysApply: false
+---
+
+# Audio-Reactive Effect Architecture
+
+All effects in `src/` share a common pipeline. When creating or editing an effect, follow this shape.
+
+## Pipeline (in order)
+1. Load audio with `librosa.load(mono=True)`, clip to `--duration` if set.
+2. Extract features with `librosa` (onset envelope, STFT magnitude, `beat_track` / `onset_detect`).
+3. Quantize to `total_frames = int(duration * FPS)` (FPS=30 by default, HOP_LENGTH=512).
+4. Per-frame loop → draw on `np.uint8` BGR canvas (OpenCV coords, y-down).
+5. Write frames via ffmpeg pipe: `h264_nvenc -preset p4` if CuPy available, else `libx264 -preset fast`.
+6. Optional audio mux (`--audio 1`) → prefer `-c:v copy` stream-copy (see stickman.py `merge_audio`).
+
+## GPU acceleration
+- Detect CuPy once at import: `import cupy as cp; cp.array([1])` inside `try/except`.
+- Use CuPy for large Gaussian blurs / FFTs only; keep geometry on CPU for simplicity.
+- Always provide a NumPy fallback path.
+
+## CLI conventions (match across ALL effects)
+- `-i/--input` (audio, required), `-o/--output` (mp4, required)
+- `-W/--width 1920`, `-H/--height 1080`, `--fps 30`
+- `-d/--duration`, `-a/--audio 0|1`
+- `-t/--token`, `-u/--url` for `authorization.authourize_user`
+- Toggle layers with `--<name> 0|1 metavar='0|1'`, not `store_true`.
+
+## Color parsing
+Accept `#RRGGBB`, `RRGGBB`, `R,G,B` → return BGR tuple for OpenCV. Reuse `_parse_color` from `stickman.py` when adding color CLI args.
+
+## Output
+- Even dimensions (required by `yuv420p` / NVENC) — pad `+1` if odd.
+- Temp file `temp_<effect>.mp4`, delete after merge.
+
+## Do NOT
+- Re-encode already-H.264 temp video during audio merge — use `-c:v copy`.
+- Hardcode odd resolutions.
+- Swallow ffmpeg stderr — always decode and print the last 20 lines on failure.

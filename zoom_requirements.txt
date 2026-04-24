@@ -1,0 +1,3 @@
+python-ffmpeg
+opencv-python-headless
+moviepy

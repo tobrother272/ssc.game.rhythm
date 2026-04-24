@@ -1,0 +1,41 @@
+---
+description: Visible effect spec — flying objects zoom from vanishing point and pop on beats
+globs: src/visible.py
+alwaysApply: false
+---
+
+# Visible Effect (`src/visible.py`)
+
+Beat-synced objects zoom OUT from the screen center (vanishing point) along fixed axes, then **pop + fade on strong beats**. Built on `lightle.py`'s GPU blur + audio pipeline.
+
+## Lifecycle of an object
+1. Spawn at screen center, tiny scale.
+2. Zoom in (grow) + fly outward along an axis of `--axes`.
+3. On strong beat → **object closest to camera POPs**: burst scale + alpha fade.
+4. Auto-die when it leaves the frame OR pop completes.
+5. Frame-budget measured in `--lifespan` frames (default tuned around DEFAULT_LIFESPAN ≈ 0.x seconds at 30 FPS).
+
+## Axes presets (`--axes`)
+- `horizontal` (default) — 2 dirs: left + right on a **single horizontal axis** (user-requested "2 trục cố định").
+- `vertical` — 2 dirs: up + down.
+- `diagonal` — 4 corners.
+- `cross` — 4 perpendicular.
+- `star` — 8 dirs.
+Add small randomness with `--angle_jitter` (radians); default 0 = strictly on axis.
+
+## Rendering
+- Circles OR `--image_path` (PNG/JPG, alpha used if RGBA).
+- Optional per-object glow halo (`--glow 0|1`, default 1).
+- Depth = distance from center → scale + brightness. Nearest object to camera (largest scale) is the pop candidate on beats.
+
+## Audio reactivity
+- Onset strength drives pop triggers.
+- Continuous beat cadence drives spawn rate so objects keep flowing between beats.
+
+## CLI
+`--image_path`, `--glow 0|1`, `--lifespan <frames>`, `--axes {horizontal,vertical,diagonal,cross,star}`, `--angle_jitter <rad>`, plus shared flags.
+
+## Do NOT
+- Spawn objects off-center — they MUST originate from the vanishing point for the "coming from behind" feel.
+- Add per-beat fixed-position spawns (that's rhythm.py); `visible` is continuous flow with beat-triggered pops.
+- Hardcode more than the listed axes presets — extend `choices=` in argparse instead.

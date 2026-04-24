@@ -1,0 +1,16 @@
+{
+    "points": [
+        {
+            "coordinates": [500, 500],
+            "duration": 60
+        },
+        {
+            "coordinates": [1000, 1000],
+            "duration": 60
+        },
+        {
+            "coordinates": [3000, 200],
+            "duration": 60
+        }
+    ]
+}

@@ -1,0 +1,132 @@
+---
+description: Rhythm-game effect spec — 3D tunnel with punch blocks, stickman HUD, viewport panels
+globs: src/rhythm.py
+alwaysApply: false
+---
+
+# Rhythm Effect (`src/rhythm.py`)
+
+First-person 3D tunnel: target blocks fly from vanishing point along **4 fixed co-axial lanes** (L-side = {0,1}, R-side = {2,3}) synced to strong beats. Stickman HUD reacts on left column, viewport panels shake in foreground.
+
+## Gameplay modes (`--mode punch|dance|line|punch,dance,line`)
+- **`punch`** (default) — `PunchTarget`: neon cube at chest height (`AIR_WORLD_Y`), **4 lanes**, `floor_spread_frac=0.50`, `CUBE_HALF=0.154` (trimmed ~30% from the old 2-lane 0.22 size so cubes stay comfortable in the tighter 4-lane layout), stickman action=`punch` (boxer strikes). No viewport-panel-to-lane alignment (viewport uses the legacy cockpit panels).
+- **`dance`** — `DanceTarget`: a flat glowing quad lying flush on the floor plane (`y = FLOOR_WORLD_Y`). Rendered by projecting 4 world corners through `cam.project` and painting a translucent neon trapezoid (outer soft glow → tinted fill → shrunken "hot" highlight biased toward the front edge → crisp neon rim) with a dark footprint icon (heel + toe ellipses, rotated along the tile's back→front axis) drawn on top. Uses **4 lanes** aligned with the 4 `ViewportFrame` panels (`floor_spread_frac=0.552`); stickman action=`dance` (foot stomps). Walls span the FULL tunnel (`span = n_lanes`).
+- **`line`** — `LineTarget` (subclass of `PunchTarget`): a **bent-path hold-note** — a thin neon polyline that threads through 3D space from a small floating hit-cube (at the near/head end) up through one or more air-space apexes back to the horizon (at the far/tail end).  Matches the CapCut `line.mp4` reference where the trail "zigzags" into the tunnel.  The hit-cube at the head carries the fist icon; the trail itself has no fist, no floor stripes, no segmentation — just a glowing bent line in lane tint (`PUNCH_COLOR_L` / `PUNCH_COLOR_R`).  `PEAK_Y = 0.70` controls apex lift above `AIR_WORLD_Y`; number of apexes = `max(1, line_beats)` so a longer hold-note gets a longer zigzag.  The target fires its **hit event exactly once** at `hit_frame` (via overridden `check_hit`) and keeps rendering for `hold_frames` after — the snake slides forward past the camera until `hold_frames` elapse. `hold_frames = line_beats × median_beat_gap` (default `line_beats=2`). Stickman action=`line` (punch-and-hold pose: arm extended straight with fist forward, frozen for the entire hold span, then springs back to GUARD on release). Uses **4 lanes** (same rails as punch/dance).
+- **`punch,dance`** or **`punch,dance,line`** (comma-combo) — parsed by `_parse_modes(spec)` into `['punch','dance']`. Beats cycle through the list: beat 0 spawns a `PunchTarget`, beat 1 a `DanceTarget`, beat 2 punch again, etc. Order matters (`dance,punch` reverses the phase). Scene dressing picks the `dance` tuning as **primary** (4-lane `floor_spread_frac=0.552`, `ViewportFrame(mode='dance')` with panels flush to tile front edges) — punch cubes live happily on the same rails. Stickman auto-switches to the unified `action='combo'` pose library (merged punch + dance + line poses) and events emit **type-prefixed kinds**: `PL`/`PR` on punch beats (no prelift, snappy jab/cross/hook/uppercut rotation), `DL`/`DR` on dance beats (LIFT→SHIFT→STOMP prelift chain, same as solo dance), `ZL`/`ZR` on line beats (HOLD_L/HOLD_R — arm extended, held for `sustain` seconds before GUARD recovery). Walls keep plain `W`, paired-spawn keeps `LL`/`RR`. Default `--density` is `1.0` in combo (each sub-mode lands on half the beats → full every-beat cadence overall).
+- Lane→side mapping: first half of lanes → stickman `L`, second half → `R`. For 4 lanes: {0,1}→L, {2,3}→R. This keeps stickman events as plain `L`/`R`/`W` in solo mode; combo mode prefixes with `P`/`D` to carry the per-beat sub-mode.
+
+## Scene layout (must preserve)
+- **Lane count**: 4 for BOTH modes (`N_LANES = N_LANES_DANCE = 4`). Do NOT hardcode lane-count assumptions anywhere — always read `cam.n_lanes`.
+- No hit-zone boxes, no floor grid lines, no StepTargets — only punch/dance blocks + walls.
+- `ViewportFrame` has two panel-geometry paths, chosen by `lane_aligned`:
+  - **Both modes** now use `_build_lane_aligned_panels(half_x, z_back, y_target_frac)`: panels are derived from lane 3D geometry so panel *i* is the forward-extension of lane *i*'s floor rail. Corner world coords = `(lane_world_x(i) ± half_x, FLOOR_WORLD_Y, z)` for `z ∈ [z_front, z_back]` where `z_front` is solved so the front edge projects to `y ≈ 0.985 × H`. Per-mode overrides (picked by `ViewportFrame(mode=...)`):
+    - **`mode='dance'`** → `half_x = DanceTarget.HALF_X`, `z_back = Z_NEAR − DanceTarget.HALF_Z`. Panel back-edge coincides **exactly** with the tile front-edge at hit_frame, so the stomp tile lands flush onto its panel.
+    - **`mode='punch'`** → `half_x = 0.40 × lane_step_world`, `z_back = Z_NEAR`. Panel back-edge = the hit line itself, so a flying cube visibly enters its panel along the correct rail. This REPLACED the old hardcoded cockpit-HUD trapezoids (`_build_cockpit_panels`, deleted) whose pixel coords didn't match the 3D lane projection and made cubes appear to drift off their rails near the horizon.
+  - Legacy `lane_aligned` kwarg is kept for API back-compat but ignored — callers should pass `mode=...`.
+- Draw pipeline unchanged: dim grey idle, neon glow + shake + cyan accent tick on hit.
+- `TunnelRenderer(lane_tiles=True)` is now enabled for **both modes**: the receding floor tiles draw one column per lane (matching the 4 viewport panels), replacing the legacy 2-column runway used by old 2-lane punch mode. Dance keeps its dim-grey outline so bright stomp pads pop; punch keeps the neon rim glow for runway energy.
+- Optional `--floor_panels` tile rows (grey neon, can be hidden).
+
+## Block rendering (3D cube)
+- Software-rasterized 3D faces, depth-sorted, per-face shading, **rounded corners**, inner neon inset, outer silhouette glow.
+- **Neon edges, NOT white borders.**
+- Custom texture via `--cube_image[_left|_right]` (perspective-warped onto faces) applies to `PunchTarget`. `DanceTarget` ignores textures (the flat-tile path paints its own glow); to get a custom 3D asset in dance mode, use `--cube_model[_left|_right]` — a non-None mesh overrides the flat-tile renderer.
+- Custom mesh via `--cube_model[_left|_right] *.obj/glb/stl/ply` (loaded with `trimesh`).
+- Controllable radius: `--cube_radius 0.18`.
+- `draw_cube_3d` / `draw_cube_3d_textured` accept an optional `half_xyz=(hx,hy,hz)` for non-uniform boxes (used by dance slabs). Normals are recomputed from scaled geometry so lighting stays correct.
+
+## Block movement
+Consistent speed + travel distance (match `0423.mp4` reference). Blocks come from **far away**, not jumping. Beat-source `tempo` keeps spacing uniform; disappearance timed to beats.
+
+## Beat scheduler (`GameManager.pre_schedule`)
+Sequence: `detect_beat_times → extract bass → frame-quantize → apply_density → resolve_travel → compute_min_lane_gap → schedule_events`. Strict **L↔R side alternation** (stickman always sees clean `L`/`R` events). When `n_lanes > 2` each side cycles its sub-lanes: left {0..mid-1}, right {mid..n-1} (reversed). For 4 lanes the cycle produces `L0 → R3 → L1 → R2 → …` — diagonal snake. Walls on strong bass (`bass > bass_thresh` AND `rng < wall_prob`) span the full tunnel (`span = n_lanes`). Accepts `mode=str | list[str]` — single string picks one target class (`'punch'` → `PunchTarget`, `'dance'` → `DanceTarget`), a list activates **combo mode**: an internal `emit_idx` counter advances once per emitted beat-event (walls + paired + single strikes) and `modes_seq[emit_idx % len(modes_seq)]` picks which target class the next beat spawns. `emit_idx` advances on walls too so the cadence stays predictable when bass peaks inject walls. **Do not diverge this logic from `stickman.py` — sync depends on bit-for-bit parity.**
+
+### Per-mode default density
+`--density` default is **None** (auto). At arg-resolve time the sentinel becomes:
+- `punch` → `1.0` (hit on every detected beat — original feel)
+- `dance` → `0.5` (hit on every other beat, matches the CapCut reference's sparser stomp cadence: ~1 tile per 2 beats, so only 1–2 tiles visible at once).
+- **combo (`punch,dance` etc.)** → `1.0` — each sub-mode occupies every-other beat, so full density produces alternating-but-continuous action (one cube, one tile, one cube, …).
+Explicit `--density X` always overrides the auto-pick. The auto-travel logic (`--travel -1`) recomputes off the DENSITY-ADJUSTED beat period, so dropping half the beats doubles the travel distance automatically — keeping the flow smooth with bigger gaps between tiles.
+
+## Stickman integration
+- Import: `from stickman import StickmanHUD, save_events`.
+- Instantiate only when `SHOW_STICKMAN=True` (flag `--stickman 0|1`). Skip `set_beat_events` / `draw` when disabled, but still build `stick_events` so `--export_events` works.
+- Action is chosen by `--mode`: `punch` → `action='punch'`, `dance` → `action='dance'`, **`punch,dance`** (or any combo list with ≥2 entries) → `action='combo'`. The combo action (`ACTIONS['combo']`) unions both pose libraries and maps strikes/prelift by the `PL`/`PR`/`DL`/`DR`/`LL`/`RR`/`W` kinds the rhythm scheduler emits in combo. Exported events JSON includes `meta['mode']` + `meta['action']` so the standalone `stickman.py` consumer can match.
+- Event kind encoding (emitted by `RhythmVisualizer.process_video`): solo mode uses plain `'L'`/`'R'`; combo mode uses `isinstance(tg, DanceTarget)` to pick prefix `'D'`, else `'P'`, and appends the side tag. Paired-spawn still collapses to `'LL'`/`'RR'` and walls stay `'W'` — neither carries a sub-mode prefix because the combo action maps them directly regardless of which beat they land on.
+
+## Color customization
+`--cube_color_left`, `--cube_color_right`, `--panel_color` via `_parse_color`. Default panel neon = **grey** (matches panel body, not punch color).
+
+## CLI (critical defaults — must match stickman.py)
+`--mode punch` (accepts `punch`, `dance`, `line`, or a comma-list like `punch,dance`, `punch,dance,line` for combo), `--travel -1` (auto), `--speed 1.0`, `--max_per_lane 3`, `--beat_min_gap 4`, `--density None` (auto: 1.0 for punch, 0.5 for dance, 1.0 for combo), `--beat_source tempo`, `--beat_subdiv 1`, `--beat_sens 0.5`, `--bloom 1`, `--floor_panels 1`, `--stickman 1`, `--depth_mode linear`, `--cube_radius 0.18`, `--export_events PATH`, `--lanes None` (= all 4), `--punch_pair_cycle 4`, `--dance_pair_cycle 4` (see [Paired-spawn mode](#paired-spawn-mode)), `--line_beats 2` (hold-note length for `line` mode, in beats — 2 means the bar stays visible sliding through/past the camera for 2 beats after hit). Bad `--mode` spellings are caught at arg-resolve time by a dry call to `_parse_modes(args.mode)`.
+
+## Lane filter (`--lanes`)
+Restrict target spawns to a subset of the 4 lanes. CLI takes **1-based** indices: `--lanes 1,2` (both L lanes), `--lanes 3,4` (both R lanes), `--lanes 1,4` (outer lanes only), `--lanes 1,2,3,4` (all — same as omitting). Also accepts range syntax `--lanes 1-3` and `--lanes all` / omit = no filter. Parsed by `_parse_lanes(spec, n_lanes)` → 0-based set, stored on `RhythmVisualizer.LANE_FILTER`, passed to `GameManager.pre_schedule(..., lane_filter=...)`. The filter removes disallowed lanes from each side's cycling list. **Walls always span the full tunnel regardless of filter** — they're the only visual affordance for "something is happening on a disabled lane". Pass the same `--lanes` spec to `stickman.py` when rendering standalone so `schedule_events` reproduces the identical event stream.
+
+### Paired-spawn mode
+Two independent pairing rules — **symmetric model**: each sub-mode (punch / dance) has the same `(N-1) đơn + 1 đôi` cycle.  Both rules can run simultaneously in combo mode (each gated on `cur_mode`).
+
+**Shared detection** — the scheduler scans the sorted enabled-lane list for **same-side adjacent pairs** (both lanes in the L half or both in the R half of the tunnel) into a single `adjacent_pairs` list, then copies it to both `punch_adjacent_pairs` and `dance_adjacent_pairs`.  Cross-midline adjacent pairs (e.g. lanes 1,2 on a 4-lane layout) are excluded so every paired strike leans cleanly toward ONE side.  Examples (4-lane layout, `mid=2`):
+- `lane_filter=None` / `{0,1,2,3}` → `[(0,1), (2,3)]` → paired rotates L ↔ R.
+- `{0,1}` → `[(0,1)]` → paired always L.
+- `{2,3}` → `[(2,3)]` → paired always R.
+- `{0,1,2}` → `[(0,1)]` (the `(1,2)` pair crosses the midline and is skipped).
+- `{1,2,3}` → `[(2,3)]` (the `(1,2)` pair skipped for the same reason).
+- `{0,3}` or `{1,2}` → `[]` → no paired strikes, every beat single.
+
+**Punch paired** (`'punch' in modes_seq` and `PUNCH_PAIR_CYCLE > 0`):
+- A `punch_paired_count` cursor tracks punch beats and a `punch_pair_cursor` rotates across `punch_adjacent_pairs`.  With **`punch_pair_cycle=N`** (CLI `--punch_pair_cycle N`, default **`N=4`** = "3 đấm đơn + 1 đấm 2-tay", musical 4/4-aligned), the beat where `count % N == N - 1` picks the next pair, spawns **2 cubes simultaneously** tagged `tg.paired_side = 'L'` / `'R'` (derived from `pair[1] < mid`), and advances the pair-cursor.  The preceding N-1 beats fall through to regular single-lane `'PL'` / `'PR'` (combo) or `'L'` / `'R'` (solo).
+- Stickman emits a single `'LL'` / `'RR'` double-hand event per paired beat (`lean_scale = 1.0`, poses `DOUBLE_LEFT` / `DOUBLE_RIGHT` with `punch='B'` so fist-enlarge + streak fire on both hands).
+- `N=1` is the legacy "strict" behaviour — every punch beat doubles; combine with `--lanes 1,2` or `--lanes 3,4` to lock the double strike to one side.
+
+**Dance paired** (`'dance' in modes_seq` and `DANCE_PAIR_CYCLE > 0`):
+- A `dance_paired_count` cursor tracks dance beats and a `dance_pair_cursor` rotates across `dance_adjacent_pairs`.  With **`dance_pair_cycle=N`** (CLI `--dance_pair_cycle N`, default **`N=4`** = "3 đơn + 1 CHỤM", musical 4/4-aligned), the beat where `count % N == N - 1` picks the next pair, spawns **2 tiles simultaneously** tagged `tg.paired_side = 'DL'` / `'DR'`, and advances the pair-cursor.  The preceding N-1 beats fall through to single-stomp `'DL'` / `'DR'` (combo) or `'L'` / `'R'` (solo).
+- Stickman collapses each paired-tile hit to a single `'JL'` / `'JR'` event (**feet-together "chụm chân" side-jump** — `FEET_STOMP_L` / `FEET_STOMP_R` with a `LIFT_DANCE → FEET_SHIFT_{L,R}` prelift chain).
+
+**Cycle presets (both sub-modes):**
+- `N=4` (default) — đôi/chụm rơi đúng downbeat của ô nhịp 4/4 kế tiếp, build-up 3 beats rồi nhấn.
+- `N=3` (legacy triplet) — 2 đơn + 1 đôi.
+- `N=2` (heavy) — mọi beat kế tiếp là đôi, dồn dập.
+- `N=1` — every beat of that sub-mode is paired.
+- `N≤0` — pairing disabled (every beat single even on adjacent lanes).
+
+**Pattern examples (both `N=4` defaults):**
+- Solo punch all 4 lanes: `L, R, L, LL, R, L, R, RR, L, R, L, LL, R, L, R, RR, …` (3 singles + 1 LL/RR alternating).
+- Solo punch `--lanes 1,2`: `L, L, L, LL, L, L, L, LL, …` (single pair, always L).
+- Solo punch `--lanes 1,2 --punch_pair_cycle 1`: `LL, LL, LL, …` (legacy strict every beat double).
+- Solo dance all 4 lanes: `L, R, L, JL, R, L, R, JR, L, R, L, JL, R, L, R, JR, …`.
+- Combo all 4 lanes (both cycles=4): `PL, DR, PL, DR, PL, DR, LL, JL, PL, DR, PL, DR, PL, DR, RR, JR, …` (punch cycle and dance cycle tick independently; both doubles fall on the 4th/8th/12th/… beat of that sub-mode).
+- Combo `--lanes 1,2 --punch_pair_cycle 1 --dance_pair_cycle 3`: `LL, DL, LL, DL, LL, JL, LL, DL, LL, DL, LL, JL, …` (punch always paired LL; dance 2+1 chụm).
+
+**Shared rules:**
+- `min_lane_gap` is bypassed in both paired paths (both lanes always spawn together).
+- `GameManager`'s "merged too-close" diagnostic dedupes by unique `hit_frame` so the count stays honest when one beat emits 2 targets.
+- Walls still spawn full-tunnel on strong bass and are emitted as normal `'W'` events.  They advance `emit_idx` (to keep the punch↔dance cadence stable in combo) but NEITHER `punch_paired_count` nor `dance_paired_count` (walls belong to no sub-mode cycle).
+- Both `punch_pair_cycle` and `dance_pair_cycle` are threaded through `GameManager.pre_schedule(...)` and exported in `save_events` meta as `punch_pair_cycle` + `dance_pair_cycle`; pair the same CLI values on `stickman.py` (or load the exported events file) to stay bit-identical.
+- Event-kind decode (rhythm.py `process_video` + stickman.py event emitter): `paired_side == 'L'/'R'` → `'LL'/'RR'`; `paired_side == 'DL'/'DR'` → `'JL'/'JR'`.  Non-paired single beats keep plain `'L'/'R'` (solo) or `'PL'/'PR'/'DL'/'DR'` (combo).
+- Paired counters increment **only after a successful emit** — lane-stacked skips don't drift the cycle across long songs.
+
+Stickman side (`stickman.py`): `schedule_events` has matching `paired_side` + `dance_paired_count` detection gated on `cur_mode` when combo is active, so `--kinds rhythm` renders are bit-identical.  Poses live in the mode-specific libraries:
+- `_PUNCH_POSES`: `DOUBLE_LEFT` / `DOUBLE_RIGHT` (both fists, `punch='B'`) → strikes `LL`/`RR`, recover `GUARD_L`/`GUARD_R`.  `_blend` treats `punch='B'` as both `_pL` and `_pR` active so the fist-enlarge + motion-streak overlays fire on BOTH hands at the beat.
+- `_DANCE_POSES`: `FEET_SHIFT_L/R` (airborne, feet-together, hips toward target side) + `FEET_STOMP_L/R` (both feet planted together on the struck side, `drop=11`) → strikes `JL`/`JR`, prelift `[LIFT_DANCE, FEET_SHIFT_{L,R}]`, recover `RECOVER_L`/`RECOVER_R`.
+The `combo` action re-exports all of the above (`LL`/`RR` + `JL`/`JR`) from the merged pose dict so paired combo runs render identically to paired solo runs.
+
+### Line (hold-note) mode
+- `LineTarget` spawns like any other target via `_spawn_target(cur_mode='line', ...)` inside `GameManager.pre_schedule`; `modes_seq` in combo cycles `punch → dance → line → punch → …`. The scheduler passes `line_beats` into the constructor so the trail's visible length scales with the hold length.
+- **Geometry**: 3D polyline waypoints computed per-frame by `LineTarget._waypoints`. Always **3 waypoints / 2 segments / single apex** (multi-apex zigzag was tried and rejected — neighbouring trails clashed when hits were dense). Head `P0 = (lane_x, AIR_WORLD_Y, z_head)` where `z_head` slides from `Z_FAR` at `spawn_frame` to `Z_NEAR` at `hit_frame`, continuing past the camera at the same velocity during the hold window. Apex `P1 = (lane_x ± APEX_LAT, AIR_WORLD_Y − PEAK_Y, z_head + BEND_FRAC × (Z_FAR − Z_NEAR))` — lifted up and nudged toward the tunnel centre (positive x for left lanes, negative for right lanes, so simultaneous L/R trails never cross).  Tail `P2 = (lane_x, AIR_WORLD_Y, z_head + (Z_FAR − Z_NEAR))` — back in lane at the horizon.  Tunable class attrs: `PEAK_Y = 0.55` (apex lift, smaller = flatter bend), `BEND_FRAC = 0.28` (apex near head = "arc rising off the head and settling toward the horizon" silhouette), `APEX_LAT = 0.10` (small lateral nudge; bigger values make the bend look diagonal rather than arched).  `line_beats` no longer affects geometry — it only drives hold-duration via `line_hold_frames`.
+- **Rendering**: each segment is projected through `cam.project` and drawn as a thick neon line (`cv2.line`) with two outer glow passes (halo + mid) alpha-blended at modest alphas so stacked trails don't saturate the canvas, plus a bright hot-core highlight inside the main line. Thickness + brightness both taper aggressively with depth via `depth_gain = 0.22 + 0.78 × (1 − z_norm)^1.4` so the near head is fat+bright (~9 px core) and the far tail thin+dim (~2 px) — this sells the 3D read AND makes dense-hit scenes stay readable (far tails fade instead of adding clutter). Head segments also get a floating hit-cube (`draw_cube_3d`, yaw `±0.22`, `CUBE_HALF × 0.95`) with a fist icon on its front face, positioned at `P0` so the strike target is unambiguous.
+- **Lane-busy guard** (`line_busy_until[lane]`): when a `LineTarget` spawns, its lane is marked busy until `hit_frame + line_hold_frames + 2`. While busy, both single-target spawns **and** paired-spawn pair selection skip that lane (paired spawns silently `continue` without advancing `punch_pair_cursor` / `dance_pair_cursor`, so the pair cycle stays in sync between rhythm.py and stickman.py).
+- **Cursor advance rule**: paired pair-cursor is incremented **AFTER** the line-busy check passes, never before — otherwise a skip would rotate the cursor in one file but not the other and desync the two schedulers.
+- `line_hold_frames = max(4, line_beats × median(diff(beat_frames)))` — anchored to the actual detected tempo so the bar always spans the intended musical length regardless of BPM.
+- Events for line beats use **4-tuple** format `(t_hit, kind, lean_scale, sustain)` where `kind ∈ {'ZL', 'ZR'}` and `sustain = hold_frames / FPS`. Non-line events stay as 3-tuples. `save_events` / `load_events` on both files serialize 4-tuples compactly (omit trailing 1.0 `lean_scale` and 0.0 `sustain`).
+- Stickman side: `set_beat_events` reads the 4th element as `sustain` and inserts a second waypoint at `t_hit + sustain` with the **same** `HOLD_L`/`HOLD_R` pose, so the arm stays frozen-extended for the full hold; GUARD recovery then tweens in after the sustain ends.
+- `LineTarget` is NOT paired-spawn-eligible (line beats always fall through the single-emit path) — paired logic only applies when `cur_mode` is `'punch'` or `'dance'`.
+
+## Lane-count migration note
+- Punch used to run on 2 lanes with `CUBE_HALF=0.22` and `floor_spread_frac=0.42`. It now runs on 4 lanes with `CUBE_HALF=0.154` and `floor_spread_frac=0.50`. The scheduler (`GameManager.pre_schedule`) and `stick_events` emit already handle any `cam.n_lanes`, so the migration is transparent to callers. Exported event files remain compatible (`lean_scale` is populated for 4-lane layouts so inner lanes get scale ≈ 0.55 and outer lanes ≈ 1.6 — applies to BOTH modes now).
+- Stickman auto-derive: `StickmanVisualizer` with `N_LANES=0` now always picks 4 regardless of action (used to branch `4 if dance else 2`).
+
+## Do NOT
+- Add hit-effect light arcs, horizontal slashes, or circular halos (user explicitly removed these).
+- Re-introduce white borders on cubes/panels.
+- Change scheduler without updating `stickman.py` in lockstep.

@@ -1,0 +1,117 @@
+---
+description: Stickman effect spec — beat-synced 2D stickman with pluggable action library
+globs: src/stickman.py
+alwaysApply: false
+---
+
+# Stickman Effect (`src/stickman.py`)
+
+Draws a 2-segment-limb stickman locked to audio beats. Usable as HUD (imported by `rhythm.py`) OR standalone CLI video.
+
+## Core classes / registries
+- `StickmanHUD` — drawable. Accepts `cam_or_size` (object with `.W/.H`, tuple, or `W=/H=` kwargs), `action`, `box=(x,y,w,h)`, `color`, `fps`.
+- `ACTIONS: dict[str, dict]` — pluggable library. Each entry has `poses`, `intro`, `guard_default`, `strikes: {kind: [...]}`, `recover: {kind: pose_name}`, **optional** `prelift: {kind: str OR list[str]}` + `prelift_time: float`. Currently ships:
+  - `punch` — boxer strikes, no prelift. Kinds: `L`/`R`/`W` + paired `LL`/`RR`.
+  - `dance` — foot stomps with **LIFT→SHIFT→STOMP→RECOVER**, `W`=two-foot JUMP. Kinds: `L`/`R`/`W`.
+  - `line` — punch-and-hold. Kinds: `ZL`/`ZR` (arm extends straight forward → pose frozen for the `sustain` seconds → GUARD recovery). Poses `HOLD_L` / `HOLD_R` in `_PUNCH_POSES` pin the arm/forearm fully extended with `punch='L'`/`'R'` so the fist-enlarge + motion-streak overlays fire at strike onset and stay lit for the entire hold window.
+  - `combo` — union of punch + dance + line pose sets. Kinds are **type-prefixed**: `PL`/`PR` (punch beats, punch-family rotation, no prelift), `DL`/`DR` (dance beats, `LIFT_{L,R}`→`SHIFT_{L,R}` prelift chain → `STOMP_{L,R}`/`STOMP_{L,R}2` → `RECOVER_{L,R}`), `ZL`/`ZR` (line beats → `HOLD_L`/`HOLD_R` held for `sustain`), `LL`/`RR` (paired double-hand punch — same as solo punch's entries), `W` (wall → `DOUBLE_UP`). Intro = punch's `INTRO_WAVE`→`READY`→`GUARD_BOTH`; `guard_default = 'GUARD_BOTH'`. Used when `rhythm.py --mode punch,dance` (or any ≥2 mode list such as `punch,dance,line`) is active so the same body performs all three gestures within one render.
+  Add new actions by dropping another entry.
+- **Stomp poses do NOT set `punch='L'/'R'`** — that flag only enlarges the fist. Foot-impact beats use `lean`/`drop` + leg-angle keys only.
+- **Dance stomp = knee-up-step-then-plant (3 phases, asymmetric legs)**:
+  1. `LIFT_L` / `LIFT_R` — the STEP-side leg's knee raises high (thigh tilted ~55° out, shin angled so the foot dangles ~20 ref-px above the floor), the OTHER leg stays near-vertical PLANTED at the floor. Body lifts slightly (`drop=-2`) and `lean` shifts onto the support foot (`lean=+2` for `LIFT_L` = body over right support). This is the pose that visibly sells "chân nhấc lên" (foot lifted up).
+  2. `SHIFT_L` / `SHIFT_R` — lifted leg extends outward (ll_u≈315°, foot ~12 ref-px above floor, ~26 ref-px lateral), other leg still supports, `lean=±3` toward the target side.
+  3. `STOMP_L` / `STOMP_R` — **symmetric wide stance** (thigh L=320°, thigh R=40°, shins near-vertical) → both ankles on the idle-floor line, total spread ~70 ref-px. `drop=+10` puts the hip at the correct landing height. `lean=±5` shifts the whole body over the stomping foot without deforming the legs.
+  - `W` (jump dodge) uses a generic `LIFT_DANCE` (both knees bent, body rises) + `SHIFT_W` (arms raised, legs splay mid-air) → `JUMP` (two-foot planted landing).
+  - The prelift chain is a LIST per kind (`'L': ['LIFT_L','SHIFT_L']`, etc.) distributed across the pre-beat window so the user sees three discrete phases, not a single smooth morph.
+- `StickmanVisualizer` — standalone CLI renderer.
+
+## Pose convention
+- Angles: 0°=down, 90°=right, 180°=up, 270°=left (screen y-down).
+- Keys per pose: `la_u la_f ra_u ra_f ll_u ll_f rl_u rl_f` (upper/forearm L/R, thigh/shin L/R), plus optional `lean`, `drop`, `punch='L'|'R'`.
+- `_LINEAR_KEYS = ('lean','drop')`, `_IGNORE_KEYS = ('punch',)` when blending.
+
+## Fluidity / organic dynamics layers (in `draw()`)
+Poses define the skeleton **targets**; the renderer layers constant organic motion on top so the body is never frozen between beats (matches the reference dancer in `nguoique.mp4`). All layers are scaled by `rest_factor = 0.2 + 0.8*min(1, nearest_beat_dt/0.35)` — 1.0 at rest, 0.2 on-beat — so scripted strikes still read sharp.
+- **Contrapposto S-curve.** `hip_sway` (0.55·`hip_half`) and `sho_sway` (0.45·`shoulder_half`) share the **same** 0.55 Hz phase but are offset by π → hips and shoulders always oscillate in opposite directions. Shoulder is no longer strongly tied to hip lean (`sho_mid_x = hip_base_x − lean_px·0.35 + sho_sway`).
+- **Torso roll.** Independent ±6° slow (0.35 Hz) tilt rotates the shoulder line around its midpoint. Head/neck rise perpendicular to the tilted shoulder axis (via `neck_top = (sho_mid_x + (−sin) · neck, sho_y + (−cos) · neck)`) so the head leans with the torso instead of floating. Rendered torso is a **true rotated quadrilateral**, not a vertical trapezoid.
+- **Weight-shift dip.** `weight_dip = |lean_px| · 0.18` → the loaded side sinks, selling "đặt trọng lượng" on the stepping foot.
+- **Pre-beat anticipation.** In the 0.16 s window before each beat the body crouches up to `0.08 · thigh` (quadratic ramp), then releases into the post-beat `bob_y`. Without it every move starts cold; with it strikes read like "load + release".
+- **Idle arm / leg drift.** Each upper segment gets a ~6° (arms) / ~3.5° (legs) sinusoidal wobble on top of the pose angle. Arms are muted per-side by the pose's `_pL` / `_pR` punch flag so fist extensions stay pin-sharp. Leg drift scales by `max(0, 1 − neutral_dist/20)` → suppressed on lifts / stomps, active on idle & guard poses so knees have a natural "loaded" flex.
+- **Back-out ease.** `_ease()` is now `1 + (c+1)(t−1)³ + c(t−1)²` with `c=1.70158` — snap lands with a tiny overshoot around t≈0.78 and settles cleanly at 1.0. Gives strikes "impact + recoil" instead of a monotonic slide. `_ease_smooth()` remains available as a plain smoothstep for non-snap blends.
+- **Post-beat impact bob.** `bob_y = −thigh·0.22·sin(πφ)·exp(−1.7φ)` over a 0.26 s window — slightly deeper than legacy so ground contact reads as mass.
+
+These layers are purely post-processing on pose joints; they don't change the pose table or `set_beat_events` contract, so events exported by `save_events` and patterns from `schedule_events` remain bit-identical.
+
+## Timeline semantics
+- `set_beat_events(events, fps)` builds `[(t, pose_name), ...]` plus a parallel `_lean_scales: list[float]`. Accepts both 2-tuple `(t, kind)` and 3-tuple `(t, kind, lean_scale)` events — missing scale defaults to 1.0 (legacy behaviour).
+- "Land-at-target" easing: pose locks in AT beat time (not over it). Adaptive tween: `0.07..0.16s` based on median beat gap.
+- Strike rotation: cycle L and R lists so repeated same-side hits pick different strikes.
+- After each hit insert a `recover[kind]` waypoint at `t_hit + hold` so arm visibly lowers. Recover waypoints always carry `lean_scale=1.0` so the body snaps back to neutral between beats.
+- **Optional PRELIFT anticipation chain** (action library `prelift` + `prelift_time`): when `prelift[kind]` is a LIST (e.g. `['LIFT_DANCE','SHIFT_L']`), `set_beat_events` places the first pose at `t_hit - prelift_time` and distributes any further poses evenly up to `t_hit - tween*0.8`. A single string is placed as one waypoint (legacy single-phase behaviour). The algorithm:
+  1. Compute `t_first = min(t_hit - prelift_time, latest)`.
+  2. Pop any existing waypoints (intro / previous recover) whose time is > `t_first` — otherwise the body would snap back to IDLE in the middle of the chain.
+  3. Clamp `t_first ≥ tl[-1].t + prelift_min_hold` (`prelift_min_hold = 0.02s`, just enough to avoid exact overlap).
+  4. If the remaining window is too tight for N phases (`span < 0.04s × (N-1)`) drop intermediate phases one at a time until it fits — the FIRST (LIFT) and LAST (SHIFT) phases are preserved so the stomp still leads with a lift.
+  5. Each chain waypoint inherits the strike's `lean_scale`; RECOVER always carries `lean_scale=1.0`.
+  Final sequence per beat: `… → LIFT → SHIFT → STOMP (@ t_hit) → RECOVER`.
+- **Per-event `lean_scale`** (dance 4-lane wide-stance): `_pose_at` multiplies the strike pose's `lean` by the interpolated scale, and applies `drop * (0.5 + 0.5*scale)` so outer-lane stomps flare the hip farther AND dip slightly lower. Scale formula (in both `rhythm.py` event emit and `schedule_events`): `1.0` for `n_lanes<=2`, else `0.55 + 1.05 * |lane-half|/half` → outer lanes (0, N-1) ≈ **1.6**, inner lanes ≈ **0.55**. Net visual: bigger side-step toward lanes 0 and 3, tucked-in step for lanes 1 and 2.
+
+## Body envelope (for --fit crop)
+`_BODY_ENVELOPE_REF = dict(x0=40, x1=220, y0=66, y1=282)` in reference coords `_REF_W=260 _REF_H=340` with `_HIP_MID_REF=(130,180)`. Derived from bones + worst-case pose extremes. **Update this if `_BONES_REF` or poses change.**
+
+## Rhythm-parity scheduler
+Standalone CLI mirrors `rhythm.py` scheduler bit-for-bit: `detect_beat_times → extract_bass_array → beat_times_to_frames → apply_density → resolve_travel → compute_min_lane_gap → schedule_events`. Same `--seed` + same params → same events. `schedule_events(..., n_lanes=N, modes=[...])` accepts the paired rhythm video's lane count (both `punch` and `dance` modes use **4 lanes** — auto-derived to 4 for any action when `--n_lanes 0`) AND the optional combo-mode sub-sequence. Side alternation + sub-lane cycling logic is identical to `GameManager.pre_schedule`. An internal `emit_idx` counter advances on every emitted event (walls + paired + singles) and `modes[emit_idx % len(modes)]` picks the sub-mode for combo. Returns `list[tuple]`: non-line events stay 3-tuple `(t, kind, lean_scale)`; **line** events (`ZL` / `ZR`) return a 4-tuple `(t, kind, lean_scale, sustain)` where `sustain = line_hold_frames / fps` so `set_beat_events` can extend the hold pose for the right musical length. `save_events` / `load_events` compact the tuples (drop default `lean_scale=1.0` and `sustain=0.0`) for readable JSON. scale computed from the chosen lane using the same formula `rhythm.py` uses, so both emitters are bit-identical. `lean_scale` is now meaningful for BOTH actions (`0.55` for inner lanes, `~1.6` for outer lanes) — punch poses have modest `lean=±3..4` so the scale just deepens the body-lean into distant lane punches without visual breakage.
+
+### Combo mode parity with rhythm.py
+When `modes=['punch','dance','line']` (or any ≥2-entry list) is passed to `schedule_events`, the emitted kinds are prefixed so the `combo` action can pick the right motion per beat: `P`+side tag on punch beats (`'PL'`/`'PR'`), `D`+side tag on dance beats (`'DL'`/`'DR'`), `Z`+side tag on line beats (`'ZL'`/`'ZR'` — always 4-tuple with sustain). Walls (`'W'`) and paired-spawn (`'LL'`/`'RR'`) stay un-prefixed because the `combo` action maps them directly regardless of which beat they'd have been on. The CLI `--mode punch,dance` wires this for you and auto-promotes `--action` to `combo` with a printed warning if you forgot to set it; pass a single value (`--mode punch` / `--mode dance`) or omit `--mode` to keep the legacy un-prefixed `'L'`/`'R'` emission (required for the solo `punch` / `dance` actions).
+
+## JSON event I/O
+- `save_events(path, events, meta)` / `load_events(path)` — payload `version: 2`.
+- Round-trips the optional `lean_scale` as a third element when it differs from 1.0; legacy v1 2-element payloads load as `(t, k, 1.0)`.
+- `rhythm.py --export_events X.json` → `stickman.py --events_file X.json` for frame-perfect sync.
+
+## CLI flags (must stay in sync with rhythm.py defaults)
+`--action` (choices from `ACTIONS`, incl. `line` + `combo`), `--mode None` (mirrors rhythm.py `--mode`; single value `punch`/`dance`/`line` keeps legacy L/R emission — solo `line` auto-sets `--action line`, solo `punch`/`dance` keeps legacy behaviour — comma-list `punch,dance` / `punch,dance,line` enables combo and auto-sets `--action combo` with a warning if the user forgot), `--line_beats 2` (hold-note length in beats — MUST match `rhythm.py --line_beats` to stay bit-identical), `--punch_pair_cycle 4` + `--dance_pair_cycle 4` (mirror rhythm.py, see below), `--n_lanes 0` (0=auto from action), `--lanes None` (1-based subset e.g. `1,4` / `1-3` / `all`; parsed by `_parse_lanes_spec` → `LANE_FILTER` → `schedule_events(..., lane_filter=...)`; MUST match rhythm.py `--lanes` when pairing via `--kinds rhythm`), `--beat_source {tempo,beat,onset}`, `--bpm`, `--beat_sens 0.5`, `--beat_subdiv {1,2,4,8}`, `--beat_min_gap 4`, `--density 1.0`, `--travel -1`, `--speed 1.0`, `--max_per_lane 3`, `--wall_prob 0.12`, `--bass_thresh 0.60`, `--seed 42`, `--kinds {rhythm,alternate,all_L,all_R}`, `--events_file`, `--export_events`, `--color`, `--bg_color`, `--bg_image`, `--box X,Y,W,H`, `--fit 0|1`, `--pad 24`. Exported events JSON stores `meta['mode']`, `meta['punch_pair_cycle']`, `meta['dance_pair_cycle']` so consumers know which kinds + cycles to expect.
+
+### Lane filter parity with rhythm.py
+`schedule_events(lane_filter=...)` removes disallowed lanes from each side's cycling list before the strict L↔R alternation runs. `--lanes 1,4` keeps clean `L,R,L,R,…`; `--lanes 2,3` keeps the inner L↔R alternation. The `meta['lanes']` field in exported events JSON records the 1-based list (or `null` = no filter). When loading via `--events_file`, `--lanes` is ignored (events are already filtered at export time).
+
+### Paired-spawn strikes (`LL`/`RR` + `JL`/`JR`)
+`schedule_events` now uses a **symmetric model** for both pairings.  A single `adjacent_pairs` list is built by scanning the sorted enabled-lane list for `(a, a+1)` pairs with both lanes on the same side of the tunnel centre (`(a < mid) == (b < mid)`); cross-side adjacent pairs (e.g. lane-1 + lane-2 on a 4-lane layout) are excluded so each paired strike leans cleanly toward ONE side.  The list is copied to `punch_adjacent_pairs` and `dance_adjacent_pairs` — criteria are identical; only the cycle length and stickman pose differ.
+
+**Punch paired (`LL` / `RR`, "đấm 2 tay về 1 phía" — double-hand commit).** Enabled whenever `punch_adjacent_pairs` is non-empty, `'punch'` is in the active modes, and `punch_pair_cycle > 0`.  A `punch_paired_count` tracks punch beats; a `punch_pair_cursor` rotates across `punch_adjacent_pairs`.  When `count % N == N - 1` (`N = punch_pair_cycle`), the next pair fires a single `'LL'` or `'RR'` event (`lean_scale = 1.0`) and both cursors advance.  The N-1 preceding punch beats fall through to regular `'PL'`/`'PR'` (combo) or `'L'`/`'R'` (solo).  In combo mode gated on `cur_mode == 'punch'`.  Poses `DOUBLE_LEFT` / `DOUBLE_RIGHT` in `_PUNCH_POSES` commit BOTH arms to the same side — near arm jabs straight out, far arm crosses the chest and reaches in the same direction slightly higher so the silhouettes don't overlap.  Both use `punch='B'`; `_blend` maps `'B'` → both `_pL=1` and `_pR=1` so the fist-enlargement + motion-streak overlays fire on both hands at the beat.  Rotations: `strikes['LL']=['DOUBLE_LEFT']`, `strikes['RR']=['DOUBLE_RIGHT']`; recoveries `recover['LL']='GUARD_L'`, `recover['RR']='GUARD_R'`.
+
+**Dance paired (`JL` / `JR`, "nhảy chụm chân" — feet-together side-jump).** Enabled whenever `dance_adjacent_pairs` is non-empty, `'dance'` is in the active modes, and `dance_pair_cycle > 0`.  Each chụm beat picks the next pair via `dance_pair_cursor` (rotates with wrap-around) and emits a single `'JL'` or `'JR'` event.  `dance_paired_count % dance_pair_cycle == dance_pair_cycle - 1` selects the chụm beat; the N-1 preceding beats fall through to single-stomp `'DL'`/`'DR'` (combo) or `'L'`/`'R'` (solo).  In combo mode gated on `cur_mode == 'dance'`.
+
+Both counters / cursors are updated **only after a successful emit** so lane-stacked skips don't drift the cycle across long songs.
+
+Cycle-length presets (both sub-modes share them):
+- `N=4` (default, musical): 3 build-up beats then paired strike on the downbeat of the next 4/4 bar.
+- `N=3` (legacy triplet): 2 đơn + 1 đôi, feels lệch pha vs. 4/4.
+- `N=2` (heavy alt): paired on every other beat of that sub-mode.
+- `N=1`: every beat of that sub-mode is paired — `N=1` on punch reproduces the legacy "strict" behaviour when `--lanes` locks to one same-side pair.
+- `N≤0`: that sub-mode's pairing disabled entirely — every beat of that sub-mode goes single regardless of adjacency.
+
+Pattern examples (all defaults `N=4` unless noted):
+- Solo punch all 4 lanes: `L, R, L, LL, R, L, R, RR, L, R, L, LL, R, L, R, RR, …` (3 singles + 1 LL/RR alternating between L-pair (0,1) and R-pair (2,3)).
+- Solo punch `--lanes 1,2`: `L, L, L, LL, L, L, L, LL, …` (single pair always L).
+- Solo punch `--lanes 1,2 --punch_pair_cycle 1`: `LL, LL, LL, …` (legacy strict pairing — every beat doubles).
+- Solo dance `--lanes 1,2`: `L, L, L, JL, L, L, L, JL, …`.
+- Solo dance all 4 lanes: `L, R, L, JL, R, L, R, JR, L, R, L, JL, R, L, R, JR, …`.
+- Combo `--mode punch,dance` all 4 lanes (both cycles=4): `PL, DR, PL, DR, PL, DR, LL, JL, PL, DR, PL, DR, PL, DR, RR, JR, …` (each sub-cycle tests its own counter independently).
+- Combo `--mode punch,dance --lanes 1,2 --punch_pair_cycle 1 --dance_pair_cycle 3`: `LL, DL, LL, DL, LL, JL, LL, DL, LL, DL, LL, JL, …` (legacy strict punch + legacy triplet dance).
+
+Poses in `_DANCE_POSES`:
+- `FEET_SHIFT_L` / `FEET_SHIFT_R` (prelift phase 2, `drop=-7` airborne, `lean=±5`, feet stay near-vertical + close together).
+- `FEET_STOMP_L` / `FEET_STOMP_R` (`drop=11` land, `lean=±8`, both legs almost straight down → clearly reads as "chụm" vs. STOMP_L/R's wide splay).
+- `strikes['JL']=['FEET_STOMP_L']`, `strikes['JR']=['FEET_STOMP_R']`; `prelift['JL']=['LIFT_DANCE','FEET_SHIFT_L']`, `prelift['JR']=['LIFT_DANCE','FEET_SHIFT_R']`; `recover` reuses `RECOVER_L`/`RECOVER_R`.
+
+Both `punch` and `dance` actions expose their own paired entries; the `combo` action pulls both (from its merged pose dict) so paired combo runs render identically to paired solo runs.  `schedule_events` infers which pairings are eligible per-run: with `modes=['punch']` only `LL`/`RR` can fire; `modes=['dance']` only `JL`/`JR`; combo enables both and gates by `cur_mode`.
+
+### Line (hold-note) scheduling
+- `line_busy_until[lane]`: tracks per-lane busy-until frame when a `ZL`/`ZR` event fires (set to `bf + line_hold_frames + 2`).  Any subsequent spawn attempt (single **or** paired) within that window is silently skipped via `continue` — and crucially, **paired-spawn pair-cursors are NOT advanced on a skip**.  The cursor-advance MUST come after the `line_busy_until` check in both `rhythm.py` and `stickman.py` or the two files will pick different pairs for subsequent paired beats and drift apart.
+- `set_beat_events` detects the 4-tuple `(t, kind, lean_scale, sustain)` and, if `sustain > 0`:
+  1. adds the strike pose waypoint at `t_hit` (as usual),
+  2. adds a **second** waypoint at `t_hit + sustain` with the SAME pose name → renderer holds the pose frozen over the entire hold,
+  3. schedules the recovery waypoint at `t_hit + sustain + tween` instead of the usual `t_hit + hold`.
+- `line_hold_frames` recomputed from `median(diff(beat_frames))` → anchored to detected tempo, so `--line_beats 2` always means "2 musical beats", not 2 fixed frames.

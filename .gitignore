@@ -1,0 +1,14 @@
+/sound_sample
+/sound_sample/*
+
+/src/__pycache__
+
+/env
+/env/*
+/zoomenv
+output/
+
+/temp
+/temp/*
+
+*.sh

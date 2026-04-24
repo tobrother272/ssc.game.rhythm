@@ -1,0 +1,81 @@
+{
+  "version": 2,
+  "meta": {
+    "fps": 30,
+    "duration": 8.0,
+    "tempo": 107.666015625,
+    "source": "tempo",
+    "subdiv": 1,
+    "density": 0.8,
+    "travel": 34,
+    "speed": 1.0,
+    "max_per_lane": 3,
+    "beat_min_gap": 4,
+    "wall_prob": 0.12,
+    "bass_thresh": 0.6,
+    "seed": 42,
+    "kind_mode": "rhythm",
+    "action": "combo",
+    "mode": "punch,dance,line",
+    "dance_pair_cycle": 4,
+    "punch_pair_cycle": 4,
+    "line_beats": 2,
+    "n_lanes": 4,
+    "lanes": null,
+    "audio": "audio.mp3"
+  },
+  "events": [
+    [
+      1.4,
+      "PL",
+      1.6
+    ],
+    [
+      1.9666666666666666,
+      "DR",
+      1.6
+    ],
+    [
+      2.5,
+      "ZL",
+      0.9,
+      1.1333333333333333
+    ],
+    [
+      3.066666666666667,
+      "PR",
+      0.9
+    ],
+    [
+      3.6333333333333333,
+      "DL",
+      1.6
+    ],
+    [
+      4.166666666666667,
+      "ZR",
+      1.6,
+      1.1333333333333333
+    ],
+    [
+      4.733333333333333,
+      "PL",
+      0.9
+    ],
+    [
+      5.3,
+      "DR",
+      0.9
+    ],
+    [
+      5.866666666666666,
+      "ZL",
+      1.6,
+      1.1333333333333333
+    ],
+    [
+      7.533333333333333,
+      "LL"
+    ]
+  ]
+}

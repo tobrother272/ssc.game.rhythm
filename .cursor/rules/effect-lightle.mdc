@@ -1,0 +1,45 @@
+---
+description: Lightle effect spec — single pulsing light shape with layered neon glow
+globs: src/lightle.py
+alwaysApply: false
+---
+
+# Lightle Effect (`src/lightle.py`)
+
+Cloned from `bubble.py` but SIMPLIFIED: **one central shape** that flashes with the music. No particles, no trails, no physics.
+
+## Core elements
+- Central shape (circle or `--image_path` mask). Alpha channel of RGBA images used as shape mask.
+- **Breathing**: bass → scale up, treble → micro-jitter.
+- **Shockwave ring** on strong bass.
+- **White flash** on beat.
+- Neon color gradient cycling over time.
+
+## Layered glow (5 toggleable layers, default all ON)
+All on → render order (back to front):
+1. `--ambient`    — wide very-soft background bloom
+2. `--mid_glow`   — medium halo
+3. `--close_glow` — tight edge-hugging glow
+4. `--core_halo`  — thin innermost ring
+5. `--solid_core` — filled shape + bright spot + specular
+
+Each layer renders only when its flag is `1`. Blend order must remain back-to-front for correct neon look.
+
+## 3D perspective mode (`--perspective 1`)
+- Clone shape into **4 copies**: 2 on left + 2 on right.
+- Arrange on a **diagonal** with depth scaling (back copies smaller + dimmer, front copies larger).
+- Right-side copies are **horizontally mirrored** so tails point outward from center.
+- Pattern matches user's reference arrows: tails sweep from inside → outside.
+
+## Audio reactivity
+- Bass band → overall scale.
+- Onset/beat → flash + shockwave trigger.
+- Smoothed envelopes so pulse doesn't look twitchy.
+
+## CLI
+`--image_path`, `--perspective 0|1`, `--ambient 0|1`, `--mid_glow 0|1`, `--close_glow 0|1`, `--core_halo 0|1`, `--solid_core 0|1`, plus shared flags (see `effects-architecture`).
+
+## Do NOT
+- Emit rays/tendrils from the shape (that's bubble.py, not lightle).
+- Add particle systems.
+- Break the 4-copy diagonal layout (user iterated on this multiple times).
