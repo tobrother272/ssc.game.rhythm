@@ -1484,6 +1484,11 @@ class LineTarget(PunchTarget):
         # per-block durations so "chain life" heuristics still work.
         self._D = max(1, int(np.median(np.asarray(self.block_shrink_dur,
                                                   dtype=np.int64))))
+
+        # Tracks which block indices have already fired a hit event —
+        # each block in a chain should pulse the viewport shake + burst
+        # its own particles + tick the combo counter as it lands.
+        self._punched: set[int] = set()
         # hit_frame      = frame when the HEAD cube reaches the hit zone
         #                  and FREEZES (stops moving).
         # final_hit_frame= frame when the HEAD cube is punched LAST,
@@ -1496,12 +1501,28 @@ class LineTarget(PunchTarget):
 
     # ── lifecycle --------------------------------------------------
     def check_hit(self, cur_frame: int) -> bool:
-        """Fire once when the HEAD cube gets its final punch (last in chain)."""
+        """Fire once per block as it lands on the punch plane.
+
+        Each block in the chain is a real "punch": we want the viewport
+        neon panels to shake, particles to burst and the combo counter
+        to tick for every one of them, not only the last block.  The
+        lifecycle (``is_dead`` / drawing) is still driven by the final
+        block's back-face arrival, so the target object stays alive for
+        the whole chain even though ``check_hit`` fires several times.
+        """
         if self.state != 'flying':
             return False
-        if self.hit_exec_f < 0 and cur_frame >= self.final_hit_frame:
-            self.hit_exec_f = cur_frame
-            return True
+        for i in range(self.n_cubes):
+            if i in self._punched:
+                continue
+            if cur_frame >= self.block_hit_frames[i]:
+                self._punched.add(i)
+                # Only stamp hit_exec_f on the LAST block — that's the
+                # frame the chain is considered "punched out" and starts
+                # its final-block shrink countdown inside is_dead.
+                if i == self.n_cubes - 1:
+                    self.hit_exec_f = cur_frame
+                return True
         return False
 
     def is_dead(self, cur_frame: int) -> bool:
@@ -1586,8 +1607,32 @@ class LineTarget(PunchTarget):
             if cur_frame >= t_back:
                 continue
 
-            # Front face Z.  While approaching (cur < t_front) it slides
-            # inward; once the front reaches the punch plane it freezes.
+            # ── Back face: TAIL IS THE ANCHOR ────────────────────────────
+            # The back face is kept on its natural velocity the entire
+            # time — both during approach and during the shrink phase.
+            # This is the junction point between block i and block i+1
+            # (they share the exact same z = z_from_norm((t_back - cur)
+            # / travel) every frame), so letting the tail keep flying
+            # guarantees the junction never drifts in either Z or Y.
+            bz = _z_at(t_back)
+
+            # Shrink progress [0..1] — 0 while approaching, then ramps
+            # up as the front face collapses onto the (still moving)
+            # back face.
+            if cur_frame >= t_front:
+                shrink_t = min(1.0, max(0.0,
+                                        (cur_frame - t_front) / float(D_i)))
+            else:
+                shrink_t = 0.0
+
+            # ── Front face: FRONT IS THE ONE THAT SHRINKS ────────────────
+            # Approach phase: front slides in at natural velocity.
+            # Shrink phase : front retreats from the punch plane back
+            #                toward the (moving) tail, so the block
+            #                collapses *from front to back*.  At
+            #                shrink_t = 0 it sits on the punch plane
+            #                (brief hit feedback), at shrink_t = 1 it
+            #                merges with the back face.
             if cur_frame < t_front:
                 z_norm_f = (t_front - cur_frame) / float(travel)
                 if z_norm_f > 1.0:
@@ -1595,22 +1640,21 @@ class LineTarget(PunchTarget):
                     continue
                 fz = cam.z_from_norm(z_norm_f)
             else:
-                fz = cam.Z_NEAR + 0.01
+                fz_anchor = cam.Z_NEAR + 0.01
+                fz = fz_anchor + (bz - fz_anchor) * shrink_t
 
-            # Back face Z.  Moves inward at the same velocity as the
-            # front.  At cur == t_back it reaches the punch plane and
-            # the block disappears.
-            bz = _z_at(t_back)
             if bz <= fz + 0.005:
                 continue
 
-            # Shrink parameter — drives Y collapse and side/cap fade.
-            if cur_frame >= t_front:
-                shrink_t = min(1.0, max(0.0,
-                                        (cur_frame - t_front) / float(D_i)))
-            else:
-                shrink_t = 0.0
-            wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
+            # Y interpolation follows the SAME direction as Z:
+            #   • wy_b stays fixed at _seg_wy(i+1) — so it lines up
+            #     exactly with the next block's front Y throughout
+            #     the shrink, eliminating the old side-drift.
+            #   • wy_f glides from _seg_wy(i) toward _seg_wy(i+1) so
+            #     the front corner merges into the junction point
+            #     as the block collapses.
+            wy_f_now = wy_f + (wy_b - wy_f) * shrink_t
+            wy_b_now = wy_b
 
             # Neon only on APPROACHING blocks, and only when nothing is
             # currently shrinking.  This keeps a single "hero" highlight
@@ -1620,7 +1664,7 @@ class LineTarget(PunchTarget):
                 neon_i = i
                 is_neon = True
 
-            segs.append((fz, bz, wy_f, wy_b_now, is_neon, i, shrink_t))
+            segs.append((fz, bz, wy_f_now, wy_b_now, is_neon, i, shrink_t))
 
         if not segs:
             return canvas
