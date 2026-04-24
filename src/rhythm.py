@@ -3607,13 +3607,18 @@ class RhythmVisualizer:
                 #   to match the up/down zigzag visible on that lane.
                 #
                 # HORIZONTAL mode:
-                #   every block lands on an OUTER lane (0 or n-1) and
-                #   the chain lives high above the horizon.  Arm side
-                #   alternates per block (even i = LEFT lane, odd i =
-                #   RIGHT lane) and vert is always UP since all blocks
-                #   sit above eye-level.  lean_scale is forced to the
-                #   "full outer" value because every hit is at the
-                #   outermost lane regardless of tg.lane.
+                #   every block spans OUTER lane 0 ↔ OUTER lane n-1 and
+                #   the chain lives high above the horizon.  Instead of
+                #   a static up-left / up-right hold, each block emits
+                #   a SWEEP event whose start & end poses bracket the
+                #   sustain window — the stickman's arm visibly sweeps
+                #   across the top of the screen in lock-step with the
+                #   block's head → tail direction:
+                #     even i (head lane 0, tail lane n-1) → ZSLR  (L→R)
+                #     odd  i (head lane n-1, tail lane 0) → ZSRL  (R→L)
+                #   lean_scale is forced to the "full outer" value
+                #   because every hit spans the outermost lanes
+                #   regardless of tg.lane.
                 is_horiz = (tg.zigzag == 'horizontal')
                 if is_horiz:
                     lean_scale_h = 0.55 + 1.05 * 1.0  # outer-lane value
@@ -3631,15 +3636,17 @@ class RhythmVisualizer:
                              if i < len(tg.block_shrink_dur) else tg._D)
                     per_sustain_i = max(1, int(dur_i)) / float(self.FPS)
                     if is_horiz:
-                        side_tag = 'L' if (i % 2 == 0) else 'R'
-                        vert     = 'U'
-                        ls       = lean_scale_h
+                        # Sweep left→right for even blocks, right→left
+                        # for odd blocks — matches the alternating
+                        # head-lane zigzag rendered by LineTarget.draw.
+                        kind_i = 'ZSLR' if (i % 2 == 0) else 'ZSRL'
+                        stick_events.append((t_i, kind_i,
+                                             lean_scale_h, per_sustain_i))
                     else:
                         side_tag = side_tag_legacy
                         vert     = 'D' if (i % 2 == 0) else 'U'
-                        ls       = lean_scale_v
-                    stick_events.append((t_i, 'Z' + side_tag + vert,
-                                         ls, per_sustain_i))
+                        stick_events.append((t_i, 'Z' + side_tag + vert,
+                                             lean_scale_v, per_sustain_i))
                 # Skip the generic single-event append below.
                 continue
             elif getattr(tg, 'paired_side', None):
