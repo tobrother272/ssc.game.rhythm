@@ -162,6 +162,61 @@ _FLOOR_SPREAD_BY_MODE = {
 }
 
 
+# Camera bob configuration for relax-mode jump / squat dodges.
+# The bob is purely a post-render Y translation of the canvas so the
+# HUDs (stickman, combo, debug overlay) can sit on top of the moved
+# scene without themselves moving.  The envelope has three phases:
+#   • ramp-up   : WINDOW_F frames easing in to the peak at dodge_frame
+#   • hold      : peak held until the obstacle has fully left the view
+#                 (i.e. hit_frame + travel_f, matching RelaxTarget.is_
+#                 dead) so the camera stays dipped / raised while the
+#                 stickman is still crouched / airborne
+#   • ramp-down : WINDOW_F frames easing back to 0 as the block dies
+# This matches the stickman's pose-sustain window, avoiding the jarring
+# case where the camera springs back while the avatar is still crouched.
+_RELAX_BOB_WINDOW_F     = 8       # ramp-in / ramp-out length (frames)
+_RELAX_BOB_HEIGHT_FRAC  = 0.08    # peak offset as a fraction of HEIGHT
+
+
+def _relax_camera_dy(targets, cur_frame: int, height: int) -> int:
+    """Compute the vertical canvas translation for relax-mode camera bob.
+
+    Iterates every live RelaxTarget in its active window and accumulates
+    the trapezoidal envelope described above.  LOW slabs (ground
+    obstacle → the player JUMPS over them) shift the canvas DOWN
+    (positive dy) so the scene appears lower on screen — the classic
+    "camera rising as feet leave the ground" effect.  HIGH bars
+    (hanging obstacle → the player DUCKS under them) shift the canvas
+    UP (negative dy) so the scene appears higher — the "camera dropping
+    as head lowers" effect.
+    """
+    peak_px = int(height * _RELAX_BOB_HEIGHT_FRAC)
+    if peak_px <= 0:
+        return 0
+    total = 0.0
+    W = _RELAX_BOB_WINDOW_F
+    for t in targets:
+        if not isinstance(t, RelaxTarget):
+            continue
+        dodge_f  = t.dodge_frame
+        hold_end = t.dodge_end_frame    # end of the sustained pose
+        start_f  = dodge_f - W
+        if cur_frame < start_f or cur_frame > hold_end:
+            continue
+        if cur_frame <= dodge_f:
+            k = 1.0 - (dodge_f - cur_frame) / float(W)
+        elif cur_frame >= hold_end - W:
+            k = (hold_end - cur_frame) / float(W)
+        else:
+            k = 1.0
+        k = max(0.0, min(1.0, k))
+        if t.kind == 'low':        # JUMP  → canvas drops
+            total += peak_px * k
+        else:                      # SQUAT → canvas rises
+            total -= peak_px * k
+    return int(total)
+
+
 def _parse_modes(spec: str | None) -> list[str]:
     """Parse the ``--mode`` CLI value into a list of gameplay sub-modes.
 
@@ -177,12 +232,12 @@ def _parse_modes(spec: str | None) -> list[str]:
     parts = [m.strip().lower() for m in str(spec).split(',') if m.strip()]
     if not parts:
         return ['punch']
-    valid = {'punch', 'dance', 'line'}
+    valid = {'punch', 'dance', 'line', 'relax'}
     bad = [p for p in parts if p not in valid]
     if bad:
         raise ValueError(
             f"Unknown mode(s) {bad}; allowed: 'punch', 'dance', 'line', "
-            f"or comma-combined e.g. 'punch,dance,line'.")
+            f"'relax', or comma-combined e.g. 'punch,dance,relax'.")
     return parts
 
 
@@ -2061,6 +2116,510 @@ class DanceTarget(Target):
                     icon_col, -1, cv2.LINE_AA)
 
 
+def _rounded_rect_points(x1: int, y1: int, x2: int, y2: int,
+                         r: int, n: int = 8) -> np.ndarray:
+    """CCW polygon that approximates a rounded rectangle.
+
+    Corners are replaced with `n`-segment quarter arcs of radius `r`.
+    `r` is clamped to at most half of the shorter side so the arcs
+    never cross.  Used by ``RelaxTarget._draw_low`` to soften the
+    front face of ground slabs.
+    """
+    r = max(0, min(r, (x2 - x1) // 2, (y2 - y1) // 2))
+    if r <= 0:
+        return np.array([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], np.int32)
+    pts: list[tuple[int, int]] = []
+    # top-left arc: 180° → 270°
+    cx, cy = x1 + r, y1 + r
+    for i in range(n + 1):
+        a = np.pi + i * (np.pi / 2) / n
+        pts.append((int(cx + r * np.cos(a)), int(cy + r * np.sin(a))))
+    # top-right arc: 270° → 360°
+    cx, cy = x2 - r, y1 + r
+    for i in range(n + 1):
+        a = -np.pi / 2 + i * (np.pi / 2) / n
+        pts.append((int(cx + r * np.cos(a)), int(cy + r * np.sin(a))))
+    # bottom-right arc: 0° → 90°
+    cx, cy = x2 - r, y2 - r
+    for i in range(n + 1):
+        a = 0 + i * (np.pi / 2) / n
+        pts.append((int(cx + r * np.cos(a)), int(cy + r * np.sin(a))))
+    # bottom-left arc: 90° → 180°
+    cx, cy = x1 + r, y2 - r
+    for i in range(n + 1):
+        a = np.pi / 2 + i * (np.pi / 2) / n
+        pts.append((int(cx + r * np.cos(a)), int(cy + r * np.sin(a))))
+    return np.array(pts, np.int32)
+
+
+class RelaxTarget(Target):
+    """Full-tunnel obstacle for the *relax* mode.
+
+    Two visual variants chosen per-spawn:
+
+      kind='low'  : a LOW, wide slab lying on the ground that spans the
+                    full tunnel width.  The player has to JUMP over it —
+                    camera pops upward and the stickman performs a LEAP.
+
+      kind='high' : a FLOATING horizontal bar suspended at head height.
+                    The player has to DUCK under it — camera dips down
+                    and the stickman performs a SQUAT.
+
+    The obstacle does not occupy a specific lane — it's a global beat
+    trigger — so the scheduler skips all lane-stacking logic for
+    `relax` mode and the hit is automatic (the player-avatar dodges
+    it; the game never "misses").
+    """
+
+    HIT_DEPTH = 0.0
+
+    # Visual tuning ────────────────────────────────────────────────────
+    LOW_HEIGHT_FRAC  = 0.07   # fraction of tunnel height (hit-plane)
+    # HIGH (floating) bar — anchored to the horizon line with the same
+    # (1-z)^1.6 perspective envelope as floor_y/ceil_y so the bar
+    # grows naturally from the vanishing point toward the camera.
+    # The bar is intentionally tall (≈35% of viewport height) so that
+    # at the hit plane it fills the whole upper half of the screen —
+    # a clear "wall you must duck under" silhouette.  HIGH_HORIZON_
+    # OFFSET_FRAC places the bar's CENTRE a fixed fraction of H above
+    # the horizon.
+    HIGH_HORIZON_OFFSET_FRAC = 0.26   # bar centre above horizon @ z=0
+    HIGH_HEIGHT_FRAC         = 0.35   # bar height           @ z=0
+
+    # Motion profile (two-phase piecewise) ────────────────────────────
+    # The block's spawn→hit travel is split into TWO distinct phases
+    # with different world-speeds, per user spec:
+    #   "70% quãng đường đầu tiên chạy chậm từ từ.
+    #    30% còn lại thì vút nhanh."
+    #
+    #   • Phase 1  (drift):  covers the first PHASE_SPLIT_D fraction
+    #                        of z-distance (z from 1.0 to 1-D) at
+    #                        low velocity — the block glides lazily
+    #                        through the far field at the horizon.
+    #   • Phase 2  (vút):    covers the remaining (1-D) of z-distance
+    #                        at PHASE_SPEED_RATIO × the phase-1 speed,
+    #                        so the block snaps into the hit plane.
+    #
+    # With D=0.70 and ratio=4 the time split works out to ~90.3% of
+    # the travel window in Phase 1 and only ~9.7% in Phase 2 — the
+    # block spends the vast majority of its travel drifting slowly,
+    # then zooms through the last 30% of distance in ~0.6s (at
+    # travel=180f / 30fps).
+    #
+    # Pass-by (p_lin > 1) carries Phase-2 velocity forward so the
+    # block exits the viewport decisively.
+    PHASE_SPLIT_D     = 0.70   # fraction of z-distance in Phase 1
+    PHASE_SPEED_RATIO = 12.0   # Phase-2 world-speed / Phase-1 speed
+
+    # Dodge timing ─────────────────────────────────────────────────────
+    # DODGE_OFFSET_{LOW,HIGH}:  where the stickman fires its pose
+    #     relative to hit_frame, expressed as a SIGNED fraction of
+    #     travel_f.
+    #       NEGATIVE → dodge_frame is BEFORE hit_frame (anticipate).
+    #       POSITIVE → dodge_frame is AFTER  hit_frame (react).
+    #
+    #     LOW (ground slab, JUMP):  +0.01 × travel
+    #         With PHASE_SPEED_RATIO=12 the block rockets through the
+    #         last 30 % of z-distance in only ~3.4 % of travel-time
+    #         (≈6 frames at travel=180).  A negative lead-in therefore
+    #         fires the jump when the slab is still at z≈0.30 — still
+    #         visually mid-tunnel.  Using a small POSITIVE offset means
+    #         the jump fires ~2 frames AFTER the slab crosses z=0, i.e.
+    #         when it is right at the hit-zone edge (user: "sát mép
+    #         vùng hít thì mới bắt đầu nhảy").
+    #
+    #     HIGH (overhead bar, SQUAT):  +0.064 × travel
+    #         Per the reference video (and user: "đối với block treo
+    #         thì khi block này khuất 1/3 rồi thì mới ngồi"), the
+    #         squat only reads well once the bar has ALREADY started
+    #         to pass overhead and the top ~1/3 of the bar has exited
+    #         the top of the viewport.  From the `(1-z)^2.0` pass-by
+    #         anchor we get exactly 1/3 occlusion at p_lin ≈ 1.063,
+    #         i.e. 11-12 frames AFTER hit_frame at travel=180.
+    #
+    # DODGE_HOLD_FRAC: how long AFTER dodge_frame the stickman holds
+    #     the pose before recovering to RELAX_STAND.  Must be large
+    #     enough to cover the block's transit past the camera plane
+    #     but short enough that the next beat's dodge_frame leaves
+    #     room for the stickman to stand (otherwise consecutive SQ
+    #     waypoints chain together and the avatar never returns to
+    #     neutral — user: "sau khi thực hiện hành động nhảy, ngồi
+    #     xong thì phải trở về vị trí ban đầu").  0.25 × travel ≈
+    #     1.5 s at travel=180 leaves ~0.5 s recovery room on the
+    #     default 2 s cadence.
+    DODGE_OFFSET_LOW  = +0.01   # fire just after z=0 — block is right at
+                                # the hit-zone edge before the jump starts
+    DODGE_OFFSET_HIGH = +0.064
+    DODGE_HOLD_FRAC   = 0.04   # hold briefly then snap back to RELAX_STAND
+
+    # Dodge timing ─────────────────────────────────────────────────────
+    # Fire the stickman squat/leap pose + camera bob exactly at the
+    # transition from Phase 1 → Phase 2.  That gives the player a
+    # single clear cue ("the block is about to snap in!") right when
+    # visual motion explodes, and the pose tween has just enough time
+    # to settle before the block hits the hit plane.  We compute this
+    # dynamically from PHASE_SPLIT_D / PHASE_SPEED_RATIO so the
+    # timing automatically stays glued to the "vút" moment no matter
+    # how the phase split is tuned.
+
+    def __init__(self, spawn_frame: int, hit_frame: int,
+                 kind: str = 'low'):
+        # Centre lane + is_left=False: lane index is irrelevant here
+        # because the slab always spans the whole width, but Target's
+        # base __init__ needs *something*, so we pass centre.
+        super().__init__(spawn_frame, hit_frame, lane=0, is_left=False)
+        self.kind = 'high' if kind == 'high' else 'low'
+        self.color = CLR_WALL_PINK
+
+    # ---------------- lifecycle ----------------
+    #
+    # Relax obstacles do NOT "hit and vanish" at the hit plane — they
+    # fly PAST the camera and only disappear once they've drifted off
+    # the viewport.  We achieve that by:
+    #
+    #   • depth()     → allow z to continue into negative territory
+    #                   past z=0 (behind the camera); floor_y / ceil_y
+    #                   already extrapolate smoothly so the slab slides
+    #                   off the bottom (low) or top (high) edge.
+    #
+    #   • check_hit() → fire EXACTLY ONCE at hit_frame so the stickman
+    #                   pose-pulse + camera-bob pipeline still sees a
+    #                   single JP/SQ event, but we KEEP state='flying'
+    #                   so the painter's-algorithm renderer keeps
+    #                   drawing the obstacle.
+    #
+    #   • is_dead()   → time-based: kill the target once it has
+    #                   travelled a full "spawn→hit" duration PAST the
+    #                   hit plane (i.e. z ≈ -1.0).  By that point LOW
+    #                   slabs have fallen well below y=H and HIGH bars
+    #                   have risen above y=0, so the block is fully
+    #                   off-screen regardless of camera-bob offset.
+
+    # Time-split derived from D / ratio.  Cache as class-level for
+    # speed but compute once — cheap and keeps the derivation visible.
+    @classmethod
+    def _phase_split_t(cls) -> float:
+        D = cls.PHASE_SPLIT_D
+        return D / (D + (1.0 - D) / cls.PHASE_SPEED_RATIO)
+
+    def depth(self, cur_frame: int) -> float:
+        if cur_frame <= self.spawn_frame:
+            return 1.0
+        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        p_lin = (cur_frame - self.spawn_frame) / travel_f
+        D = self.PHASE_SPLIT_D
+        T = self._phase_split_t()
+        z_split = 1.0 - D                  # z at the Phase 1 → 2 hand-off
+        if p_lin <= T:
+            # Phase 1 (drift): z: 1.0 → z_split over t: [0, T]
+            z = 1.0 - D * (p_lin / T)
+        elif p_lin <= 1.0:
+            # Phase 2 (vút): z: z_split → 0 over t: [T, 1]
+            z = z_split * (1.0 - (p_lin - T) / (1.0 - T))
+        else:
+            # Pass-by: carry Phase-2 velocity forward so the block
+            # exits the viewport at the same sharp speed.  Phase-2
+            # world-velocity in z-units per unit of normalised time
+            # is z_split / (1 - T).
+            v2 = z_split / (1.0 - T)
+            z = -v2 * (p_lin - 1.0)
+        # Clamp so numerical blowup in (1-z)**k stays bounded.
+        return max(-1.2, z)
+
+    @property
+    def dodge_frame(self) -> int:
+        """Frame at which the stickman SQUAT / JUMP and camera bob fire.
+
+        Offset from ``hit_frame`` by ``DODGE_OFFSET_{LOW,HIGH} ×
+        travel_f`` — negative for LOW (anticipate the jump) and
+        positive for HIGH (wait until the bar has started to obscure
+        overhead, then squat).  This matches the reference motion
+        where a jump must precede the slab but a duck is delayed
+        until the bar is visibly passing above.
+        """
+        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        offset_frac = (self.DODGE_OFFSET_LOW if self.kind == 'low'
+                       else self.DODGE_OFFSET_HIGH)
+        return self.hit_frame + int(round(travel_f * offset_frac))
+
+    @property
+    def dodge_end_frame(self) -> int:
+        """Frame at which the stickman returns to RELAX_STAND and the
+        camera bob finishes its ramp-down.  Set to ``dodge_frame +
+        DODGE_HOLD_FRAC * travel_f`` so the dodge pose covers the
+        short "vút" phase plus a bit of pass-by but releases long
+        before the next beat's dodge_frame (on a typical 2 s cadence
+        at travel=180 this leaves ≈0.5 s of recovery room).
+        """
+        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        return self.dodge_frame + int(round(travel_f * self.DODGE_HOLD_FRAC))
+
+    def check_hit(self, cur_frame: int) -> bool:
+        if cur_frame < self.hit_frame:
+            return False
+        if self.hit_exec_f >= 0:
+            return False
+        self.hit_exec_f = cur_frame
+        return True
+
+    def is_dead(self, cur_frame: int) -> bool:
+        if self.hit_exec_f < 0:
+            return False
+        # Kill the target once the depth has hit its pass-by clamp
+        # (z = -1.2).  Past that point depth() returns a constant, so
+        # the block is visually frozen — LOW is well below the viewport,
+        # HIGH has shrunk to the top margin — and keeping it alive just
+        # wastes the painter's-algorithm sort.  We derive the exit
+        # frame analytically from the Phase-2 world-velocity:
+        #     v2 = z_split / (1 - T)
+        #     Δframes = travel_f · 1.2 / v2
+        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        T = self._phase_split_t()
+        z_split = 1.0 - self.PHASE_SPLIT_D
+        v2 = z_split / max(1e-6, 1.0 - T)
+        exit_pad = int(round(travel_f * 1.2 / v2))
+        return cur_frame - self.hit_frame > exit_pad
+
+    # ---------------- helpers ----------------
+    def _span_x(self, cam: "PerspectiveCamera", z: float):
+        """Pink slab spans the full lane runway (outer lanes edge-to-edge).
+
+        We deliberately use the LANE boundaries — not the tunnel walls —
+        so the bar stays inside the visible runway even at z=0 where the
+        wall projection blows out past the screen edges.  A small extra
+        margin (half a lane step) keeps the slab reading as "spanning
+        everything" rather than ending exactly on the rails.
+
+        NOTE: we bypass `cam.lane_x()` because it applies
+        `int(round(lane))` and then uses the lane-bottom LUT whenever
+        the rounded index falls inside [0, n-1] — which, due to
+        Python's banker's rounding, collapses `-0.5 → 0` (no left
+        extrapolation) while `n-0.5 → n` correctly extrapolates to the
+        right.  That asymmetry skewed the slab visibly toward the
+        right edge.  Here we linearly extrapolate both bounds from
+        the lane-bottom step so the slab stays centered.
+        """
+        n = max(1, cam.n_lanes)
+        if n >= 2:
+            step = (cam.lane_x_bottom[-1] - cam.lane_x_bottom[0]) / (n - 1)
+        else:
+            step = 0.0
+        bot_l = cam.lane_x_bottom[0]  - 0.5 * step
+        bot_r = cam.lane_x_bottom[-1] + 0.5 * step
+        converge = (1.0 - z) ** 1.0
+        x_l = int(cam.cx + (bot_l - cam.cx) * converge)
+        x_r = int(cam.cx + (bot_r - cam.cx) * converge)
+        return x_l, x_r
+
+    def _y_band(self, cam: "PerspectiveCamera", z: float):
+        """Top-y / bottom-y of the pink band at depth z.
+
+        LOW  : bottom sits on the floor (tracks floor_y); naturally
+               slides off the bottom of the viewport when z<0 because
+               floor_y(z) grows past cam.H.
+
+        HIGH : centre is anchored ABOVE the horizon by a fixed world-
+               offset.  During APPROACH (z>=0) the anchor rises with
+               the same (1-z)^1.6 envelope as the floor/ceiling, so the
+               bar feels in-sync with the tunnel perspective.  During
+               PASS-BY (z<0) we use a STEEPER anchor envelope so the
+               bar rises faster than it grows, letting it fully exit
+               the top of the viewport by z≈-0.9 instead of lingering
+               as a huge slab pinned at the top of the screen.
+        """
+        if self.kind == 'low':
+            fy = cam.floor_y(z)
+            cy = cam.ceil_y(z)
+            tunnel_h = fy - cy
+            h = tunnel_h * self.LOW_HEIGHT_FRAC
+            y_b = fy
+            y_t = fy - h
+        else:
+            t_h = max(0.0, (1.0 - z)) ** 1.6
+            if z >= 0.0:
+                t_a = t_h
+            else:
+                t_a = (1.0 - z) ** 2.0
+            off0 = cam.H * self.HIGH_HORIZON_OFFSET_FRAC
+            h_ref = cam.H * self.HIGH_HEIGHT_FRAC
+            c = cam.cy_v - t_a * off0
+            h = h_ref * t_h
+            y_t = c - h * 0.5
+            y_b = c + h * 0.5
+        return int(y_t), int(y_b)
+
+    # ---------------- rendering ----------------
+    def draw(self, canvas: np.ndarray, cam: "PerspectiveCamera",
+             cur_frame: int):
+        if self.state != 'flying':
+            return canvas
+        z = self.depth(cur_frame)
+
+        # Front face
+        x_l,  x_r  = self._span_x(cam, z)
+        y_t,  y_b  = self._y_band(cam, z)
+
+        # Back face — depth offset.  LOW uses a larger offset so the
+        # visible TOP surface of the slab has enough vertical span
+        # for the diagonal 3-D ribs to read clearly (user: "cảm giác
+        # 3D hơn").  HIGH keeps the thinner slab look.
+        z_off_back = 0.10  # same depth offset for both LOW and HIGH
+        z_back = min(1.0, z + z_off_back)
+        x_lb, x_rb = self._span_x(cam, z_back)
+        y_tb, y_bb = self._y_band(cam, z_back)
+
+        if self.kind == 'low':
+            return self._draw_low(canvas, cam, z,
+                                  x_l, x_r, y_t, y_b,
+                                  x_lb, x_rb, y_tb, y_bb)
+        return self._draw_high(canvas, cam, z,
+                               x_l, x_r, y_t, y_b,
+                               x_lb, x_rb, y_tb, y_bb)
+
+    # -- per-kind rendering -------------------------------------------------
+    def _draw_low(self, canvas, cam, z,
+                  x_l, x_r, y_t, y_b,
+                  x_lb, x_rb, y_tb, y_bb):
+        """Ground slab — a 3-D neon brick with a visible TOP face.
+
+        Camera sits above floor level, so for LOW we SEE the top of
+        the slab.  The top is drawn as a darker pink trapezoid
+        tapering toward the back-face in perspective; the front face
+        carries the bright magenta "energy bar" stripes.  The front
+        face uses a ROUNDED rectangle (user: "bo góc để mềm mại
+        hơn") and the vertical laser stripes are spaced wider than
+        before (user: "giãn các đường kẻ") so the bar reads less
+        busy at close range.  No white outline — edges read via the
+        tonal step between top and front faces plus a soft rim
+        highlight tracing the rounded top edge.
+        """
+        front_col    = CLR_WALL_PINK         # bright magenta
+        top_col      = (140, 25, 190)        # warm pink for top face
+        top_edge_col = (15, 5, 25)           # near-black: used for BOTH
+                                             # top-face ribs and front-face
+                                             # vertical stripes so the two
+                                             # faces read as a single
+                                             # grooved brick (user: "số
+                                             # vạch các mặt phải đồng nhất")
+
+        scale = cam.scale(z)
+
+        # --- Stripe count — FIXED at 24 lines per face ───────────────────
+        # User: "số line đen 2 mặt fix cứng là 24 line".  Same count on
+        # both top and front, paired 1-1 so each top rib continues as
+        # its matching front stripe and forms a seamless groove
+        # wrapping the brick's front-top edge.
+        N_STRIPES = 24
+        rib_w = max(2, int(2.4 * scale))
+
+        # Pre-compute paired (front-edge X, back-edge X) coordinates.
+        strip_xs = []
+        for i in range(1, N_STRIPES):       # skip i=0 and i=N_STRIPES
+            f = i / N_STRIPES
+            sxf = int(x_l  + (x_r  - x_l)  * f)
+            sxb = int(x_lb + (x_rb - x_lb) * f)
+            strip_xs.append((sxf, sxb))
+
+        # --- TOP face: trapezoid from (front-top line) to (back-top line)
+        top_poly = np.array([(x_l, y_t), (x_r, y_t),
+                             (x_rb, y_tb), (x_lb, y_tb)], np.int32)
+        cv2.fillPoly(canvas, [top_poly], top_col)
+
+        # Dark diagonal ribs that trace from the front edge back to
+        # the vanishing point.  Drawn BEFORE the front face so the
+        # rounded front carves cleanly over the front ends.
+        for sxf, sxb in strip_xs:
+            cv2.line(canvas, (sxf, y_t), (sxb, y_tb),
+                     top_edge_col, rib_w, lineType=cv2.LINE_AA)
+
+        # --- FRONT face (rounded rectangle) --------------------------------
+        # User: "xóa đường kẻ trắng phân cách 2 mặt đi" — the rim
+        # highlight that used to trace the front-top arc has been
+        # removed, so the transition between top and front faces is
+        # read purely from the tonal step + the continuous dark
+        # grooves wrapping from one face to the other.
+        r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
+        front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
+        cv2.fillPoly(canvas, [front_pts], front_col)
+
+        # Vertical BLACK stripes on the front face at the SAME x-
+        # positions as the top ribs (each front stripe is the
+        # downward continuation of one top rib).  Clipped to the
+        # rounded silhouette via a mask so they don't poke out at
+        # the rounded corners.
+        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [front_pts], 255)
+        temp = canvas.copy()
+        for sxf, _ in strip_xs:
+            cv2.line(temp, (sxf, y_t), (sxf, y_b),
+                     top_edge_col, rib_w, lineType=cv2.LINE_AA)
+        canvas[mask > 0] = temp[mask > 0]
+        return canvas
+
+    def _draw_high(self, canvas, cam, z,
+                   x_l, x_r, y_t, y_b,
+                   x_lb, x_rb, y_tb, y_bb):
+        """Overhead bar — neon 3-D brick matching LOW block style.
+
+        Camera is below this block, so the visible secondary face is
+        the BOTTOM face (mirrors LOW's top face).  Front face is the
+        same rounded-rect magenta with 24 black vertical stripes.
+        Bottom face uses 24 matching diagonal ribs so the grooves
+        wrap continuously around the bottom-front edge — identical
+        design language to the ground slab (user: "thiết kế lại vật
+        cản treo", obstacle-visual-style rule).
+        """
+        front_col    = CLR_WALL_PINK          # bright magenta
+        bot_col      = (140, 25, 190)         # warm purple — bottom face
+        top_col      = (70, 25, 95)           # dark plum — hidden top face
+        groove_col   = (15, 5, 25)            # near-black grooves (both faces)
+
+        scale = cam.scale(z)
+
+        # ── fixed 24-line groove system (matches LOW) ─────────────────────
+        N_STRIPES = 24
+        rib_w = max(2, int(2.4 * scale))
+
+        strip_xs = []
+        for i in range(1, N_STRIPES):
+            f = i / N_STRIPES
+            sxf = int(x_l  + (x_r  - x_l)  * f)
+            sxb = int(x_lb + (x_rb - x_lb) * f)
+            strip_xs.append((sxf, sxb))
+
+        # ── TOP face (hidden / far side) — dark fill only, no ribs ───────
+        top_poly = np.array([(x_l, y_t), (x_r, y_t),
+                             (x_rb, y_tb), (x_lb, y_tb)], np.int32)
+        cv2.fillPoly(canvas, [top_poly], top_col)
+
+        # ── BOTTOM face — trapezoid visible from below ────────────────────
+        bot_poly = np.array([(x_l, y_b), (x_r, y_b),
+                             (x_rb, y_bb), (x_lb, y_bb)], np.int32)
+        cv2.fillPoly(canvas, [bot_poly], bot_col)
+
+        # Diagonal ribs on the bottom face, converging to vanishing point.
+        # Each rib runs from the front-bottom edge backward — same x-coords
+        # as the matching front stripes.
+        for sxf, sxb in strip_xs:
+            cv2.line(canvas, (sxf, y_b), (sxb, y_bb),
+                     groove_col, rib_w, lineType=cv2.LINE_AA)
+
+        # ── FRONT face (rounded rectangle) ───────────────────────────────
+        r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
+        front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
+        cv2.fillPoly(canvas, [front_pts], front_col)
+
+        # Vertical black stripes clipped to rounded silhouette.
+        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [front_pts], 255)
+        temp = canvas.copy()
+        for sxf, _ in strip_xs:
+            cv2.line(temp, (sxf, y_t), (sxf, y_b),
+                     groove_col, rib_w, lineType=cv2.LINE_AA)
+        canvas[mask > 0] = temp[mask > 0]
+        return canvas
+
+
 class WallTarget(Target):
     """Laser-stripe wall obstacle spanning 2 adjacent lanes."""
 
@@ -2747,7 +3306,8 @@ class GameManager:
                           is_left: bool,
                           line_block_hits: list[int] | None = None,
                           line_block_shrinks: list[int] | None = None,
-                          line_hold_eff: int | None = None):
+                          line_hold_eff: int | None = None,
+                          relax_kind: str | None = None):
             if m == 'dance':
                 return DanceTarget(spawn_f, bf, lane, is_left)
             if m == 'line':
@@ -2760,6 +3320,15 @@ class GameManager:
                                   block_hit_frames=line_block_hits,
                                   block_shrink_frames=line_block_shrinks,
                                   zigzag=line_zigzag)
+            if m == 'relax':
+                # Randomise each beat between LOW (ground slab → jump)
+                # and HIGH (floating bar → duck).  `relax_kind` lets the
+                # caller override to force one or the other (e.g. for
+                # testing).
+                if relax_kind not in ('low', 'high'):
+                    relax_kind = ('high' if self.rng.random() < 0.5
+                                  else 'low')
+                return RelaxTarget(spawn_f, bf, kind=relax_kind)
             return PunchTarget(spawn_f, bf, lane, is_left)
 
         def _target_cls_for(m: str):
@@ -2893,6 +3462,13 @@ class GameManager:
         # chains appear strictly one-after-another across the 4 lanes
         # (no two chains side-by-side at the same time).
         line_global_busy_until: int = -10 ** 9
+        # ── Relax-mode global lock ─────────────────────────────────────
+        # Relax obstacles span the whole tunnel, so only ONE can be in
+        # flight at a time — otherwise two full-width slabs would
+        # overlap.  We reserve half a travel-window between consecutive
+        # relax spawns which also gives the stickman / camera time to
+        # finish the dodge animation before the next cue.
+        relax_busy_until: int = -10 ** 9
         skipped_early = 0
         skipped_stacked = 0
         # Combo-mode cursor: advances once per SCHEDULED beat-event (incl.
@@ -2935,6 +3511,39 @@ class GameManager:
                 continue
 
             target_cls = _target_cls_for(cur_mode)
+
+            # ── RELAX obstacle path (full-tunnel, no lane cycling) ─────
+            # Relax obstacles span the entire track, so we spawn ONE
+            # per beat regardless of which lane the side-cursor would
+            # have picked.  A dedicated global lock (`relax_busy_until`)
+            # prevents two slabs overlapping in flight and gives the
+            # camera / stickman enough breathing room between dodges.
+            if cur_mode == 'relax':
+                if bf < relax_busy_until:
+                    skipped_stacked += 1
+                    continue
+                t = _spawn_target('relax', spawn_f, bf, 0, False)
+                self.targets.append(t)
+                # Stream obstacles continuously: while one slab is
+                # front-and-centre, the NEXT should already be gliding
+                # in from the horizon so the viewer sees a pipeline of
+                # blocks receding into the vanishing point — never a
+                # blank "waiting" gap between them.  Using travel // 4
+                # allows ~4 blocks in flight at once; the far blocks
+                # are mostly occluded by the near one until it passes,
+                # at which point the next one is already large enough
+                # to take over seamlessly.  The previous travel // 2
+                # value combined with the 4× speed slowdown produced
+                # 3-second empty gaps where the player only saw the
+                # dying tail of one block before the next appeared.
+                # Floor of 8 frames for extreme slow-travel edge cases;
+                # also respect `min_gap_frames` so inter-beat spacing
+                # set by the caller still wins when larger.
+                relax_busy_until = bf + max(
+                    8, self.travel // 4, min_gap_frames)
+                last_bf = bf
+                emit_idx += 1
+                continue
 
             # ── PAIRED spawn path (punch): (N-1) single + 1 double ──
             # Same cycle model as dance-paired.  On every Nth punch
@@ -3216,6 +3825,17 @@ class RhythmVisualizer:
         # alternate direction (chain is a wide left-right zigzag across
         # the tunnel, with head/tail on the two outer lanes).
         self.LINE_ZIGZAG:       str = 'vertical'
+        # ── Relax-mode cadence (solo relax only) ────────────────────────
+        # 0.0 (default) = music-driven: obstacles spawn on audio beats
+        # (wave-columns or onset events, same as every other mode).
+        # >0.0          = fixed-interval: ignore audio and schedule one
+        #                 obstacle every N seconds.  Useful for laid-back
+        #                 videos where obstacle cadence shouldn't be tied
+        #                 to the song's rhythm.  Only applied when
+        #                 --mode is SOLO "relax"; combos still follow
+        #                 audio beats so inter-mode alternation stays
+        #                 coherent.
+        self.RELAX_INTERVAL:    float = 0.0
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -3512,7 +4132,9 @@ class RhythmVisualizer:
         elif 'punch' in modes_seq:
             primary_mode = 'punch'
         else:
-            primary_mode = 'punch'  # 'line' solo uses punch scene dressing
+            # 'line' solo and 'relax' solo both reuse the punch scene
+            # dressing (plain tunnel, no lane rails, no air targets).
+            primary_mode = 'punch'
         mode         = primary_mode   # used below for scene dressing
         if combo_mode:
             print(f"[mode] combo ✔  beats cycle: "
@@ -3543,6 +4165,8 @@ class RhythmVisualizer:
             stick_action = 'combo'
         elif len(modes_seq) == 1 and modes_seq[0] == 'line':
             stick_action = 'line'
+        elif len(modes_seq) == 1 and modes_seq[0] == 'relax':
+            stick_action = 'relax'
         else:
             stick_action = mode
         stick     = StickmanHUD(cam, action=stick_action) if self.SHOW_STICKMAN else None
@@ -3555,16 +4179,38 @@ class RhythmVisualizer:
         # BLOCK_SPEED < 1.0 slows the blocks down (longer travel → more blocks
         # visible at once on each lane, staggered near→far, like the reference
         # tunnel shot); > 1.0 speeds them up.
+        # Solo relax obstacles are meant to drift in slowly — the
+        # player is just chilling and watching them glide past.  We
+        # halve the effective speed (= double the travel window) so
+        # each slab is on-screen roughly twice as long as a punch cube
+        # would be at the same --speed setting.  Combo modes that
+        # include relax keep the shared speed so lane cadence stays
+        # coherent with the other sub-modes.
+        solo_relax = (len(modes_seq) == 1 and modes_seq[0] == 'relax')
+        # 4.0× slowdown for relax mode: originally 2.0, bumped per user
+        # feedback ("các khối đi chuyển chậm hơn x2 nữa") — the dodge
+        # choreography reads better when blocks drift in slowly enough
+        # for the stickman pose + camera bob to settle between beats.
+        _relax_slow_mult = 4.0 if solo_relax else 1.0
+
         travel = self.TRAVEL_FRAMES
         if self.TRAVEL_FRAMES < 0 and len(beat_frames) >= 2:
             diffs = np.diff(beat_frames)
             base = int(round(np.median(diffs) * 2))     # one L↔R cycle
             speed = max(0.05, float(self.BLOCK_SPEED))
-            travel = max(8, int(round(base / speed)))
+            travel = max(8, int(round(base / speed * _relax_slow_mult)))
             n_in_flight = max(1, int(round(travel / base)))
+            slow_note = (f"  relax_slow×{_relax_slow_mult:.1f}"
+                         if _relax_slow_mult != 1.0 else "")
             print(f"[travel:auto] period={int(np.median(diffs))}f  "
-                  f"base_cycle={base}f  speed={speed:.2f}  "
+                  f"base_cycle={base}f  speed={speed:.2f}{slow_note}  "
                   f"travel={travel}f  (~{n_in_flight} blocks/lane visible)")
+        elif self.TRAVEL_FRAMES >= 0 and _relax_slow_mult != 1.0:
+            # Explicit --travel was given; still halve for relax so the
+            # user doesn't have to double it manually.
+            travel = max(8, int(round(self.TRAVEL_FRAMES * _relax_slow_mult)))
+            print(f"[travel:manual] user travel={self.TRAVEL_FRAMES}f "
+                  f"× relax_slow {_relax_slow_mult:.1f} = {travel}f")
 
         game = GameManager(cam, travel=travel)
 
@@ -3587,6 +4233,68 @@ class RhythmVisualizer:
         if self.LANE_FILTER is not None:
             lane_list = sorted(v + 1 for v in self.LANE_FILTER)
             print(f"[lane_filter] Enabled lanes (1-based): {lane_list}")
+
+        # ── Solo-relax fixed-delay cadence override ────────────────────
+        # When --mode is solo "relax" AND --relax_interval is set, we
+        # REPLACE `beat_frames` with a schedule that guarantees the
+        # PREVIOUS block has fully disappeared BEFORE the next one
+        # spawns at the horizon.  The CLI value is interpreted as a
+        # "time delay" in the strict sense (user: "khối phía trước
+        # phải khuất hẵn sau bao nhiêu s thì mới bắt đầu xuất hiện
+        # khối tiếp theo"):
+        #
+        #     next_spawn = prev_die + delay*FPS
+        #
+        # prev_die is derived analytically from RelaxTarget.is_dead
+        # (`hit + travel·1.2/v2`).  Since every block has its
+        # spawn_frame = hit_frame − travel, the inter-hit step is:
+        #
+        #     step_f = travel + exit_pad + 1 + delay_f
+        #            = (travel to fly in) + (travel past camera) +
+        #              (requested idle delay)
+        #
+        # The very first block's hit is pinned at `travel` so it
+        # glides in cleanly from the horizon at t=0 instead of popping
+        # into the camera plane.
+        solo_relax = (len(modes_seq) == 1 and modes_seq[0] == 'relax')
+        if solo_relax and self.RELAX_INTERVAL > 0.0:
+            # Derive exit_pad from the RelaxTarget motion profile so
+            # the schedule stays correct even if the phase parameters
+            # change later.
+            T_split  = RelaxTarget._phase_split_t()
+            z_split  = 1.0 - RelaxTarget.PHASE_SPLIT_D
+            v2       = z_split / max(1e-6, 1.0 - T_split)
+            exit_pad = int(round(travel * 1.2 / v2))
+            delay_f  = max(0, int(round(self.RELAX_INTERVAL * self.FPS)))
+            step_f   = max(1, travel + exit_pad + 1 + delay_f)
+            first_f  = travel
+            beat_frames = list(range(first_f, total_frames, step_f))
+            print(f"[relax-timer] fixed-delay cadence: "
+                  f"delay={self.RELAX_INTERVAL:.2f}s ({delay_f}f) "
+                  f"after disappearance  "
+                  f"(travel={travel}f + exit_pad={exit_pad}f "
+                  f"+ delay={delay_f}f → step={step_f}f)  "
+                  f"→ {len(beat_frames)} obstacles "
+                  f"(first @ frame {first_f} / {first_f/self.FPS:.2f}s)")
+        elif solo_relax:
+            # Music-driven solo-relax: drop any beat whose spawn would
+            # fall before frame 0.  Without this, early-song beats
+            # (bf < travel) materialise "already mid-flight" at frame
+            # 0 — the block appears close to the camera and zooms in
+            # aggressively, reading as a sudden fast pop-in instead of
+            # the slow horizon-to-camera glide this mode is meant to
+            # show.  We only apply it to relax because combo / punch
+            # modes intentionally accept mid-flight spawns so the song
+            # can start on-beat.
+            n_before = len(beat_frames)
+            beat_frames = [int(bf) for bf in beat_frames if bf >= travel]
+            dropped = n_before - len(beat_frames)
+            if dropped:
+                print(f"[relax-timer] dropped {dropped} early beat(s) "
+                      f"(bf<{travel}) so every obstacle glides in "
+                      f"cleanly from the horizon instead of popping "
+                      f"in mid-flight.")
+
         game.pre_schedule(beat_frames, bass_arr,
                           min_gap_frames=self.BEAT_MIN_GAP,
                           min_lane_gap=min_lane_gap,
@@ -3627,6 +4335,27 @@ class RhythmVisualizer:
             if isinstance(tg, WallTarget):
                 kind = 'W'
                 lean_scale = 1.0
+            elif isinstance(tg, RelaxTarget):
+                # Relax obstacles → jump (low) or squat (high) — no
+                # lane cycling, lean_scale stays neutral.  We fire at
+                # `dodge_frame` (Phase 1 → Phase 2 transition) so the
+                # stickman starts the pose exactly as visual motion
+                # explodes into the "vút" phase.
+                #
+                # The pose holds until `dodge_end_frame` (dodge + a
+                # fraction of travel driven by DODGE_HOLD_FRAC) and
+                # then the tween engine recovers to RELAX_STAND.  This
+                # gives the avatar a clear "dodge → stand → dodge"
+                # rhythm between blocks instead of chaining SQ/JP
+                # waypoints end-to-end (which the user observed as
+                # "never returning to initial position").
+                kind = 'JP' if tg.kind == 'low' else 'SQ'
+                lean_scale = 1.0
+                t_hit = tg.dodge_frame / self.FPS
+                hold_frames = tg.dodge_end_frame - tg.dodge_frame
+                sustain = max(
+                    _RELAX_BOB_WINDOW_F, int(hold_frames)
+                ) / float(self.FPS)
             elif isinstance(tg, LineTarget):
                 # Emit one short event per block in the chain so the
                 # stickman arm tracks each cube.  Each event sustains
@@ -3806,6 +4535,15 @@ class RhythmVisualizer:
 
             # 4. process hits → VFX (particles only, no flash/slash)
             for tg in hits:
+                # RelaxTarget is a DODGE obstacle, not a hit — the player
+                # avatar jumps or squats to avoid it.  No particle burst,
+                # no combo increment, no viewport shake: those would all
+                # read as "you hit / destroyed the block" which is the
+                # opposite of the relax mode's intent.  Camera bob and
+                # the stickman JP/SQ pose already provide the feedback
+                # that the obstacle was successfully avoided.
+                if isinstance(tg, RelaxTarget):
+                    continue
                 # In horizontal-zigzag LineTarget chains each block lands
                 # on a different lane (outer-left vs outer-right) and the
                 # chain also lives higher in the sky than the normal
@@ -3856,6 +4594,19 @@ class RhythmVisualizer:
             # 6. bloom / glow on everything so far (skip UI to keep text crisp)
             if self.BLOOM:
                 canvas = gpu_glow(canvas, sigma=9.0, gain=0.32)
+
+            # 6b. Relax-mode camera bob — vertical post-shift of the scene
+            # to sell the jump (canvas drops) / duck (canvas rises).  We
+            # apply this AFTER bloom so the bloom glow moves with the
+            # scene, and BEFORE the HUDs so stickman / combo / debug
+            # overlays stay pinned to their screen positions.
+            if 'relax' in modes_seq:
+                _bob_dy = _relax_camera_dy(game.targets, fi, self.HEIGHT)
+                if _bob_dy != 0:
+                    _M = np.float32([[1, 0, 0], [0, 1, _bob_dy]])
+                    canvas = cv2.warpAffine(
+                        canvas, _M, (self.WIDTH, self.HEIGHT),
+                        borderValue=(0, 0, 0))
 
             # 7. HUDs (drawn last, above bloom)
             viewport.update()
@@ -4139,12 +4890,20 @@ def parse_arguments():
                          'height, stickman punches them. '
                          '"dance" = flat slabs sliding along the floor, '
                          'stickman stomps on them. '
+                         '"line" = elongated rail-style holds with '
+                         'shrinking chain segments. '
+                         '"relax" = dodge-style: full-tunnel pink '
+                         'obstacles arrive from far — a LOW ground '
+                         'slab triggers a JUMP (camera + stickman rise); '
+                         'a HIGH floating bar triggers a SQUAT '
+                         '(camera + stickman dip).  Kind is picked '
+                         'randomly per beat. '
                          'COMBO: pass a comma-list like '
-                         '"punch,dance" (or "dance,punch") to alternate '
-                         'per beat — beat 0 spawns the first mode, '
-                         'beat 1 the second, and so on.  Stickman '
+                         '"punch,dance" (or "dance,punch,relax") to '
+                         'alternate per beat — beat 0 spawns the first '
+                         'mode, beat 1 the second, and so on.  Stickman '
                          'switches to a unified "combo" action that '
-                         'punches for P-beats and stomps for D-beats.'))
+                         'covers all beat types.'))
     p.add_argument('--dance_pair_cycle', type=int, default=4, metavar='N',
                    help=('Dance paired-spawn cycle length (active when '
                          'the enabled lane set has ≥ 1 same-side '
@@ -4193,6 +4952,25 @@ def parse_arguments():
                          'face) and tail (back face) of each block '
                          'always sit on the two outer lanes, producing '
                          'a wide horizontal zig-zag across the tunnel.'))
+    p.add_argument('--relax_interval', type=float, default=0.0,
+                   metavar='SEC',
+                   help=('Solo-relax cadence mode. '
+                         '0.0 (default) = "theo nhạc": obstacles spawn '
+                         'on the detected audio beats (wave-columns / '
+                         'onsets), same as every other mode. '
+                         '>0.0 = "theo thời gian": idle DELAY between '
+                         'the moment the previous block has fully '
+                         'disappeared and the moment the next block '
+                         'appears at the horizon.  Guarantees only '
+                         'ONE block is visible on screen at a time '
+                         '(user: "khối phía trước phải khuất hẵn sau '
+                         'bao nhiêu s thì mới bắt đầu xuất hiện khối '
+                         'tiếp theo").  Only active when --mode is '
+                         'solo "relax"; combo modes that include '
+                         'relax still follow audio beats so inter-'
+                         'mode alternation stays coherent.  Typical '
+                         'values: 0.5–2.0 for calm, breathing '
+                         'gameplay.'))
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -4295,6 +5073,7 @@ if __name__ == '__main__':
     viz.LINE_BEATS       = max(1, int(args.line_beats))
     viz.LINE_DEBUG       = bool(args.line_debug)
     viz.LINE_ZIGZAG      = str(args.line_zigzag).lower().strip() or 'vertical'
+    viz.RELAX_INTERVAL   = max(0.0, float(args.relax_interval))
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:
