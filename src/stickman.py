@@ -211,6 +211,35 @@ _PUNCH_POSES: dict[str, dict] = {
     'HOLD_R_DOWN': dict(la_u=305, la_f=170, ra_u= 42, ra_f= 42,
                         ll_u=330, ll_f=348, rl_u= 38, rl_f= 15,
                         lean= 6, drop=5, punch='R'),
+
+    # ── HORIZONTAL SWEEP — arm tracks the chain's lane-to-lane direction.
+    # Used by the 'line' action when the scheduler emits ZSLR / ZSRL
+    # (``line_zigzag=horizontal``).  The strike pose is placed at t_hit
+    # (block head arrives) and the matching HOLD-END pose is placed at
+    # t_hit + sustain (block tail arrives), so the tween engine
+    # animates a smooth arm sweep across the top of the screen in
+    # lock-step with the block's head → tail direction.
+    #
+    # Angle convention: 0°=down, 90°=right, 180°=up, 270°=left.
+    # 225° = upper-LEFT (between 180 and 270), 135° = upper-RIGHT
+    # (between 90 and 180).  Interpolating 225° → 135° or 135° → 225°
+    # both pass through 180° (straight up), producing a clean arc.
+    # Elbow is locked straight (la_u == la_f on L side, ra_u == ra_f
+    # on R side) so the sweep reads as a rigid pointing arm instead of
+    # a floppy jab.  ``punch`` keeps the fist enlarged / streak-lit
+    # for the full sustain window.
+    'SWEEP_L_LEFT':  dict(la_u=225, la_f=225, ra_u= 55, ra_f=190,
+                          ll_u=322, ll_f=345, rl_u= 30, rl_f= 12,
+                          lean=-4, drop=0, punch='L'),
+    'SWEEP_L_RIGHT': dict(la_u=135, la_f=135, ra_u= 55, ra_f=190,
+                          ll_u=322, ll_f=345, rl_u= 30, rl_f= 12,
+                          lean= 4, drop=0, punch='L'),
+    'SWEEP_R_RIGHT': dict(la_u=305, la_f=170, ra_u=135, ra_f=135,
+                          ll_u=330, ll_f=348, rl_u= 38, rl_f= 15,
+                          lean= 4, drop=0, punch='R'),
+    'SWEEP_R_LEFT':  dict(la_u=305, la_f=170, ra_u=225, ra_f=225,
+                          ll_u=330, ll_f=348, rl_u= 38, rl_f= 15,
+                          lean=-4, drop=0, punch='R'),
 }
 
 
@@ -253,12 +282,34 @@ ACTIONS['line'] = {
         'ZLD': ['HOLD_L_DOWN'],
         'ZRU': ['HOLD_R_UP'],
         'ZRD': ['HOLD_R_DOWN'],
+        # Horizontal sweep (line_zigzag=horizontal).  BOTH kinds use the
+        # SAME (left) arm so the sweep reads as a continuous pendulum
+        # across successive blocks — the end pose of one block IS the
+        # start pose of the next, producing a seamless arm motion with
+        # no inter-block pose-snap.
+        #   ZSLR : la_u 225°(up-LEFT) → 135°(up-RIGHT)   (block L→R)
+        #   ZSRL : la_u 135°(up-RIGHT) → 225°(up-LEFT)   (block R→L)
+        # Only the START pose is listed here; the matching END pose
+        # lives in ``holds_end`` below and is used by set_beat_events
+        # when the event carries sustain > 0.
+        'ZSLR': ['SWEEP_L_LEFT'],
+        'ZSRL': ['SWEEP_L_RIGHT'],
         'W':   ['DOUBLE_UP'],
+    },
+    # Optional per-kind hold-end pose used by set_beat_events when
+    # ``sustain > 0``.  If a kind has an entry here, the tween engine
+    # animates arm-pose-from-start → arm-pose-from-end over the sustain
+    # window (instead of the legacy "same pose frozen" behaviour).
+    'holds_end': {
+        'ZSLR': 'SWEEP_L_RIGHT',
+        'ZSRL': 'SWEEP_L_LEFT',
     },
     'recover': {
         'ZL': 'GUARD_L', 'ZR': 'GUARD_R',
         'ZLU': 'GUARD_L', 'ZLD': 'GUARD_L',
         'ZRU': 'GUARD_R', 'ZRD': 'GUARD_R',
+        # Both sweeps use the LEFT arm, so both recover toward GUARD_L.
+        'ZSLR': 'GUARD_L', 'ZSRL': 'GUARD_L',
         'W': 'GUARD_BOTH',
     },
 }
@@ -473,6 +524,17 @@ ACTIONS['combo'] = {
         'ZLD': ['HOLD_L_DOWN'],
         'ZRU': ['HOLD_R_UP'],
         'ZRD': ['HOLD_R_DOWN'],
+        # Horizontal line-sweep (line_zigzag=horizontal) also works in
+        # combo mode when the beat cycle includes a line sub-mode.
+        # Both sweeps use the LEFT arm so the motion reads as a
+        # continuous pendulum across blocks (end-of-block-N pose IS
+        # start-of-block-N+1 pose).
+        'ZSLR': ['SWEEP_L_LEFT'],
+        'ZSRL': ['SWEEP_L_RIGHT'],
+    },
+    'holds_end': {
+        'ZSLR': 'SWEEP_L_RIGHT',
+        'ZSRL': 'SWEEP_L_LEFT',
     },
     'prelift': {
         # Only dance beats get an anticipation chain; punch beats snap
@@ -492,6 +554,8 @@ ACTIONS['combo'] = {
         'ZL': 'GUARD_L', 'ZR': 'GUARD_R',
         'ZLU': 'GUARD_L', 'ZLD': 'GUARD_L',
         'ZRU': 'GUARD_R', 'ZRD': 'GUARD_R',
+        # Both sweeps use the LEFT arm → recover toward GUARD_L.
+        'ZSLR': 'GUARD_L', 'ZSRL': 'GUARD_L',
     },
 }
 
@@ -630,6 +694,14 @@ class StickmanHUD:
         # beat impact reads as a real slam instead of a smooth morph.
         prelift_map  = lib.get('prelift') or {}
         prelift_time = float(lib.get('prelift_time', 0.0) or 0.0)
+        # Optional per-kind hold-end pose.  When a kind has an entry here
+        # AND the event carries ``sustain > 0``, the waypoint at
+        # t_hit + sustain uses this END pose instead of repeating the
+        # strike pose — the tween engine then interpolates between them
+        # and the arm visibly SWEEPS across the screen during the hold.
+        # Used by 'line' horizontal-zigzag mode (ZSLR / ZSRL) so the
+        # stickman's arm tracks each block's lane-to-lane direction.
+        holds_end = lib.get('holds_end') or {}
 
         valid_kinds = set(strikes.keys())
         # Each entry: (t_hit, kind, lean_scale, sustain).  Sustain ≥ 0
@@ -789,7 +861,13 @@ class StickmanHUD:
             # skip this and fall through to the normal recover.
             if sustain > 0.0:
                 t_hold_end = t_hit + sustain
-                tl.append((t_hold_end, pose_name))
+                # If the action library declares a SEPARATE end pose for
+                # this kind, use it so the tween engine animates the
+                # strike → end pose transition across the sustain window
+                # (e.g. arm SWEEP for horizontal line chains).  Otherwise
+                # repeat the strike pose → legacy frozen hold.
+                end_pose = holds_end.get(kind, pose_name)
+                tl.append((t_hold_end, end_pose))
                 scales.append(l_scale)
                 # Retract happens ``tween`` seconds AFTER the hold
                 # ends so there's a clean lower-arm animation even on
