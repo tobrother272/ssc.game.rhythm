@@ -1488,6 +1488,18 @@ class LineTarget(PunchTarget):
             p = cam.project(x, y, z)
             return (int(p[0]), int(p[1])) if p else None
 
+        # Bo góc nhẹ cho từng face — radius = 8% cạnh ngắn nhất (min 1 px).
+        # Tạo cảm giác mềm mại, không sắc cạnh mà vẫn giữ hình dạng quad.
+        def _fill_rounded(quad_pts, color):
+            pts_f = np.asarray(quad_pts, dtype=np.float32)
+            edges = [float(np.linalg.norm(pts_f[(k + 1) % len(pts_f)] -
+                                          pts_f[k]))
+                     for k in range(len(pts_f))]
+            r = max(1.0, min(edges) * 0.08)
+            rp = (_round_poly(pts_f, r, steps=5)
+                  if r > 1.0 else pts_f).astype(np.int32)
+            cv2.fillPoly(canvas, [rp], color, lineType=cv2.LINE_AA)
+
         for fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t in segs:
             # Front face corners (centred at wy_f)
             fTL = _pt(wx - hx, wy_f + hx, fz)
@@ -1538,8 +1550,7 @@ class LineTarget(PunchTarget):
 
             if all(p is not None for p in sf):
                 side_col = tuple(int(c * s_bright) for c in col)
-                cv2.fillPoly(canvas, [np.array(sf, dtype=np.int32)],
-                             side_col, lineType=cv2.LINE_AA)
+                _fill_rounded(sf, side_col)
 
             # ── TOP / BOTTOM connecting face ───────────────────────────────
             # For a tilted block (wy_f ≠ wy_b) the horizontal face that
@@ -1561,13 +1572,11 @@ class LineTarget(PunchTarget):
                 h2 = _pt(wx + hx, wy_b + hx, bz)
                 h3 = _pt(wx - hx, wy_b + hx, bz)
             if all(p is not None for p in (h0, h1, h2, h3)):
-                horiz_poly = np.array([h0, h1, h2, h3], dtype=np.int32)
-                cv2.fillPoly(canvas, [horiz_poly], horiz_col, cv2.LINE_AA)
+                _fill_rounded((h0, h1, h2, h3), horiz_col)
 
             # ── FRONT FACE ────────────────────────────────────────────────
-            fill_col   = tuple(int(c * f_bright) for c in col)
-            front_poly = np.array([fTL, fTR, fBR, fBL], dtype=np.int32)
-            cv2.fillPoly(canvas, [front_poly], fill_col, lineType=cv2.LINE_AA)
+            fill_col = tuple(int(c * f_bright) for c in col)
+            _fill_rounded((fTL, fTR, fBR, fBL), fill_col)
 
             cx_s   = int((fTL[0] + fBR[0]) / 2)
             cy_s   = int((fTL[1] + fBR[1]) / 2)
