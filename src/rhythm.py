@@ -1253,6 +1253,106 @@ class PunchTarget(Target):
         return canvas
 
 
+def detect_wave_columns(y: np.ndarray, sr: int, hop_length: int,
+                        fps: float,
+                        min_gap_frames: int = 4,
+                        prominence_pct: float = 20.0,
+                        smooth_win: int = 1) -> list[dict]:
+    """Extract "wave columns" from an RMS envelope.
+
+    Each column describes one perceived attack+sustain in the audio and
+    is used by line-mode as the SINGLE source of truth for both:
+
+        1. WHEN a block arrives at the punch zone → ``rise_f`` = frame
+           where the RMS envelope starts rising (local minimum just
+           before the peak).
+        2. HOW LONG the block takes to shrink away → ``end_f - rise_f``
+           where ``end_f`` is the midpoint of the descent from the peak
+           to the next local minimum (the "average" falling-off point).
+
+    Returned fields (all frame indices are VIDEO frames at ``fps``):
+        rise_f  : rise-start frame  (block arrives / spawns shrink)
+        peak_f  : peak frame        (loudest point of the column)
+        end_f   : descent-midpoint  (block is fully gone by here)
+        height  : peak amplitude    (used to rank strongest columns)
+    """
+    try:
+        from scipy.signal import find_peaks
+    except Exception:
+        return []
+
+    if y is None or len(y) == 0 or sr <= 0 or fps <= 0:
+        return []
+
+    # Use an INTERNAL finer envelope — independent of the rhythm
+    # feature hop — so transients stay crisp even when the caller
+    # loaded audio at sr=22050 and hop=512.
+    local_hop   = max(128, min(int(hop_length), 256))
+    local_frame = max(512, local_hop * 4)
+    rms = librosa.feature.rms(y=y, frame_length=local_frame,
+                              hop_length=local_hop)[0]
+    n = len(rms)
+    if n < 3:
+        return []
+
+    # Light moving-average smoothing to suppress micro-peaks.
+    k = max(1, int(smooth_win))
+    if k > 1:
+        kernel = np.ones(k, dtype=np.float32) / float(k)
+        rms_s = np.convolve(rms, kernel, mode='same')
+    else:
+        rms_s = rms.astype(np.float32, copy=True)
+
+    sec_per_hop = local_hop / float(sr)
+    sec_per_vf = 1.0 / float(fps)
+    # Minimum inter-peak distance in RMS hop units.
+    min_dist_hops = max(1, int(round(min_gap_frames * sec_per_vf
+                                     / max(1e-9, sec_per_hop))))
+    prom = max(1e-6, float(np.percentile(rms_s, prominence_pct)))
+
+    peaks, _props = find_peaks(rms_s, distance=min_dist_hops,
+                               prominence=prom)
+    if len(peaks) == 0:
+        return []
+
+    def hop_to_frame(h: int) -> int:
+        return int(round(h * sec_per_hop * fps))
+
+    columns: list[dict] = []
+    for p in peaks:
+        p = int(p)
+        # Rise start = scan left while envelope was rising toward p.
+        left = p
+        while left > 0 and rms_s[left - 1] < rms_s[left]:
+            left -= 1
+        # Right minimum = scan right while envelope is descending.
+        right = p
+        while right < n - 1 and rms_s[right + 1] < rms_s[right]:
+            right += 1
+        # Column "end" = midpoint of the descent (average falling-off
+        # point, as the user described).
+        end_idx = (p + right) // 2
+        columns.append({
+            'rise_f': hop_to_frame(left),
+            'peak_f': hop_to_frame(p),
+            'end_f':  hop_to_frame(end_idx),
+            'height': float(rms[p]),
+        })
+
+    # Enforce strict time ordering + non-overlap of (rise_f, end_f)
+    # windows (columns with identical rise due to rounding collapse
+    # into the stronger one).
+    columns.sort(key=lambda c: c['rise_f'])
+    dedup: list[dict] = []
+    for c in columns:
+        if dedup and c['rise_f'] <= dedup[-1]['rise_f']:
+            if c['height'] > dedup[-1]['height']:
+                dedup[-1] = c
+            continue
+        dedup.append(c)
+    return dedup
+
+
 class LineTarget(PunchTarget):
     """Chain-of-cubes hold-note (mode='line').
 
@@ -1309,24 +1409,62 @@ class LineTarget(PunchTarget):
 
     def __init__(self, spawn_frame: int, hit_frame: int, lane: int,
                  is_left: bool, hold_frames: int,
-                 line_beats: int = 2):
+                 line_beats: int = 2,
+                 block_hit_frames: list[int] | None = None,
+                 block_shrink_frames: list[int] | None = None):
         super().__init__(spawn_frame, hit_frame, lane, is_left)
         self.hold_frames = max(1, int(hold_frames))
         self.line_beats  = max(1, int(line_beats))
-        # n_cubes is anchored to the *musical* beat count at 8th-note
-        # subdivision (2 blocks per beat), matching the CapCut reference
-        # video look.  So a 2-beat hold → 4 blocks, 4-beat hold → 8
-        # (clamped to 8).  This keeps chain length tied to music rather
-        # than per-frame spacing.
-        self.n_cubes = min(8, max(2, 2 * self.line_beats))
-        # D (frames between consecutive cube centres & shrink duration)
-        # is derived so n_cubes blocks exactly span `hold_frames`:
-        # block 0 hits at hit_frame, block n-1 hits at hit_frame + hold.
-        # This keeps each block's arrival on-beat and lets the shrink
-        # pacing auto-scale with song tempo.
-        D = max(1, int(round(self.hold_frames /
-                             max(1, self.n_cubes - 1))))
-        self._D = D
+        # Prefer the caller-supplied block_hit_frames as the source of
+        # truth for n_cubes (waveform-driven scheduler produces one
+        # block per RMS column — could be any number 2..8).  Fallback
+        # to 8th-note subdivision when no explicit per-block frames
+        # are given.
+        if block_hit_frames is not None and len(block_hit_frames) >= 2:
+            self.n_cubes = min(8, max(2, int(len(block_hit_frames))))
+            _bh = sorted(int(v) for v in block_hit_frames[:self.n_cubes])
+            for i in range(1, len(_bh)):
+                if _bh[i] <= _bh[i - 1]:
+                    _bh[i] = _bh[i - 1] + 1
+            self.block_hit_frames = _bh
+        else:
+            self.n_cubes = min(8, max(2, 2 * self.line_beats))
+            D = max(1, int(round(self.hold_frames /
+                                 max(1, self.n_cubes - 1))))
+            self.block_hit_frames = [self.hit_frame + i * D
+                                     for i in range(self.n_cubes)]
+
+        # Per-block shrink duration.  When the scheduler derives
+        # durations from the waveform (rise → descent-midpoint per
+        # column) each block shrinks in lockstep with its own column.
+        # Otherwise fallback to the median intra-block gap so the
+        # legacy uniform-spacing behaviour is preserved.
+        if (block_shrink_frames is not None
+                and len(block_shrink_frames) >= self.n_cubes):
+            self.block_shrink_dur = [max(1, int(v))
+                                     for v in block_shrink_frames[:self.n_cubes]]
+        else:
+            if len(self.block_hit_frames) >= 2:
+                _diffs = np.diff(np.asarray(self.block_hit_frames,
+                                            dtype=np.int64))
+                _med = max(1, int(np.median(_diffs)))
+            else:
+                _med = max(1, int(round(self.hold_frames)))
+            # Last block gets the median gap (or the gap before it)
+            # since there's no "next block" to infer from.
+            self.block_shrink_dur = []
+            for i in range(self.n_cubes):
+                if i < self.n_cubes - 1:
+                    d = int(self.block_hit_frames[i + 1]
+                            - self.block_hit_frames[i])
+                else:
+                    d = _med
+                self.block_shrink_dur.append(max(1, d))
+
+        # Baseline _D kept for any legacy inspector; use the median of
+        # per-block durations so "chain life" heuristics still work.
+        self._D = max(1, int(np.median(np.asarray(self.block_shrink_dur,
+                                                  dtype=np.int64))))
         # hit_frame      = frame when the HEAD cube reaches the hit zone
         #                  and FREEZES (stops moving).
         # final_hit_frame= frame when the HEAD cube is punched LAST,
@@ -1334,7 +1472,8 @@ class LineTarget(PunchTarget):
         # New hit order: head (i=0) first, then tails sequentially.
         # final_hit_frame = frame when the LAST tail cube clears.
         self.freeze_frame     = self.hit_frame          # kept for compat; unused
-        self.final_hit_frame  = self.hit_frame + (self.n_cubes - 1) * D
+        self.hit_frame        = int(self.block_hit_frames[0])
+        self.final_hit_frame  = int(self.block_hit_frames[-1])
 
     # ── lifecycle --------------------------------------------------
     def check_hit(self, cur_frame: int) -> bool:
@@ -1349,9 +1488,11 @@ class LineTarget(PunchTarget):
     def is_dead(self, cur_frame: int) -> bool:
         if self.hit_exec_f < 0:
             return False
-        # Wait for the last block's shrink animation to finish
-        # (lasts D more frames after the final hit).
-        if cur_frame > self.final_hit_frame + self._D + 1:
+        # Wait for the LAST block's own shrink animation to finish
+        # (each block now has its own wave-derived duration).
+        last_dur = (self.block_shrink_dur[-1]
+                    if self.block_shrink_dur else self._D)
+        if cur_frame > self.final_hit_frame + last_dur + 1:
             self.state = 'hit'
             return True
         return False
@@ -1367,19 +1508,13 @@ class LineTarget(PunchTarget):
             return canvas
 
         travel = max(1, self.hit_frame - self.spawn_frame)
+        # Median block-duration drives the chain's visual scale (hz);
+        # individual per-block shrink durations drive the ANIMATION
+        # clock (so short waveform columns shrink fast, long columns
+        # shrink slowly) while the physical size stays consistent.
         D = self._D
 
-        # Auto-size hz so adjacent cubes appear end-to-end touching.
-        #   velocity  = (Z_FAR - Z_NEAR) / travel  [wu/frame]
-        #   D_z       = D * velocity                [wu between centres]
-        #   hz        = D_z / 2                     [half-extent in Z]
-        # This ratio is perspective-invariant: cubes look touching at
-        # any depth.
         hx = PunchTarget.CUBE_HALF
-        # Depth = 10× half-width (5× the previous 2×).
-        hz = hx * 10.0
-        # Small yaw (~10°) gives 3D depth cue without making the cube
-        # appear disproportionately wide due to the visible side face.
         yaw = 0.18 if self.is_left else -0.18
         wx = cam.lane_world_x(self.lane)
         wy = cam.AIR_WORLD_Y
@@ -1387,18 +1522,7 @@ class LineTarget(PunchTarget):
         freeze_frame    = self.freeze_frame
         final_hit_frame = self.final_hit_frame
 
-        # ── Zigzag chain rendering ────────────────────────────────────────
-        # Hit order: head (i=0) first, then tails i=1..n-1 sequentially.
-        # Segments alternate Y so adjacent blocks touch at Y = wy:
-        #   even i (0,2) → centre at wy + hx  (below horizon, "down")
-        #   odd  i (1,3) → centre at wy - hx  (above horizon, "up")
-        #
-        # Each block has two phases:
-        #   • Approaching: normal depth, moving toward camera.
-        #   • Shrinking  : front face frozen at hit zone; back face retreats
-        #                  toward front face over D frames, then block vanishes.
-
-        # ── Derive hz for exact touching ──────────────────────────────────
+        # ── Derive hz for exact touching (median-D based) ────────────────
         velocity = (cam.Z_FAR - cam.Z_NEAR) / travel   # wu / frame
         D_z      = D * velocity                          # wu between centres
         hz       = D_z * 0.42                            # slight gap between blocks
@@ -1411,20 +1535,16 @@ class LineTarget(PunchTarget):
         # Each block is a TILTED prism:
         #   wy_f = front-face Y centre = _seg_wy(i)
         #   wy_b = back-face  Y centre = _seg_wy(i+1)
-        # So the tail of block i (wy_b) == the head of block i+1 (wy_f) →
-        # perfect junction, no gap, no overlap.
-        #
         # Format: (fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t)
         segs = []
         neon_i: int | None = None
 
         # ── Pre-pass: có khối nào đang shrink (vẫn còn thấy) không? ──────
-        # Nếu có, các khối phía sau sẽ KHÔNG nhận trạng thái neon; chỉ sau
-        # khi khối trước biến mất hoàn toàn thì khối kế tiếp mới lên neon.
         has_shrink = False
         for k in range(self.n_cubes):
-            fa_k = cur_frame - (self.hit_frame + k * D)
-            if 0 <= fa_k < D and hz * (1.0 - fa_k / D) > 0.005:
+            D_k  = self.block_shrink_dur[k]
+            fa_k = cur_frame - self.block_hit_frames[k]
+            if 0 <= fa_k < D_k and hz * (1.0 - fa_k / D_k) > 0.005:
                 has_shrink = True
                 break
 
@@ -1436,7 +1556,7 @@ class LineTarget(PunchTarget):
             wy_f = _seg_wy(i)
             wy_b = _seg_wy(i + 1)          # back Y always = next block's front Y
 
-            eff_hit_i  = self.hit_frame + i * D
+            eff_hit_i  = self.block_hit_frames[i]
             frames_ago = cur_frame - eff_hit_i
 
             if frames_ago < 0:
@@ -1460,21 +1580,20 @@ class LineTarget(PunchTarget):
                              i == neon_i, i, 0.0))
                 prev_back_z = bz_i
 
-            elif frames_ago < D:
-                # ── Shrinking ─────────────────────────────────────────────
-                # Front face frozen at hit zone.
-                # Back face retreats in Z AND Y toward the front face.
-                shrink_t = frames_ago / D
+            else:
+                # ── Shrinking (per-block wave-driven duration) ────────────
+                D_i      = self.block_shrink_dur[i]
+                if frames_ago >= D_i:
+                    continue   # fully collapsed, skip
+                shrink_t = frames_ago / float(D_i)
                 fz_fixed = cam.Z_NEAR + 0.01
                 bz_now   = fz_fixed + hz * (1.0 - shrink_t)
                 if bz_now <= fz_fixed + 0.005:
                     continue
-                # Back Y interpolates toward front Y as block collapses.
                 wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
                 segs.append((fz_fixed, bz_now, wy_f, wy_b_now,
                              False, i, shrink_t))
                 prev_back_z = bz_now
-            # else: fully collapsed, skip
 
         if not segs:
             return canvas
@@ -2354,7 +2473,9 @@ class GameManager:
                      lane_filter: set[int] | None = None,
                      dance_pair_cycle: int = 4,
                      punch_pair_cycle: int = 4,
-                     line_beats: int = 2):
+                     line_beats: int = 2,
+                     beat_density: float = 1.0,
+                     wave_columns: list[dict] | None = None):
         """Create one target per beat_frame.
 
         Rules:
@@ -2392,24 +2513,104 @@ class GameManager:
             modes_seq = ['punch']
 
         # Derive a stable "hold length" (in video frames) for line/hold
-        # targets from the median inter-beat gap * `line_beats`.  This
-        # anchors the bar's sustain to musical tempo rather than absolute
-        # time, so it "feels" like a real long-note across any song BPM.
+        # targets from the median inter-beat gap * `line_beats`.
+        #
+        # Note: hold duration intentionally follows the post-density beat grid
+        # so line chains keep a clear, slower sustain when density is low.
         if len(beat_frames) >= 2 and line_beats > 0:
             _gaps = np.diff(np.asarray(beat_frames, dtype=np.int64))
             _median_gap = max(1, int(np.median(_gaps)))
-            line_hold_frames = max(4, int(line_beats * _median_gap))
+            line_hold_frames = max(4, int(round(line_beats * _median_gap)))
         else:
             line_hold_frames = max(4, self.travel // 3)
 
+        # ── Line-mode: derive chains DIRECTLY from waveform columns ──────
+        # Each RMS "column" (rise → peak → descent-midpoint) becomes one
+        # block.  `blocks_per_chain` consecutive columns form one chain,
+        # and the chain's spawn point is the rise-start of its first
+        # column.  This enforces the user's 3 rules:
+        #   1. chain start = rise_f of column #1
+        #   2. chain total life = end_f of last column − rise_f of first
+        #   3. per-block shrink time = (end_f - rise_f) of THAT column
+        line_block_hits_by_start:    dict[int, list[int]] = {}
+        line_block_shrinks_by_start: dict[int, list[int]] = {}
+        line_hold_by_start:          dict[int, int]       = {}
+
+        if (len(modes_seq) == 1
+                and modes_seq[0] == 'line'
+                and wave_columns is not None
+                and len(wave_columns) >= 2):
+            total_frames = max(1, len(bass_arr))
+            blocks_per_chain = max(2, 2 * int(line_beats))
+
+            # Keep columns in-range and strictly ordered.
+            cols_all = [c for c in wave_columns
+                        if 0 <= c['rise_f'] < total_frames]
+            cols_all.sort(key=lambda c: c['rise_f'])
+
+            # Decide how many chains we want.  Follow the density cadence
+            # that produced `beat_frames` so --density still controls the
+            # overall chain count (e.g. density=0.5 → ~half as many chains).
+            if len(beat_frames) >= 2:
+                target_chains = max(1, int(round(
+                    len(beat_frames) / blocks_per_chain)))
+            else:
+                target_chains = max(1, len(cols_all) // blocks_per_chain)
+
+            need_cols = target_chains * blocks_per_chain
+            # Pick the strongest `need_cols` columns (by RMS peak
+            # height), then re-sort by time and slice into chains.
+            cols_strong = sorted(cols_all, key=lambda c: -c['height'])[:need_cols]
+            cols_strong.sort(key=lambda c: c['rise_f'])
+
+            chain_groups: list[list[dict]] = []
+            for ci in range(0, len(cols_strong), blocks_per_chain):
+                grp = cols_strong[ci:ci + blocks_per_chain]
+                if len(grp) < blocks_per_chain:
+                    break
+                chain_groups.append(grp)
+
+            # Build per-chain metadata.  `beat_frames` is replaced with
+            # one entry per chain = rise_f of the first column, which
+            # is what the rest of the scheduler consumes downstream.
+            chain_starts: list[int] = []
+            for grp in chain_groups:
+                hits    = [int(c['rise_f']) for c in grp]
+                shrinks = [max(1, int(c['end_f'] - c['rise_f'])) for c in grp]
+                # Enforce strict monotonic ordering on hits.
+                for i in range(1, len(hits)):
+                    if hits[i] <= hits[i - 1]:
+                        hits[i] = min(total_frames - 1, hits[i - 1] + 1)
+                start_bf = hits[0]
+                hold_eff = max(1, hits[-1] - hits[0])
+                line_block_hits_by_start[start_bf]    = hits
+                line_block_shrinks_by_start[start_bf] = shrinks
+                line_hold_by_start[start_bf]          = hold_eff
+                chain_starts.append(start_bf)
+
+            if chain_starts:
+                print(f"[line-wave] columns={len(cols_all)}  "
+                      f"picked={len(cols_strong)}  "
+                      f"chains={len(chain_starts)} x {blocks_per_chain} blocks  "
+                      f"base_hold={line_hold_frames}f")
+                beat_frames = chain_starts
+
         def _spawn_target(m: str, spawn_f: int, bf: int, lane: int,
-                          is_left: bool):
+                          is_left: bool,
+                          line_block_hits: list[int] | None = None,
+                          line_block_shrinks: list[int] | None = None,
+                          line_hold_eff: int | None = None):
             if m == 'dance':
                 return DanceTarget(spawn_f, bf, lane, is_left)
             if m == 'line':
+                _hold = (line_hold_eff
+                         if line_hold_eff is not None
+                         else line_hold_frames)
                 return LineTarget(spawn_f, bf, lane, is_left,
-                                  hold_frames=line_hold_frames,
-                                  line_beats=line_beats)
+                                  hold_frames=_hold,
+                                  line_beats=line_beats,
+                                  block_hit_frames=line_block_hits,
+                                  block_shrink_frames=line_block_shrinks)
             return PunchTarget(spawn_f, bf, lane, is_left)
 
         def _target_cls_for(m: str):
@@ -2570,10 +2771,13 @@ class GameManager:
         for bf in beat_frames:
             if bf - last_bf < min_gap_frames:
                 continue
-            if bf - self.travel < 0:
+            # Resolve target mode first so we can apply mode-specific early-spawn
+            # policy (line chains may start "already in flight" at frame 0).
+            cur_mode = _mode_for(emit_idx)
+            spawn_f = bf - self.travel
+            if spawn_f < 0 and cur_mode != 'line':
                 skipped_early += 1
                 continue
-            spawn_f = bf - self.travel
 
             # target type
             b = float(bass_arr[min(bf, len(bass_arr) - 1)])
@@ -2588,7 +2792,6 @@ class GameManager:
                 emit_idx += 1
                 continue
 
-            cur_mode   = _mode_for(emit_idx)
             target_cls = _target_cls_for(cur_mode)
 
             # ── PAIRED spawn path (punch): (N-1) single + 1 double ──
@@ -2724,16 +2927,27 @@ class GameManager:
                 skipped_stacked += 1
                 continue
 
-            t = _spawn_target(cur_mode, spawn_f, bf, chosen_lane, is_left)
+            line_block_hits = None
+            line_block_shrinks = None
+            line_hold_eff = None
+            if cur_mode == 'line':
+                line_block_hits    = line_block_hits_by_start.get(int(bf))
+                line_block_shrinks = line_block_shrinks_by_start.get(int(bf))
+                line_hold_eff      = line_hold_by_start.get(int(bf))
+            t = _spawn_target(cur_mode, spawn_f, bf, chosen_lane, is_left,
+                              line_block_hits=line_block_hits,
+                              line_block_shrinks=line_block_shrinks,
+                              line_hold_eff=line_hold_eff)
             self.targets.append(t)
             last_spawn_on[chosen_lane] = spawn_f
             if isinstance(t, LineTarget):
-                # Block this lane (and ALL lanes globally) until the
-                # chain has fully died, i.e. past the last block's
-                # shrink animation.  Chain final death frame =
-                # hit_frame + hold_frames + D + 1 (see is_dead).  Add
-                # a small buffer so there's no spatial overlap.
-                chain_life = line_hold_frames + t._D + 3
+                # Chain life = last block's hit - first block's hit
+                # + last block's wave-derived shrink duration + a small
+                # buffer.  This keeps the next chain from overlapping.
+                hold_eff   = int(t.final_hit_frame - t.hit_frame)
+                last_dur   = (t.block_shrink_dur[-1]
+                              if t.block_shrink_dur else t._D)
+                chain_life = hold_eff + last_dur + 3
                 line_busy_until[chosen_lane] = bf + chain_life
                 line_global_busy_until       = bf + chain_life
             next_side = 1 - chosen_side
@@ -2854,6 +3068,8 @@ class RhythmVisualizer:
         # tail slides past the camera.  Default 2 ≈ "hold through one extra
         # beat".  Only used when 'line' appears in --mode.
         self.LINE_BEATS:        int = 2
+        # Draw line-mode block timing debug overlay (timeline markers).
+        self.LINE_DEBUG:        bool = False
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -3017,6 +3233,47 @@ class RhythmVisualizer:
             bass_arr[f] = float(np.clip(
                 np.mean(spec_mag[:BASS_RANGE, oi]) / bass_max * 3, 0, 1))
 
+        # Debug waveform envelope (RMS) sampled per output frame so it can be
+        # drawn directly against frame-based block markers.  Uses the SAME
+        # finer hop/frame as detect_wave_columns so the visible wave peaks
+        # line up 1:1 with the scheduler's column picks.
+        line_dbg_wave: np.ndarray | None = None
+        if self.LINE_DEBUG and total_frames > 0:
+            _dbg_hop   = 256
+            _dbg_frame = 1024
+            rms = librosa.feature.rms(y=y, frame_length=_dbg_frame,
+                                      hop_length=_dbg_hop)[0]
+            line_dbg_wave = np.zeros(total_frames, dtype=np.float32)
+            sec_per_hop = _dbg_hop / float(sr)
+            for f in range(total_frames):
+                t_f = f / float(self.FPS)
+                ri = min(int(round(t_f / sec_per_hop)), len(rms) - 1)
+                ri = max(0, ri)
+                line_dbg_wave[f] = float(rms[ri])
+            p95 = float(np.percentile(line_dbg_wave, 95))
+            if p95 > 1e-8:
+                line_dbg_wave = np.clip(line_dbg_wave / p95, 0.0, 1.0)
+
+        # ── Wave columns for line-mode scheduler ─────────────────────────
+        # Detect rise→peak→descent-midpoint triples on the RMS envelope so
+        # each block in a line-chain can be pinned to an actual wave column:
+        #   • block arrival  = column.rise_f
+        #   • block shrink   = column.end_f − column.rise_f
+        wave_columns: list[dict] = []
+        if 'line' in self.MODE:
+            # Space columns at least `beat_min_gap` video-frames apart so
+            # ultra-close double peaks don't both become separate blocks.
+            _mg = max(2, int(self.BEAT_MIN_GAP))
+            wave_columns = detect_wave_columns(
+                y, sr, HOP_LENGTH, float(self.FPS),
+                min_gap_frames=_mg,
+                prominence_pct=20.0,
+                smooth_win=1,
+            )
+            if wave_columns:
+                print(f"[line-wave] detected {len(wave_columns)} RMS columns "
+                      f"(min_gap={_mg}f, prom=p20)")
+
         # Beat times -> video frame indices (targets will POP exactly here)
         beat_frames = [int(round(t * self.FPS)) for t in beat_times]
         beat_frames = [bf for bf in beat_frames if 0 <= bf < total_frames]
@@ -3050,6 +3307,16 @@ class RhythmVisualizer:
             print(f"[mode] {exc} — falling back to 'punch'.")
             modes_seq = ['punch']
         combo_mode   = len(modes_seq) >= 2
+        # onset peaks are often a little late vs. perceived beat attack.
+        # For line chains we bias events slightly earlier so visual hit feels
+        # tighter to music (empirically ~2 frames @30fps).
+        if ('line' in modes_seq
+                and self.BEAT_SOURCE == 'onset'
+                and len(beat_frames) > 0):
+            advance_f = 2
+            beat_frames = [max(0, bf - advance_f) for bf in beat_frames]
+            beat_frames = sorted(set(beat_frames))
+            print(f"[line-timing] onset advance: -{advance_f}f")
         # Scene dressing: 'dance' wins if present (has lane panel rails);
         # otherwise use the first mode present.  'line' falls back to
         # 'punch' scene dressing since a line bar is still an air target
@@ -3141,7 +3408,9 @@ class RhythmVisualizer:
                           lane_filter=self.LANE_FILTER,
                           dance_pair_cycle=self.DANCE_PAIR_CYCLE,
                           punch_pair_cycle=self.PUNCH_PAIR_CYCLE,
-                          line_beats=self.LINE_BEATS)
+                          line_beats=self.LINE_BEATS,
+                          beat_density=self.BEAT_DENSITY,
+                          wave_columns=wave_columns)
 
         # Give the stickman its beat timeline for pose-sync.
         # We use the ACTUAL scheduled targets (not raw beat_frames) so that:
@@ -3184,16 +3453,20 @@ class RhythmVisualizer:
                 else:
                     offset_norm = abs(tg.lane - half) / half
                     lean_scale = 0.55 + 1.05 * offset_norm
-                D   = tg._D
-                n   = tg.n_cubes
-                per_sustain = D / float(self.FPS)
+                n = tg.n_cubes
                 # Head (i=0) hits first, then tails i=1..n-1 sequentially.
-                # even i (0,2) = DOWN, odd i (1,3) = UP.
+                # even i (0,2) = DOWN, odd i (1,3) = UP.  Each block's
+                # sustain uses its OWN wave-derived shrink duration so
+                # the stickman arm holds the pose exactly as long as the
+                # column on screen.
                 for i in range(n):
-                    t_i  = (tg.hit_frame + i * D) / self.FPS
+                    t_i  = tg.block_hit_frames[i] / self.FPS
                     vert = 'D' if (i % 2 == 0) else 'U'
+                    dur_i = (tg.block_shrink_dur[i]
+                             if i < len(tg.block_shrink_dur) else tg._D)
+                    per_sustain_i = max(1, int(dur_i)) / float(self.FPS)
                     stick_events.append((t_i, 'Z' + side_tag + vert,
-                                         lean_scale, per_sustain))
+                                         lean_scale, per_sustain_i))
                 # Skip the generic single-event append below.
                 continue
             elif getattr(tg, 'paired_side', None):
@@ -3247,6 +3520,19 @@ class RhythmVisualizer:
             print(f"[stickman] disabled — {len(stick_events)} events prepared "
                   f"for export only")
 
+        # Optional line debug markers: one marker per Z* block event.
+        line_dbg_events: list[tuple[int, str]] = []
+        if self.LINE_DEBUG:
+            for ev in stick_events:
+                if (len(ev) >= 2 and isinstance(ev[1], str)
+                        and ev[1].startswith('Z')):
+                    f_ev = int(round(float(ev[0]) * self.FPS))
+                    line_dbg_events.append((f_ev, ev[1]))
+            line_dbg_events.sort(key=lambda t: t[0])
+            if line_dbg_events:
+                ts = ", ".join(f"{f/self.FPS:.3f}" for f, _ in line_dbg_events)
+                print(f"[line-debug] block_events={len(line_dbg_events)}  t=[{ts}]")
+
         # Persist events so stickman.py can render a standalone video that
         # lines up frame-for-frame with THIS rhythm render.
         if getattr(self, 'EXPORT_EVENTS', None):
@@ -3271,7 +3557,7 @@ class RhythmVisualizer:
                 'lanes':    (sorted(v + 1 for v in self.LANE_FILTER)
                              if self.LANE_FILTER is not None else None),
             })
-            print(f"[export] Wrote {len(stick_events)} events → "
+            print(f"[export] Wrote {len(stick_events)} events -> "
                   f"{self.EXPORT_EVENTS}")
 
         # ── render loop ──────────────────────────────────────────────
@@ -3341,6 +3627,73 @@ class RhythmVisualizer:
             if stick is not None:
                 stick.draw(canvas, fi)
             combo.draw(canvas, fi)
+
+            if self.LINE_DEBUG and line_dbg_events:
+                # Top timeline: visualize where each line block event lands.
+                x0 = int(self.WIDTH * 0.06)
+                x1 = int(self.WIDTH * 0.94)
+                y0 = int(self.HEIGHT * 0.055)
+                y1 = y0 + 8
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), (65, 65, 65), -1)
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), (140, 140, 140), 1)
+
+                for idx, (f_ev, kind_ev) in enumerate(line_dbg_events, start=1):
+                    px = int(x0 + (x1 - x0) * (f_ev / max(1, total_frames - 1)))
+                    if fi < f_ev - 1:
+                        col = (120, 120, 120)     # upcoming
+                    elif abs(fi - f_ev) <= 1:
+                        col = (80, 240, 255)      # active
+                    else:
+                        col = (80, 220, 120)      # passed
+                    cv2.line(canvas, (px, y0 - 6), (px, y1 + 6), col, 1,
+                             lineType=cv2.LINE_AA)
+                    if idx <= 12:
+                        cv2.putText(canvas, str(idx), (px - 5, y0 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, col, 1,
+                                    lineType=cv2.LINE_AA)
+
+                # Current frame cursor on timeline.
+                px_now = int(x0 + (x1 - x0) * (fi / max(1, total_frames - 1)))
+                cv2.line(canvas, (px_now, y0 - 10), (px_now, y1 + 10),
+                         (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                # Next-event delta readout.
+                next_f = next((f for f, _ in line_dbg_events if f >= fi), None)
+                dt_txt = "--"
+                if next_f is not None:
+                    dt_txt = f"{(next_f - fi) / self.FPS:+.3f}s"
+                cv2.putText(canvas,
+                            f"LINE DBG blocks={len(line_dbg_events)}  t={fi/self.FPS:.3f}s  next={dt_txt}",
+                            (x0, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                            (220, 220, 220), 1, lineType=cv2.LINE_AA)
+                # RMS waveform overlay directly under the timeline.
+                if line_dbg_wave is not None and len(line_dbg_wave) == total_frames:
+                    wy0 = y1 + 30
+                    wy1 = wy0 + int(self.HEIGHT * 0.10)
+                    cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (40, 40, 40), -1)
+                    cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (120, 120, 120), 1)
+                    # Baseline
+                    cv2.line(canvas, (x0, wy1), (x1, wy1), (90, 90, 90), 1,
+                             lineType=cv2.LINE_AA)
+                    # Polyline waveform
+                    step = max(1, (x1 - x0) // 360)
+                    pts = []
+                    for x in range(x0, x1 + 1, step):
+                        frac = (x - x0) / max(1, (x1 - x0))
+                        wf_i = min(total_frames - 1,
+                                   max(0, int(round(frac * (total_frames - 1)))))
+                        amp = float(line_dbg_wave[wf_i])  # 0..1
+                        yv = int(wy1 - amp * (wy1 - wy0 - 2))
+                        pts.append((x, yv))
+                    if len(pts) >= 2:
+                        cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], False,
+                                      (130, 170, 255), 1, lineType=cv2.LINE_AA)
+                    # Fill under curve (light alpha effect via overlay)
+                    if len(pts) >= 2:
+                        ov = canvas.copy()
+                        fill_poly = [(x0, wy1)] + pts + [(x1, wy1)]
+                        cv2.fillPoly(ov, [np.array(fill_poly, dtype=np.int32)],
+                                     (70, 110, 170), lineType=cv2.LINE_AA)
+                        canvas = cv2.addWeighted(ov, 0.35, canvas, 0.65, 0)
 
             all_frames.append(canvas)
 
@@ -3587,6 +3940,10 @@ def parse_arguments():
                          'longer holds (and longer bar visuals).  '
                          'Only meaningful when "line" is present in '
                          '--mode.'))
+    p.add_argument('--line_debug', type=int, default=0, metavar='0|1',
+                   help=('Draw line-mode timing debug overlay (block markers '
+                         'on a top timeline + current frame indicator). '
+                         'Useful for waveform sync checks. Default 0.'))
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -3687,6 +4044,7 @@ if __name__ == '__main__':
     viz.DANCE_PAIR_CYCLE = int(args.dance_pair_cycle)
     viz.PUNCH_PAIR_CYCLE = int(args.punch_pair_cycle)
     viz.LINE_BEATS       = max(1, int(args.line_beats))
+    viz.LINE_DEBUG       = bool(args.line_debug)
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:
