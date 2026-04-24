@@ -1390,54 +1390,63 @@ class LineTarget(PunchTarget):
         # ── Derive hz for exact touching ──────────────────────────────────
         velocity = (cam.Z_FAR - cam.Z_NEAR) / travel   # wu / frame
         D_z      = D * velocity                          # wu between centres
-        hz       = D_z / 2.0                             # back_i == front_{i+1}
+        hz       = D_z * 0.42                            # slight gap between blocks
 
         def _seg_wy(idx: int) -> float:
-            """Y centre for segment idx: even=down, odd=up."""
+            """Y centre for segment idx: even=below-horizon, odd=above."""
             return (wy + hx) if (idx % 2 == 0) else (wy - hx)
 
         # ── Build segment list ─────────────────────────────────────────────
-        # Format: (fz, bz, wy_s, is_neon, cube_i, shrink_t)
-        # shrink_t = 0.0 → approaching; 0..1 → shrinking (1 = fully gone).
+        # Each block is a TILTED prism:
+        #   wy_f = front-face Y centre = _seg_wy(i)
+        #   wy_b = back-face  Y centre = _seg_wy(i+1)
+        # So the tail of block i (wy_b) == the head of block i+1 (wy_f) →
+        # perfect junction, no gap, no overlap.
+        #
+        # Format: (fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t)
         segs = []
-        neon_i: int | None = None      # frontmost un-hit block
+        neon_i: int | None = None
 
         for i in range(self.n_cubes):
+            wy_f = _seg_wy(i)
+            wy_b = _seg_wy(i + 1)          # back Y always = next block's front Y
+
             eff_hit_i  = self.hit_frame + i * D
             frames_ago = cur_frame - eff_hit_i
 
             if frames_ago < 0:
                 # ── Approaching ──────────────────────────────────────────
-                frames_to = -frames_ago
-                z_norm_i  = frames_to / travel
+                z_norm_i = (-frames_ago) / travel
                 if z_norm_i > 1.0:
-                    continue                    # not yet spawned
+                    continue
                 if neon_i is None:
-                    neon_i = i                  # first un-hit = neon
+                    neon_i = i
                 wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
                 segs.append((
                     max(wz_i - hz, cam.Z_NEAR + 0.01),
                     min(wz_i + hz, cam.Z_FAR  - 0.01),
-                    _seg_wy(i), i == neon_i, i, 0.0
+                    wy_f, wy_b, i == neon_i, i, 0.0
                 ))
 
             elif frames_ago < D:
                 # ── Shrinking ─────────────────────────────────────────────
-                # Front face stays at hit zone; back face retreats forward.
-                shrink_t = frames_ago / D        # 0 → 1 over D frames
+                # Front face frozen at hit zone.
+                # Back face retreats in Z AND Y toward the front face.
+                shrink_t = frames_ago / D
                 fz_fixed = cam.Z_NEAR + 0.01
                 bz_now   = fz_fixed + hz * (1.0 - shrink_t)
                 if bz_now <= fz_fixed + 0.005:
-                    continue                    # fully collapsed
-                segs.append((fz_fixed, bz_now, _seg_wy(i),
+                    continue
+                # Back Y interpolates toward front Y as block collapses.
+                wy_b_now = wy_b + (wy_f - wy_b) * shrink_t
+                segs.append((fz_fixed, bz_now, wy_f, wy_b_now,
                              False, i, shrink_t))
-            # else: fully gone, skip
+            # else: fully collapsed, skip
 
         if not segs:
             return canvas
 
-        # Painter order: back-to-front (largest front_z first)
-        segs.sort(key=lambda s: s[0], reverse=True)
+        segs.sort(key=lambda s: s[0], reverse=True)   # back-to-front
 
         col     = self.color
         rim_col = tuple(min(255, int(c * 1.8)) for c in col)
@@ -1446,15 +1455,22 @@ class LineTarget(PunchTarget):
             p = cam.project(x, y, z)
             return (int(p[0]), int(p[1])) if p else None
 
-        for fz, bz, wy_s, is_neon, cube_i, shrink_t in segs:
-            fTL = _pt(wx - hx, wy_s + hx, fz)
-            fTR = _pt(wx + hx, wy_s + hx, fz)
-            fBR = _pt(wx + hx, wy_s - hx, fz)
-            fBL = _pt(wx - hx, wy_s - hx, fz)
+        for fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t in segs:
+            # Front face corners (centred at wy_f)
+            fTL = _pt(wx - hx, wy_f + hx, fz)
+            fTR = _pt(wx + hx, wy_f + hx, fz)
+            fBR = _pt(wx + hx, wy_f - hx, fz)
+            fBL = _pt(wx - hx, wy_f - hx, fz)
             if None in (fTL, fTR, fBR, fBL):
                 continue
 
-            fade = 1.0 - shrink_t * 0.6    # fades to 40% during shrink
+            # Back face corners (centred at wy_b — different Y for tilt)
+            bTL = _pt(wx - hx, wy_b + hx, bz)
+            bTR = _pt(wx + hx, wy_b + hx, bz)
+            bBR = _pt(wx + hx, wy_b - hx, bz)
+            bBL = _pt(wx - hx, wy_b - hx, bz)
+
+            fade = 1.0 - shrink_t * 0.6
 
             if is_neon:
                 s_bright = 0.82 * fade
@@ -1469,15 +1485,11 @@ class LineTarget(PunchTarget):
                 side_lw  = 1
                 front_lw = 1
 
-            # ── SIDE FACE ────────────────────────────────────────────────
+            # ── SIDE FACE (tilted — back corners at wy_b) ─────────────────
             if self.is_left:
-                bTR = _pt(wx + hx, wy_s + hx, bz)
-                bBR = _pt(wx + hx, wy_s - hx, bz)
-                sf  = (fTR, fBR, bBR, bTR)
+                sf = (fTR, fBR, bBR, bTR)
             else:
-                bTL = _pt(wx - hx, wy_s + hx, bz)
-                bBL = _pt(wx - hx, wy_s - hx, bz)
-                sf  = (fTL, fBL, bBL, bTL)
+                sf = (fTL, fBL, bBL, bTL)
 
             if all(p is not None for p in sf):
                 side_col = tuple(int(c * s_bright) for c in col)
@@ -1486,6 +1498,31 @@ class LineTarget(PunchTarget):
                 cv2.line(canvas, sf[0], sf[3], edge_col, side_lw, cv2.LINE_AA)
                 cv2.line(canvas, sf[1], sf[2], edge_col, side_lw, cv2.LINE_AA)
                 cv2.line(canvas, sf[2], sf[3], edge_col, side_lw, cv2.LINE_AA)
+
+            # ── TOP / BOTTOM connecting face ───────────────────────────────
+            # For a tilted block (wy_f ≠ wy_b) the horizontal face that
+            # "caps" the slant is visible:
+            #   wy_b < wy_f  → block rises toward back  → TOP face visible
+            #   wy_b > wy_f  → block falls toward back  → BOTTOM face visible
+            horiz_bright = (s_bright + f_bright) * 0.5
+            horiz_col    = tuple(int(c * horiz_bright) for c in col)
+            if wy_b < wy_f:
+                # TOP face: upper edges of front and back faces
+                h0 = _pt(wx - hx, wy_f - hx, fz)
+                h1 = _pt(wx + hx, wy_f - hx, fz)
+                h2 = _pt(wx + hx, wy_b - hx, bz)
+                h3 = _pt(wx - hx, wy_b - hx, bz)
+            else:
+                # BOTTOM face: lower edges of front and back faces
+                h0 = _pt(wx - hx, wy_f + hx, fz)
+                h1 = _pt(wx + hx, wy_f + hx, fz)
+                h2 = _pt(wx + hx, wy_b + hx, bz)
+                h3 = _pt(wx - hx, wy_b + hx, bz)
+            if all(p is not None for p in (h0, h1, h2, h3)):
+                horiz_poly = np.array([h0, h1, h2, h3], dtype=np.int32)
+                cv2.fillPoly(canvas, [horiz_poly], horiz_col, cv2.LINE_AA)
+                cv2.polylines(canvas, [horiz_poly], True, edge_col,
+                              side_lw, cv2.LINE_AA)
 
             # ── FRONT FACE ────────────────────────────────────────────────
             fill_col   = tuple(int(c * f_bright) for c in col)
