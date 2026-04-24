@@ -1407,6 +1407,13 @@ class LineTarget(PunchTarget):
     LENGTH_MULT: float = 2.8
     THICKNESS_MULT: float = 0.92
 
+    # World-Y used for horizontal-zigzag chains.  More negative = higher
+    # above the horizon (camera tilts upward to see the chain).  Set
+    # so that at Z_NEAR the block sits in the top ~⅓ of the frame and
+    # at Z_FAR it grazes the horizon, giving a clear perspective view
+    # of the whole 4-block chain with no block occluding another.
+    HORIZONTAL_WY: float = -0.30
+
     def __init__(self, spawn_frame: int, hit_frame: int, lane: int,
                  is_left: bool, hold_frames: int,
                  line_beats: int = 2,
@@ -1566,7 +1573,13 @@ class LineTarget(PunchTarget):
 
         hx = PunchTarget.CUBE_HALF
         yaw = 0.18 if self.is_left else -0.18
-        wy_center = cam.AIR_WORLD_Y
+        # Horizontal-zigzag chains live higher in world-Y so the camera
+        # tilts upward and the viewer can see through to the rear blocks
+        # of the chain instead of having them occluded by the nearest
+        # one.  Vertical-zigzag keeps the legacy AIR_WORLD_Y.
+        wy_center = (LineTarget.HORIZONTAL_WY
+                     if self.zigzag == 'horizontal'
+                     else cam.AIR_WORLD_Y)
         wx_lane   = cam.lane_world_x(self.lane)
 
         freeze_frame    = self.freeze_frame
@@ -3583,31 +3596,50 @@ class RhythmVisualizer:
                 lean_scale = 1.0
             elif isinstance(tg, LineTarget):
                 # Emit one short event per block in the chain so the
-                # stickman arm tracks each cube: UP for odd-indexed
-                # blocks (above horizon) and DOWN for even-indexed ones
-                # (below horizon).  Each event sustains for CHAIN_D
-                # frames so the pose freezes exactly until the next
-                # block arrives.
-                side_tag = 'L' if tg.is_left else 'R'
-                if nL <= 2:
-                    lean_scale = 1.0
+                # stickman arm tracks each cube.  Each event sustains
+                # for that block's OWN wave-derived shrink duration so
+                # the stickman pose freezes exactly as long as the
+                # column is on screen.
+                #
+                # VERTICAL mode (legacy):
+                #   side comes from the chain's is_left (whole chain
+                #   lives on one lane), vert alternates D/U per block
+                #   to match the up/down zigzag visible on that lane.
+                #
+                # HORIZONTAL mode:
+                #   every block lands on an OUTER lane (0 or n-1) and
+                #   the chain lives high above the horizon.  Arm side
+                #   alternates per block (even i = LEFT lane, odd i =
+                #   RIGHT lane) and vert is always UP since all blocks
+                #   sit above eye-level.  lean_scale is forced to the
+                #   "full outer" value because every hit is at the
+                #   outermost lane regardless of tg.lane.
+                is_horiz = (tg.zigzag == 'horizontal')
+                if is_horiz:
+                    lean_scale_h = 0.55 + 1.05 * 1.0  # outer-lane value
                 else:
-                    offset_norm = abs(tg.lane - half) / half
-                    lean_scale = 0.55 + 1.05 * offset_norm
+                    side_tag_legacy = 'L' if tg.is_left else 'R'
+                    if nL <= 2:
+                        lean_scale_v = 1.0
+                    else:
+                        offset_norm = abs(tg.lane - half) / half
+                        lean_scale_v = 0.55 + 1.05 * offset_norm
                 n = tg.n_cubes
-                # Head (i=0) hits first, then tails i=1..n-1 sequentially.
-                # even i (0,2) = DOWN, odd i (1,3) = UP.  Each block's
-                # sustain uses its OWN wave-derived shrink duration so
-                # the stickman arm holds the pose exactly as long as the
-                # column on screen.
                 for i in range(n):
                     t_i  = tg.block_hit_frames[i] / self.FPS
-                    vert = 'D' if (i % 2 == 0) else 'U'
                     dur_i = (tg.block_shrink_dur[i]
                              if i < len(tg.block_shrink_dur) else tg._D)
                     per_sustain_i = max(1, int(dur_i)) / float(self.FPS)
+                    if is_horiz:
+                        side_tag = 'L' if (i % 2 == 0) else 'R'
+                        vert     = 'U'
+                        ls       = lean_scale_h
+                    else:
+                        side_tag = side_tag_legacy
+                        vert     = 'D' if (i % 2 == 0) else 'U'
+                        ls       = lean_scale_v
                     stick_events.append((t_i, 'Z' + side_tag + vert,
-                                         lean_scale, per_sustain_i))
+                                         ls, per_sustain_i))
                 # Skip the generic single-event append below.
                 continue
             elif getattr(tg, 'paired_side', None):
@@ -3734,20 +3766,30 @@ class RhythmVisualizer:
             # 4. process hits → VFX (particles only, no flash/slash)
             for tg in hits:
                 # In horizontal-zigzag LineTarget chains each block lands
-                # on a different lane (outer-left vs outer-right), so the
-                # particle burst must follow the block that was actually
-                # punched this frame rather than the target's nominal
-                # spawn lane.
-                if (isinstance(tg, LineTarget)
-                        and tg.zigzag == 'horizontal'
-                        and tg.last_punched_i >= 0):
+                # on a different lane (outer-left vs outer-right) and the
+                # chain also lives higher in the sky than the normal
+                # air-punch zone, so the particle burst must follow both
+                # the block's actual X (per-block, not the target's
+                # nominal spawn lane) AND its elevated Y.
+                _line_horiz = (isinstance(tg, LineTarget)
+                               and tg.zigzag == 'horizontal')
+                if _line_horiz and tg.last_punched_i >= 0:
                     _lane_frac = (0.0 if (tg.last_punched_i % 2 == 0)
                                   else float(max(0, cam.n_lanes - 1)))
                     x = int(cam.lane_x(_lane_frac, 0.02))
                 else:
                     x = int(cam.lane_x(tg.lane, 0.02))
                 if isinstance(tg, PunchTarget):
-                    y = int(cam.air_y(0.02, 0.55))
+                    if _line_horiz:
+                        # Project the block's actual world-Y at the punch
+                        # plane so the particles spawn right ON the block,
+                        # not down at chest height.
+                        _proj = cam.project(0.0,
+                                            LineTarget.HORIZONTAL_WY,
+                                            cam.Z_NEAR + 0.01)
+                        y = int(_proj[1]) if _proj else int(cam.air_y(0.02, 0.55))
+                    else:
+                        y = int(cam.air_y(0.02, 0.55))
                     count = 50
                     viewport.trigger(1.0)
                 elif isinstance(tg, DanceTarget):
