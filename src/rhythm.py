@@ -1495,9 +1495,6 @@ class LineTarget(PunchTarget):
                 side_col = tuple(int(c * s_bright) for c in col)
                 cv2.fillPoly(canvas, [np.array(sf, dtype=np.int32)],
                              side_col, lineType=cv2.LINE_AA)
-                cv2.line(canvas, sf[0], sf[3], edge_col, side_lw, cv2.LINE_AA)
-                cv2.line(canvas, sf[1], sf[2], edge_col, side_lw, cv2.LINE_AA)
-                cv2.line(canvas, sf[2], sf[3], edge_col, side_lw, cv2.LINE_AA)
 
             # ── TOP / BOTTOM connecting face ───────────────────────────────
             # For a tilted block (wy_f ≠ wy_b) the horizontal face that
@@ -1521,15 +1518,11 @@ class LineTarget(PunchTarget):
             if all(p is not None for p in (h0, h1, h2, h3)):
                 horiz_poly = np.array([h0, h1, h2, h3], dtype=np.int32)
                 cv2.fillPoly(canvas, [horiz_poly], horiz_col, cv2.LINE_AA)
-                cv2.polylines(canvas, [horiz_poly], True, edge_col,
-                              side_lw, cv2.LINE_AA)
 
             # ── FRONT FACE ────────────────────────────────────────────────
             fill_col   = tuple(int(c * f_bright) for c in col)
             front_poly = np.array([fTL, fTR, fBR, fBL], dtype=np.int32)
             cv2.fillPoly(canvas, [front_poly], fill_col, lineType=cv2.LINE_AA)
-            cv2.polylines(canvas, [front_poly], True, edge_col,
-                          front_lw, cv2.LINE_AA)
 
             cx_s   = int((fTL[0] + fBR[0]) / 2)
             cy_s   = int((fTL[1] + fBR[1]) / 2)
