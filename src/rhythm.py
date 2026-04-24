@@ -1292,9 +1292,10 @@ class LineTarget(PunchTarget):
     - ``CHAIN_D = 3`` → more visible "brick" separation
     """
 
-    # Frames between consecutive cubes in the chain.  Must be ≥ 1.
-    # 16th-note spacing at ~152 BPM / 30 fps  (beat≈12f / 4 subdivisions = 3f)
-    CHAIN_D: int = 3
+    # Frames between consecutive cube CENTRES.  Must be ≥ 1.
+    # 6 = 8th-note spacing at ~152 BPM / 30 fps (beat≈12f / 2 subdivisions).
+    # With hz = D_z/2 this gives depth = D_z = 2× the original touching depth.
+    CHAIN_D: int = 6
     CORNER_RADIUS: float = 0.12
     # World-Z where the head cube centre freezes.
     # Set so front_z = HEAD_Z_CLAMP − hz ≈ Z_NEAR → fills ~20 % of frame.
@@ -1319,8 +1320,10 @@ class LineTarget(PunchTarget):
         #                  and FREEZES (stops moving).
         # final_hit_frame= frame when the HEAD cube is punched LAST,
         #                  after all tail cubes have passed through.
-        self.freeze_frame     = self.hit_frame
-        self.final_hit_frame  = self.hit_frame + self.n_cubes * D
+        # New hit order: head (i=0) first, then tails sequentially.
+        # final_hit_frame = frame when the LAST tail cube clears.
+        self.freeze_frame     = self.hit_frame          # kept for compat; unused
+        self.final_hit_frame  = self.hit_frame + (self.n_cubes - 1) * D
 
     # ── lifecycle --------------------------------------------------
     def check_hit(self, cur_frame: int) -> bool:
@@ -1372,16 +1375,18 @@ class LineTarget(PunchTarget):
         final_hit_frame = self.final_hit_frame
 
         # ── Zigzag chain rendering ────────────────────────────────────────
+        # Hit order: head (i=0) first, then tails i=1..n-1 sequentially.
+        # Segment i is alive while cur_frame < hit_frame + i*D.
         # Segments alternate Y so adjacent blocks touch at Y = wy:
-        #   even i (0,2) → centre at wy + hx  (below horizon, "down" on screen)
-        #   odd  i (1,3) → centre at wy - hx  (above horizon, "up"  on screen)
-        # top of even = wy = bottom of odd → they share an edge at Y=wy.
-        # hz is derived from CHAIN_D so back_i == front_{i+1} exactly.
+        #   even i (0,2) → centre at wy + hx  (below horizon, "down")
+        #   odd  i (1,3) → centre at wy - hx  (above horizon, "up")
 
         if self.hit_exec_f >= 0:
             return canvas
 
         # ── Derive hz for exact touching ──────────────────────────────────
+        # With CHAIN_D=6: D_z is twice the original 3-frame spacing,
+        # so hz = D_z/2 gives depth = D_z = 2× the old touching depth.
         velocity = (cam.Z_FAR - cam.Z_NEAR) / travel   # wu / frame
         D_z      = D * velocity                          # wu between centres
         hz       = D_z / 2.0                             # back_i == front_{i+1}
@@ -1390,41 +1395,28 @@ class LineTarget(PunchTarget):
             """Y centre for segment idx: even=down, odd=up."""
             return (wy + hx) if (idx % 2 == 0) else (wy - hx)
 
-        # ── HEAD world-Z ──────────────────────────────────────────────────
-        if cur_frame < freeze_frame:
-            frames_to_hit = freeze_frame - cur_frame
-            z_norm_h = frames_to_hit / travel
-            if z_norm_h > 1.0:
-                return canvas
-            head_wz = cam.z_from_norm(max(0.0, min(1.0, z_norm_h)))
-            head_wz = max(head_wz, self.HEAD_Z_CLAMP)
-        else:
-            head_wz = self.HEAD_Z_CLAMP
-
-        # ── Build segment list [(front_z, back_z, wy_seg, is_head, idx)] ──
+        # ── Build segment list [(front_z, back_z, wy_seg, is_neon, idx)] ──
+        # Each segment i disappears once cur_frame >= hit_frame + i*D.
+        # Only the frontmost ALIVE block is "neon" (bright highlight + fist
+        # icon); as each block is hit the next one takes the neon role.
         segs = []
+        neon_i: int | None = None      # smallest alive i = frontmost
 
-        segs.append((
-            max(head_wz - hz, cam.Z_NEAR + 0.01),
-            min(head_wz + hz, cam.Z_FAR  - 0.01),
-            _seg_wy(0), True, 0
-        ))
-
-        for i in range(1, self.n_cubes):
+        for i in range(self.n_cubes):
             eff_hit_i = self.hit_frame + i * D
             if cur_frame >= eff_hit_i:
-                continue
+                continue                          # this block has been hit
             frames_to_i = eff_hit_i - cur_frame
             z_norm_i = frames_to_i / travel
             if z_norm_i > 1.0:
-                continue
-            tail_wz = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
-            if tail_wz <= head_wz:
-                continue
+                continue                          # not yet spawned
+            if neon_i is None:
+                neon_i = i                        # first alive = frontmost
+            wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
             segs.append((
-                max(tail_wz - hz, cam.Z_NEAR + 0.01),
-                min(tail_wz + hz, cam.Z_FAR  - 0.01),
-                _seg_wy(i), False, i
+                max(wz_i - hz, cam.Z_NEAR + 0.01),
+                min(wz_i + hz, cam.Z_FAR  - 0.01),
+                _seg_wy(i), i == neon_i, i
             ))
 
         if not segs:
@@ -1440,13 +1432,28 @@ class LineTarget(PunchTarget):
             p = cam.project(x, y, z)
             return (int(p[0]), int(p[1])) if p else None
 
-        for fz, bz, wy_s, is_head, cube_i in segs:
+        for fz, bz, wy_s, is_neon, cube_i in segs:
             fTL = _pt(wx - hx, wy_s + hx, fz)
             fTR = _pt(wx + hx, wy_s + hx, fz)
             fBR = _pt(wx + hx, wy_s - hx, fz)
             fBL = _pt(wx - hx, wy_s - hx, fz)
             if None in (fTL, fTR, fBR, fBL):
                 continue
+
+            if is_neon:
+                # Frontmost alive block: ALL faces full neon brightness.
+                s_bright = 0.82    # side fill (bright)
+                f_bright = 1.00    # front fill (full)
+                edge_col = rim_col
+                side_lw  = 2
+                front_lw = 3
+            else:
+                # Trailing blocks: noticeably darker / receding.
+                s_bright = 0.18
+                f_bright = 0.22
+                edge_col = tuple(int(c * 0.55) for c in rim_col)
+                side_lw  = 1
+                front_lw = 1
 
             # ── SIDE FACE ────────────────────────────────────────────────
             if self.is_left:
@@ -1459,21 +1466,19 @@ class LineTarget(PunchTarget):
                 sf  = (fTL, fBL, bBL, bTL)
 
             if all(p is not None for p in sf):
-                side_bright = 0.55 if is_head else 0.42
-                side_col    = tuple(int(c * side_bright) for c in col)
+                side_col = tuple(int(c * s_bright) for c in col)
                 cv2.fillPoly(canvas, [np.array(sf, dtype=np.int32)],
                              side_col, lineType=cv2.LINE_AA)
-                cv2.line(canvas, sf[0], sf[3], rim_col, 1, cv2.LINE_AA)
-                cv2.line(canvas, sf[1], sf[2], rim_col, 1, cv2.LINE_AA)
-                cv2.line(canvas, sf[2], sf[3], rim_col, 1, cv2.LINE_AA)
+                cv2.line(canvas, sf[0], sf[3], edge_col, side_lw, cv2.LINE_AA)
+                cv2.line(canvas, sf[1], sf[2], edge_col, side_lw, cv2.LINE_AA)
+                cv2.line(canvas, sf[2], sf[3], edge_col, side_lw, cv2.LINE_AA)
 
             # ── FRONT FACE ────────────────────────────────────────────────
-            fill_bright = 0.90 if is_head else 0.60
-            fill_col    = tuple(int(c * fill_bright) for c in col)
-            front_poly  = np.array([fTL, fTR, fBR, fBL], dtype=np.int32)
+            fill_col   = tuple(int(c * f_bright) for c in col)
+            front_poly = np.array([fTL, fTR, fBR, fBL], dtype=np.int32)
             cv2.fillPoly(canvas, [front_poly], fill_col, lineType=cv2.LINE_AA)
-            cv2.polylines(canvas, [front_poly], True, rim_col,
-                          2 if is_head else 1, cv2.LINE_AA)
+            cv2.polylines(canvas, [front_poly], True, edge_col,
+                          front_lw, cv2.LINE_AA)
 
             cx_s   = int((fTL[0] + fBR[0]) / 2)
             cy_s   = int((fTL[1] + fBR[1]) / 2)
@@ -3082,16 +3087,13 @@ class RhythmVisualizer:
                 D   = tg._D
                 n   = tg.n_cubes
                 per_sustain = D / float(self.FPS)
-                # Tail blocks i=1..n-1 hit at hit_frame + i*D.
-                for i in range(1, n):
+                # Head (i=0) hits first, then tails i=1..n-1 sequentially.
+                # even i (0,2) = DOWN, odd i (1,3) = UP.
+                for i in range(n):
                     t_i  = (tg.hit_frame + i * D) / self.FPS
-                    vert = 'U' if (i % 2 == 1) else 'D'
+                    vert = 'D' if (i % 2 == 0) else 'U'
                     stick_events.append((t_i, 'Z' + side_tag + vert,
                                          lean_scale, per_sustain))
-                # Head block (i=0, even → DOWN) hits last.
-                t_head = tg.final_hit_frame / self.FPS
-                stick_events.append((t_head, 'Z' + side_tag + 'D',
-                                     lean_scale, per_sustain))
                 # Skip the generic single-event append below.
                 continue
             elif getattr(tg, 'paired_side', None):

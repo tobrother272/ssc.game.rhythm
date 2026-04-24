@@ -1649,20 +1649,17 @@ def schedule_events(beat_frames: list[int],
             if bf < line_global_busy_until:
                 skipped_stacked += 1
                 continue
-            # Emit one event per block (zigzag: odd=UP, even=DOWN).
+            # Emit one event per block: head (i=0) first, tails after.
             # Mirrors rhythm.py's per-block event emission exactly.
-            _CHAIN_D  = 3                              # must match LineTarget.CHAIN_D
+            # even i (0,2) = DOWN, odd i (1,3) = UP.
+            _CHAIN_D  = 6                              # must match LineTarget.CHAIN_D
             _n_cubes  = min(4, max(2, line_hold_frames // _CHAIN_D + 1))
             _per_sus  = _CHAIN_D / float(fps)
-            for _i in range(1, _n_cubes):
+            for _i in range(_n_cubes):
                 _t_i  = (bf + _i * _CHAIN_D) / fps
-                _vert = 'U' if (_i % 2 == 1) else 'D'
+                _vert = 'D' if (_i % 2 == 0) else 'U'
                 events.append((_t_i, 'Z' + side_tag + _vert,
                                lean_scale, _per_sus))
-            # Head (i=0, even → DOWN) is punched last.
-            _t_head = (bf + _n_cubes * _CHAIN_D) / fps
-            events.append((_t_head, 'Z' + side_tag + 'D',
-                           lean_scale, _per_sus))
             line_busy_until[chosen_lane] = bf + line_hold_frames + 2
             line_global_busy_until = bf + line_hold_frames + 2
         else:
