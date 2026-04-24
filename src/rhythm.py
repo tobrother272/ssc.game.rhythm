@@ -1411,10 +1411,18 @@ class LineTarget(PunchTarget):
                  is_left: bool, hold_frames: int,
                  line_beats: int = 2,
                  block_hit_frames: list[int] | None = None,
-                 block_shrink_frames: list[int] | None = None):
+                 block_shrink_frames: list[int] | None = None,
+                 zigzag: str = 'vertical'):
         super().__init__(spawn_frame, hit_frame, lane, is_left)
         self.hold_frames = max(1, int(hold_frames))
         self.line_beats  = max(1, int(line_beats))
+        # Zigzag axis for this chain: 'vertical' (legacy saw-tooth inside
+        # a single lane) or 'horizontal' (chain spans lane 0 <-> lane n-1,
+        # each block alternates direction).  Stored per-target so mixed
+        # runs are possible even if current CLI forces a single value.
+        self.zigzag = (zigzag or 'vertical').lower().strip()
+        if self.zigzag not in ('vertical', 'horizontal'):
+            self.zigzag = 'vertical'
         # Prefer the caller-supplied block_hit_frames as the source of
         # truth for n_cubes (waveform-driven scheduler produces one
         # block per RMS column — could be any number 2..8).  Fallback
@@ -1489,6 +1497,11 @@ class LineTarget(PunchTarget):
         # each block in a chain should pulse the viewport shake + burst
         # its own particles + tick the combo counter as it lands.
         self._punched: set[int] = set()
+        # Index of the block whose hit frame was consumed most recently
+        # by check_hit().  The main-loop VFX block uses this to place
+        # the particle burst at the correct lane for horizontal-zigzag
+        # chains, where each block lands on a different X position.
+        self.last_punched_i: int = -1
         # hit_frame      = frame when the HEAD cube reaches the hit zone
         #                  and FREEZES (stops moving).
         # final_hit_frame= frame when the HEAD cube is punched LAST,
@@ -1517,6 +1530,7 @@ class LineTarget(PunchTarget):
                 continue
             if cur_frame >= self.block_hit_frames[i]:
                 self._punched.add(i)
+                self.last_punched_i = i
                 # Only stamp hit_exec_f on the LAST block — that's the
                 # frame the chain is considered "punched out" and starts
                 # its final-block shrink countdown inside is_dead.
@@ -1552,15 +1566,36 @@ class LineTarget(PunchTarget):
 
         hx = PunchTarget.CUBE_HALF
         yaw = 0.18 if self.is_left else -0.18
-        wx = cam.lane_world_x(self.lane)
-        wy = cam.AIR_WORLD_Y
+        wy_center = cam.AIR_WORLD_Y
+        wx_lane   = cam.lane_world_x(self.lane)
 
         freeze_frame    = self.freeze_frame
         final_hit_frame = self.final_hit_frame
 
-        def _seg_wy(idx: int) -> float:
-            """Y centre for segment idx: even=below-horizon, odd=above."""
-            return (wy + hx) if (idx % 2 == 0) else (wy - hx)
+        # ── Zigzag-axis-aware segment centres ─────────────────────────────
+        # Two modes:
+        #   vertical (legacy): single lane, blocks saw-tooth up/down in Y.
+        #   horizontal      : single Y (AIR_WORLD_Y), blocks sweep between
+        #                      lane 0 and lane n_lanes-1 in X.  Each junction
+        #                      _seg_wx(k) pins the shared (X) coordinate of
+        #                      block k-1's back and block k's front, so the
+        #                      chain stays seamless even with X-tilt.
+        if self.zigzag == 'horizontal':
+            _lane_left_x  = cam.lane_world_x(0)
+            _lane_right_x = cam.lane_world_x(max(0, cam.n_lanes - 1))
+
+            def _seg_wx(idx: int) -> float:
+                return _lane_left_x if (idx % 2 == 0) else _lane_right_x
+
+            def _seg_wy(idx: int) -> float:
+                return wy_center
+        else:
+            def _seg_wx(idx: int) -> float:
+                return wx_lane
+
+            def _seg_wy(idx: int) -> float:
+                """Y centre for segment idx: even=below-horizon, odd=above."""
+                return (wy_center + hx) if (idx % 2 == 0) else (wy_center - hx)
 
         # ── Time-anchored geometry ────────────────────────────────────────
         # Block i's front face arrives at the punch plane at frame
@@ -1580,7 +1615,7 @@ class LineTarget(PunchTarget):
             dn = min(1.0, max(0.0, dn))
             return cam.z_from_norm(dn)
 
-        # Format: (fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t)
+        # Format: (fz, bz, wx_f, wx_b, wy_f, wy_b, is_neon, cube_i, shrink_t)
         segs = []
         neon_i: int | None = None
 
@@ -1598,6 +1633,8 @@ class LineTarget(PunchTarget):
         for i in range(self.n_cubes):
             wy_f = _seg_wy(i)
             wy_b = _seg_wy(i + 1)   # back Y always = next block's front Y
+            wx_f = _seg_wx(i)
+            wx_b = _seg_wx(i + 1)   # back X always = next block's front X
 
             t_front = self.block_hit_frames[i]
             t_back  = self.block_back_frames[i]
@@ -1646,15 +1683,21 @@ class LineTarget(PunchTarget):
             if bz <= fz + 0.005:
                 continue
 
-            # Y interpolation follows the SAME direction as Z:
-            #   • wy_b stays fixed at _seg_wy(i+1) — so it lines up
-            #     exactly with the next block's front Y throughout
-            #     the shrink, eliminating the old side-drift.
-            #   • wy_f glides from _seg_wy(i) toward _seg_wy(i+1) so
-            #     the front corner merges into the junction point
-            #     as the block collapses.
+            # Y / X interpolation follows the SAME direction as Z:
+            #   • Back (wx_b / wy_b) stays anchored at its junction coord
+            #     so it lines up with the next block's front throughout
+            #     the shrink (no side-drift at the junction).
+            #   • Front (wx_f / wy_f) glides toward that same junction,
+            #     so the front corner merges into the junction point as
+            #     the block collapses front-to-back.
+            #
+            # In vertical mode wx_f == wx_b (== wx_lane) so the X glide
+            # is a no-op; in horizontal mode wy_f == wy_b (== AIR_WORLD_Y)
+            # so the Y glide is a no-op.  Same formula works for both.
             wy_f_now = wy_f + (wy_b - wy_f) * shrink_t
             wy_b_now = wy_b
+            wx_f_now = wx_f + (wx_b - wx_f) * shrink_t
+            wx_b_now = wx_b
 
             # Neon only on APPROACHING blocks, and only when nothing is
             # currently shrinking.  This keeps a single "hero" highlight
@@ -1664,7 +1707,8 @@ class LineTarget(PunchTarget):
                 neon_i = i
                 is_neon = True
 
-            segs.append((fz, bz, wy_f_now, wy_b_now, is_neon, i, shrink_t))
+            segs.append((fz, bz, wx_f_now, wx_b_now,
+                         wy_f_now, wy_b_now, is_neon, i, shrink_t))
 
         if not segs:
             return canvas
@@ -1690,20 +1734,21 @@ class LineTarget(PunchTarget):
                   if r > 1.0 else pts_f).astype(np.int32)
             cv2.fillPoly(canvas, [rp], color, lineType=cv2.LINE_AA)
 
-        for fz, bz, wy_f, wy_b, is_neon, cube_i, shrink_t in segs:
-            # Front face corners (centred at wy_f)
-            fTL = _pt(wx - hx, wy_f + hx, fz)
-            fTR = _pt(wx + hx, wy_f + hx, fz)
-            fBR = _pt(wx + hx, wy_f - hx, fz)
-            fBL = _pt(wx - hx, wy_f - hx, fz)
+        for fz, bz, wx_f, wx_b, wy_f, wy_b, is_neon, cube_i, shrink_t in segs:
+            # Front face corners (centred at (wx_f, wy_f))
+            fTL = _pt(wx_f - hx, wy_f + hx, fz)
+            fTR = _pt(wx_f + hx, wy_f + hx, fz)
+            fBR = _pt(wx_f + hx, wy_f - hx, fz)
+            fBL = _pt(wx_f - hx, wy_f - hx, fz)
             if None in (fTL, fTR, fBR, fBL):
                 continue
 
-            # Back face corners (centred at wy_b — different Y for tilt)
-            bTL = _pt(wx - hx, wy_b + hx, bz)
-            bTR = _pt(wx + hx, wy_b + hx, bz)
-            bBR = _pt(wx + hx, wy_b - hx, bz)
-            bBL = _pt(wx - hx, wy_b - hx, bz)
+            # Back face corners (centred at (wx_b, wy_b) — tilt may offset
+            # in either X (horizontal mode) or Y (vertical mode))
+            bTL = _pt(wx_b - hx, wy_b + hx, bz)
+            bTR = _pt(wx_b + hx, wy_b + hx, bz)
+            bBR = _pt(wx_b + hx, wy_b - hx, bz)
+            bBL = _pt(wx_b - hx, wy_b - hx, bz)
 
             fade = 1.0 - shrink_t * 0.6
 
@@ -1732,8 +1777,23 @@ class LineTarget(PunchTarget):
                 side_lw  = 1
                 front_lw = 1
 
-            # ── SIDE FACE (tilted — back corners at wy_b) ─────────────────
-            if self.is_left:
+            # ── SIDE / CAP FACES ──────────────────────────────────────────
+            # The SIDE face is the one that connects the front face to
+            # the back face along the TILT axis (and therefore shows the
+            # slant most clearly from camera).  In vertical mode the
+            # block tilts in Y, so the visible "side" is the LEFT/RIGHT
+            # wall and its selection is driven by the chain's lane side
+            # (is_left) just like the legacy code.  In horizontal mode
+            # the block tilts in X, so the visible "side" is still a
+            # LEFT/RIGHT wall but it's now naturally skewed in X; we
+            # pick whichever wall faces the camera based on the tilt
+            # direction (wx_b > wx_f → RIGHT wall is "outer" and thus
+            # visible, wx_b < wx_f → LEFT wall).
+            if self.zigzag == 'horizontal':
+                pick_right = (wx_b >= wx_f)
+            else:
+                pick_right = self.is_left
+            if pick_right:
                 sf = (fTR, fBR, bBR, bTR)
             else:
                 sf = (fTL, fBL, bBL, bTL)
@@ -1742,27 +1802,30 @@ class LineTarget(PunchTarget):
                 side_col = tuple(int(c * s_bright) for c in col)
                 _fill_rounded(sf, side_col)
 
-            # ── TOP / BOTTOM connecting face ───────────────────────────────
-            # For a tilted block (wy_f ≠ wy_b) the horizontal face that
-            # "caps" the slant is visible:
-            #   wy_b < wy_f  → block rises toward back  → TOP face visible
-            #   wy_b > wy_f  → block falls toward back  → BOTTOM face visible
-            horiz_bright = (s_bright + f_bright) * 0.5
-            horiz_col    = tuple(int(c * horiz_bright) for c in col)
-            if wy_b < wy_f:
-                # TOP face: upper edges of front and back faces
-                h0 = _pt(wx - hx, wy_f - hx, fz)
-                h1 = _pt(wx + hx, wy_f - hx, fz)
-                h2 = _pt(wx + hx, wy_b - hx, bz)
-                h3 = _pt(wx - hx, wy_b - hx, bz)
-            else:
-                # BOTTOM face: lower edges of front and back faces
-                h0 = _pt(wx - hx, wy_f + hx, fz)
-                h1 = _pt(wx + hx, wy_f + hx, fz)
-                h2 = _pt(wx + hx, wy_b + hx, bz)
-                h3 = _pt(wx - hx, wy_b + hx, bz)
-            if all(p is not None for p in (h0, h1, h2, h3)):
-                _fill_rounded((h0, h1, h2, h3), horiz_col)
+            # ── CAP FACE (top/bottom) ─────────────────────────────────────
+            # The horizontal face that "caps" the slant is only visible
+            # when the block actually tilts in Y (vertical-zigzag mode).
+            # In horizontal mode wy_f == wy_b so this would be a thin
+            # edge-on sliver — skip it and let the SIDE face alone carry
+            # the tilt cue (mirrors how vertical mode lets the CAP carry
+            # it).
+            if self.zigzag != 'horizontal':
+                horiz_bright = (s_bright + f_bright) * 0.5
+                horiz_col    = tuple(int(c * horiz_bright) for c in col)
+                if wy_b < wy_f:
+                    # TOP face: upper edges of front and back faces
+                    h0 = _pt(wx_f - hx, wy_f - hx, fz)
+                    h1 = _pt(wx_f + hx, wy_f - hx, fz)
+                    h2 = _pt(wx_b + hx, wy_b - hx, bz)
+                    h3 = _pt(wx_b - hx, wy_b - hx, bz)
+                else:
+                    # BOTTOM face: lower edges of front and back faces
+                    h0 = _pt(wx_f - hx, wy_f + hx, fz)
+                    h1 = _pt(wx_f + hx, wy_f + hx, fz)
+                    h2 = _pt(wx_b + hx, wy_b + hx, bz)
+                    h3 = _pt(wx_b - hx, wy_b + hx, bz)
+                if all(p is not None for p in (h0, h1, h2, h3)):
+                    _fill_rounded((h0, h1, h2, h3), horiz_col)
 
             # ── FRONT FACE ────────────────────────────────────────────────
             fill_col = tuple(int(c * f_bright) for c in col)
@@ -2546,7 +2609,8 @@ class GameManager:
                      punch_pair_cycle: int = 4,
                      line_beats: int = 2,
                      beat_density: float = 1.0,
-                     wave_columns: list[dict] | None = None):
+                     wave_columns: list[dict] | None = None,
+                     line_zigzag: str = 'vertical'):
         """Create one target per beat_frame.
 
         Rules:
@@ -2681,7 +2745,8 @@ class GameManager:
                                   hold_frames=_hold,
                                   line_beats=line_beats,
                                   block_hit_frames=line_block_hits,
-                                  block_shrink_frames=line_block_shrinks)
+                                  block_shrink_frames=line_block_shrinks,
+                                  zigzag=line_zigzag)
             return PunchTarget(spawn_f, bf, lane, is_left)
 
         def _target_cls_for(m: str):
@@ -3140,6 +3205,11 @@ class RhythmVisualizer:
         self.LINE_BEATS:        int = 2
         # Draw line-mode block timing debug overlay (timeline markers).
         self.LINE_DEBUG:        bool = False
+        # Line-mode zigzag axis: 'vertical' = legacy saw-tooth within a
+        # single lane; 'horizontal' = blocks span lane 1 <-> lane 4 and
+        # alternate direction (chain is a wide left-right zigzag across
+        # the tunnel, with head/tail on the two outer lanes).
+        self.LINE_ZIGZAG:       str = 'vertical'
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -3480,7 +3550,8 @@ class RhythmVisualizer:
                           punch_pair_cycle=self.PUNCH_PAIR_CYCLE,
                           line_beats=self.LINE_BEATS,
                           beat_density=self.BEAT_DENSITY,
-                          wave_columns=wave_columns)
+                          wave_columns=wave_columns,
+                          line_zigzag=self.LINE_ZIGZAG)
 
         # Give the stickman its beat timeline for pose-sync.
         # We use the ACTUAL scheduled targets (not raw beat_frames) so that:
@@ -3662,7 +3733,19 @@ class RhythmVisualizer:
 
             # 4. process hits → VFX (particles only, no flash/slash)
             for tg in hits:
-                x = int(cam.lane_x(tg.lane, 0.02))
+                # In horizontal-zigzag LineTarget chains each block lands
+                # on a different lane (outer-left vs outer-right), so the
+                # particle burst must follow the block that was actually
+                # punched this frame rather than the target's nominal
+                # spawn lane.
+                if (isinstance(tg, LineTarget)
+                        and tg.zigzag == 'horizontal'
+                        and tg.last_punched_i >= 0):
+                    _lane_frac = (0.0 if (tg.last_punched_i % 2 == 0)
+                                  else float(max(0, cam.n_lanes - 1)))
+                    x = int(cam.lane_x(_lane_frac, 0.02))
+                else:
+                    x = int(cam.lane_x(tg.lane, 0.02))
                 if isinstance(tg, PunchTarget):
                     y = int(cam.air_y(0.02, 0.55))
                     count = 50
@@ -4014,6 +4097,19 @@ def parse_arguments():
                    help=('Draw line-mode timing debug overlay (block markers '
                          'on a top timeline + current frame indicator). '
                          'Useful for waveform sync checks. Default 0.'))
+    p.add_argument('--line_zigzag', type=str, default='vertical',
+                   choices=['vertical', 'horizontal'],
+                   help=('Line-mode zigzag axis.  "vertical" (default, '
+                         'legacy) = each block of a chain tilts up/down '
+                         'while staying on a single lane — the chain is '
+                         'a saw-tooth rail on one lane.  "horizontal" = '
+                         'blocks span the FULL tunnel width (lane 1 '
+                         'to lane 4) and alternate direction: block 1 '
+                         'goes lane1->lane4, block 2 lane4->lane1, '
+                         'block 3 lane1->lane4, etc.  The head (front '
+                         'face) and tail (back face) of each block '
+                         'always sit on the two outer lanes, producing '
+                         'a wide horizontal zig-zag across the tunnel.'))
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -4115,6 +4211,7 @@ if __name__ == '__main__':
     viz.PUNCH_PAIR_CYCLE = int(args.punch_pair_cycle)
     viz.LINE_BEATS       = max(1, int(args.line_beats))
     viz.LINE_DEBUG       = bool(args.line_debug)
+    viz.LINE_ZIGZAG      = str(args.line_zigzag).lower().strip() or 'vertical'
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:
