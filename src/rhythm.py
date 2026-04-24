@@ -1338,7 +1338,9 @@ class LineTarget(PunchTarget):
     def is_dead(self, cur_frame: int) -> bool:
         if self.hit_exec_f < 0:
             return False
-        if cur_frame > self.hit_exec_f + 3:
+        # Wait for the last block's shrink animation to finish
+        # (lasts D more frames after the final hit).
+        if cur_frame > self.final_hit_frame + self._D + 1:
             self.state = 'hit'
             return True
         return False
@@ -1376,17 +1378,16 @@ class LineTarget(PunchTarget):
 
         # ── Zigzag chain rendering ────────────────────────────────────────
         # Hit order: head (i=0) first, then tails i=1..n-1 sequentially.
-        # Segment i is alive while cur_frame < hit_frame + i*D.
         # Segments alternate Y so adjacent blocks touch at Y = wy:
         #   even i (0,2) → centre at wy + hx  (below horizon, "down")
         #   odd  i (1,3) → centre at wy - hx  (above horizon, "up")
-
-        if self.hit_exec_f >= 0:
-            return canvas
+        #
+        # Each block has two phases:
+        #   • Approaching: normal depth, moving toward camera.
+        #   • Shrinking  : front face frozen at hit zone; back face retreats
+        #                  toward front face over D frames, then block vanishes.
 
         # ── Derive hz for exact touching ──────────────────────────────────
-        # With CHAIN_D=6: D_z is twice the original 3-frame spacing,
-        # so hz = D_z/2 gives depth = D_z = 2× the old touching depth.
         velocity = (cam.Z_FAR - cam.Z_NEAR) / travel   # wu / frame
         D_z      = D * velocity                          # wu between centres
         hz       = D_z / 2.0                             # back_i == front_{i+1}
@@ -1395,29 +1396,42 @@ class LineTarget(PunchTarget):
             """Y centre for segment idx: even=down, odd=up."""
             return (wy + hx) if (idx % 2 == 0) else (wy - hx)
 
-        # ── Build segment list [(front_z, back_z, wy_seg, is_neon, idx)] ──
-        # Each segment i disappears once cur_frame >= hit_frame + i*D.
-        # Only the frontmost ALIVE block is "neon" (bright highlight + fist
-        # icon); as each block is hit the next one takes the neon role.
+        # ── Build segment list ─────────────────────────────────────────────
+        # Format: (fz, bz, wy_s, is_neon, cube_i, shrink_t)
+        # shrink_t = 0.0 → approaching; 0..1 → shrinking (1 = fully gone).
         segs = []
-        neon_i: int | None = None      # smallest alive i = frontmost
+        neon_i: int | None = None      # frontmost un-hit block
 
         for i in range(self.n_cubes):
-            eff_hit_i = self.hit_frame + i * D
-            if cur_frame >= eff_hit_i:
-                continue                          # this block has been hit
-            frames_to_i = eff_hit_i - cur_frame
-            z_norm_i = frames_to_i / travel
-            if z_norm_i > 1.0:
-                continue                          # not yet spawned
-            if neon_i is None:
-                neon_i = i                        # first alive = frontmost
-            wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
-            segs.append((
-                max(wz_i - hz, cam.Z_NEAR + 0.01),
-                min(wz_i + hz, cam.Z_FAR  - 0.01),
-                _seg_wy(i), i == neon_i, i
-            ))
+            eff_hit_i  = self.hit_frame + i * D
+            frames_ago = cur_frame - eff_hit_i
+
+            if frames_ago < 0:
+                # ── Approaching ──────────────────────────────────────────
+                frames_to = -frames_ago
+                z_norm_i  = frames_to / travel
+                if z_norm_i > 1.0:
+                    continue                    # not yet spawned
+                if neon_i is None:
+                    neon_i = i                  # first un-hit = neon
+                wz_i = cam.z_from_norm(max(0.0, min(1.0, z_norm_i)))
+                segs.append((
+                    max(wz_i - hz, cam.Z_NEAR + 0.01),
+                    min(wz_i + hz, cam.Z_FAR  - 0.01),
+                    _seg_wy(i), i == neon_i, i, 0.0
+                ))
+
+            elif frames_ago < D:
+                # ── Shrinking ─────────────────────────────────────────────
+                # Front face stays at hit zone; back face retreats forward.
+                shrink_t = frames_ago / D        # 0 → 1 over D frames
+                fz_fixed = cam.Z_NEAR + 0.01
+                bz_now   = fz_fixed + hz * (1.0 - shrink_t)
+                if bz_now <= fz_fixed + 0.005:
+                    continue                    # fully collapsed
+                segs.append((fz_fixed, bz_now, _seg_wy(i),
+                             False, i, shrink_t))
+            # else: fully gone, skip
 
         if not segs:
             return canvas
@@ -1432,7 +1446,7 @@ class LineTarget(PunchTarget):
             p = cam.project(x, y, z)
             return (int(p[0]), int(p[1])) if p else None
 
-        for fz, bz, wy_s, is_neon, cube_i in segs:
+        for fz, bz, wy_s, is_neon, cube_i, shrink_t in segs:
             fTL = _pt(wx - hx, wy_s + hx, fz)
             fTR = _pt(wx + hx, wy_s + hx, fz)
             fBR = _pt(wx + hx, wy_s - hx, fz)
@@ -1440,18 +1454,18 @@ class LineTarget(PunchTarget):
             if None in (fTL, fTR, fBR, fBL):
                 continue
 
+            fade = 1.0 - shrink_t * 0.6    # fades to 40% during shrink
+
             if is_neon:
-                # Frontmost alive block: ALL faces full neon brightness.
-                s_bright = 0.82    # side fill (bright)
-                f_bright = 1.00    # front fill (full)
-                edge_col = rim_col
+                s_bright = 0.82 * fade
+                f_bright = 1.00 * fade
+                edge_col = tuple(int(c * fade) for c in rim_col)
                 side_lw  = 2
                 front_lw = 3
             else:
-                # Trailing blocks: noticeably darker / receding.
-                s_bright = 0.18
-                f_bright = 0.22
-                edge_col = tuple(int(c * 0.55) for c in rim_col)
+                s_bright = 0.18 * fade
+                f_bright = 0.22 * fade
+                edge_col = tuple(int(c * 0.55 * fade) for c in rim_col)
                 side_lw  = 1
                 front_lw = 1
 
