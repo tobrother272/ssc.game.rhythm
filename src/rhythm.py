@@ -234,7 +234,7 @@ def _parse_lanes(spec: str | None, n_lanes: int) -> set[int] | None:
 TARGET_TRAVEL_FRAMES = 40    # how many frames a target takes to cross from z=1 → z=0
 SPAWN_COOLDOWN       = 3
 ONSET_SPAWN_THRESH   = 0.35
-WALL_SPAWN_PROB      = 0.12
+WALL_SPAWN_PROB      = 0.0   # punch mode no longer spawns full-tunnel walls
 HIT_Z_THRESHOLD      = 0.08  # z below this is considered "at hit zone"
 
 
@@ -2924,21 +2924,14 @@ class GameManager:
             # policy (line chains may start "already in flight" at frame 0).
             cur_mode = _mode_for(emit_idx)
             spawn_f = bf - self.travel
-            if spawn_f < 0 and cur_mode != 'line':
+            # Allow negative spawn_f: Target.depth() handles that cleanly
+            # — the block just appears already partway down the tunnel
+            # at frame 0, which is the visually correct behaviour when
+            # the song starts mid-measure.  Only drop the beat if its
+            # own hit frame is already in the past (bf < 0), which
+            # would be impossible to render as a real hit.
+            if bf < 0:
                 skipped_early += 1
-                continue
-
-            # target type
-            b = float(bass_arr[min(bf, len(bass_arr) - 1)])
-            r = self.rng.random()
-            if b > 0.60 and r < WALL_SPAWN_PROB:
-                # Full-tunnel wall spanning every lane.
-                center_lane = (n_lanes - 1) / 2.0
-                t = WallTarget(spawn_f, bf, lane=center_lane,
-                               is_left=False, span=n_lanes)
-                self.targets.append(t)
-                last_bf = bf
-                emit_idx += 1
                 continue
 
             target_cls = _target_cls_for(cur_mode)
@@ -3407,25 +3400,27 @@ class RhythmVisualizer:
             if p95 > 1e-8:
                 line_dbg_wave = np.clip(line_dbg_wave / p95, 0.0, 1.0)
 
-        # ── Wave columns for line-mode scheduler ─────────────────────────
-        # Detect rise→peak→descent-midpoint triples on the RMS envelope so
-        # each block in a line-chain can be pinned to an actual wave column:
-        #   • block arrival  = column.rise_f
-        #   • block shrink   = column.end_f − column.rise_f
-        wave_columns: list[dict] = []
-        if 'line' in self.MODE:
-            # Space columns at least `beat_min_gap` video-frames apart so
-            # ultra-close double peaks don't both become separate blocks.
-            _mg = max(2, int(self.BEAT_MIN_GAP))
-            wave_columns = detect_wave_columns(
-                y, sr, HOP_LENGTH, float(self.FPS),
-                min_gap_frames=_mg,
-                prominence_pct=20.0,
-                smooth_win=1,
-            )
-            if wave_columns:
-                print(f"[line-wave] detected {len(wave_columns)} RMS columns "
-                      f"(min_gap={_mg}f, prom=p20)")
+        # ── Wave columns: single source of truth for punch-point timing ──
+        # Detect rise→peak→descent-midpoint triples on the RMS envelope.
+        # Used by:
+        #   • line-mode scheduler to derive whole chains (each block = 1
+        #     column: arrival=rise_f, shrink=end_f−rise_f).
+        #   • ALL other modes (punch / dance / combo / wall) to SNAP each
+        #     beat_frame to the closest column.rise_f so every visible
+        #     punch lands on a real audio peak instead of drifting on the
+        #     onset/tempo grid.  The number and cadence of events still
+        #     comes from BEAT_SOURCE + BEAT_DENSITY; only the exact frame
+        #     of each event is retimed to match the waveform.
+        _mg = max(2, int(self.BEAT_MIN_GAP))
+        wave_columns: list[dict] = detect_wave_columns(
+            y, sr, HOP_LENGTH, float(self.FPS),
+            min_gap_frames=_mg,
+            prominence_pct=20.0,
+            smooth_win=1,
+        )
+        if wave_columns:
+            print(f"[wave] detected {len(wave_columns)} RMS columns "
+                  f"(min_gap={_mg}f, prom=p20)")
 
         # Beat times -> video frame indices (targets will POP exactly here)
         beat_frames = [int(round(t * self.FPS)) for t in beat_times]
@@ -3470,6 +3465,44 @@ class RhythmVisualizer:
             beat_frames = [max(0, bf - advance_f) for bf in beat_frames]
             beat_frames = sorted(set(beat_frames))
             print(f"[line-timing] onset advance: -{advance_f}f")
+
+        # ── Wave-column beats: one punch per RMS column ───────────────────
+        # For every mode EXCEPT solo line (which derives chains directly
+        # inside pre_schedule) and --beat_source tempo (which the user
+        # explicitly asked for a metronome-steady cadence), REPLACE
+        # beat_frames with the rise-start frame of each detected wave
+        # column.  The goal is a STRICT 1:1 between the visible
+        # waveform columns and the spawned blocks, so --density is
+        # intentionally IGNORED here — the user asked "why does my
+        # block count not match the column count?", and the answer is
+        # that density was previously halving the column list.
+        #
+        # We still enforce `--beat_min_gap` to collapse genuine
+        # double-peaks that are too close to be distinguishable
+        # visually (e.g. a hi-hat split-second repeat), but nothing
+        # else trims the column list after this point inside the
+        # beat-generation stage.  If the envelope is flat (no columns
+        # detected) we fall back to the original onset/beat_track
+        # beat_frames so nothing breaks on pure-tone inputs.
+        solo_line = (len(modes_seq) == 1 and modes_seq[0] == 'line')
+        if (not solo_line
+                and self.BEAT_SOURCE != 'tempo'
+                and wave_columns
+                and len(wave_columns) >= 1):
+            col_rises = sorted(int(c['rise_f']) for c in wave_columns
+                               if 0 <= int(c['rise_f']) < total_frames)
+            n_cols = len(col_rises)
+            # Enforce min_gap so ultra-close double peaks don't collide.
+            _mg = max(1, int(self.BEAT_MIN_GAP))
+            dedup: list[int] = []
+            for bf in col_rises:
+                if not dedup or bf - dedup[-1] >= _mg:
+                    dedup.append(bf)
+            beat_frames = dedup
+            print(f"[wave-beats] replaced onset/beat-track events with "
+                  f"{n_cols} RMS columns -> {len(beat_frames)} beats "
+                  f"(1:1 mapping, density ignored, "
+                  f"min_gap={_mg}f merged {n_cols - len(beat_frames)})")
         # Scene dressing: 'dance' wins if present (has lane panel rails);
         # otherwise use the first mode present.  'line' falls back to
         # 'punch' scene dressing since a line bar is still an air target
@@ -3700,18 +3733,19 @@ class RhythmVisualizer:
             print(f"[stickman] disabled — {len(stick_events)} events prepared "
                   f"for export only")
 
-        # Optional line debug markers: one marker per Z* block event.
+        # Optional debug markers: one marker per beat/block event.
+        # Works for ALL modes — collects every stickman event regardless
+        # of kind prefix so punch/dance/combo/line all show correctly.
         line_dbg_events: list[tuple[int, str]] = []
         if self.LINE_DEBUG:
             for ev in stick_events:
-                if (len(ev) >= 2 and isinstance(ev[1], str)
-                        and ev[1].startswith('Z')):
+                if len(ev) >= 2 and isinstance(ev[1], str):
                     f_ev = int(round(float(ev[0]) * self.FPS))
                     line_dbg_events.append((f_ev, ev[1]))
             line_dbg_events.sort(key=lambda t: t[0])
             if line_dbg_events:
                 ts = ", ".join(f"{f/self.FPS:.3f}" for f, _ in line_dbg_events)
-                print(f"[line-debug] block_events={len(line_dbg_events)}  t=[{ts}]")
+                print(f"[beat-debug] events={len(line_dbg_events)}  t=[{ts}]")
 
         # Persist events so stickman.py can render a standalone video that
         # lines up frame-for-frame with THIS rhythm render.
@@ -3864,7 +3898,7 @@ class RhythmVisualizer:
                 if next_f is not None:
                     dt_txt = f"{(next_f - fi) / self.FPS:+.3f}s"
                 cv2.putText(canvas,
-                            f"LINE DBG blocks={len(line_dbg_events)}  t={fi/self.FPS:.3f}s  next={dt_txt}",
+                            f"BEAT DBG events={len(line_dbg_events)}  t={fi/self.FPS:.3f}s  next={dt_txt}",
                             (x0, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                             (220, 220, 220), 1, lineType=cv2.LINE_AA)
                 # RMS waveform overlay directly under the timeline.
