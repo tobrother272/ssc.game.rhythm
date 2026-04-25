@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+
+
 from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -171,6 +173,29 @@ class SegmentConfigPanel(QWidget):
         self.audio_combo.currentIndexChanged.connect(self._commit_general)
         self.form_layout.addRow("Audio source", self.audio_combo)
 
+        # Trimmed audio path — read-only display + "Open" button to reveal
+        # the file in the OS file explorer so the user can play/verify it.
+        trimmed_row = QHBoxLayout()
+        trimmed_row.setSpacing(4)
+        self.trimmed_audio_label = QLabel("—")
+        self.trimmed_audio_label.setObjectName("trimmedAudioLabel")
+        self.trimmed_audio_label.setToolTip(
+            "Pre-trimmed WAV for this segment (auto-generated).\n"
+            "Stored next to the project so you can open it in any audio\n"
+            "editor to verify the exact clip used for rendering."
+        )
+        self.trimmed_audio_label.setWordWrap(False)
+        self.trimmed_audio_label.setMinimumWidth(0)
+        trimmed_row.addWidget(self.trimmed_audio_label, 1)
+        self.trimmed_audio_open_btn = QPushButton("Open")
+        self.trimmed_audio_open_btn.setObjectName("zoomButton")
+        self.trimmed_audio_open_btn.setFixedWidth(44)
+        self.trimmed_audio_open_btn.setEnabled(False)
+        self.trimmed_audio_open_btn.setToolTip("Reveal trimmed WAV in file explorer")
+        self.trimmed_audio_open_btn.clicked.connect(self._on_open_trimmed_audio)
+        trimmed_row.addWidget(self.trimmed_audio_open_btn)
+        self.form_layout.addRow("Trimmed audio", trimmed_row)
+
         self.start_spin = QDoubleSpinBox()
         self.start_spin.setRange(0.0, 36000.0)
         self.start_spin.setDecimals(2)
@@ -327,6 +352,29 @@ class SegmentConfigPanel(QWidget):
         self.header_label.setText(
             f"{segment.name}  {format_sec(segment.start_time_sec)} -> {format_sec(segment.end_time_sec)}"
         )
+
+        # Trimmed audio label + open button.
+        tap = segment.trimmed_audio_path
+        tap_exists = bool(tap and Path(tap).exists())
+        if tap_exists:
+            self.trimmed_audio_label.setText(Path(tap).name)  # type: ignore[arg-type]
+            self.trimmed_audio_label.setToolTip(str(tap))
+            self.trimmed_audio_label.setStyleSheet("color:#7bd88f;")
+            self.trimmed_audio_open_btn.setEnabled(True)
+        elif tap:
+            self.trimmed_audio_label.setText(f"⚠ missing: {Path(tap).name}")
+            self.trimmed_audio_label.setToolTip(f"File not found: {tap}")
+            self.trimmed_audio_label.setStyleSheet("color:#f59e0b;")
+            self.trimmed_audio_open_btn.setEnabled(False)
+        else:
+            self.trimmed_audio_label.setText("— (not trimmed yet)")
+            self.trimmed_audio_label.setToolTip(
+                "Will be generated automatically when a segment is created\n"
+                "or its start/end times are changed."
+            )
+            self.trimmed_audio_label.setStyleSheet("color:#6b6b6b;")
+            self.trimmed_audio_open_btn.setEnabled(False)
+
         status_value = segment.render_status.value
         if status_value == "error" and segment.last_render_error:
             # Show the first line of the error inline + full message in tooltip.
@@ -568,31 +616,33 @@ class SegmentConfigPanel(QWidget):
         self._rebuild_dynamic_settings()
         self.segment_changed.emit(segment.id)
 
-    def _on_open_folder_clicked(self) -> None:
-        """Reveal the rendered MP4 in the OS file explorer.
-
-        Tries to *select* the file (so the user can immediately see/copy
-        the exact MP4) on Windows / macOS; on Linux falls back to opening
-        the parent folder, since there's no portable "select file" intent.
-        """
-        path = self._rendered_video_path()
-        if path is None:
-            return
+    def _reveal_path(self, path: Path) -> None:
+        """Reveal *path* in the OS file explorer with the file selected."""
         try:
             if sys.platform.startswith("win"):
-                # explorer /select, "C:\path\file.mp4"  → opens the parent
-                # folder with the file highlighted.  The trailing comma in
-                # the flag is required and there's no space before the path.
                 subprocess.Popen(["explorer", f"/select,{path}"])
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", "-R", str(path)])
             else:
-                # Linux et al — no universal "reveal", open the folder.
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
-        except Exception as exc:  # pragma: no cover - defensive
-            # Last-ditch fallback: just open the parent folder.
+        except Exception as exc:  # pragma: no cover
             try:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
             except Exception:
                 print(f"[OpenFolder] failed: {exc}")
+
+    def _on_open_folder_clicked(self) -> None:
+        """Reveal the rendered MP4 in the OS file explorer."""
+        path = self._rendered_video_path()
+        if path is not None:
+            self._reveal_path(path)
+
+    def _on_open_trimmed_audio(self) -> None:
+        """Reveal the pre-trimmed WAV in the OS file explorer."""
+        seg = self._segment
+        if seg is None or not seg.trimmed_audio_path:
+            return
+        path = Path(seg.trimmed_audio_path)
+        if path.exists():
+            self._reveal_path(path)
 

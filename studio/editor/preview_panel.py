@@ -33,6 +33,12 @@ class PreviewPanel(QWidget):
     """Media preview with source selector and playback controls."""
 
     playhead_changed = Signal(float)
+    # Forward Qt's playbackStateChanged signal as a plain int (the
+    # ``QMediaPlayer.PlaybackState`` enum value).  Consumed by
+    # :class:`MainWindow` to enable / disable timeline scrubbing — we
+    # only allow the user to scrub the red playhead while the preview
+    # is in Playing or Paused state, never when it's Stopped.
+    playback_state_changed = Signal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -502,6 +508,14 @@ class PreviewPanel(QWidget):
         # Ensure button stays enabled whenever we have a usable source.
         if self._media_ready or is_playing:
             self.play_button.setEnabled(True)
+        # Broadcast the new state so MainWindow can gate timeline
+        # scrubbing on Playing / Paused only.  We forward the enum's
+        # underlying integer (``.value``) rather than ``int(state)``
+        # because PySide6's ``QMediaPlayer.PlaybackState`` is not an
+        # ``IntEnum`` in every build (CPython 3.13 + Qt 6.7+ raises
+        # ``TypeError: int() argument must be ... not 'PlaybackState'``
+        # on direct ``int(...)`` conversion).
+        self.playback_state_changed.emit(int(state.value))
 
     def _show_loading(self) -> None:
         """Switch stage to loading page and start dot animation."""

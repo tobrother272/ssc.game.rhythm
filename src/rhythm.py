@@ -27,7 +27,6 @@ import sys
 import subprocess
 import shlex
 import ffmpeg
-from authorization import authourize_user
 
 # ── GPU acceleration (CuPy + cuFFT) ──────────────────────────────────────────
 try:
@@ -286,6 +285,101 @@ def _parse_lanes(spec: str | None, n_lanes: int) -> set[int] | None:
             raise ValueError(
                 f"Lane {v + 1} out of range — valid lanes are 1..{n_lanes}.")
     return out if out else None
+
+
+def _parse_beat_times(args) -> list[float]:
+    """Resolve ``--beat_times`` / ``--beats_file`` into a sorted/deduped list.
+
+    Returns an empty list when ``--beat_source`` is anything other than
+    ``array`` (other sources don't consume this field).  Otherwise:
+
+      * Exactly one of ``--beat_times`` / ``--beats_file`` MUST be set.
+      * ``--beat_times`` is comma-separated seconds, e.g.
+        ``"1.20, 1.85, 2.4"`` (whitespace tolerated).
+      * ``--beats_file`` is a JSON file containing a flat list of numbers,
+        e.g. ``[1.20, 1.85, 2.4]`` — no other schema is supported by
+        design (one canonical format keeps this simple).
+      * Negative values are rejected (a beat at t<0 makes no sense and is
+        almost certainly a bug in the caller).  Out-of-range values
+        ``>= duration`` are silently clipped later inside the visualiser
+        (we don't know the duration here yet).
+      * Result is sorted ascending and de-duplicated to within 0.5 ms so
+        floating-point round-trips through JSON don't double-fire blocks.
+
+    Raises
+    ------
+    SystemExit
+        Via ``sys.exit(1)`` with a helpful CLI message when the inputs
+        are inconsistent (both/none provided in array mode, malformed
+        JSON, non-numeric tokens, empty list, …).  We exit instead of
+        raising because this runs from ``main()`` where the caller has
+        no way to recover.
+    """
+    if args.beat_source != 'array':
+        if args.beat_times is not None or args.beats_file is not None:
+            print("[--beat_times/--beats_file] ignored "
+                  "(only used when --beat_source=array).")
+        return []
+
+    if (args.beat_times is None) == (args.beats_file is None):
+        if args.beat_times is None:
+            print("[--beat_source=array] requires either --beat_times "
+                  "(inline list) or --beats_file (JSON path).")
+        else:
+            print("[--beat_source=array] supply EITHER --beat_times OR "
+                  "--beats_file, not both.")
+        sys.exit(1)
+
+    import json
+
+    raw: list[float] = []
+    if args.beat_times is not None:
+        for tok in str(args.beat_times).split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                raw.append(float(tok))
+            except ValueError:
+                print(f"[--beat_times] '{tok}' is not a number.")
+                sys.exit(1)
+    else:
+        try:
+            with open(args.beats_file, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[--beats_file] cannot read '{args.beats_file}': {exc}")
+            sys.exit(1)
+        if not isinstance(payload, list):
+            print(f"[--beats_file] expected a JSON array of numbers, "
+                  f"got {type(payload).__name__}.")
+            sys.exit(1)
+        for i, v in enumerate(payload):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                print(f"[--beats_file] entry #{i} is not a number: {v!r}")
+                sys.exit(1)
+            raw.append(float(v))
+
+    if not raw:
+        print("[--beat_source=array] beat list is empty.")
+        sys.exit(1)
+
+    for v in raw:
+        if v < 0.0:
+            print(f"[--beat_source=array] negative time {v} not allowed.")
+            sys.exit(1)
+
+    raw.sort()
+    deduped: list[float] = []
+    for v in raw:
+        if not deduped or (v - deduped[-1]) > 5e-4:  # 0.5 ms
+            deduped.append(v)
+    if len(deduped) != len(raw):
+        print(f"[--beat_source=array] dropped {len(raw) - len(deduped)} "
+              f"near-duplicate time(s) (within 0.5 ms).")
+    return deduped
+
+
 TARGET_TRAVEL_FRAMES = 40    # how many frames a target takes to cross from z=1 → z=0
 SPAWN_COOLDOWN       = 3
 ONSET_SPAWN_THRESH   = 0.35
@@ -3182,7 +3276,8 @@ class GameManager:
                      line_beats: int = 2,
                      beat_density: float = 1.0,
                      wave_columns: list[dict] | None = None,
-                     line_zigzag: str = 'vertical'):
+                     line_zigzag: str = 'vertical',
+                     beat_source: str = 'tempo'):
         """Create one target per beat_frame.
 
         Rules:
@@ -3243,7 +3338,81 @@ class GameManager:
         line_block_shrinks_by_start: dict[int, list[int]] = {}
         line_hold_by_start:          dict[int, int]       = {}
 
+        # ── Line-mode + ARRAY source: derive chains 1:1 from user beats ──
+        # When the caller supplies explicit ``--beat_times`` (Studio's
+        # "Auto Gen Block" → user-edited tick array), we MUST honour every
+        # supplied entry as a real block.  The wave-column derivation
+        # below silently picks the strongest RMS columns and re-groups
+        # them, which (a) drops user entries and (b) lets chains overlap
+        # against the global busy lock — symptom: 61 array beats render
+        # only ~44 cubes.
+        #
+        # Strategy: chunk ``beat_frames`` into groups of
+        # ``blocks_per_chain = 2*line_beats`` consecutive entries; each
+        # group becomes ONE LineTarget chain with explicit per-block
+        # hit frames.  A trailing solo entry (≤ blocks_per_chain−1)
+        # is appended to the previous chain so no user beat is dropped
+        # (capped at LineTarget's max 8 cubes).  Per-block shrink width
+        # = gap to the NEXT block in the chain; the last block uses the
+        # median inter-beat gap so the tail block has a sane shrink
+        # animation length.
+        line_array_chains_used = False
         if (len(modes_seq) == 1
+                and modes_seq[0] == 'line'
+                and beat_source == 'array'
+                and len(beat_frames) >= 2):
+            total_frames = max(1, len(bass_arr))
+            blocks_per_chain = max(2, 2 * int(line_beats))
+            _bf = sorted(int(b) for b in beat_frames
+                         if 0 <= int(b) < total_frames)
+            if len(_bf) >= 2:
+                _gaps = [max(1, _bf[i + 1] - _bf[i])
+                         for i in range(len(_bf) - 1)]
+                _med_gap = max(1, int(np.median(_gaps))) if _gaps else \
+                           max(1, self.travel // 8)
+
+                chain_groups: list[list[int]] = []
+                for ci in range(0, len(_bf), blocks_per_chain):
+                    grp = list(_bf[ci:ci + blocks_per_chain])
+                    if len(grp) >= 2:
+                        chain_groups.append(grp)
+                    elif len(grp) == 1 and chain_groups \
+                            and len(chain_groups[-1]) < 8:
+                        # Solo trailing block — append to previous chain
+                        # so the user's last beat is not silently dropped.
+                        chain_groups[-1].append(grp[0])
+
+                chain_starts: list[int] = []
+                for grp in chain_groups:
+                    hits = list(grp)
+                    for i in range(1, len(hits)):
+                        if hits[i] <= hits[i - 1]:
+                            hits[i] = hits[i - 1] + 1
+                    shrinks = []
+                    for i in range(len(hits)):
+                        if i < len(hits) - 1:
+                            shrinks.append(max(1, hits[i + 1] - hits[i]))
+                        else:
+                            shrinks.append(_med_gap)
+                    start_bf = hits[0]
+                    hold_eff = max(1, hits[-1] - hits[0])
+                    line_block_hits_by_start[start_bf]    = hits
+                    line_block_shrinks_by_start[start_bf] = shrinks
+                    line_hold_by_start[start_bf]          = hold_eff
+                    chain_starts.append(start_bf)
+
+                if chain_starts:
+                    n_blocks = sum(len(g) for g in chain_groups)
+                    print(f"[line-array] {len(_bf)} array beats -> "
+                          f"{len(chain_starts)} chains "
+                          f"({n_blocks} total blocks, "
+                          f"<= {blocks_per_chain} per chain, "
+                          f"median_gap={_med_gap}f)")
+                    beat_frames = chain_starts
+                    line_array_chains_used = True
+
+        if (not line_array_chains_used
+                and len(modes_seq) == 1
                 and modes_seq[0] == 'line'
                 and wave_columns is not None
                 and len(wave_columns) >= 2):
@@ -3518,8 +3687,15 @@ class GameManager:
             # have picked.  A dedicated global lock (`relax_busy_until`)
             # prevents two slabs overlapping in flight and gives the
             # camera / stickman enough breathing room between dodges.
+            #
+            # ARRAY-source exception: skip the busy lock entirely so
+            # every user-supplied beat materialises as an obstacle.
+            # `process_video` already drops `_relax_slow_mult` to 1.0
+            # for array source so auto-travel ≈ one user-gap, which
+            # naturally prevents two slabs being mid-air at the same
+            # time without us needing the lock here.
             if cur_mode == 'relax':
-                if bf < relax_busy_until:
+                if beat_source != 'array' and bf < relax_busy_until:
                     skipped_stacked += 1
                     continue
                 t = _spawn_target('relax', spawn_f, bf, 0, False)
@@ -3539,8 +3715,9 @@ class GameManager:
                 # Floor of 8 frames for extreme slow-travel edge cases;
                 # also respect `min_gap_frames` so inter-beat spacing
                 # set by the caller still wins when larger.
-                relax_busy_until = bf + max(
-                    8, self.travel // 4, min_gap_frames)
+                if beat_source != 'array':
+                    relax_busy_until = bf + max(
+                        8, self.travel // 4, min_gap_frames)
                 last_bf = bf
                 emit_idx += 1
                 continue
@@ -3696,8 +3873,26 @@ class GameManager:
                 # the LAST block's back face hits the punch plane (+1
                 # buffer frame so a new chain never starts exactly
                 # atop the tail of the previous one).
+                #
+                # ARRAY source exception: when the user supplied explicit
+                # ``--beat_times`` we group consecutive entries into
+                # chains and the very next chain's first block is
+                # itself the next user-supplied beat — by construction
+                # spaced ~one gap AFTER this chain's last block.  Adding
+                # the legacy `last_width + 2f` tail would push the busy
+                # window PAST the next chain's start and silently skip
+                # it (symptom: 61 array beats render only ~44 cubes).
+                # For array mode we shrink chain_life to the chain's
+                # SPAN only (last_hit − first_hit), so the lock releases
+                # exactly when the last block of this chain arrives at
+                # the punch plane and the next user beat is honoured.
                 last_back  = int(t.block_back_frames[-1])
-                chain_life = max(1, last_back - int(t.hit_frame)) + 2
+                if beat_source == 'array':
+                    chain_life = max(1,
+                                     int(t.block_hit_frames[-1])
+                                     - int(t.hit_frame))
+                else:
+                    chain_life = max(1, last_back - int(t.hit_frame)) + 2
                 line_busy_until[chosen_lane] = bf + chain_life
                 line_global_busy_until       = bf + chain_life
             next_side = 1 - chosen_side
@@ -3752,12 +3947,20 @@ class RhythmVisualizer:
         # 'tempo' = perfectly uniform cadence from BPM (recommended, default)
         # 'beat'  = each beat from librosa beat_track (may jitter)
         # 'onset' = every transient (most blocks, irregular)
+        # 'array' = caller supplies the exact hit times in seconds via
+        #           BEAT_TIMES — librosa is used only to load the audio
+        #           for duration/bass/RMS, never for beat detection.  This
+        #           is the deterministic mode used by Studio when the user
+        #           has hand-edited the beat ticks before rendering.
         self.BEAT_SOURCE:   str   = 'tempo'
         self.BEAT_SENS:     float = 0.5      # 0..1  higher = more beats kept
         self.BEAT_SUBDIV:   int   = 1        # 1,2,4 – multiply each beat
         self.BEAT_MIN_GAP:  int   = 4        # frames between targets
         self.BEAT_BPM:      float | None = None  # override tempo detection
         self.BEAT_DENSITY:  float = 1.0      # 0.5 = half, 2.0 = double cadence
+        # Hit-time list used in BEAT_SOURCE='array' (seconds, sorted, deduped,
+        # already filtered to [0, duration)).  Empty list in any other source.
+        self.BEAT_TIMES:    list[float] = []
         self.BLOCK_SPEED:   float = 1.0      # 1.0 = one block/lane visible
                                              # 0.5 = 2× slower (2 visible)
                                              # 0.33 = 3× slower (3 visible), etc.
@@ -3782,6 +3985,11 @@ class RhythmVisualizer:
         self.PANEL_NEON_COLOR:  tuple | None = None   # viewport 4-tile neon
         # -- event export (for rendering a matched stickman-only video) --
         self.EXPORT_EVENTS:     str | None = None
+        # -- detection-only mode: when True, run audio analysis + scheduler
+        #    (so EXPORT_EVENTS is populated) then exit BEFORE the heavy
+        #    frame rendering loop.  Used by the Studio UI to preview where
+        #    blocks will spawn without spending render time.
+        self.DETECT_ONLY:       bool = False
         # -- gameplay mode: 'punch' (air cubes + stickman punches) or
         #                   'dance' (floor slabs + stickman stomps)
         self.MODE:              str = 'punch'
@@ -3934,6 +4142,21 @@ class RhythmVisualizer:
             total_detected = len(beat_times)
             kept = total_detected        # no strength filtering in tempo mode
 
+        elif self.BEAT_SOURCE == 'array':
+            # Caller-supplied hit times — bypass librosa beat detection
+            # entirely.  We trust the list (sorted/deduped already by
+            # ``main()`` at parse time) and only clip to the audio's
+            # actual duration so out-of-range entries don't crash the
+            # frame conversion below.  Density and the wave-column
+            # snap-to-peak step are SKIPPED for this source so the
+            # rendered blocks land exactly where the caller asked.
+            beat_times = np.asarray(self.BEAT_TIMES, dtype=float)
+            beat_times = beat_times[(beat_times >= 0.0)
+                                    & (beat_times < total_duration)]
+            tempo_val = 0.0
+            total_detected = len(beat_times)
+            kept = total_detected
+
         elif self.BEAT_SOURCE == 'onset':
             # onset_detect: finds every transient, very sensitive.
             # delta ∈ [0.05 .. 0.60]; higher delta → fewer onsets.
@@ -3974,7 +4197,7 @@ class RhythmVisualizer:
         # When beat_track catches only every 2nd/4th hit we can inject
         # evenly-spaced sub-beats in between.  (Skipped in 'tempo' mode
         # because subdivision is already baked into the period spacing.)
-        if (self.BEAT_SOURCE != 'tempo'
+        if (self.BEAT_SOURCE not in ('tempo', 'array')
                 and self.BEAT_SUBDIV > 1 and len(beat_times) >= 2):
             sub_times = []
             for a, b in zip(beat_times, beat_times[1:]):
@@ -3985,11 +4208,17 @@ class RhythmVisualizer:
             beat_times = np.array(sub_times)
 
         t_feat = time.time()
-        print(f"Features extracted in {t_feat - t_load:.2f}s  "
-              f"(source={self.BEAT_SOURCE}, sens={sens:.2f}, subdiv={self.BEAT_SUBDIV}, "
-              f"tempo {tempo_val:.1f} BPM, "
-              f"{total_detected} detected -> {kept} kept "
-              f"-> {len(beat_times)} events after subdivision)")
+        if self.BEAT_SOURCE == 'array':
+            print(f"Features extracted in {t_feat - t_load:.2f}s  "
+                  f"(source=array, supplied={len(self.BEAT_TIMES)}, "
+                  f"in-range={kept}, subdiv/density disabled, "
+                  f"min_gap={self.BEAT_MIN_GAP}f still applied)")
+        else:
+            print(f"Features extracted in {t_feat - t_load:.2f}s  "
+                  f"(source={self.BEAT_SOURCE}, sens={sens:.2f}, "
+                  f"subdiv={self.BEAT_SUBDIV}, tempo {tempo_val:.1f} BPM, "
+                  f"{total_detected} detected -> {kept} kept "
+                  f"-> {len(beat_times)} events after subdivision)")
 
         total_frames = int(total_duration * self.FPS)
         bass_arr = np.zeros(total_frames, dtype=np.float32)
@@ -4048,7 +4277,13 @@ class RhythmVisualizer:
 
         # Density control — keep every Nth beat (d<1) or split each interval
         # into sub-beats (d>1).  1.0 keeps the cadence unchanged.
-        d = float(self.BEAT_DENSITY)
+        # SOURCE=='array' is exempt: the caller already chose the exact
+        # cadence by hand, so density is force-disabled to keep the
+        # rendered blocks at a strict 1:1 with the supplied list.
+        if self.BEAT_SOURCE == 'array':
+            d = 1.0
+        else:
+            d = float(self.BEAT_DENSITY)
         if d < 0.999 and len(beat_frames) > 1:
             step = max(1, int(round(1.0 / d)))
             beat_frames = beat_frames[::step]
@@ -4106,7 +4341,7 @@ class RhythmVisualizer:
         # beat_frames so nothing breaks on pure-tone inputs.
         solo_line = (len(modes_seq) == 1 and modes_seq[0] == 'line')
         if (not solo_line
-                and self.BEAT_SOURCE != 'tempo'
+                and self.BEAT_SOURCE not in ('tempo', 'array')
                 and wave_columns
                 and len(wave_columns) >= 1):
             col_rises = sorted(int(c['rise_f']) for c in wave_columns
@@ -4191,7 +4426,21 @@ class RhythmVisualizer:
         # feedback ("các khối đi chuyển chậm hơn x2 nữa") — the dodge
         # choreography reads better when blocks drift in slowly enough
         # for the stickman pose + camera bob to settle between beats.
-        _relax_slow_mult = 4.0 if solo_relax else 1.0
+        #
+        # ARRAY-source exception: when the caller hand-picks beat times
+        # (Studio "Auto Gen Block" → user-edited ticks), the user has
+        # already chosen the cadence and expects every entry to spawn
+        # an obstacle.  Keeping the 4× multiplier here would auto-blow
+        # `travel` to several SECONDS for sparsely-spaced user beats
+        # (e.g. 5 s/beat → travel = 40 s) which then silently drops
+        # every beat that falls inside the [0, travel) window via the
+        # early-spawn filter below — symptom: zero obstacles render.
+        # For array+relax we keep the multiplier at 1.0 so travel
+        # auto-derives to roughly one user-gap, blocks fit between
+        # consecutive user beats, and the early-spawn filter doesn't
+        # need to drop anything.
+        _relax_slow_mult = (4.0 if solo_relax
+                            and self.BEAT_SOURCE != 'array' else 1.0)
 
         travel = self.TRAVEL_FRAMES
         if self.TRAVEL_FRAMES < 0 and len(beat_frames) >= 2:
@@ -4276,6 +4525,32 @@ class RhythmVisualizer:
                   f"+ delay={delay_f}f → step={step_f}f)  "
                   f"→ {len(beat_frames)} obstacles "
                   f"(first @ frame {first_f} / {first_f/self.FPS:.2f}s)")
+        elif solo_relax and self.BEAT_SOURCE == 'array':
+            # In relax mode, user-supplied array entries represent the
+            # SPAWN time of each obstacle — i.e. the moment the slab
+            # first appears at the horizon and starts gliding toward
+            # the camera.  This matches the natural mental model when
+            # hand-placing ticks against the audio waveform: "khi mình
+            # nghe tới đoạn này thì khối phải bắt đầu xuất hiện".
+            #
+            # ``pre_schedule`` downstream still treats ``bf`` as the
+            # HIT frame (``spawn_frame = bf − travel``), so we offset
+            # every user entry by +travel here to keep the rest of
+            # the pipeline unchanged.  Any beat whose resulting hit
+            # frame would fall past the end of the song is dropped
+            # (the slab would never reach the camera anyway, and the
+            # render loop would just spin past it).
+            n_before = len(beat_frames)
+            translated = [int(bf) + int(travel) for bf in beat_frames]
+            beat_frames = [bf for bf in translated
+                           if bf < total_frames]
+            n_clipped = len(translated) - len(beat_frames)
+            print(f"[relax-array] interpreting {n_before} array "
+                  f"beat(s) as obstacle SPAWN times "
+                  f"(hit_frame = beat + travel={travel}f). "
+                  f"{len(beat_frames)} block(s) fit within audio "
+                  f"({total_frames}f); dropped {n_clipped} whose "
+                  f"hit_frame overshoots the end.")
         elif solo_relax:
             # Music-driven solo-relax: drop any beat whose spawn would
             # fall before frame 0.  Without this, early-song beats
@@ -4305,7 +4580,8 @@ class RhythmVisualizer:
                           line_beats=self.LINE_BEATS,
                           beat_density=self.BEAT_DENSITY,
                           wave_columns=wave_columns,
-                          line_zigzag=self.LINE_ZIGZAG)
+                          line_zigzag=self.LINE_ZIGZAG,
+                          beat_source=self.BEAT_SOURCE)
 
         # Give the stickman its beat timeline for pose-sync.
         # We use the ACTUAL scheduled targets (not raw beat_frames) so that:
@@ -4502,6 +4778,15 @@ class RhythmVisualizer:
             })
             print(f"[export] Wrote {len(stick_events)} events -> "
                   f"{self.EXPORT_EVENTS}")
+
+        # Detection-only fast-path: bail BEFORE the per-frame rendering
+        # loop so the Studio UI gets accurate beat timestamps without
+        # paying for the full video render.  Events JSON has already been
+        # written above when ``--export_events`` is supplied.
+        if getattr(self, 'DETECT_ONLY', False):
+            print(f"[detect-only] skipping render loop "
+                  f"({len(stick_events)} events ready)")
+            return
 
         # ── render loop ──────────────────────────────────────────────
         all_frames: list[np.ndarray] = []
@@ -4804,12 +5089,27 @@ def parse_arguments():
                          f'Manual example: --travel {TARGET_TRAVEL_FRAMES}'))
     # --- beat detection knobs ---
     p.add_argument('--beat_source', type=str, default='tempo',
-                   choices=['tempo', 'beat', 'onset'],
+                   choices=['tempo', 'beat', 'onset', 'array'],
                    help=('"tempo" = perfectly uniform cadence from BPM '
                          '— blocks flow at constant rate, always pop on beat '
                          '(recommended, matches reference video). '
                          '"beat" = each librosa beat (may jitter). '
-                         '"onset" = every transient. Default: tempo'))
+                         '"onset" = every transient. '
+                         '"array" = caller-supplied hit times (see '
+                         '--beat_times / --beats_file); skips audio analysis '
+                         'and ignores --density. Default: tempo'))
+    p.add_argument('--beat_times', type=str, default=None, metavar='LIST',
+                   help=('Comma-separated hit times in seconds, e.g. '
+                         '"1.20,1.85,2.40,3.05". Used only when '
+                         '--beat_source=array.  Either this or --beats_file '
+                         'is REQUIRED in that mode; supplying both is an '
+                         'error.  Out-of-range entries (<0 or >=duration) '
+                         'are dropped.  Sorted + deduplicated automatically.'))
+    p.add_argument('--beats_file', type=str, default=None, metavar='PATH',
+                   help=('JSON file containing a flat array of hit times in '
+                         'seconds, e.g. [1.20, 1.85, 2.40].  Used only when '
+                         '--beat_source=array; alternative to --beat_times '
+                         'when the list is too long for the command line.'))
     p.add_argument('--bpm', type=float, default=None,
                    help=('Force BPM in "tempo" mode instead of auto-detection '
                          '(useful when librosa detects half / double the true '
@@ -4986,6 +5286,11 @@ def parse_arguments():
                          'JSON file so stickman.py --events_file can render '
                          'a standalone stickman video that syncs perfectly '
                          'with this rhythm video.'))
+    p.add_argument('--detect_only', action='store_true',
+                   help=('Run audio analysis + beat scheduling (writing '
+                         '--export_events JSON) then exit BEFORE the '
+                         'frame-render loop.  Used by Studio to preview '
+                         'block timing without rendering the video.'))
     p.add_argument('-t', '--token', type=str, default=None)
     p.add_argument('-u', '--url',   type=str, default=None)
     return p.parse_args()
@@ -4993,14 +5298,6 @@ def parse_arguments():
 
 if __name__ == '__main__':
     args = parse_arguments()
-    if args.token:
-        if not authourize_user(args.token, args.url):
-            print("Authentication failed.")
-            sys.exit(1)
-    else:
-        print("No token provided – authentication skipped.")
-        sys.exit(1)
-
     viz = RhythmVisualizer()
     viz.WIDTH         = args.width
     viz.HEIGHT        = args.height
@@ -5015,6 +5312,7 @@ if __name__ == '__main__':
     viz.BEAT_SENS     = args.beat_sens
     viz.BEAT_SUBDIV   = args.beat_subdiv
     viz.BEAT_MIN_GAP  = args.beat_min_gap
+    viz.BEAT_TIMES    = _parse_beat_times(args)
     # Per-mode density default: punch = every beat (1.0), dance = every
     # other beat (0.5, matches the CapCut reference's sparser stomp
     # cadence — one tile per 2 beats so only 1–2 tiles visible at a time).
@@ -5060,6 +5358,7 @@ if __name__ == '__main__':
         print(f"[color] {e}")
         sys.exit(1)
     viz.EXPORT_EVENTS = args.export_events
+    viz.DETECT_ONLY   = bool(args.detect_only)
     # Validate --mode early so bad spellings (e.g. "pouch,dance") surface
     # at CLI parse time instead of halfway through rendering.
     try:
@@ -5083,10 +5382,15 @@ if __name__ == '__main__':
         sys.exit(1)
 
     import os
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    if not args.detect_only:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
     temp = viz.process_video(args.input)
-    if temp:
+    if args.detect_only:
+        # Detection-only mode: events JSON has been written by --export_events
+        # (if supplied) and no video was rendered.  Nothing more to do.
+        pass
+    elif temp:
         out_path = args.output if args.output.endswith('.mp4') else args.output + '.mp4'
         if args.audio:
             viz.merge_audio(temp, args.input, out_path)

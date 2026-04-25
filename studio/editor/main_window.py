@@ -24,7 +24,15 @@ from PySide6.QtWidgets import (
 
 from studio.auth.auth_service import AuthService, AuthUser
 from studio.auth.token_store import clear_token
-from studio.core_bridge import RenderJob, RenderService, ThumbnailService, WaveformService
+from studio.core_bridge import (
+    AudioTrimService,
+    BeatDetectJob,
+    BeatDetectService,
+    RenderJob,
+    RenderService,
+    ThumbnailService,
+    WaveformService,
+)
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
 from studio.editor.segment_config_panel import SegmentConfigPanel
@@ -69,6 +77,34 @@ class MainWindow(QMainWindow):
         )
         self.waveform_service = WaveformService()
         self.waveform_service.connect_cache()
+        self.audio_trim_service = AudioTrimService()
+        self.audio_trim_service.ready.connect(self._on_trim_ready)
+        self.audio_trim_service.failed.connect(self._on_trim_failed)
+
+        # Beat-detection preview service — runs ``rhythm.py --detect_only``
+        # so the timeline can show exactly where blocks will spawn before
+        # the user commits to a full render.
+        self.beat_detect_service = BeatDetectService(str(self._app_root))
+        self.beat_detect_service.ready.connect(self._on_beats_ready)
+        self.beat_detect_service.failed.connect(self._on_beats_failed)
+        # Segment IDs whose "Auto Gen Block" was clicked while the audio
+        # trim was still in flight.  Drained by ``_on_trim_ready`` (which
+        # then fires the deferred detection) and ``_on_trim_failed``
+        # (which clears the loading state with an error toast).  We
+        # never fall back to the un-trimmed full audio because that
+        # would feed rhythm.py the WRONG section of the song (only the
+        # first ``duration`` seconds of the source file, not the
+        # ``[start, end]`` window the segment covers) and produce ticks
+        # that don't line up with the waveform the user sees.
+        self._pending_auto_gen: set[str] = set()
+        # Segment IDs whose audio trim is currently being produced by
+        # ``AudioTrimService``.  Used by ``_request_beat_detect`` to
+        # decide whether to piggy-back on an already-running trim
+        # (just queue) or kick off a new ffmpeg job (queue + trim).
+        # Spawning a parallel ffmpeg trim against the same output file
+        # would cause Windows file-lock failures, so we keep them
+        # serialised through this guard.
+        self._inflight_trim_segments: set[str] = set()
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
         # Segment IDs whose render was triggered by the Preview button;
@@ -193,7 +229,16 @@ class MainWindow(QMainWindow):
             self.preview_panel.seek_to_seconds
         )
         self.timeline_panel.segment_split.connect(self._on_segment_split)
+        self.timeline_panel.auto_gen_block_requested.connect(
+            self._on_auto_gen_block_requested
+        )
+        self.timeline_panel.beat_events_edited.connect(
+            self._on_beat_events_edited
+        )
         self.preview_panel.playhead_changed.connect(self.timeline_panel.set_playhead)
+        self.preview_panel.playback_state_changed.connect(
+            self._on_preview_playback_state_changed
+        )
         self.segment_panel.segment_changed.connect(self._on_segment_changed_by_form)
         self.segment_panel.render_requested.connect(self._on_render_segment_requested)
         self.segment_panel.preview_requested.connect(self._on_preview_segment_requested)
@@ -201,6 +246,7 @@ class MainWindow(QMainWindow):
         self.render_service.progress.connect(self._on_render_progress)
         self.render_service.finished.connect(self._on_render_finished)
         self.render_service.failed.connect(self._on_render_failed)
+        self.render_service.trimmed.connect(self._on_trim_ready)
 
         self.waveform_service.ready.connect(self._on_waveform_ready)
         self.waveform_service.failed.connect(self._on_waveform_failed)
@@ -209,25 +255,48 @@ class MainWindow(QMainWindow):
         self.project = project
         self.media_panel.set_project(project)
         self.timeline_panel.set_project(project)
+        self.timeline_panel.clear_beat_events()
+        # Re-paint the timeline strip from each segment's persisted
+        # ``beat_events`` so the user sees the same ticks they last
+        # generated, immediately after opening the project — no need
+        # to click Auto Gen Block again just to re-display them.  The
+        # detection itself is NOT re-run; we trust the saved JSON.
+        for seg in project.segments:
+            if seg.beat_events:
+                self.timeline_panel.set_beat_events(
+                    seg.id, list(seg.beat_events)
+                )
         self.segment_panel.set_project(project)
         self.segment_panel.set_segment(None)
         self._current_waveform_path = None
-        # Restore waveform from the first audio MediaItem that has saved peaks.
-        # This makes waveform persist across save/load without re-extraction.
+        # Restore waveform from the first audio MediaItem with cached data.
+        # Prefer RMS (matches game render); fall back to nothing — old peak
+        # data alone is no longer drawn so re-import will recompute RMS.
         restored = False
         for media in project.media_items:
-            if media.kind.value == "audio" and media.waveform_peaks:
-                self._current_waveform_path = media.source_path
-                self.timeline_panel.set_waveform(
-                    media.source_path,
-                    media.waveform_peaks,
-                    media.waveform_duration_sec,
-                    peaks_per_sec=media.waveform_peaks_per_sec,
-                )
-                restored = True
-                break
+            if media.kind.value != "audio":
+                continue
+            if not media.waveform_rms:
+                continue
+            self._current_waveform_path = media.source_path
+            self.timeline_panel.set_waveform(
+                media.source_path,
+                media.waveform_rms,
+                media.waveform_duration_sec,
+                rms_per_sec=media.waveform_rms_per_sec,
+            )
+            restored = True
+            break
         if not restored:
             self.timeline_panel.clear_waveform()
+            # If audio exists but RMS was never computed (legacy project),
+            # request extraction now so the waveform appears on next paint.
+            for media in project.media_items:
+                if media.kind.value == "audio" and not media.waveform_rms:
+                    self.timeline_panel.set_waveform_loading()
+                    self._current_waveform_path = media.source_path
+                    self.waveform_service.request(media.source_path)
+                    break
         self._update_status()
 
     def _new_project(self) -> Project:
@@ -454,14 +523,14 @@ class MainWindow(QMainWindow):
             return
         self._current_waveform_path = audio_path
 
-        # Check if the MediaItem already has saved peaks (persist across restart).
+        # Check if the MediaItem already has cached RMS (persist across restart).
         media = self._find_media_by_path(audio_path)
-        if media and media.waveform_peaks:
+        if media and media.waveform_rms:
             self.timeline_panel.set_waveform(
                 audio_path,
-                media.waveform_peaks,
+                media.waveform_rms,
                 media.waveform_duration_sec,
-                peaks_per_sec=media.waveform_peaks_per_sec,
+                rms_per_sec=media.waveform_rms_per_sec,
             )
             return
 
@@ -478,22 +547,29 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_waveform_ready(
-        self, audio_path: str, peaks: object, duration_sec: float
+        self,
+        audio_path: str,
+        peaks: object,
+        rms: object,
+        duration_sec: float,
     ) -> None:
         if audio_path != self._current_waveform_path:
             return
-        peaks_list = list(peaks)
-        # Persist peaks into the MediaItem so reopening the project skips extraction.
+        peaks_list = list(peaks) if peaks else []
+        rms_list   = list(rms)   if rms   else []
+        # Persist into the MediaItem so reopening the project skips extraction.
         media = self._find_media_by_path(audio_path)
         if media:
             media.waveform_peaks = peaks_list
-            media.waveform_duration_sec = duration_sec
             media.waveform_peaks_per_sec = self.waveform_service.PEAKS_PER_SEC
+            media.waveform_rms = rms_list
+            media.waveform_rms_per_sec = self.waveform_service.RMS_PER_SEC
+            media.waveform_duration_sec = duration_sec
         self.timeline_panel.set_waveform(
             audio_path,
-            peaks_list,
+            rms_list,
             duration_sec,
-            peaks_per_sec=self.waveform_service.PEAKS_PER_SEC,
+            rms_per_sec=self.waveform_service.RMS_PER_SEC,
         )
         self.statusBar().showMessage(
             f"Waveform loaded ({duration_sec:.1f}s)", 3000
@@ -504,6 +580,225 @@ class MainWindow(QMainWindow):
             return
         self.timeline_panel.clear_waveform()
         self.statusBar().showMessage(f"Waveform failed: {message}", 5000)
+
+    # ------------------------------------------------------------------
+    # Audio trim — pre-cut segment audio to <project_dir>/temps/
+    # ------------------------------------------------------------------
+    def _project_temps_dir(self) -> Path:
+        """Return <project_dir>/temps/, creating it if needed.
+
+        Falls back to <app_root>/temps/ when the project has never been
+        saved (no project_dir is set yet).
+        """
+        proj_dir = getattr(self.project, "project_dir", None)
+        base = Path(proj_dir) if proj_dir else self._app_root
+        path = base / "temps"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _request_audio_trim(self, segment: Segment) -> None:
+        """Queue a background FFmpeg trim of *segment*'s audio window.
+
+        Skipped silently if the segment has no audio source or zero duration.
+        Output file keeps the same extension as the source so the codec/
+        container is never changed (MP3 → MP3, AAC → AAC, etc.).
+        Saved to the same <app_root>/temps/ folder as rendered videos so
+        everything is co-located.
+
+        Marks the segment as having a trim in-flight so the beat-detect
+        path can piggy-back on this job instead of spawning a parallel
+        ffmpeg that would race on the same output file.
+        """
+        if not segment.audio_path or not Path(segment.audio_path).exists():
+            return
+        if segment.duration_sec <= 0:
+            return
+        src_ext = Path(segment.audio_path).suffix or ".mp3"
+        out_path = self._app_temps_dir() / f"audio_{segment.id}{src_ext}"
+        self._inflight_trim_segments.add(segment.id)
+        self.audio_trim_service.trim(
+            segment_id=segment.id,
+            audio_path=segment.audio_path,
+            start_sec=segment.start_time_sec,
+            end_sec=segment.end_time_sec,
+            out_path=out_path,
+        )
+
+    def _on_trim_ready(self, segment_id: str, trimmed_path: str) -> None:
+        """Store the trimmed WAV path on the segment and update the UI."""
+        self._inflight_trim_segments.discard(segment_id)
+        segment = self.project.get_segment(segment_id)
+        if segment is None:
+            return
+        segment.trimmed_audio_path = trimmed_path
+        # Refresh the inspector so the read-only field updates.
+        if self.segment_panel.current_segment and \
+                self.segment_panel.current_segment.id == segment_id:
+            self.segment_panel.set_segment(segment)
+        self.statusBar().showMessage(
+            f"Trimmed audio saved: {Path(trimmed_path).name}", 3000
+        )
+        # If the user clicked "Auto Gen Block" while this trim was still
+        # running, dispatch the deferred detection now that the correct
+        # audio chunk is on disk.  ``BeatDetectJob.cache_key`` keys on
+        # the file's (size, mtime_ns) so a re-trim that overwrites the
+        # same path will not return stale events.
+        if segment_id in self._pending_auto_gen:
+            self._pending_auto_gen.discard(segment_id)
+            self._request_beat_detect(segment)
+
+    def _on_trim_failed(self, segment_id: str, message: str) -> None:
+        self._inflight_trim_segments.discard(segment_id)
+        self.statusBar().showMessage(f"Audio trim failed: {message}", 5000)
+        print(f"[AudioTrim] segment={segment_id} error={message}", flush=True)
+        # Drop any deferred Auto-Gen request — without a valid trim we
+        # have nothing safe to feed rhythm.py.  Clear the loading state
+        # so the timeline strip stops spinning forever.
+        if segment_id in self._pending_auto_gen:
+            self._pending_auto_gen.discard(segment_id)
+            self.timeline_panel.clear_beat_events(segment_id)
+            self.statusBar().showMessage(
+                f"Auto Gen Block aborted: trim failed ({message})", 6000
+            )
+
+    # ── Beat-detection preview ──────────────────────────────────────────
+    def _request_beat_detect(self, segment: Segment) -> None:
+        """Schedule a ``rhythm.py --detect_only`` run for *segment*.
+
+        Detection ONLY runs against the pre-trimmed audio (the WAV/MP3
+        produced by :class:`AudioTrimService` covering exactly the
+        segment's [start, end] window).  When the trim isn't on disk
+        yet the request is queued in ``self._pending_auto_gen`` and
+        dispatched from ``_on_trim_ready`` once ffmpeg finishes —
+        we never fall back to the full audio file because that would
+        analyse the song's leading ``duration`` seconds (not the
+        segment's actual time window) and produce ticks that don't
+        align with the waveform shown on the timeline strip.
+        """
+        if not segment.audio_path:
+            return
+        if segment.duration_sec <= 0:
+            return
+
+        trimmed = segment.trimmed_audio_path
+        if not trimmed or not Path(trimmed).exists():
+            # Queue this request and ensure a trim is in flight.  When
+            # one is already running we piggy-back on it (re-issuing
+            # would race on the same output file and trip Windows file
+            # locking inside ffmpeg) — ``_on_trim_ready`` will drain
+            # ``_pending_auto_gen`` once the existing job lands.
+            self._pending_auto_gen.add(segment.id)
+            self.timeline_panel.set_beat_events_loading(segment.id)
+            self.statusBar().showMessage(
+                f"Auto Gen Block: waiting for audio trim of "
+                f"'{segment.name}'…",
+                4000,
+            )
+            if segment.id not in self._inflight_trim_segments:
+                self._request_audio_trim(segment)
+            return
+
+        rs = segment.render_settings or {}
+        job = BeatDetectJob(
+            segment_id=segment.id,
+            audio_path=trimmed,
+            duration_sec=float(segment.duration_sec),
+            mode=str(segment.mode or "punch"),
+            beat_source=str(rs.get("beat_source", "onset")),
+            beat_sens=float(rs.get("beat_sens", 0.7)),
+            beat_min_gap=int(rs.get("beat_min_gap", 4)),
+            density=float(rs.get("density", 0.5)),
+            speed=float(rs.get("speed", 0.8)),
+            fps=int(self.project.output_fps or 30),
+        )
+        self.timeline_panel.set_beat_events_loading(segment.id)
+        self.statusBar().showMessage(
+            f"Detecting beats for {segment.name}…", 2000
+        )
+        self.beat_detect_service.detect(job)
+
+    def _on_beats_ready(self, segment_id: str, events: object) -> None:
+        evs = list(events) if events else []
+        self.timeline_panel.set_beat_events(segment_id, evs)
+        seg = self.project.get_segment(segment_id)
+        seg_name = seg.name if seg else segment_id[:8]
+        # Persist on the segment so the ticks survive a project re-open
+        # — the next session shows them on the timeline strip without
+        # the user needing to click Auto Gen Block again.  Tuples here
+        # match the in-memory shape used by BeatDetectService and the
+        # timeline draw helpers; the project store rewrites them as
+        # JSON arrays on save and rehydrates back to tuples on load.
+        if seg is not None:
+            seg.beat_events = [(float(t), str(k)) for t, k in evs]
+            # Mark project dirty so autosave picks up the change.
+            self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Beats ready for {seg_name}: {len(evs)} block(s)", 3000
+        )
+
+    def _on_beat_events_edited(self, segment_id: str) -> None:
+        """Sync timeline-panel edits back to the segment + autosave.
+
+        The panel owns the live ``_beat_events`` dict during a session;
+        this handler copies the latest list for ``segment_id`` into
+        :attr:`Segment.beat_events` and marks the project dirty so the
+        autosave timer flushes the edit to disk. Without this, every
+        drag / delete / kind-change would be lost on reload.
+        """
+        if not segment_id:
+            return
+        seg = self.project.get_segment(segment_id)
+        if seg is None:
+            return
+        events = self.timeline_panel.get_beat_events(segment_id)
+        seg.beat_events = [
+            (float(t), str(k)) for t, k in events
+        ]
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Beats edited for {seg.name}: {len(events)} block(s)",
+            2000,
+        )
+
+    def _on_beats_failed(self, segment_id: str, message: str) -> None:
+        # Don't wipe the segment's saved events — a transient ffmpeg /
+        # subprocess blip shouldn't cost the user their last good
+        # detection.  We DO restore the strip from the saved list so
+        # the spinner/loading state is replaced by something readable
+        # (or cleared entirely if the segment never had a successful
+        # run on file).
+        seg = self.project.get_segment(segment_id)
+        if seg is not None and seg.beat_events:
+            self.timeline_panel.set_beat_events(
+                segment_id, list(seg.beat_events)
+            )
+        else:
+            self.timeline_panel.clear_beat_events(segment_id)
+        self.statusBar().showMessage(
+            f"Beat detection failed: {message}", 5000
+        )
+        print(f"[BeatDetect] segment={segment_id} error={message}",
+              flush=True)
+
+    def _on_auto_gen_block_requested(self, segment_id: str) -> None:
+        """Manual handler for the timeline's "Auto Gen Block" button.
+
+        Beat-detect runs ONLY through this entry-point now (no auto-fire
+        on selection / drag / form-change), so the user explicitly opts
+        in to spawning the rhythm.py subprocess.  The subsequent
+        ``ready`` / ``failed`` signals from :class:`BeatDetectService`
+        flow into ``_on_beats_ready`` / ``_on_beats_failed`` exactly as
+        before, painting the timeline strip when results land.
+        """
+        if not segment_id:
+            return
+        segment = self.project.get_segment(segment_id)
+        if segment is None:
+            self.statusBar().showMessage(
+                "Auto Gen Block: select a segment first", 3000
+            )
+            return
+        self._request_beat_detect(segment)
 
     def _on_create_segment_requested(self, media_id: str, start_time: float) -> None:
         media = self.project.get_media(media_id)
@@ -539,7 +834,34 @@ class MainWindow(QMainWindow):
         # Extract waveform now that an audio media has been dropped onto timeline.
         if segment.audio_path:
             self._request_waveform_for(segment.audio_path)
+        # Trim the audio clip for this segment so the WAV is ready before
+        # the user hits Render / Preview.
+        self._request_audio_trim(segment)
         self._on_project_changed()
+
+    def _on_preview_playback_state_changed(self, state_value: int) -> None:
+        """Allow timeline scrubbing only while preview is Playing / Paused.
+
+        The user explicitly asked that the red playhead stop following
+        mouse clicks whenever the preview video is in StoppedState — a
+        click on the timeline (or even the playhead itself) while the
+        media is parked must NOT lurch playback to a new position.
+        StoppedState's enum value is 0 (matches PySide6's
+        ``QMediaPlayer.PlaybackState.StoppedState``); anything else is
+        Playing or Paused, both of which keep scrubbing live so the
+        user can still seek mid-playback or while paused.
+
+        Compares against ``StoppedState.value`` rather than wrapping
+        the enum in ``int(...)`` because PySide6's ``PlaybackState``
+        is not an ``IntEnum`` in every build (CPython 3.13 + Qt 6.7+
+        raises ``TypeError`` on direct ``int(state)`` conversion).
+        """
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        is_stopped = state_value == int(
+            QMediaPlayer.PlaybackState.StoppedState.value
+        )
+        self.timeline_panel.set_scrub_enabled(not is_stopped)
 
     def _on_segment_selected(self, segment: Segment | None) -> None:
         self.segment_panel.set_segment(segment)
@@ -559,6 +881,11 @@ class MainWindow(QMainWindow):
         current = self.segment_panel.current_segment
         if current is not None:
             self.segment_panel.set_segment(current)
+            # Re-trim after a timeline drag/move so the [start, end] window
+            # of the segment's audio matches the new position.  Beat-detect
+            # is NOT triggered here — the user runs it manually via the
+            # "Auto Gen Block" button when they're ready to preview blocks.
+            self._request_audio_trim(current)
         self._on_project_changed()
 
     def _on_segment_split(self, original_id: str, new_id: str) -> None:
@@ -571,10 +898,17 @@ class MainWindow(QMainWindow):
 
     def _on_segment_changed_by_form(self, _segment_id: str) -> None:
         self.timeline_panel.refresh()
-        # If the form changed the audio source, trigger/switch the waveform.
         current = self.segment_panel.current_segment
+        # If the form changed the audio source, trigger/switch the waveform.
         audio = current.audio_path if current and current.audio_path else None
         self._request_waveform_for(audio)
+        # Re-trim: the user may have changed start/end or the audio source.
+        # Beat-detect is NOT triggered here either — the user iterates on
+        # mode/sens/density/… without paying for a subprocess each tweak,
+        # then clicks "Auto Gen Block" when they want to preview the
+        # resulting block layout on the timeline.
+        if current:
+            self._request_audio_trim(current)
         self._update_status()
 
     def _sync_timeline_positions(self) -> None:
@@ -608,6 +942,15 @@ class MainWindow(QMainWindow):
         # Use a separate output path so preview doesn't clobber the real render.
         output_path = self._app_temps_dir() / f"preview_{segment.id}.mp4"
         dur = segment.duration_sec if segment.duration_sec and segment.duration_sec > 0 else None
+        # Forward saved beat events so the preview matches the timeline
+        # ticks exactly — same array path the full Render uses below.
+        beat_times: list[float] = []
+        for ev in (segment.beat_events or []):
+            try:
+                t = float(ev[0]) if isinstance(ev, (tuple, list)) else float(ev)
+            except (TypeError, ValueError, IndexError):
+                continue
+            beat_times.append(t)
         job = RenderJob(
             segment_id=segment.id,
             mode=segment.mode,
@@ -617,12 +960,12 @@ class MainWindow(QMainWindow):
             start_time_sec=segment.start_time_sec,
             duration_sec=dur,
             is_preview=True,
-            # Pass project resolution so rhythm.py renders at the correct
-            # dimensions.  Preview overrides below will shrink this to
-            # 960×540 @ 24fps — still 16:9 matching the project aspect.
             output_width=self.project.output_width,
             output_height=self.project.output_height,
             output_fps=self.project.output_fps,
+            trimmed_audio_path=segment.trimmed_audio_path,
+            project_temps_dir=str(self._app_temps_dir()),
+            beat_times=beat_times,
         )
         self._preview_segment_ids.add(segment.id)
         segment.render_status = RenderStatus.QUEUED
@@ -665,6 +1008,7 @@ class MainWindow(QMainWindow):
             output_width=self.project.output_width,
             output_height=self.project.output_height,
             output_fps=self.project.output_fps,
+            project_temps_dir=str(self._app_temps_dir()),
         )
         self.render_service.enqueue(job)
         # Show "Rendering 0%" overlay over the player so the user gets clear

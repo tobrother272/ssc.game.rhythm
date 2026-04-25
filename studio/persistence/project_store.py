@@ -73,6 +73,7 @@ class ProjectStore:
         data = asdict(segment)
         data["render_status"] = segment.render_status.value
         data["audio_path"] = self._to_relative(segment.audio_path, project_dir)
+        data["trimmed_audio_path"] = self._to_relative(segment.trimmed_audio_path, project_dir)
         data["video_path"] = self._to_relative(segment.video_path, project_dir)
         data["thumbnail_path"] = self._to_relative(segment.thumbnail_path, project_dir)
         return data
@@ -86,6 +87,11 @@ class ProjectStore:
             duration_sec=payload.get("duration_sec"),
             thumbnail_path=self._to_absolute(payload.get("thumbnail_path"), project_dir),
             imported_at=payload.get("imported_at", ""),
+            waveform_peaks=payload.get("waveform_peaks", []) or [],
+            waveform_peaks_per_sec=payload.get("waveform_peaks_per_sec", 100),
+            waveform_duration_sec=payload.get("waveform_duration_sec", 0.0),
+            waveform_rms=payload.get("waveform_rms", []) or [],
+            waveform_rms_per_sec=payload.get("waveform_rms_per_sec", 100),
         )
 
     def _deserialize_segment(self, payload: dict[str, Any], project_dir: Path) -> Segment:
@@ -93,6 +99,19 @@ class ProjectStore:
         # so projects saved before the rename keep their renders attached.
         legacy_video_path = payload.get("rendered_video_path")
         new_video_path = payload.get("video_path", legacy_video_path)
+        # Beat-events round-trip as JSON arrays ``[[t, kind], …]``; the
+        # consuming code in ``TimelinePanel`` indexes with ``ev[0]``/
+        # ``ev[1]`` so list-vs-tuple is interchangeable here.  Coerce
+        # to ``(float, str)`` tuples for type-stability with the in-
+        # memory shape produced by ``BeatDetectService``.
+        raw_events = payload.get("beat_events", []) or []
+        beat_events: list = []
+        for row in raw_events:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                try:
+                    beat_events.append((float(row[0]), str(row[1])))
+                except (TypeError, ValueError):
+                    pass
         return Segment(
             id=payload.get("id", ""),
             name=payload.get("name", "Segment"),
@@ -103,11 +122,13 @@ class ProjectStore:
             audio_duration_sec=payload.get("audio_duration_sec", 0.0),
             mode=payload.get("mode", "punch"),
             render_settings=payload.get("render_settings", {}),
+            trimmed_audio_path=self._to_absolute(payload.get("trimmed_audio_path"), project_dir),
             video_path=self._to_absolute(new_video_path, project_dir),
             render_status=RenderStatus(payload.get("render_status", RenderStatus.IDLE.value)),
             last_rendered_at=payload.get("last_rendered_at"),
             last_render_error=payload.get("last_render_error"),
             thumbnail_path=self._to_absolute(payload.get("thumbnail_path"), project_dir),
+            beat_events=beat_events,
         )
 
     @staticmethod

@@ -41,6 +41,20 @@ class RenderJob:
     output_width: Optional[int] = None
     output_height: Optional[int] = None
     output_fps: Optional[int] = None
+    # Pre-trimmed WAV produced by AudioTrimService.  When set and the file
+    # exists on disk, _run_job uses it directly as -i (no pydub re-trim).
+    trimmed_audio_path: Optional[str] = None
+    # Directory where trimmed WAVs should be saved (<project_dir>/temps/).
+    # When a pre-trimmed file doesn't exist yet, the fallback trim is saved
+    # here (not in AppData/Temp) so the file persists and can be re-used.
+    project_temps_dir: Optional[str] = None
+    # Explicit beat-event times (seconds, relative to the trimmed audio
+    # window — i.e. ``t_local`` exactly as edited on the timeline).
+    # When non-empty, ``_run_job`` forwards them to rhythm.py via
+    # ``--beat_source array --beat_times <csv>`` so the final video
+    # honours the user's timeline edits instead of re-running onset
+    # detection (which can drift slightly from the saved positions).
+    beat_times: list[float] = field(default_factory=list)
 
 
 class RenderService(QObject):
@@ -49,6 +63,9 @@ class RenderService(QObject):
     progress = Signal(str, int)  # segment_id, 0..100
     finished = Signal(str, str)  # segment_id, output_path
     failed = Signal(str, str)    # segment_id, error_message
+    # Emitted when the fallback trim saves a WAV to project_temps_dir so
+    # MainWindow can store the path back on the segment and save the project.
+    trimmed = Signal(str, str)   # segment_id, trimmed_wav_path
 
     def __init__(
         self,
@@ -86,9 +103,27 @@ class RenderService(QObject):
         output_height: Optional[int] = None,
         output_fps: Optional[int] = None,
         is_preview: bool = False,
+        project_temps_dir: Optional[str] = None,
     ) -> RenderJob:
-        """Build render job object from segment state."""
+        """Build render job object from segment state.
+
+        When ``segment.beat_events`` is populated (Auto Gen Block result
+        or manual timeline edits), the times are extracted into the
+        job's ``beat_times`` list so :meth:`_run_job` can pass them as
+        ``--beat_source array --beat_times`` and skip onset detection
+        in the rhythm.py subprocess. The render then matches the
+        timeline preview tick-for-tick.
+        """
         dur = segment.duration_sec if segment.duration_sec and segment.duration_sec > 0 else None
+        beat_times: list[float] = []
+        for ev in (segment.beat_events or []):
+            try:
+                # ``ev`` is a (t_local, kind) tuple after deserialise
+                # but legacy data could be a bare float — accept both.
+                t = float(ev[0]) if isinstance(ev, (tuple, list)) else float(ev)
+            except (TypeError, ValueError, IndexError):
+                continue
+            beat_times.append(t)
         return RenderJob(
             segment_id=segment.id,
             mode=segment.mode,
@@ -101,6 +136,9 @@ class RenderService(QObject):
             output_width=output_width,
             output_height=output_height,
             output_fps=output_fps,
+            trimmed_audio_path=segment.trimmed_audio_path,
+            project_temps_dir=project_temps_dir,
+            beat_times=beat_times,
         )
 
     def _run_loop(self) -> None:
@@ -138,45 +176,73 @@ class RenderService(QObject):
         else:
             mode_arg = job.mode
 
-        # --- Audio trimming ------------------------------------------------
-        # When the job covers only part of the audio (start_time_sec > 0 or
-        # duration_sec is given) we trim the source with pydub first so
-        # src.rhythm always sees a file that starts at t=0 and is exactly the
-        # right length.  The temp file is cleaned up in the finally block.
+        # --- Audio selection -----------------------------------------------
+        # Priority:
+        # 1. Pre-trimmed WAV from AudioTrimService (persisted next to project)
+        #    → no pydub work at render time; the file is already lossless WAV
+        #    with the exact [start, end] window the user configured.
+        # 2. On-the-fly pydub trim (fallback: project not yet saved, or trim
+        #    hasn't run yet) → same lossless WAV approach, written to a
+        #    NamedTemporaryFile that is deleted in the finally block.
         audio_path = job.audio_path
         temp_audio: Optional[str] = None
+        audio_was_trimmed = False  # set True whenever we cut the audio window
         try:
-            needs_trim = (job.start_time_sec > 0.01) or (
-                job.duration_sec is not None and job.duration_sec > 0
+            pre_trimmed = (
+                job.trimmed_audio_path
+                and Path(job.trimmed_audio_path).exists()
             )
-            if needs_trim:
-                from pydub import AudioSegment as _PydubAudio  # lazy import
-
-                raw = _PydubAudio.from_file(audio_path)
-                start_ms = int(job.start_time_sec * 1000)
-                if job.duration_sec is not None:
-                    end_ms = start_ms + int(job.duration_sec * 1000)
-                else:
-                    end_ms = len(raw)
-                trimmed = raw[start_ms:end_ms]
-                # Export as WAV (lossless PCM) so the beat/onset detector
-                # in rhythm.py receives pristine audio data.  Re-encoding to
-                # the lossy source format (e.g. MP3→MP3) applies a second
-                # lossy-compression pass that smears the transients and
-                # spectral peaks the detector relies on, causing missed or
-                # mis-timed beats.  WAV is always decodable by rhythm.py and
-                # avoids any quality loss while only being a few MB larger
-                # for typical segment durations.
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp.close()
-                trimmed.export(tmp.name, format="wav")
-                audio_path = tmp.name
-                temp_audio = tmp.name
+            if pre_trimmed:
+                audio_path = job.trimmed_audio_path  # type: ignore[assignment]
+                audio_was_trimmed = True
                 print(
-                    f"[RenderService] Trimmed audio → WAV temp: {tmp.name} "
-                    f"({start_ms}ms – {end_ms}ms)",
+                    f"[RenderService] Using pre-trimmed audio: "
+                    f"{Path(audio_path).name}",
                     flush=True,
                 )
+            else:
+                needs_trim = (job.start_time_sec > 0.01) or (
+                    job.duration_sec is not None and job.duration_sec > 0
+                )
+                if needs_trim:
+                    from studio.core_bridge.audio_trim_service import trim_audio_ffmpeg
+
+                    src_ext = Path(audio_path).suffix or ".mp3"
+                    start_sec = job.start_time_sec
+                    end_sec = (
+                        start_sec + job.duration_sec
+                        if job.duration_sec is not None
+                        else start_sec + 99999.0  # effectively full remainder
+                    )
+                    if job.project_temps_dir:
+                        out_dir = Path(job.project_temps_dir)
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_clip = out_dir / f"audio_{job.segment_id}{src_ext}"
+                        trim_audio_ffmpeg(audio_path, start_sec, end_sec, out_clip)
+                        audio_path = str(out_clip)
+                        audio_was_trimmed = True
+                        # Notify MainWindow so it stores the path on the segment.
+                        self.trimmed.emit(job.segment_id, audio_path)
+                        print(
+                            f"[RenderService] Trim → {out_clip.name} "
+                            f"({start_sec:.3f}s – {end_sec:.3f}s)",
+                            flush=True,
+                        )
+                    else:
+                        # Project not saved yet — fall back to system temp.
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=src_ext, delete=False
+                        )
+                        tmp.close()
+                        trim_audio_ffmpeg(audio_path, start_sec, end_sec, Path(tmp.name))
+                        audio_path = tmp.name
+                        temp_audio = tmp.name
+                        audio_was_trimmed = True
+                        print(
+                            f"[RenderService] Trim → system temp {tmp.name} "
+                            "(save project to use project-folder audio next time)",
+                            flush=True,
+                        )
 
             # --- Build subprocess command -----------------------------------
             # src.rhythm expects:
@@ -212,35 +278,54 @@ class RenderService(QObject):
             if job.output_fps:
                 command.extend(["--fps", str(job.output_fps)])
 
-            # When we've already trimmed, src.rhythm sees the file from t=0,
-            # so --duration == trimmed file length (redundant but safe).
-            # When no trimming was needed but duration_sec is given, cap here.
-            if not needs_trim and job.duration_sec is not None:
+            # If the audio was trimmed, rhythm.py sees a clip starting at
+            # t=0 with the exact duration — no -d needed.  Only pass -d
+            # when the full source file is used and we want to cap duration.
+            if not audio_was_trimmed and job.duration_sec is not None:
                 command.extend(["-d", str(job.duration_sec)])
 
-            # src.rhythm requires --token (otherwise it sys.exit(1) at startup).
-            # Even though authourize_user() short-circuits to True, the
-            # `if args.token:` gate must still see a non-empty value.
-            token = self._token_provider() if self._token_provider else None
-            if token:
-                command.extend(["--token", token])
-            else:
-                # Fallback: any non-empty placeholder still satisfies the
-                # gate.  We log a warning so the user knows they're not
-                # authenticated and the network-side auth check (currently
-                # disabled in authorization.py) would fail if re-enabled.
-                command.extend(["--token", "studio_local"])
-                print(
-                    "[RenderService] Warning: no auth token available; passing "
-                    "placeholder. Re-authenticate if rendering uploads to "
-                    "the backend.",
-                    file=sys.stderr, flush=True,
-                )
-            url = self._url_provider() if self._url_provider else None
-            if url:
-                command.extend(["--url", url])
-
             command.extend(self._settings_to_args(settings))
+
+            # ----------------------------------------------------------------
+            # Beat-events override — when the segment has saved beat
+            # events (from Auto Gen Block or hand-edited on the
+            # timeline), feed them directly to rhythm.py via array
+            # mode so the final video honours every drag/insert/
+            # delete the user committed.  This is appended AFTER
+            # ``_settings_to_args`` so our ``--beat_source array``
+            # supersedes whatever ``beat_source`` the segment's
+            # render_settings set (argparse keeps the last value
+            # for repeated flags).
+            #
+            # Times are clipped to [0, duration_sec] when a duration
+            # cap is known — saved events can fall outside the
+            # current window if the user resized the segment after
+            # editing.  rhythm.py's _parse_beat_times also clips on
+            # its end, but trimming here keeps the CLI line shorter.
+            # ----------------------------------------------------------------
+            if job.beat_times:
+                if job.duration_sec is not None and job.duration_sec > 0:
+                    cap = float(job.duration_sec)
+                    valid = [
+                        t for t in job.beat_times
+                        if 0.0 <= float(t) <= cap + 1e-3
+                    ]
+                else:
+                    valid = [
+                        float(t) for t in job.beat_times if float(t) >= 0.0
+                    ]
+                if valid:
+                    times_csv = ",".join(f"{float(t):.6f}" for t in valid)
+                    command.extend([
+                        "--beat_source", "array",
+                        "--beat_times", times_csv,
+                    ])
+                    print(
+                        f"[RenderService] Using saved beat array: "
+                        f"{len(valid)} event(s) "
+                        f"(skipping onset detection)",
+                        flush=True,
+                    )
 
             # ----------------------------------------------------------------
             # Fast-preview overrides — applied ONLY when this is a Preview
@@ -363,6 +448,22 @@ class RenderService(QObject):
         "beat_min_gap",
     })
 
+    # Only the fields that are visible in the UI are forwarded to rhythm.py.
+    # Hidden fields (travel, lanes, beat_min_gap, …) are kept in the project
+    # file for future use but are intentionally NOT passed to the subprocess
+    # so rhythm.py falls back to its own well-tested defaults — giving output
+    # identical to a plain CLI run without those flags.
+    # Mirrors SegmentConfigPanel._VISIBLE_FIELDS exactly (plus beat_source
+    # which maps to the visible combo box in the UI).
+    _ALLOWED_KEYS = frozenset({
+        "beat_source",
+        "beat_sens",
+        "density",
+        "speed",
+        "floor_panels",
+        "stickman",
+    })
+
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
     # accidental settings key would otherwise surface as "unrecognized arg").
     _SKIP_KEYS = frozenset({"mode_list"})
@@ -372,6 +473,8 @@ class RenderService(QObject):
         args: list[str] = []
         for key, value in settings.items():
             if key in cls._SKIP_KEYS:
+                continue
+            if key not in cls._ALLOWED_KEYS:
                 continue
             cli_key = f"--{key}"
 
