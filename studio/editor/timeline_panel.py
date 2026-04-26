@@ -3987,6 +3987,34 @@ class TimelinePanel(QWidget):
                 new_events.append((t_local, "L", h_norm))
             new_events.sort(key=lambda e: e[0])
 
+        # ── Density filter ─ collapse clusters within ``min_spacing`` ──
+        # When the user has set ``Segment.min_beat_spacing_sec > 0``,
+        # walk the time-sorted events and keep only the *highest-
+        # amplitude* peak per cluster.  A cluster is any run of
+        # consecutive events whose successive gaps are all below the
+        # spacing threshold — the very pattern that produced the
+        # "5 ticks per snare hit" the user circled in red.
+        #
+        # Why "highest" rather than "first" or "median"?  The visible
+        # tip of a peak is what the user perceives as *the* beat;
+        # keeping the highest-amplitude member of the cluster guarantees
+        # the surviving stick lands on that perceived tip even when the
+        # detector finds slightly-earlier or slightly-later neighbours.
+        min_gap = float(
+            getattr(seg, "min_beat_spacing_sec", 0.0) or 0.0
+        )
+        if min_gap > 1e-6 and len(new_events) >= 2:
+            collapsed: list[tuple[float, str, float]] = []
+            cluster: list[tuple[float, str, float]] = [new_events[0]]
+            for ev in new_events[1:]:
+                if ev[0] - cluster[-1][0] < min_gap:
+                    cluster.append(ev)
+                else:
+                    collapsed.append(max(cluster, key=lambda e: e[2]))
+                    cluster = [ev]
+            collapsed.append(max(cluster, key=lambda e: e[2]))
+            new_events = collapsed
+
         self._beat_events[seg_id] = new_events
         self._beat_events_loading.discard(seg_id)
         self._focused_beat = None

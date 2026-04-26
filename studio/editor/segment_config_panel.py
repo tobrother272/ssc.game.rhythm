@@ -242,6 +242,34 @@ class SegmentConfigPanel(QWidget):
         self.end_spin.valueChanged.connect(self._commit_general)
         self.form_layout.addRow("End (s)", self.end_spin)
 
+        # Min beat spacing — anti-cluster filter for *Gen by Chart*.
+        # When > 0 the panel's peak-detector collapses any cluster of
+        # peaks closer than this gap into a single (highest-amplitude)
+        # stick, which removes the "5-ticks-per-snare-hit" cluster the
+        # user reported.  Auto Gen Block has its own lane-spacing
+        # (rhythm.py ``--beat_min_gap``) so it is unaffected.  Stored on
+        # ``Segment.min_beat_spacing_sec`` and persisted to the project.
+        self.min_spacing_spin = QDoubleSpinBox()
+        self.min_spacing_spin.setRange(0.0, 5.0)
+        self.min_spacing_spin.setDecimals(2)
+        self.min_spacing_spin.setSingleStep(0.01)
+        self.min_spacing_spin.setSuffix(" s")
+        self.min_spacing_spin.setToolTip(
+            "Minimum spacing (seconds) between two beat sticks generated\n"
+            "by the *Gen by Chart* button.  Peaks closer than this gap\n"
+            "are collapsed into a single stick at the highest-amplitude\n"
+            "peak of the cluster, so a single drum hit no longer emits\n"
+            "5–6 ticks at the same spot.\n"
+            "\n"
+            "0.00 s          = off; every detected peak emits its own stick.\n"
+            "0.05–0.10 s    = mild merge (preserves tight drum rolls).\n"
+            "0.15 s (default) = balanced — one stick per audible beat for\n"
+            "                  most music while keeping fast double-hits.\n"
+            "0.20–0.30 s    = aggressive merge for very dense audio."
+        )
+        self.min_spacing_spin.valueChanged.connect(self._commit_general)
+        self.form_layout.addRow("Min beat spacing", self.min_spacing_spin)
+
         self.mode_combo = QComboBox()
         for mode in ["punch", "dance", "line", "relax", "combo"]:
             self.mode_combo.addItem(mode.capitalize(), mode)
@@ -375,6 +403,10 @@ class SegmentConfigPanel(QWidget):
             self.start_spin.setValue(segment.start_time_sec)
         with QSignalBlocker(self.end_spin):
             self.end_spin.setValue(segment.end_time_sec)
+        with QSignalBlocker(self.min_spacing_spin):
+            self.min_spacing_spin.setValue(
+                float(getattr(segment, "min_beat_spacing_sec", 0.0) or 0.0)
+            )
         with QSignalBlocker(self.mode_combo):
             idx = self.mode_combo.findData(segment.mode)
             if idx >= 0:
@@ -651,6 +683,9 @@ class SegmentConfigPanel(QWidget):
         end = float(self.end_spin.value())
         segment.start_time_sec = min(start, end)
         segment.end_time_sec = max(start, end)
+        segment.min_beat_spacing_sec = max(
+            0.0, min(5.0, float(self.min_spacing_spin.value()))
+        )
         self._load_segment_fields(segment)
         # Audio source may have just changed → re-evaluate preview/render gating.
         self._set_empty_state(False)
@@ -685,12 +720,41 @@ class SegmentConfigPanel(QWidget):
         self.render_requested.emit(self._segment.id)
 
     def _on_reset_clicked(self) -> None:
+        """Reset every *tunable* field of the current segment to its default.
+
+        Two layers reset here:
+
+        1. ``render_settings`` — the mode-specific dict driving the
+           dynamic form rows (density / speed / beat_sens / …).
+           Rebuilt via :func:`build_settings` so each Pydantic model's
+           own defaults win.
+        2. **Top-level Segment fields shown as static rows** — namely
+           ``min_beat_spacing_sec`` (and any future tunable scalar in
+           the same row group).  Without this, *Reset defaults* would
+           silently leave ``Min beat spacing`` at whatever value the
+           user last typed, which was the bug the user reported (the
+           field stayed at ``0.00 s`` after Reset even though the
+           dataclass default is ``0.15 s``).  Defaults are pulled from
+           ``Segment.__dataclass_fields__`` so changing the dataclass
+           default automatically updates Reset behaviour without
+           hunting through this file.
+
+        The static spinbox is then reloaded via
+        :meth:`_load_segment_fields` so the UI reflects the reset
+        immediately — ``_rebuild_dynamic_settings`` only repaints
+        dynamic rows.
+        """
         segment = self._segment
         if segment is None:
             return
         segment.render_settings = build_settings(segment.mode, {}).model_dump(
             mode="json", exclude_none=True
         )
+        defaults = Segment.__dataclass_fields__
+        segment.min_beat_spacing_sec = float(
+            defaults["min_beat_spacing_sec"].default
+        )
+        self._load_segment_fields(segment)
         self._rebuild_dynamic_settings()
         self.segment_changed.emit(segment.id)
 

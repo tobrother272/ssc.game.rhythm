@@ -69,6 +69,23 @@ class Segment:
     # identically to the legacy "no-threshold" pipeline.  Persisted so
     # the user's tuning survives a project close/re-open.
     beat_height_threshold: float = 0.0
+    # Minimum spacing (seconds) between two beat sticks emitted by the
+    # *Gen by Chart* button.  When > 0, the panel's peak-detection pass
+    # walks the chart-local maxima left-to-right and collapses any
+    # cluster of peaks closer than this gap into a single stick at the
+    # *highest-amplitude* peak of the cluster.  ``0.0`` disables merging
+    # entirely — every detected peak emits its own stick.  Auto Gen
+    # Block is unaffected (it has its own lane-spacing logic inside
+    # rhythm.py).  Persisted so each segment can be tuned independently
+    # and the value survives a project reopen.
+    #
+    # Default ``0.15 s`` (≈ 4 frames @ 30 fps) was chosen empirically
+    # so a single drum hit no longer emits the 5–6-tick cluster the
+    # user observed on real audio while still preserving fast rolls
+    # and double hits.  Existing projects without this field saved on
+    # disk fall back to ``0.0`` via :func:`project_store.load` so we
+    # don't silently mutate already-tuned beat sticks.
+    min_beat_spacing_sec: float = 0.15
     # Position + size of the stickman draw-box, expressed as fractions
     # of the rendered video frame (0..1) so the value is resolution-
     # independent and survives changes to project output_width /

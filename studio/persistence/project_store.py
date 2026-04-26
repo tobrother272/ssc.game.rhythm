@@ -160,6 +160,9 @@ class ProjectStore:
             beat_height_threshold=max(0.0, min(1.0, float(
                 payload.get("beat_height_threshold", 0.0) or 0.0
             ))),
+            min_beat_spacing_sec=max(0.0, min(5.0, float(
+                payload.get("min_beat_spacing_sec", 0.0) or 0.0
+            ))),
             stickman_location=stickman_location,
         )
 
