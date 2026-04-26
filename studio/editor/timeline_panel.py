@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -285,12 +286,19 @@ class SegmentBlockMeta:
 
 
 class SegmentRectItem(QGraphicsRectItem):
-    """Draggable timeline block bound to one segment.
+    """Static timeline block bound to one segment.
+
+    Segments exist purely to assign mode / action settings to a slice
+    of the master timeline — once split off, their start/end times
+    are fixed.  We therefore disable drag entirely (``ItemIsMovable``
+    is OFF) so the only mouse interactions left are select + double-
+    click-to-focus.  Reordering / resizing happens through the split
+    button + Properties panel, never through drag-and-drop.
 
     The visible fill / outline / selection halo are *not* drawn by
     this item — they are painted by the scene's ``drawBackground``
     pass (see :meth:`TimelinePanel._paint_segment_blocks`).  The
-    item itself only carries the geometry, drag/select flags and
+    item itself only carries the geometry + selection flag plus
     child items (status badge + name label).
 
     Why?  An earlier Qt regression caused translucent / decorated
@@ -308,36 +316,19 @@ class SegmentRectItem(QGraphicsRectItem):
         super().__init__()
         self.segment_id = segment.id
         self._pixels_per_second = pixels_per_second
+        # Selectable only — drag is intentionally disabled so timeline
+        # positions are immutable through mouse interaction.
         self.setFlags(
-            QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable
-            | QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
-            | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
         )
         self.setAcceptHoverEvents(True)
         # Item is invisible — visuals come from ``drawBackground``.
         # We still need a non-empty rect (set later by ``_draw_segment``)
-        # so Qt's hit-testing and drag mechanics work as expected.
+        # so Qt's hit-testing for selection works as expected.
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.setPen(QPen(Qt.PenStyle.NoPen))
 
     def itemChange(self, change, value):  # type: ignore[override]
-        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
-            new_pos = value
-            return QPointF(max(0.0, new_pos.x()), self.SEGMENT_Y)
-        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionHasChanged:
-            # Drag updates pos but no item paint runs in our scene
-            # (the item itself is invisible) — invalidate the
-            # background layer so the block's painted fill follows
-            # the drag in real time.
-            scene = self.scene()
-            if scene is not None:
-                try:
-                    scene.invalidate(
-                        scene.sceneRect(),
-                        QGraphicsScene.SceneLayer.BackgroundLayer,
-                    )
-                except RuntimeError:
-                    pass
         if change == QGraphicsRectItem.GraphicsItemChange.ItemSelectedHasChanged:
             # Selection halo is painted in ``_paint_segment_blocks``
             # — repaint when select state flips so the halo appears
@@ -1368,6 +1359,12 @@ class TimelinePanel(QWidget):
     # empty string when nothing is selected; MainWindow ignores those).
     auto_gen_block_requested = Signal(str)  # segment_id
 
+    # Emitted when the user clicks the toolbar's "Delete Segment" button
+    # (after they confirm the destructive prompt).  MainWindow handles
+    # the actual mutation: stop preview if active, drop the segment from
+    # ``project.segments``, clear panel caches and refresh the timeline.
+    segment_delete_requested = Signal(str)  # segment_id
+
     # Emitted after the user mutates a segment's beat-event list via the
     # timeline strip (drag / delete / kind change / insert). The receiver
     # is responsible for copying ``timeline_panel._beat_events[segment_id]``
@@ -1587,6 +1584,7 @@ class TimelinePanel(QWidget):
         # so ``_on_selection_changed`` never fires for this entry path.
         # Sync action-button enable state explicitly.
         self.split_button.setEnabled(True)
+        self.delete_segment_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
         self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
@@ -2281,6 +2279,23 @@ class TimelinePanel(QWidget):
         top.addWidget(self.split_button)
 
         top.addStretch()
+
+        # "Delete Segment" — drop the currently selected segment from the
+        # project after a confirm prompt.  Disabled until a segment is
+        # selected (mirrors the other selection-dependent buttons below
+        # — toggled in ``_on_selection_changed`` / ``_on_empty_clicked``).
+        self.delete_segment_button = QPushButton("Delete Segment")
+        self.delete_segment_button.setObjectName("deleteSegmentButton")
+        self.delete_segment_button.setEnabled(False)
+        self.delete_segment_button.setToolTip(
+            "Remove the selected segment from the project.\n"
+            "Beat events, render settings and the trimmed audio cache\n"
+            "for this segment are dropped.  This cannot be undone."
+        )
+        self.delete_segment_button.clicked.connect(
+            self._on_delete_segment_clicked
+        )
+        top.addWidget(self.delete_segment_button)
 
         # "Auto Gen Block" — manual trigger for ``rhythm.py --detect_only``.
         # Detection no longer fires on segment selection / drag / form
@@ -3574,12 +3589,6 @@ class TimelinePanel(QWidget):
         x = self._time_to_x(segment.start_time_sec)
         width = max(20.0, segment.duration_sec * self._effective_pps)
         block = SegmentRectItem(segment, self._effective_pps)
-        # Disable drag in focus mode so the user can't accidentally move the
-        # only visible segment off the viewport while zoomed-in.
-        if self._focus_segment_id is not None:
-            block.setFlag(
-                QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, False
-            )
         block_h = self._SEGMENT_TRACK_H - 8  # fills track with 4px top+bottom margin
         block.setRect(0, 0, width, block_h)
         block.setPos(x, SegmentRectItem.SEGMENT_Y)
@@ -3790,6 +3799,7 @@ class TimelinePanel(QWidget):
         same_segment = (segment.id == self._selected_segment_id)
         self._selected_segment_id = segment.id
         self.split_button.setEnabled(True)
+        self.delete_segment_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
         self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
@@ -3808,11 +3818,40 @@ class TimelinePanel(QWidget):
         self._defocus_other_threshold_lines(None)
         self.scene.clearSelection()
         self.split_button.setEnabled(False)
+        self.delete_segment_button.setEnabled(False)
         self.auto_gen_button.setEnabled(False)
         self.gen_by_chart_button.setEnabled(False)
         self.clear_beats_button.setEnabled(False)
         self.overview_bar.set_selected(None)
         self.segment_selected.emit(None)
+
+    def _on_delete_segment_clicked(self) -> None:
+        """Confirm + forward a delete request for the selected segment.
+
+        We only emit :pyattr:`segment_delete_requested` here — the
+        actual mutation of ``project.segments`` lives in MainWindow so
+        it can also stop the live preview (when previewing this
+        segment), drop the segment-config form selection and route
+        through the standard ``_on_project_changed`` autosave path
+        used by every other destructive edit.
+        """
+        if self._project is None or self._selected_segment_id is None:
+            return
+        seg = self._project.get_segment(self._selected_segment_id)
+        if seg is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Segment",
+            f"Delete segment '{seg.name}'?\n"
+            f"Beat events and render settings for this segment will\n"
+            f"be removed.  This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.segment_delete_requested.emit(seg.id)
 
     def _on_auto_gen_clicked(self) -> None:
         """Forward the click as :pyattr:`auto_gen_block_requested`.
@@ -4138,25 +4177,6 @@ class TimelinePanel(QWidget):
         self._project.segments.append(right)
         self.segment_split.emit(segment.id, right.id)
         self.refresh()
-
-    def sync_segment_positions(self) -> None:
-        """Apply moved block positions back to segment start times.
-
-        In focus mode segments are not draggable so this is a no-op.
-        """
-        if not self._project or self._focus_segment_id is not None:
-            return
-        for segment in self._project.segments:
-            block = self._block_map.get(segment.id)
-            if block is None:
-                continue
-            new_start = self._x_to_time(block.pos().x())
-            snapped = round(new_start * 10) / 10.0
-            if abs(snapped - segment.start_time_sec) > 1e-6:
-                duration = segment.duration_sec or 8.0
-                segment.start_time_sec = max(0.0, snapped)
-                segment.end_time_sec = segment.start_time_sec + duration
-                self.segment_changed.emit(segment.id)
 
     def _on_playhead_scrubbed(self, time_sec: float) -> None:
         """Handle user dragging/clicking playhead on timeline."""

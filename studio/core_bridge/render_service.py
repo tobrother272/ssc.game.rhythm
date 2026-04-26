@@ -552,6 +552,7 @@ class RenderService(QObject):
     # (e.g. "0.0"), which argparse rejects.  These are coerced to int strings.
     _INT_KEYS = frozenset({
         "beat_min_gap",
+        "max_per_lane",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -566,6 +567,7 @@ class RenderService(QObject):
         "beat_sens",
         "density",
         "speed",
+        "max_per_lane",
         "floor_panels",
         "stickman",
         "line_zigzag",

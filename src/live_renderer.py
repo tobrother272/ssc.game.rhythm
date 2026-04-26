@@ -354,6 +354,7 @@ class LiveFrameRenderer:
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
 
@@ -362,14 +363,21 @@ class LiveFrameRenderer:
         doesn't); we therefore re-create cam / tunnel / viewport / stick.
         Audio analysis is preserved.
 
-        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels`` are
-        OPTIONAL overrides — pass ``None`` (the default) to keep the
-        current value.  Bundled into this single entrypoint because all
-        three decorate the SAME scene primitives that ``update_mode``
-        already rebuilds, so the cost is identical regardless of which
-        subset changes.  Editor calls this with whatever subset of
-        params the segment-config form actually mutated; preview
-        hot-reloads complete in well under 200 ms either way.
+        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels`` /
+        ``max_per_lane`` are OPTIONAL overrides — pass ``None`` (the
+        default) to keep the current value.  Bundled into this single
+        entrypoint because all of them decorate the SAME scene
+        primitives that ``update_mode`` already rebuilds, so the cost
+        is identical regardless of which subset changes.  Editor calls
+        this with whatever subset of params the segment-config form
+        actually mutated; preview hot-reloads complete in well under
+        200 ms either way.
+
+        ``max_per_lane`` resets ``_min_lane_gap`` (computed inside
+        ``_build_scene``) so a tighter cap immediately drops more beats
+        as "lane-stacked" while a looser cap pulls them back in — the
+        scheduler diagnostic line in stdout reflects the change on the
+        very next frame.
         """
         self._mode_str = mode
         if show_stickman is not None:
@@ -378,6 +386,8 @@ class LiveFrameRenderer:
             self._stickman_box = tuple(stickman_box)  # type: ignore[assignment]
         if show_floor_panels is not None:
             self._show_floor_panels = bool(show_floor_panels)
+        if max_per_lane is not None:
+            self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
         self._cur_fi = -1
 

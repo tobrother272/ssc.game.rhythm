@@ -484,6 +484,7 @@ class SegmentConfigPanel(QWidget):
         "beat_sens",
         "density",
         "speed",
+        "max_per_lane",
         "floor_panels",
         "stickman",
     )
@@ -502,6 +503,7 @@ class SegmentConfigPanel(QWidget):
         "beat_sens":   "Beat sens",
         "density":     "Density",
         "speed":       "Speed",
+        "max_per_lane":"Max / lane",
         "floor_panels":"Floor panels",
         "stickman":    "Stickman",
         "mode_list":   "Sub-modes",

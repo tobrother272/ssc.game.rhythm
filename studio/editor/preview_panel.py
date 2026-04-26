@@ -1331,14 +1331,16 @@ class PreviewPanel(QWidget):
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw.
 
-        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels``
-        are pass-through overrides for :meth:`LiveFrameRenderer.update_mode`;
-        ``None`` keeps the renderer's current value.  The editor folds
-        the segment-config "Sticky Man / Floor panels / mode" form
-        edits into a single call so the scene is rebuilt exactly once.
+        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels`` /
+        ``max_per_lane`` are pass-through overrides for
+        :meth:`LiveFrameRenderer.update_mode`; ``None`` keeps the
+        renderer's current value.  The editor folds the segment-config
+        "Sticky Man / Floor panels / mode / Max per lane" form edits
+        into a single call so the scene is rebuilt exactly once.
         """
         if not self._live_active or self._live_renderer is None:
             return
@@ -1347,6 +1349,7 @@ class PreviewPanel(QWidget):
             show_stickman=show_stickman,
             stickman_box=stickman_box,
             show_floor_panels=show_floor_panels,
+            max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)
 

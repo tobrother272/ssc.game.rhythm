@@ -1119,7 +1119,6 @@ def _draw_neon_edges(canvas: np.ndarray,
     crop = canvas[y0:y1, x0:x1]
 
     glow_col = tuple(int(min(255.0, c * 1.15 + 25)) for c in base_color)
-    core_col = tuple(int(min(255.0, c + 170)) for c in base_color)
     wide = max(3, core_thick * 4)
 
     overlay = np.zeros_like(crop)
@@ -1130,10 +1129,6 @@ def _draw_neon_edges(canvas: np.ndarray,
     k = (wide * 2) | 1
     overlay = cv2.GaussianBlur(overlay, (k, k), 0)
     np.maximum(crop, overlay, out=crop)
-
-    for poly in polys:
-        cv2.polylines(canvas, [poly], True, core_col,
-                      core_thick, lineType=cv2.LINE_AA)
 
 
 def draw_cube_3d(canvas: np.ndarray, cam: PerspectiveCamera,
@@ -1357,48 +1352,106 @@ class PunchTarget(Target):
     MESH_RIGHT:    tuple | None = None
     MESH_WIREFRAME: bool = False
 
+    # Visual flight bounds.  Independent of cam.Z_FAR / cam.Z_NEAR (which
+    # govern game logic): cube travels visually from Z_VIS_FAR (horizon,
+    # eye level) down to Z_VIS_NEAR — the "hit line" = back-edge of the
+    # foreground hit panels = ``cam.Z_NEAR`` (2.5).  At this depth the
+    # cube's centre lands flush on the red hit-line (where the 4 punch
+    # panels meet the floor grid) and detonates THERE — instead of zooming
+    # past Z_NEAR and exploding centimetres from the lens.
+    Z_VIS_FAR:  float = 28.0
+    Z_VIS_NEAR: float = 2.5
+    # Trajectory descends from horizon (eye level) to WY_HIT (cube fully
+    # below eye → top face visible, sits inside the bottom hit panel).
+    WY_SPAWN: float = 0.0
+    WY_HIT:   float = 0.25
+    # Cube ARRIVES at the panel this many frames BEFORE ``hit_frame`` and
+    # holds there until ``hit_frame``.  At 30 fps, 2 frames ≈ 67 ms — long
+    # enough for the eye + irregular playback sampling to register the
+    # arrival.  The hit (stickman strike + VFX + sound) still fires on the
+    # exact ``hit_frame`` (= UI beat-stick).  See ``check_hit`` for the
+    # state machine that turns this into "vanish exactly on the beat".
+    HIT_ARRIVAL_OFFSET: int = 2
+
+    def depth(self, cur_frame: int) -> float:
+        """Override base depth so cube reaches panel HIT_ARRIVAL_OFFSET
+        frames early and stays there until ``hit_frame``.
+
+        Effect: from ``hit_frame - HIT_ARRIVAL_OFFSET`` onwards depth=0
+        (cube fully at the hit panel).  Earlier than that, linear travel
+        from horizon to panel — same speed as before, just the final
+        ``HIT_ARRIVAL_OFFSET`` frames are spent locked at depth=0 instead
+        of finishing the last few % of the journey.  Practically the
+        cube looks identical (those last 2 frames cover only ~5% of
+        ``Z_VIS_FAR-Z_VIS_NEAR``) but its arrival is now perceptible.
+        """
+        if cur_frame <= self.spawn_frame:
+            return 1.0
+        arrival_frame = self.hit_frame - self.HIT_ARRIVAL_OFFSET
+        if cur_frame >= arrival_frame:
+            return 0.0
+        denom = max(1, arrival_frame - self.spawn_frame)
+        p = (cur_frame - self.spawn_frame) / denom
+        return 1.0 - p
+
+    def check_hit(self, cur_frame: int) -> bool:
+        """Hit fires AT ``hit_frame`` (= beat moment = stickman strike).
+
+        Combined with the ``depth`` override above, the cube is:
+          • flying through tunnel       on frames < hit - HIT_ARRIVAL_OFFSET
+          • locked at panel (depth=0)   on frames in
+                                        [hit - HIT_ARRIVAL_OFFSET, hit_frame]
+          • vanished                    on frames > hit_frame
+
+        We keep ``state='flying'`` THROUGH ``hit_frame`` itself so the
+        painter still draws the cube at the panel for that frame — that
+        way the visual "punch + dissolve" lands exactly on the audio
+        beat / UI beat-stick instead of one frame early.
+        """
+        if self.state != 'flying':
+            return False
+        if cur_frame < self.hit_frame:
+            return False
+        if self.hit_exec_f < 0:
+            self.hit_exec_f = cur_frame
+            return True
+        self.state = 'hit'
+        return False
+
     def draw(self, canvas, cam, cur_frame):
         if self.state != 'flying':
             return canvas
-        z_norm = self.depth(cur_frame)
-        wz = cam.z_from_norm(z_norm)
+        z_norm = self.depth(cur_frame)   # 1 at spawn, 0 at hit
         wx = cam.lane_world_x(self.lane)
-        wy = cam.AIR_WORLD_Y
+        # Linear interpolation through 3D world space — straight-line
+        # trajectory from (lane_x, 0, Z_VIS_FAR) to (lane_x, WY_HIT, Z_VIS_NEAR)
+        wz = self.Z_VIS_NEAR + z_norm * (self.Z_VIS_FAR - self.Z_VIS_NEAR)
+        wy = self.WY_SPAWN + (self.WY_HIT - self.WY_SPAWN) * (1.0 - z_norm)
 
         mesh = self.MESH_LEFT if self.is_left else self.MESH_RIGHT
         tex  = self.TEXTURE_LEFT if self.is_left else self.TEXTURE_RIGHT
 
         if mesh is not None:
-            # Full 3-D mesh (.obj / .glb / .stl / .ply) with Lambert shading
-            draw_mesh_3d(canvas, cam, mesh,
-                         (wx, wy, wz),
-                         self.CUBE_HALF,
+            draw_mesh_3d(canvas, cam, mesh, (wx, wy, wz), self.CUBE_HALF,
                          base_color=self.color,
                          rim=CLR_WHITE if self.MESH_WIREFRAME else None)
-        elif tex is not None:
-            draw_cube_3d_textured(canvas, cam,
-                                  (wx, wy, wz),
-                                  self.CUBE_HALF,
-                                  tex[0], tex[1],
-                                  rim=CLR_WHITE)
-        else:
-            # Yaw cube so its front face rotates TOWARD the center axis:
-            # left-lane cubes tilt clockwise (yaw > 0) and right-lane
-            # cubes tilt counter-clockwise (yaw < 0).  The two cubes
-            # mirror each other and both expose their inner side face +
-            # top face → looks like solid geometry instead of a flat
-            # square staring into the camera.
-            yaw = 0.35 if self.is_left else -0.35
-            cube_info = draw_cube_3d(canvas, cam,
-                                     (wx, wy, wz),
-                                     self.CUBE_HALF,
-                                     color=self.color,
-                                     yaw=yaw,
-                                     corner_radius=self.CORNER_RADIUS)
-            if cube_info is not None and cube_info['size'] >= 22:
-                _draw_fist_icon(canvas, cube_info['cx'], cube_info['cy'],
-                                int(cube_info['size'] * 0.58),
-                                CLR_WHITE)
+            return canvas
+        if tex is not None:
+            draw_cube_3d_textured(canvas, cam, (wx, wy, wz), self.CUBE_HALF,
+                                  tex[0], tex[1], rim=None)
+            return canvas
+
+        # Perfect dice: uniform half on all axes, yaw = 0 (axis-aligned).
+        # 3 faces emerge naturally from perspective at hit zone:
+        #   • FRONT — always visible
+        #   • TOP   — WY_HIT > CUBE_HALF → cube fully below eye line → camera looks down
+        #   • SIDE  — lane is off-centre → camera sees inner face
+        cube_info = draw_cube_3d(canvas, cam, (wx, wy, wz), self.CUBE_HALF,
+                                 color=self.color, yaw=0.0,
+                                 corner_radius=self.CORNER_RADIUS)
+        if cube_info is not None and cube_info['size'] >= 22:
+            _draw_fist_icon(canvas, cube_info['cx'], cube_info['cy'],
+                            int(cube_info['size'] * 0.58), CLR_WHITE)
         return canvas
 
 

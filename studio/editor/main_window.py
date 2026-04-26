@@ -150,11 +150,6 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._auto_save)
         self._autosave_timer.start()
 
-        self._segment_sync_timer = QTimer(self)
-        self._segment_sync_timer.setInterval(300)
-        self._segment_sync_timer.timeout.connect(self._sync_timeline_positions)
-        self._segment_sync_timer.start()
-
         self.setWindowTitle(f"Human Tetris Studio - {user.display_name}")
         self.resize(1500, 900)
 
@@ -263,6 +258,9 @@ class MainWindow(QMainWindow):
             self.preview_panel.seek_to_seconds
         )
         self.timeline_panel.segment_split.connect(self._on_segment_split)
+        self.timeline_panel.segment_delete_requested.connect(
+            self._on_segment_delete_requested
+        )
         self.timeline_panel.auto_gen_block_requested.connect(
             self._on_auto_gen_block_requested
         )
@@ -1135,6 +1133,46 @@ class MainWindow(QMainWindow):
         self._sync_preview_button_state()
         self._on_project_changed()
 
+    def _on_segment_delete_requested(self, segment_id: str) -> None:
+        """Drop a segment from the project after user-confirmed delete.
+
+        Cleans up every cache that referenced this segment so a future
+        re-create with the same id (very unlikely but possible) starts
+        from a clean slate:
+
+        - Stop live preview if it was driving this segment (the
+          renderer holds onto the trimmed audio buffer; keeping it
+          alive after the segment is gone would render against a
+          stale window).
+        - Clear the segment-config inspector if it was showing this
+          segment.
+        - Remove the timeline panel's beat-event cache for this id.
+        - Remove the segment from ``project.segments``.
+        - Mark project dirty so autosave persists the deletion.
+        """
+        seg = self.project.get_segment(segment_id)
+        if seg is None:
+            return
+        seg_name = seg.name
+        if (
+            self._preview_mode_active
+            and self._preview_active_segment_id == segment_id
+        ):
+            self._stop_preview_mode()
+        current = self.segment_panel.current_segment
+        if current is not None and current.id == segment_id:
+            self.segment_panel.set_segment(None)
+        self.timeline_panel.clear_beat_events(segment_id)
+        self.project.segments = [
+            s for s in self.project.segments if s.id != segment_id
+        ]
+        self.timeline_panel.refresh()
+        self._sync_preview_button_state()
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Segment '{seg_name}' deleted", 3000
+        )
+
     def _on_segment_changed_by_form(self, _segment_id: str) -> None:
         self.timeline_panel.refresh()
         current = self.segment_panel.current_segment
@@ -1164,9 +1202,6 @@ class MainWindow(QMainWindow):
         if current is not None:
             self._request_preview_restart(current.id)
         self._update_status()
-
-    def _sync_timeline_positions(self) -> None:
-        self.timeline_panel.sync_segment_positions()
 
     def _render_selected_segment(self) -> None:
         current = self.segment_panel.current_segment
@@ -1413,7 +1448,7 @@ class MainWindow(QMainWindow):
             "bloom": False,  # always off for live preview (8–15 ms / frame)
             "show_stickman": bool(_get("stickman", True)),
             "show_floor_panels": bool(_get("floor_panels", True)),
-            "max_per_lane": int(_get("max_per_lane", 1)),
+            "max_per_lane": int(_get("max_per_lane", 2)),
             "block_speed": float(_get("speed", 0.8)),
             "beat_min_gap": int(_get("beat_min_gap", 4)),
             "line_beats": int(_get("line_beats", 2)),
@@ -1568,6 +1603,7 @@ class MainWindow(QMainWindow):
             rs = segment.render_settings or {}
             show_stickman = bool(rs.get("stickman", True))
             show_floor_panels = bool(rs.get("floor_panels", True))
+            max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
                 if show_stickman else None
@@ -1578,6 +1614,7 @@ class MainWindow(QMainWindow):
                     show_stickman=show_stickman,
                     stickman_box=stickman_box,
                     show_floor_panels=show_floor_panels,
+                    max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"[preview] update_mode error: {exc!r}", flush=True)
