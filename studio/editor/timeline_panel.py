@@ -1124,6 +1124,7 @@ class TimelineView(QGraphicsView):
         hit_item = self.itemAt(event.position().toPoint())
         on_tick = isinstance(hit_item, BeatTickItem)
         on_segment = isinstance(hit_item, SegmentRectItem)
+        on_beat_strip_bg = isinstance(hit_item, BeatStripBgItem)
         # Threshold line (no child items — hit is the line itself).
         thr_line_hit: Optional[WaveformThresholdLine] = None
         _probe = hit_item
@@ -1153,6 +1154,29 @@ class TimelineView(QGraphicsView):
                 event.accept()
                 return
 
+        # ── Beat-strip-area guard ─────────────────────────────────────
+        # The strip is a *beat-edit* surface: double-click adds a beat
+        # and right-click opens the "Add Beat Block" menu.  Treat its
+        # Y-range as no-scrub so the very first press of a double-click
+        # gesture doesn't seek the audio player to the click position.
+        # Without this guard, every "add beat" double-click drove the
+        # live-preview audio back to local-time ≈ 0 (the user's
+        # reported "khi thêm stick thì seek bị chạy lại về 0"); the
+        # delete-tick path is unaffected because Delete keystrokes
+        # never enter ``mousePressEvent``.
+        on_beat_strip = on_beat_strip_bg
+        if (
+            not on_beat_strip
+            and panel is not None
+            and not on_tick
+            and not on_threshold
+            and not on_segment
+        ):
+            strip_top = float(panel._BEAT_STRIP_Y)
+            strip_bot = strip_top + float(panel._BEAT_STRIP_H)
+            if strip_top <= scene_pos.y() <= strip_bot:
+                on_beat_strip = True
+
         if self._panel_ref is not None:
             self._panel_ref._defocus_other_threshold_lines(thr_line_hit)
 
@@ -1160,6 +1184,7 @@ class TimelineView(QGraphicsView):
             self._scrub_enabled
             and not on_tick
             and not on_threshold
+            and not on_beat_strip
             and abs(scene_pos.x() - self._playhead_x) <= 8
         ):
             self._dragging_playhead = True
@@ -1173,6 +1198,7 @@ class TimelineView(QGraphicsView):
             self._scrub_enabled
             and not on_tick
             and not on_threshold
+            and not on_beat_strip
             and scene_pos.y() <= self.sceneRect().height()
         ):
             self.playhead_scrubbed.emit(
@@ -3745,13 +3771,31 @@ class TimelinePanel(QWidget):
         segment = self._project.get_segment(block.segment_id)
         if segment is None:
             return
+        # ── No-op self-reselect guard ─────────────────────────────────
+        # When the user adds a beat tick we ``setSelected(True)`` on the
+        # freshly-rebuilt :class:`BeatTickItem` (so arrow-key nudges
+        # land on it).  That fires ``selectionChanged`` with the
+        # ALREADY-selected segment block ALSO in the selection set
+        # (refresh re-applied it silently a moment earlier).  Without
+        # this guard we would re-emit :signal:`segment_selected` for
+        # the same segment we already announced, and MainWindow's
+        # ``_on_segment_selected`` would chain into
+        # ``preview_panel.set_source_segment`` → ``_load_path`` →
+        # ``stop_live_preview`` — killing live preview AND seeking
+        # the audio player back to the segment start.  That is the
+        # exact "add stick → out of preview mode → duration back to
+        # 0" regression the user reported (delete works because
+        # ``_focused_beat`` is cleared on delete, so no follow-up
+        # ``setSelected`` fires after ``refresh``).
+        same_segment = (segment.id == self._selected_segment_id)
         self._selected_segment_id = segment.id
         self.split_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
         self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
         self.overview_bar.set_selected(segment.id)
-        self.segment_selected.emit(segment)
+        if not same_segment:
+            self.segment_selected.emit(segment)
 
     def _on_empty_clicked(self) -> None:
         # Order matters — clear the focus state BEFORE the scene's

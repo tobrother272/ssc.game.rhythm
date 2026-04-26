@@ -4570,31 +4570,33 @@ class RhythmVisualizer:
                   f"→ {len(beat_frames)} obstacles "
                   f"(first @ frame {first_f} / {first_f/self.FPS:.2f}s)")
         elif solo_relax and self.BEAT_SOURCE == 'array':
-            # In relax mode, user-supplied array entries represent the
-            # SPAWN time of each obstacle — i.e. the moment the slab
-            # first appears at the horizon and starts gliding toward
-            # the camera.  This matches the natural mental model when
-            # hand-placing ticks against the audio waveform: "khi mình
-            # nghe tới đoạn này thì khối phải bắt đầu xuất hiện".
+            # Editor preview (``src/live_renderer.py``) feeds the user's
+            # beat array into ``pre_schedule`` unchanged — so each tick
+            # marks the HIT frame (the moment the slab arrives at the
+            # camera plane and the player must be dodging).  Match that
+            # interpretation here so the final MP4 plays back the exact
+            # cadence the user judged in the timeline editor: tick at
+            # t = 5 s ⇒ slab hits the camera at t = 5 s in BOTH paths.
             #
-            # ``pre_schedule`` downstream still treats ``bf`` as the
-            # HIT frame (``spawn_frame = bf − travel``), so we offset
-            # every user entry by +travel here to keep the rest of
-            # the pipeline unchanged.  Any beat whose resulting hit
-            # frame would fall past the end of the song is dropped
-            # (the slab would never reach the camera anyway, and the
-            # render loop would just spin past it).
+            # An earlier revision added ``+travel`` to every user entry
+            # (interpreting beats as SPAWN times instead).  That made
+            # every rendered dodge land ``travel`` frames late vs. the
+            # preview the user signed off on, which is exactly the
+            # "preview đúng nhưng render sai" desync this branch fixes.
+            # ``pre_schedule`` downstream still derives
+            # ``spawn_frame = hit_frame − travel`` so the slab visibly
+            # appears ``travel`` frames before its hit, identical to
+            # the preview.
             n_before = len(beat_frames)
-            translated = [int(bf) + int(travel) for bf in beat_frames]
-            beat_frames = [bf for bf in translated
-                           if bf < total_frames]
-            n_clipped = len(translated) - len(beat_frames)
+            beat_frames = [int(bf) for bf in beat_frames
+                           if 0 <= int(bf) < total_frames]
+            n_clipped = n_before - len(beat_frames)
             print(f"[relax-array] interpreting {n_before} array "
-                  f"beat(s) as obstacle SPAWN times "
-                  f"(hit_frame = beat + travel={travel}f). "
-                  f"{len(beat_frames)} block(s) fit within audio "
-                  f"({total_frames}f); dropped {n_clipped} whose "
-                  f"hit_frame overshoots the end.")
+                  f"beat(s) as obstacle HIT times "
+                  f"(spawn_frame = hit − travel={travel}f, "
+                  f"matching preview).  {len(beat_frames)} block(s) "
+                  f"fit within audio ({total_frames}f); dropped "
+                  f"{n_clipped} that fell outside the song.")
         elif solo_relax:
             # Music-driven solo-relax: drop any beat whose spawn would
             # fall before frame 0.  Without this, early-song beats
@@ -4930,7 +4932,7 @@ class RhythmVisualizer:
         # which caused ArrayMemoryError on long segments (e.g. a 3-minute
         # clip at 1920×1080 requires ~30 GB of RAM for the buffer alone).
         codec_label = "NVENC" if _CUPY else ("avc1" if self.is_mac else "libx264")
-        print(f"Rendering + streaming frames to encoder ({codec_label})...")
+        print(f"Rendering frames to encoder ({codec_label})...")
         t_render = time.time()
         last_pct = 0
 
@@ -5142,7 +5144,10 @@ class RhythmVisualizer:
             _vwriter.release()
         if _vproc is not None:
             if _vproc.stdin:
-                _vproc.stdin.close()
+                try:
+                    _vproc.stdin.close()
+                except OSError:
+                    pass
             _vproc.wait()
 
         print(f"\nTotal time: {time.time()-t0:.2f}s")

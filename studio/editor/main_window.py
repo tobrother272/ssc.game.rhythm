@@ -40,6 +40,11 @@ from studio.editor.timeline_panel import TimelinePanel
 from studio.models import Project, RenderStatus, Segment, build_settings
 from studio.persistence import ProjectStore
 
+# Live preview is delivered by an in-process renderer (see
+# ``src.live_renderer``), built on demand when the user toggles
+# Preview ON.  Imported lazily inside the start-handler so the heavy
+# rhythm.py + librosa + OpenCV chain doesn't load at app launch.
+
 
 class MainWindow(QMainWindow):
     """Top-level editor shell for Human Tetris Studio."""
@@ -107,9 +112,38 @@ class MainWindow(QMainWindow):
         self._inflight_trim_segments: set[str] = set()
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
-        # Segment IDs whose render was triggered by the Preview button;
-        # when their job finishes the rendered video is auto-played.
-        self._preview_segment_ids: set[str] = set()
+        # ── Live preview mode (Preview button as a TOGGLE) ────────────
+        # The preview button now drives an in-process drawing renderer
+        # (:class:`src.live_renderer.LiveFrameRenderer`) instead of a
+        # full ffmpeg HLS render.  When ON: the renderer produces
+        # frames on demand for the segment-local audio playhead and
+        # the panel's ``QLabel.setPixmap`` displays them at fps; edits
+        # to mode / beats hot-reload the schedule WITHOUT re-spawning
+        # any subprocess.  When OFF: renderer is closed and the panel
+        # returns to idle.  Only one segment may be live-previewed at
+        # a time.
+        self._preview_mode_active: bool = False
+        self._preview_active_segment_id: Optional[str] = None
+        # The active in-process renderer (None outside preview mode).
+        # Stored on the window so the edit-trigger debounce can find
+        # it without round-tripping through the panel.
+        self._live_preview_renderer: Optional[object] = None
+        # Debounce timer so a flurry of beat-tick drags ends in a
+        # single hot-reload instead of rebuilding the schedule every
+        # 16ms.  Hot-reload is the in-process renderer's update path
+        # (~50–200 ms) so the debounce can be tight — 80 ms feels
+        # instantaneous to a user dragging.
+        self._preview_restart_timer = QTimer(self)
+        self._preview_restart_timer.setSingleShot(True)
+        self._preview_restart_timer.setInterval(80)
+        self._preview_restart_timer.timeout.connect(
+            self._perform_live_preview_update
+        )
+        # Bit-set of pending hot-reload kinds since the last update
+        # actually fired — avoids redundant ``update_mode`` calls when
+        # only beats changed, and vice versa.
+        self._live_preview_pending_mode: bool = False
+        self._live_preview_pending_beats: bool = False
 
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setInterval(60_000)
@@ -245,6 +279,13 @@ class MainWindow(QMainWindow):
         self.preview_panel.stickman_location_changed.connect(
             self._on_stickman_location_edited
         )
+        # The panel may auto-stop live-preview when its source is
+        # forcibly replaced (e.g. user clicked another segment) — keep
+        # our toggle flags + segment-panel button in sync via this
+        # signal so the state machine stays consistent.
+        self.preview_panel.live_preview_stopped.connect(
+            self._on_live_preview_panel_stopped
+        )
         self.segment_panel.segment_changed.connect(self._on_segment_changed_by_form)
         self.segment_panel.render_requested.connect(self._on_render_segment_requested)
         self.segment_panel.preview_requested.connect(self._on_preview_segment_requested)
@@ -258,6 +299,12 @@ class MainWindow(QMainWindow):
         self.waveform_service.failed.connect(self._on_waveform_failed)
 
     def _set_project(self, project: Project) -> None:
+        # If the user opens / creates a new project while a preview is
+        # running, the previous segment_id is meaningless in the new
+        # project — kill the daemon, wipe its buffered .ts files, and
+        # reset the toggle so the Preview button starts clean.
+        if getattr(self, "_preview_mode_active", False):
+            self._stop_preview_mode()
         self.project = project
         self.media_panel.set_project(project)
         self.timeline_panel.set_project(project)
@@ -816,6 +863,15 @@ class MainWindow(QMainWindow):
             2000,
         )
 
+        # ── Live preview hot-reload ─────────────────────────────────
+        # When live-preview is ON for THIS segment, the renderer's
+        # schedule needs to absorb the new tick array.  We use the
+        # beats-only path because beat-tick drags don't change the
+        # mode / scene / HUDs; rebuilding those would only add
+        # latency (50-200 ms each) without changing anything the
+        # user can see.
+        self._request_preview_beats_only(segment_id)
+
     def _on_stickman_location_edited(
         self, segment_id: str, location: dict
     ) -> None:
@@ -844,6 +900,12 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return
         self._on_project_changed()
+        # Hot-reload live preview so the dragged box lands on the
+        # rendered frame within the next ~80 ms debounce tick — same
+        # treatment as a mode/density edit.  Without this the user has
+        # to toggle Preview off + on for the new placement to show up,
+        # defeating the point of the drag-edit overlay.
+        self._request_preview_restart(seg.id)
         self.statusBar().showMessage(
             f"Stickman box updated for {seg.name}: "
             f"x={seg.stickman_location['x']*100:.1f}% "
@@ -1014,7 +1076,41 @@ class MainWindow(QMainWindow):
             # is NOT triggered here — the user runs it manually via the
             # "Auto Gen Block" button when they're ready to preview blocks.
             self._request_audio_trim(current)
+            # Audio window changes invalidate the renderer's audio
+            # buffers — librosa already crunched the OLD trim.  Rather
+            # than silently render mismatched visuals, drop out of
+            # preview so the user knows to re-toggle once the new
+            # trim lands.
+            if (
+                self._preview_mode_active
+                and self._preview_active_segment_id == current.id
+            ):
+                self._stop_preview_mode()
+                self.statusBar().showMessage(
+                    "Preview stopped — segment range changed; "
+                    "click Preview again to reload.",
+                    4000,
+                )
+        self._sync_preview_button_state()
         self._on_project_changed()
+
+    def _sync_preview_button_state(self) -> None:
+        """Reflect the live-preview toggle on whatever segment the
+        config panel is currently showing.
+
+        The Preview button lives on the segment panel and only knows
+        about the segment it's displaying — so when the user clicks
+        a DIFFERENT segment in the timeline, we need to re-paint the
+        button (checked iff the displayed segment is the one being
+        previewed).
+        """
+        current = self.segment_panel.current_segment
+        active = (
+            self._preview_mode_active
+            and current is not None
+            and current.id == self._preview_active_segment_id
+        )
+        self.segment_panel.set_preview_active(bool(active))
 
     def _on_segment_split(self, original_id: str, new_id: str) -> None:
         """Handle timeline split: update inspector and mark project dirty."""
@@ -1022,6 +1118,21 @@ class MainWindow(QMainWindow):
         self.segment_panel.set_project(self.project)
         if new_segment is not None:
             self.segment_panel.set_segment(new_segment)
+        # Splitting changes the segment's audio window — the renderer
+        # was loaded with the pre-split clip and would now be
+        # rendering against the wrong portion.  Drop out of preview;
+        # the user re-toggles on the half they want to inspect.
+        if self._preview_mode_active and self._preview_active_segment_id in (
+            original_id,
+            new_id,
+        ):
+            self._stop_preview_mode()
+            self.statusBar().showMessage(
+                "Preview stopped — segment was split; "
+                "click Preview again on the desired half.",
+                4000,
+            )
+        self._sync_preview_button_state()
         self._on_project_changed()
 
     def _on_segment_changed_by_form(self, _segment_id: str) -> None:
@@ -1046,6 +1157,12 @@ class MainWindow(QMainWindow):
         # stale state until the user re-selects the segment.
         if hasattr(self, "preview_panel"):
             self.preview_panel._refresh_stickman_button_state()
+        # Live preview reflects this segment's mode/density/threshold,
+        # so any form change while preview mode is ON should restart
+        # the render from the current cursor with the new params.
+        # Debounced so rapid spinner-drags don't churn ffmpeg.
+        if current is not None:
+            self._request_preview_restart(current.id)
         self._update_status()
 
     def _sync_timeline_positions(self) -> None:
@@ -1062,65 +1179,424 @@ class MainWindow(QMainWindow):
             self._enqueue_segment(segment)
 
     def _on_preview_segment_requested(self, segment_id: str) -> None:
-        """Render the segment (trimmed audio + current settings) and auto-play.
+        """Toggle live preview mode for the segment.
 
-        A dedicated preview render job is enqueued.  The output is written to
-        ``<app_root>/temps/preview_<segment_id>.mp4`` so it doesn't clobber
-        the full-quality render at ``temps/segment_<segment_id>.mp4``.
-        When the render finishes, ``_on_render_finished`` detects the
-        preview flag and loads the video into the preview panel.
+        OFF → ON  : build an in-process :class:`LiveFrameRenderer` for
+        the segment and hand it to :class:`PreviewPanel` so the player
+        starts drawing frames against the segment's audio playhead.
+        First frame appears in ~1.5–2 s (audio analysis + scene init);
+        every subsequent edit hot-reloads in <200 ms.
+
+        ON  → OFF : tear down the renderer and stop audio playback.
+
+        While the toggle is ON, edits to mode / beats fire
+        ``_request_preview_restart`` which debounces and routes the
+        change to ``preview_panel.update_live_*`` — no subprocess
+        spawn, no HLS, no .ts files.
         """
+        if self._preview_mode_active:
+            already = (self._preview_active_segment_id == segment_id)
+            self._stop_preview_mode()
+            if already:
+                return
+            # Else fall through to start a preview for the new segment.
+
         segment = self.project.get_segment(segment_id)
         if segment is None:
             return
         if not segment.audio_path:
             self.statusBar().showMessage("Segment has no audio source", 3000)
+            self.segment_panel.set_preview_active(False)
             return
-        # Use a separate output path so preview doesn't clobber the real render.
-        output_path = self._app_temps_dir() / f"preview_{segment.id}.mp4"
-        dur = segment.duration_sec if segment.duration_sec and segment.duration_sec > 0 else None
-        # Forward saved beat events so the preview matches the timeline
-        # ticks exactly — same array path the full Render uses below.
+
+        self._start_live_preview(segment)
+
+    def _stop_preview_mode(self) -> None:
+        """Tear down the in-process live preview + reset toggle state.
+
+        Idempotent.  Cancels the pending edit-debounce, drops the
+        renderer (frees its 30 – 100 MB of NumPy buffers), tells the
+        panel to stop drawing and revert to its idle page, and
+        un-checks the segment-panel's Preview button.
+
+        Note: ``preview_panel.stop_live_preview`` emits
+        ``live_preview_stopped`` which we also handle in
+        :meth:`_on_live_preview_panel_stopped`.  That handler is
+        intentionally idempotent so the round-trip from this method
+        through the signal path doesn't double-message the user via
+        the status bar.
+        """
+        seg_id = self._preview_active_segment_id
+        # Cancel any debounced hot-reload that hasn't fired yet — its
+        # target renderer is about to be closed.
+        self._preview_restart_timer.stop()
+        self._live_preview_pending_mode = False
+        self._live_preview_pending_beats = False
+        # Tell the panel to stop the frame timer + close the renderer.
+        try:
+            self.preview_panel.stop_live_preview()
+        except Exception:  # noqa: BLE001
+            pass
+        # Drop our own reference to the renderer (panel holds the
+        # canonical one but mirroring it here lets edit handlers
+        # short-circuit before bothering the panel).
+        self._live_preview_renderer = None
+        self._preview_mode_active = False
+        self._preview_active_segment_id = None
+        if seg_id is not None:
+            self.statusBar().showMessage("Preview stopped.", 2500)
+        self.segment_panel.set_preview_active(False)
+        self._update_status()
+
+    def _on_live_preview_panel_stopped(self) -> None:
+        """Mirror panel-initiated live-preview stops onto our state.
+
+        Reachable when the panel auto-stops because a different source
+        was loaded (timeline click on another segment, source-combo
+        change, post-render auto-load…).  Our explicit
+        :meth:`_stop_preview_mode` also routes through this slot via
+        ``stop_live_preview``'s signal — that's why the body is
+        idempotent.
+        """
+        if not self._preview_mode_active:
+            return
+        self._preview_restart_timer.stop()
+        self._live_preview_pending_mode = False
+        self._live_preview_pending_beats = False
+        self._live_preview_renderer = None
+        self._preview_mode_active = False
+        self._preview_active_segment_id = None
+        self.segment_panel.set_preview_active(False)
+        self._update_status()
+
+    def _start_live_preview(self, segment: Segment) -> None:
+        """Build a renderer for ``segment`` and hand it to the panel.
+
+        The renderer is constructed at 1280×720 / 24 fps (project's
+        output settings stay independent for the final export).  Audio
+        is taken from ``trimmed_audio_path`` when present so the
+        renderer's t=0 matches the segment's start; raw ``audio_path``
+        is the safe fallback for new / un-trimmed segments.
+
+        Construction blocks for ~1–2 s (audio analysis + game
+        pre-schedule) — we surface this as a status-bar hint and
+        update the preview panel's render-progress overlay so the
+        user knows the system isn't frozen.  All subsequent edits
+        run via ``update_beats`` / ``update_mode`` and complete in
+        well under 200 ms.
+        """
+        from src.live_renderer import LiveFrameRenderer
+
+        # Pick the audio file: pre-trimmed WAV ▸ raw audio_path.
+        audio_path = ""
+        if (
+            getattr(segment, "trimmed_audio_path", None)
+            and Path(segment.trimmed_audio_path).exists()
+        ):
+            audio_path = str(segment.trimmed_audio_path)
+        elif segment.audio_path:
+            audio_path = str(segment.audio_path)
+        if not audio_path:
+            self.statusBar().showMessage(
+                "Segment has no audio source — cannot preview.", 4000
+            )
+            return
+
+        # Beat array: ``segment.beat_events`` is a list of
+        # ``(t_local, kind, height)`` tuples; the renderer only needs
+        # the t_local floats.  Tolerate scalar entries from older
+        # project files.
         beat_times: list[float] = []
         for ev in (segment.beat_events or []):
             try:
-                t = float(ev[0]) if isinstance(ev, (tuple, list)) else float(ev)
+                t = (
+                    float(ev[0])
+                    if isinstance(ev, (tuple, list))
+                    else float(ev)
+                )
             except (TypeError, ValueError, IndexError):
                 continue
-            beat_times.append(t)
-        job = RenderJob(
-            segment_id=segment.id,
-            mode=segment.mode,
-            audio_path=segment.audio_path,
-            output_path=str(output_path),
-            render_settings=segment.render_settings or {},
-            start_time_sec=segment.start_time_sec,
-            duration_sec=dur,
-            is_preview=True,
-            output_width=self.project.output_width,
-            output_height=self.project.output_height,
-            output_fps=self.project.output_fps,
-            trimmed_audio_path=segment.trimmed_audio_path,
-            project_temps_dir=str(self._app_temps_dir()),
-            beat_times=beat_times,
-        )
-        self._preview_segment_ids.add(segment.id)
-        segment.render_status = RenderStatus.QUEUED
-        segment.last_render_progress = 0
-        self.render_service.enqueue(job)
+            beat_times.append(max(0.0, t))
+
+        # Resolve render-time tunables from the segment's settings;
+        # fall back to BaseRenderSettings defaults when missing so a
+        # freshly-created segment without explicit settings still
+        # gets a sane preview.
+        kwargs = self._live_renderer_kwargs(segment)
+
+        try:
+            renderer = LiveFrameRenderer(
+                audio_path,
+                beat_times=beat_times,
+                mode=segment.mode,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.statusBar().showMessage(
+                f"Preview failed to initialise: {exc}", 6000
+            )
+            print(
+                f"[preview] LiveFrameRenderer init error: {exc!r}",
+                flush=True,
+            )
+            self.segment_panel.set_preview_active(False)
+            return
+
+        self._preview_mode_active = True
+        self._preview_active_segment_id = segment.id
+        self._live_preview_renderer = renderer
+
+        # Hand the renderer + audio to the panel.  ``project_offset_sec``
+        # so the timeline's red playhead tracks correctly during
+        # live preview.
+        seg_start = float(segment.start_time_sec or 0.0)
+        try:
+            self.preview_panel.start_live_preview(
+                renderer,
+                audio_path,
+                start_local_sec=0.0,
+                project_offset_sec=seg_start,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.statusBar().showMessage(
+                f"Preview panel failed to attach: {exc}", 6000
+            )
+            print(
+                f"[preview] panel.start_live_preview error: {exc!r}",
+                flush=True,
+            )
+            renderer.close()
+            self._live_preview_renderer = None
+            self._preview_mode_active = False
+            self._preview_active_segment_id = None
+            self.segment_panel.set_preview_active(False)
+            return
+
+        self.segment_panel.set_preview_active(True)
         self.statusBar().showMessage(
-            f"Preview rendering '{segment.name}' ({segment.start_time_sec:.1f}s"
-            f"–{segment.end_time_sec:.1f}s)…", 3000
+            f"Preview live: {segment.name} — edit to hot-reload.",
+            4000,
         )
-        # Show "Preview 0%" overlay over the player so the user has a clear
-        # visual cue that something is happening (matches the Render flow).
-        self.preview_panel.set_render_progress(
-            0,
-            label="Preview",
-            subtitle=f"{segment.name} — preparing…",
-        )
-        self.segment_panel.set_segment(segment)
         self._update_status()
+
+    def _live_renderer_kwargs(self, segment: Segment) -> dict:
+        """Translate a Segment's render_settings into LiveFrameRenderer kwargs.
+
+        Centralised so both initial construction and any future
+        "rebuild renderer with new settings" path use the exact same
+        mapping.  Anything missing from the segment's
+        ``render_settings`` dict falls back to the live-renderer's
+        constructor default.
+        """
+        # Late import: ``_parse_color`` lives next to ``rhythm.py`` and
+        # we already added ``src/`` to ``sys.path`` from
+        # ``live_renderer.py``'s import block, so it's resolvable here.
+        try:
+            from rhythm import _parse_color
+        except ImportError:
+            # Fallback: keep colour overrides off rather than crashing.
+            def _parse_color(_: str) -> None:  # type: ignore[no-redef]
+                return None
+
+        rs = segment.render_settings or {}
+
+        def _get(key: str, default):
+            val = rs.get(key, default)
+            if val is None:
+                return default
+            return val
+
+        kwargs: dict = {
+            "fps": 24,
+            "width": 1280,
+            "height": 720,
+            "bloom": False,  # always off for live preview (8–15 ms / frame)
+            "show_stickman": bool(_get("stickman", True)),
+            "show_floor_panels": bool(_get("floor_panels", True)),
+            "max_per_lane": int(_get("max_per_lane", 1)),
+            "block_speed": float(_get("speed", 0.8)),
+            "beat_min_gap": int(_get("beat_min_gap", 4)),
+            "line_beats": int(_get("line_beats", 2)),
+            "line_zigzag": str(_get("line_zigzag", "vertical") or "vertical"),
+            "dance_pair_cycle": int(_get("dance_pair_cycle", 4)),
+            "punch_pair_cycle": int(_get("punch_pair_cycle", 4)),
+        }
+
+        # Cube + panel colours: settings store hex / "R,G,B" strings,
+        # ``_parse_color`` returns BGR tuples ready for OpenCV.
+        try:
+            kwargs["cube_color_left"] = _parse_color(rs.get("cube_color_left"))
+            kwargs["cube_color_right"] = _parse_color(rs.get("cube_color_right"))
+            kwargs["panel_neon_color"] = _parse_color(rs.get("panel_neon_color"))
+        except ValueError:
+            # Malformed colour string in settings — silently skip the
+            # override and let the renderer use its defaults.
+            kwargs.setdefault("cube_color_left", None)
+            kwargs.setdefault("cube_color_right", None)
+            kwargs.setdefault("panel_neon_color", None)
+
+        # Lane filter: settings list is 1-based; renderer expects a
+        # 0-based set, or ``None`` for "all enabled".
+        lanes = rs.get("lanes")
+        if isinstance(lanes, list) and lanes:
+            try:
+                lane_set = {max(0, int(l) - 1) for l in lanes}
+            except (TypeError, ValueError):
+                lane_set = None
+            kwargs["lane_filter"] = lane_set
+        else:
+            kwargs["lane_filter"] = None
+
+        # Stickman draw-box: segment stores ``{x, y, w, h}`` fractions
+        # (0..1).  Convert to pixel rect against the renderer's chosen
+        # 1280×720 canvas; passing ``None`` keeps the StickmanHUD
+        # default.
+        if kwargs["show_stickman"]:
+            box = self._segment_stickman_box_pixels(
+                segment, kwargs["width"], kwargs["height"]
+            )
+            if box is not None:
+                kwargs["stickman_box"] = box
+
+        return kwargs
+
+    def _segment_stickman_box_pixels(
+        self,
+        segment: Segment,
+        width: int = 1280,
+        height: int = 720,
+    ) -> Optional[tuple[int, int, int, int]]:
+        """Resolve a segment's stickman fractions to a pixel ``(x,y,w,h)``.
+
+        Mirrors the math used at renderer construction so a hot-reload
+        triggered by a stickman drag/resize lands on EXACTLY the same
+        box the user sees in the player overlay.  Returns ``None`` when
+        the segment has no ``stickman_location`` dict or any field
+        fails to coerce — callers pass ``None`` straight through to
+        :class:`LiveFrameRenderer` which then falls back to the
+        :class:`StickmanHUD` default left-column box.
+        """
+        loc = getattr(segment, "stickman_location", None)
+        if not isinstance(loc, dict):
+            return None
+        try:
+            return (
+                int(float(loc.get("x", 0.0)) * width),
+                int(float(loc.get("y", 0.0)) * height),
+                int(float(loc.get("w", 0.0)) * width),
+                int(float(loc.get("h", 0.0)) * height),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _request_preview_restart(self, segment_id: str) -> None:
+        """Schedule a debounced live-preview hot-reload.
+
+        Called from any handler that mutates state the renderer's
+        schedule depends on — beat ticks, mode, density, density-gap,
+        line zigzag, lane mask…  Multiple consecutive edits within
+        ~80ms coalesce into a single ``update_beats`` /
+        ``update_mode`` call.
+
+        Distinct from the OLD HLS-restart flow with the same name —
+        this no longer cancels any subprocess; it just queues a
+        renderer.update_*() call.  Kept under the same name so all
+        the existing callers in the form / timeline edit handlers
+        keep working without churn.
+        """
+        if not self._preview_mode_active:
+            return
+        if segment_id != self._preview_active_segment_id:
+            return
+        # Default to "everything changed" — cheap because we only fire
+        # ``update_mode`` once and ``update_beats`` once after the
+        # debounce; no per-edit subprocess work to amortise.
+        self._live_preview_pending_mode = True
+        self._live_preview_pending_beats = True
+        self._preview_restart_timer.start()
+
+    def _request_preview_beats_only(self, segment_id: str) -> None:
+        """Variant of ``_request_preview_restart`` for pure-beat edits.
+
+        Used by :meth:`_on_beat_events_edited` so a beat-tick drag
+        doesn't also rebuild the cam/tunnel/HUD scene — that would
+        be wasteful (mode hasn't changed) and adds a few hundred ms
+        of latency on top of the schedule rebuild.
+        """
+        if not self._preview_mode_active:
+            return
+        if segment_id != self._preview_active_segment_id:
+            return
+        self._live_preview_pending_beats = True
+        self._preview_restart_timer.start()
+
+    def _perform_live_preview_update(self) -> None:
+        """Apply the queued mode/beat hot-reload to the live renderer."""
+        if not self._preview_mode_active:
+            return
+        seg_id = self._preview_active_segment_id
+        if seg_id is None:
+            return
+        segment = self.project.get_segment(seg_id)
+        if segment is None:
+            self._stop_preview_mode()
+            return
+
+        do_mode = self._live_preview_pending_mode
+        do_beats = self._live_preview_pending_beats
+        # Reset the dirty flags BEFORE issuing the calls so an edit
+        # that lands during the update is still picked up by the
+        # next debounce tick instead of being lost when we clear at
+        # the bottom.
+        self._live_preview_pending_mode = False
+        self._live_preview_pending_beats = False
+
+        # Mode update goes first because update_mode rebuilds the
+        # scene (cam / tunnel / game), which means the schedule has
+        # to be re-derived from the current beat array anyway — so we
+        # follow with update_beats whenever the user has re-edited
+        # the array since the renderer was constructed.
+        #
+        # Decor params (stickman visibility / box, floor panels) are
+        # bundled into this call so a single ``_build_scene`` rebuild
+        # picks up everything the user just edited in the segment-
+        # config form (mode + Sticky Man + Floor panels) or via the
+        # player's stickman drag overlay.  Passing them on every mode
+        # update — even when only the mode list changed — is harmless:
+        # the renderer just rebinds attrs to their existing values.
+        if do_mode:
+            rs = segment.render_settings or {}
+            show_stickman = bool(rs.get("stickman", True))
+            show_floor_panels = bool(rs.get("floor_panels", True))
+            stickman_box = (
+                self._segment_stickman_box_pixels(segment)
+                if show_stickman else None
+            )
+            try:
+                self.preview_panel.update_live_mode(
+                    segment.mode,
+                    show_stickman=show_stickman,
+                    stickman_box=stickman_box,
+                    show_floor_panels=show_floor_panels,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[preview] update_mode error: {exc!r}", flush=True)
+        if do_beats:
+            beat_times: list[float] = []
+            for ev in (segment.beat_events or []):
+                try:
+                    t = (
+                        float(ev[0])
+                        if isinstance(ev, (tuple, list))
+                        else float(ev)
+                    )
+                except (TypeError, ValueError, IndexError):
+                    continue
+                beat_times.append(max(0.0, t))
+            try:
+                self.preview_panel.update_live_beats(beat_times)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[preview] update_beats error: {exc!r}", flush=True)
 
     def _on_render_segment_requested(self, segment_id: str) -> None:
         segment = self.project.get_segment(segment_id)
@@ -1169,15 +1645,12 @@ class MainWindow(QMainWindow):
             return
         segment.render_status = RenderStatus.RENDERING
         segment.last_render_progress = max(0, min(100, int(progress)))
-        is_preview = segment_id in self._preview_segment_ids
-        label = "Preview" if is_preview else "Rendering"
         self.statusBar().showMessage(
-            f"{label} {segment.name}: {progress}%", 1500
+            f"Rendering {segment.name}: {progress}%", 1500
         )
-        # Big overlay percentage centered on the player.
         self.preview_panel.set_render_progress(
             progress,
-            label=label,
+            label="Rendering",
             subtitle=segment.name,
         )
         # Lightweight status-label-only refresh — never rebuilds form widgets,
@@ -1190,47 +1663,33 @@ class MainWindow(QMainWindow):
         segment = self.project.get_segment(segment_id)
         if segment is None:
             return
-        is_preview = segment_id in self._preview_segment_ids
-        self._preview_segment_ids.discard(segment_id)
 
         segment.render_status = RenderStatus.DONE
         segment.last_render_error = None
         segment.last_render_progress = 100
         segment.last_rendered_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-        # Hide the rendering overlay; we're about to load the result.
         self.preview_panel.hide_render_overlay()
 
         # The rendered file's local time 0 corresponds to project time
         # ``segment.start_time_sec`` — pass it so the timeline's red
         # playhead tracks the project timeline (not 0..video_duration).
         offset = float(segment.start_time_sec or 0.0)
-        if is_preview:
-            # Preview renders don't overwrite the segment's official
-            # video_path; they just show the result immediately in the
-            # preview panel.
-            self.statusBar().showMessage(
-                f"Preview ready: {segment.name} — playing…", 5000
-            )
-            self.preview_panel.load_video(output_path, playhead_offset_sec=offset)
-            self.timeline_panel.set_playhead(segment.start_time_sec)
-        else:
-            # Persist the absolute path so the segment knows where its
-            # rendered MP4 lives even after the project file moves.
-            segment.video_path = str(Path(output_path).resolve())
-            self.statusBar().showMessage(
-                f"Render done: {segment.name} — playing…", 5000
-            )
-            # Auto-load + play the rendered video, mirroring the Preview UX.
-            # ``load_video`` queues playback so it kicks in as soon as the
-            # player reports the media is ready.
-            self.preview_panel.load_video(output_path, playhead_offset_sec=offset)
-            self.timeline_panel.set_playhead(segment.start_time_sec)
-            # Persist render metadata (video_path, status, timestamp) to
-            # disk immediately so a crash / accidental close doesn't lose
-            # the freshly rendered association.  Skipped for previews
-            # since they don't mutate any saved state.
-            self._auto_save_after_render(segment.name)
+        # Persist the absolute path so the segment knows where its
+        # rendered MP4 lives even after the project file moves.
+        segment.video_path = str(Path(output_path).resolve())
+        self.statusBar().showMessage(
+            f"Render done: {segment.name} — playing…", 5000
+        )
+        # Auto-load + play the rendered video.  ``load_video`` queues
+        # playback so it kicks in as soon as the player reports the
+        # media is ready.
+        self.preview_panel.load_video(output_path, playhead_offset_sec=offset)
+        self.timeline_panel.set_playhead(segment.start_time_sec)
+        # Persist render metadata (video_path, status, timestamp) to
+        # disk immediately so a crash / accidental close doesn't lose
+        # the freshly rendered association.
+        self._auto_save_after_render(segment.name)
 
         self.segment_panel.set_segment(segment)
         self.timeline_panel.refresh()
@@ -1265,13 +1724,13 @@ class MainWindow(QMainWindow):
         segment = self.project.get_segment(segment_id)
         if segment is None:
             return
-        self._preview_segment_ids.discard(segment_id)
         segment.render_status = RenderStatus.ERROR
         segment.last_render_error = message
         segment.last_render_progress = 0
         self.preview_panel.hide_render_overlay()
         self.statusBar().showMessage(f"Render failed: {segment.name}", 5000)
         self.segment_panel.set_segment(segment)
+        self._sync_preview_button_state()
         self._update_status()
 
     def _update_status(self) -> None:
