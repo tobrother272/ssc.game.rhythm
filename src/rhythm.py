@@ -3958,6 +3958,12 @@ class RhythmVisualizer:
         self.BEAT_MIN_GAP:  int   = 4        # frames between targets
         self.BEAT_BPM:      float | None = None  # override tempo detection
         self.BEAT_DENSITY:  float = 1.0      # 0.5 = half, 2.0 = double cadence
+        # Audio-amplitude floor (0..1) — events whose ``event_heights``
+        # entry is below this threshold are dropped right before
+        # ``--export_events`` writes the JSON, so the studio's
+        # waveform-threshold slider can ask the rhythm core for a
+        # pre-filtered set instead of dimming ticks client-side.
+        self.BEAT_HEIGHT_THRESHOLD: float = 0.0
         # Hit-time list used in BEAT_SOURCE='array' (seconds, sorted, deduped,
         # already filtered to [0, duration)).  Empty list in any other source.
         self.BEAT_TIMES:    list[float] = []
@@ -4817,6 +4823,69 @@ class RhythmVisualizer:
         else:
             event_heights = [1.0] * len(stick_events)
 
+        # Apply the audio-amplitude threshold (powers the studio's
+        # waveform red-line slider).
+        #
+        # The naive approach — filter ``stick_events`` by their
+        # nearest-column height — silently DROPS peaks that the
+        # ``GameManager.pre_schedule`` lane-spacing constraints
+        # (``MAX_PER_LANE``, ``min_lane_gap``) had already removed
+        # from ``self.targets``.  Symptom: the user sees red wave
+        # peaks above the threshold line on the timeline that have
+        # NO corresponding beat tick, because the scheduler quietly
+        # skipped that beat as "lane stacked" before the threshold
+        # filter ever ran.
+        #
+        # The user's expectation is "every red peak above the line
+        # is a beat".  To honour that we REGENERATE the event list
+        # straight from ``wave_columns`` whose normalised height is
+        # ≥ threshold, completely bypassing the lane scheduler for
+        # this export.  The rendered video downstream is unaffected:
+        # it still runs ``GameManager`` against the supplied beat
+        # times via ``--beat_source array`` and applies its own
+        # spacing rules — but the studio's timeline preview now
+        # matches the visible peaks 1:1.
+        #
+        # Skipped when:
+        #   - ``BEAT_SOURCE == 'array'`` (caller already chose the
+        #     exact event set; we must not silently rewrite it).
+        #   - No wave columns were detected (pure-tone or silent
+        #     audio); the original event list is still useful.
+        if (
+            self.BEAT_HEIGHT_THRESHOLD > 1e-6
+            and self.BEAT_SOURCE != 'array'
+            and wave_columns
+        ):
+            thr = float(self.BEAT_HEIGHT_THRESHOLD)
+            _max_h = max(float(c.get('height', 0.0))
+                         for c in wave_columns)
+            _max_h = max(_max_h, 1e-9)
+            new_events: list = []
+            new_heights: list[float] = []
+            for c in wave_columns:
+                h_norm = float(c.get('height', 0.0)) / _max_h
+                h_norm = max(0.0, min(1.0, h_norm))
+                if h_norm < thr - 1e-6:
+                    continue
+                t_sec = float(int(c['rise_f'])) / float(self.FPS)
+                if t_sec < 0.0 or t_sec >= float(total_duration):
+                    continue
+                # Generic "punch" kind — the studio timeline ignores
+                # ``kind`` for visual styling (it just stores it for
+                # round-trip), and the render path overrides it via
+                # its own scheduler when the studio re-feeds the
+                # times via ``--beat_times``.
+                new_events.append((t_sec, 'L'))
+                new_heights.append(h_norm)
+            print(
+                f"[beat_height_threshold {thr:.3f}] derived "
+                f"{len(new_events)} events from {len(wave_columns)} "
+                f"wave columns (was {len(stick_events)} scheduler "
+                f"events; bypassing lane-spacing for export)"
+            )
+            stick_events  = new_events
+            event_heights = new_heights
+
         # Persist events so stickman.py can render a standalone video that
         # lines up frame-for-frame with THIS rhythm render.
         if getattr(self, 'EXPORT_EVENTS', None):
@@ -5214,6 +5283,14 @@ def parse_arguments():
     p.add_argument('--beat_min_gap', type=int, default=4,
                    help=('Minimum frames between consecutive targets '
                          '(to avoid visual overlap). Default 4.'))
+    p.add_argument('--beat_height_threshold', type=float, default=0.0,
+                   metavar='0..1',
+                   help=('Drop events whose audio amplitude (0..1, '
+                         'normalised against the loudest column in the '
+                         'song) falls below this threshold. Useful for '
+                         'silencing weak ticks driven by the rhythm '
+                         'studio threshold slider. 0 keeps every event '
+                         '(default), 1 keeps only the single loudest.'))
     p.add_argument('--density', type=float, default=None,
                    help=('Overall block density multiplier. '
                          '0.5 = half as many blocks (sparser), '
@@ -5403,6 +5480,9 @@ if __name__ == '__main__':
     viz.BEAT_SENS     = args.beat_sens
     viz.BEAT_SUBDIV   = args.beat_subdiv
     viz.BEAT_MIN_GAP  = args.beat_min_gap
+    viz.BEAT_HEIGHT_THRESHOLD = max(0.0, min(1.0, float(
+        args.beat_height_threshold or 0.0
+    )))
     viz.BEAT_TIMES    = _parse_beat_times(args)
     # Per-mode density default: punch = every beat (1.0), dance = every
     # other beat (0.5, matches the CapCut reference's sparser stomp

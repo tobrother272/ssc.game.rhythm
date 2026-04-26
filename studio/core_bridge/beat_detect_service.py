@@ -48,6 +48,12 @@ class BeatDetectJob:
     density: float = 0.5
     speed: float = 0.8
     fps: int = 30
+    # Audio-amplitude floor (0..1) — passed to ``rhythm.py`` as
+    # ``--beat_height_threshold`` so the rhythm core returns a
+    # pre-filtered events list. Mirrors
+    # :pyattr:`Segment.beat_height_threshold` and is what powers the
+    # studio's red threshold slider over the waveform.
+    beat_height_threshold: float = 0.0
     extra_args: List[str] = field(default_factory=list)
 
     def cache_key(self) -> tuple:
@@ -78,6 +84,7 @@ class BeatDetectJob:
             round(self.density, 4),
             round(self.speed, 4),
             int(self.fps),
+            round(self.beat_height_threshold, 4),
             tuple(self.extra_args),
         )
 
@@ -106,6 +113,7 @@ def _build_command(job: BeatDetectJob, repo_root: Path, events_path: Path,
         "--beat_min_gap", str(int(job.beat_min_gap)),
         "--density", str(job.density),
         "--speed", str(job.speed),
+        "--beat_height_threshold", str(float(job.beat_height_threshold)),
         "-d", str(int(round(job.duration_sec))),
     ]
     cmd.extend(job.extra_args)
