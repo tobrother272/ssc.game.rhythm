@@ -271,9 +271,6 @@ class MainWindow(QMainWindow):
             self._on_beat_threshold_changed
         )
         self.preview_panel.playhead_changed.connect(self.timeline_panel.set_playhead)
-        self.preview_panel.playback_state_changed.connect(
-            self._on_preview_playback_state_changed
-        )
         self.preview_panel.stickman_location_changed.connect(
             self._on_stickman_location_edited
         )
@@ -1023,30 +1020,6 @@ class MainWindow(QMainWindow):
         # the user hits Render / Preview.
         self._request_audio_trim(segment)
         self._on_project_changed()
-
-    def _on_preview_playback_state_changed(self, state_value: int) -> None:
-        """Allow timeline scrubbing only while preview is Playing / Paused.
-
-        The user explicitly asked that the red playhead stop following
-        mouse clicks whenever the preview video is in StoppedState — a
-        click on the timeline (or even the playhead itself) while the
-        media is parked must NOT lurch playback to a new position.
-        StoppedState's enum value is 0 (matches PySide6's
-        ``QMediaPlayer.PlaybackState.StoppedState``); anything else is
-        Playing or Paused, both of which keep scrubbing live so the
-        user can still seek mid-playback or while paused.
-
-        Compares against ``StoppedState.value`` rather than wrapping
-        the enum in ``int(...)`` because PySide6's ``PlaybackState``
-        is not an ``IntEnum`` in every build (CPython 3.13 + Qt 6.7+
-        raises ``TypeError`` on direct ``int(state)`` conversion).
-        """
-        from PySide6.QtMultimedia import QMediaPlayer
-
-        is_stopped = state_value == int(
-            QMediaPlayer.PlaybackState.StoppedState.value
-        )
-        self.timeline_panel.set_scrub_enabled(not is_stopped)
 
     def _on_segment_selected(self, segment: Segment | None) -> None:
         self.segment_panel.set_segment(segment)

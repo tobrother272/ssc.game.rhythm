@@ -741,7 +741,12 @@ class PreviewPanel(QWidget):
         self.play_button = QPushButton("Play")
         self.play_button.clicked.connect(self._toggle_play)
         self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.player.stop)
+        # Use Pause + rewind-to-0 instead of QMediaPlayer.stop().  A real
+        # ``stop()`` resets ``duration()`` to 0, which collapses the seek
+        # slider's range to ``(0, 0)`` and makes scrubbing impossible
+        # until the user hits Play again.  Pausing keeps the duration so
+        # the user can drag the slider around even when "stopped".
+        self.stop_button.clicked.connect(self._on_stop_clicked)
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderMoved.connect(self.player.setPosition)
@@ -913,6 +918,17 @@ class PreviewPanel(QWidget):
             return
 
         self.player.play()
+
+    def _on_stop_clicked(self) -> None:
+        """Stop button: pause and rewind to the start.
+
+        ``QMediaPlayer.stop()`` would reset ``duration()`` to 0 and
+        collapse the seek slider to an unusable ``(0, 0)`` range.  By
+        pausing instead we keep the duration so the user can still
+        scrub the slider while playback is parked.
+        """
+        self.player.pause()
+        self.player.setPosition(0)
 
     def _on_position_changed(self, value: int) -> None:
         self.seek_slider.blockSignals(True)

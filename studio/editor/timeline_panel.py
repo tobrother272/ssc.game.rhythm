@@ -84,6 +84,15 @@ ZOOM_MAX_STEP_SEC = 300.0        # loosest zoom: 5 min/tick
 ZOOM_MIN_PPS = TARGET_MAJOR_PX / ZOOM_MAX_STEP_SEC   # ≈ 0.267 px/s
 ZOOM_MAX_PPS = TARGET_MAJOR_PX / ZOOM_MIN_STEP_SEC   # = 8000  px/s
 ZOOM_SLIDER_RES = 1000           # slider granularity (0..1000)
+# "Ratio" button locks zoom to an absolute pixels-per-second value so
+# the waveform's visual shape is identical across window sizes /
+# monitors / zoom states.  Reference frame: ``RATIO_LOCK_VIEW_SEC``
+# seconds span exactly ``RATIO_LOCK_VIEW_WIDTH_PX`` of timeline width.
+# Wider viewports just show more seconds; the px-per-second ratio
+# never changes.
+RATIO_LOCK_VIEW_SEC = 10.0
+RATIO_LOCK_VIEW_WIDTH_PX = 1080.0
+RATIO_LOCK_PPS = RATIO_LOCK_VIEW_WIDTH_PX / RATIO_LOCK_VIEW_SEC  # = 108 px/s
 # "Nice" major-tick intervals in seconds; we always pick the smallest
 # value >= raw target.  Goes from 10 ms up to 5 min.
 _NICE_MAJOR_STEPS = (
@@ -1029,14 +1038,11 @@ class TimelineView(QGraphicsView):
         # (an internal PanelRoot QWidget), so we keep a direct
         # reference here for keyboard / focus dispatch.
         self._panel_ref: Optional["TimelinePanel"] = None
-        # When False, mouse clicks/drags on the timeline do NOT scrub the
-        # red playhead.  Toggled by :class:`MainWindow` whenever the
-        # preview player enters / leaves the StoppedState so a stopped
-        # video doesn't surprise-jump every time the user clicks the
-        # ruler or waveform area while doing other work.  Defaults to
-        # False because Qt's QMediaPlayer starts in StoppedState and
-        # ``playbackStateChanged`` won't fire for that initial value.
-        self._scrub_enabled = False
+        # Mouse clicks/drags on the timeline always scrub the red
+        # playhead — including when the preview player is in
+        # StoppedState.  Users explicitly asked to be able to seek
+        # while the video isn't playing.
+        self._scrub_enabled = True
         self.setAcceptDrops(True)
         self.setRenderHints(self.renderHints())
         # Default QGraphicsView aligns the scene to AlignCenter — that left
@@ -1547,6 +1553,9 @@ class TimelinePanel(QWidget):
             self.overview_bar.set_selected(self._selected_segment_id)
             self.overview_bar.set_focused(self._focus_segment_id)
             self.overview_bar.update()
+            # Reflect any pps change (auto-fit on resize, focus enter,
+            # Ctrl+wheel) on the Ratio button's checked state.
+            self._sync_ratio_button_state()
         finally:
             self._refresh_pending = False
 
@@ -2237,20 +2246,6 @@ class TimelinePanel(QWidget):
         self._draw_playhead(time_sec)
         self._playhead_label.setText(format_seconds(self._playhead_time_sec))
 
-    def set_scrub_enabled(self, enabled: bool) -> None:
-        """Allow / disallow mouse-driven playhead scrubbing.
-
-        Disabled while the preview player is in ``StoppedState`` so the
-        red playhead doesn't lurch to wherever the user clicks while
-        the video is parked — only Play / Pause states keep scrubbing
-        available.  Drag-in-progress is also cancelled defensively so
-        a stop-while-dragging doesn't leave the playhead frozen
-        mid-drag.
-        """
-        self.view._scrub_enabled = bool(enabled)
-        if not enabled:
-            self.view._dragging_playhead = False
-
     def _build_ui(self) -> None:
         self.setObjectName("PanelRoot")
         outer = QVBoxLayout(self)
@@ -2357,6 +2352,20 @@ class TimelinePanel(QWidget):
         )
         self.zoom_fit_button.clicked.connect(self._on_zoom_fit_clicked)
         top.addWidget(self.zoom_fit_button)
+
+        self.zoom_ratio_button = QPushButton("Ratio")
+        self.zoom_ratio_button.setObjectName("zoomButton")
+        self.zoom_ratio_button.setFixedWidth(48)
+        self.zoom_ratio_button.setCheckable(True)
+        self.zoom_ratio_button.setToolTip(
+            f"Lock zoom to a fixed {RATIO_LOCK_PPS:.0f} px/s "
+            f"({RATIO_LOCK_VIEW_SEC:.0f}s in {RATIO_LOCK_VIEW_WIDTH_PX:.0f}px).\n"
+            "Wider viewports show more seconds, narrower ones less — the\n"
+            "waveform's visual shape is identical across window sizes.\n"
+            "Button stays highlighted while the lock is active."
+        )
+        self.zoom_ratio_button.clicked.connect(self._on_zoom_ratio_clicked)
+        top.addWidget(self.zoom_ratio_button)
 
         # Rule mode toggle — pulls each beat tick downward as a dashed
         # vertical guide that overlays the waveform, making it easy to
@@ -2500,6 +2509,7 @@ class TimelinePanel(QWidget):
         target = pps_to_slider_value(self.pixels_per_second)
         if self.zoom_slider.value() == target:
             self._update_zoom_slider_tooltip()
+            self._sync_ratio_button_state()
             return
         blocked = self.zoom_slider.blockSignals(True)
         try:
@@ -2507,6 +2517,28 @@ class TimelinePanel(QWidget):
         finally:
             self.zoom_slider.blockSignals(blocked)
         self._update_zoom_slider_tooltip()
+        self._sync_ratio_button_state()
+
+    def _sync_ratio_button_state(self) -> None:
+        """Light up the Ratio button iff current zoom matches the lock value.
+
+        The lock applies to whichever pps is "live": ``_effective_pps`` in
+        focus mode, ``pixels_per_second`` in overview mode.  Block the
+        button's signals while flipping its checked state so we don't
+        re-trigger ``_on_zoom_ratio_clicked``.
+        """
+        if not hasattr(self, "zoom_ratio_button"):
+            return
+        in_focus = self._focus_segment_id is not None
+        cur_pps = self._effective_pps if in_focus else self.pixels_per_second
+        locked = abs(cur_pps - RATIO_LOCK_PPS) < 0.01
+        if self.zoom_ratio_button.isChecked() == locked:
+            return
+        blocked = self.zoom_ratio_button.blockSignals(True)
+        try:
+            self.zoom_ratio_button.setChecked(locked)
+        finally:
+            self.zoom_ratio_button.blockSignals(blocked)
 
     def _update_zoom_slider_tooltip(self) -> None:
         if not hasattr(self, "zoom_slider"):
@@ -2565,6 +2597,33 @@ class TimelinePanel(QWidget):
         usable_px = max(40.0, viewport_w - padding_px * 2)
         pps = usable_px / max(0.01, end_sec)
         self._apply_zoom(pps)
+        self.view.horizontalScrollBar().setValue(0)
+
+    def _on_zoom_ratio_clicked(self) -> None:
+        """Lock zoom to ``RATIO_LOCK_PPS`` (absolute px/s).
+
+        Reference: ``RATIO_LOCK_VIEW_SEC`` seconds in
+        ``RATIO_LOCK_VIEW_WIDTH_PX`` pixels of timeline width.  Since
+        pps is independent of the viewport, the waveform's visual
+        shape (peaks, spacing, slopes) is byte-for-byte identical
+        whether the window is 800px or 2560px wide — only the COUNT
+        of visible seconds varies.
+
+        Focus-aware: in focus mode we treat this as a manual zoom on
+        the focused segment (same path as Ctrl+wheel zoom) so the
+        user stays focused — only the visible-seconds ratio is
+        rewritten.  In overview mode it routes through ``_apply_zoom``
+        normally.
+        """
+        pps = RATIO_LOCK_PPS
+        if self._focus_segment_id is not None:
+            self._focus_manual_zoom = True
+            self._effective_pps = pps
+            self.view._pps = pps
+            self._sync_zoom_slider()
+            self.refresh()
+        else:
+            self._apply_zoom(pps)
         self.view.horizontalScrollBar().setValue(0)
 
     def _on_rule_toggled(self, checked: bool) -> None:
@@ -3195,19 +3254,34 @@ class TimelinePanel(QWidget):
         if x1 <= x0:
             return
 
-        span_px = max(1, int(x1 - x0))
-        step    = max(1, span_px // 360)
-
         rms_window  = rms[start_idx:end_idx]
         total_ticks = len(rms_window)
         if total_ticks < 1:
             return
 
+        # Sample each visible pixel directly against the RMS tick stream.
+        # Earlier this was ``step = span_px // 360`` which made step grow
+        # with the scene (60 inside a 200-second segment, 3 inside a
+        # 10-second one), so the same audio rendered very differently in
+        # a long vs short segment even at identical pps.  We now clip the
+        # loop to the painter's dirty rect (Qt's drawBackground passes
+        # the visible area) and sample one rms tick per pixel via
+        # ``px / px_per_tick`` — independent of total scene width.
+        draw_x0 = max(x0, float(rect.left()))
+        draw_x1 = min(x1, float(rect.right()))
+        if draw_x1 <= draw_x0:
+            return
+
+        # When pps >> rms_per_sec each tick is many pixels wide; step by
+        # tick-width so we don't redundantly sample the same tick multiple
+        # times.  Otherwise step every pixel for crisp peaks.
+        step = max(1, int(px_per_tick))
+
         pts: list[tuple[float, float]] = []
-        for x in range(int(x0), int(x1) + 1, step):
-            frac = (x - x0) / float(max(1, x1 - x0))
-            wf_i = min(total_ticks - 1,
-                       max(0, int(round(frac * (total_ticks - 1)))))
+        for x in range(int(draw_x0), int(draw_x1) + 1, step):
+            wf_i = int(round(x / px_per_tick))
+            if wf_i < 0 or wf_i >= total_ticks:
+                continue
             amp = float(rms_window[wf_i])
             yv  = wy1 - amp * (wy1 - wy0 - 2)
             pts.append((float(x), yv))
@@ -3228,12 +3302,16 @@ class TimelinePanel(QWidget):
             painter.setPen(QPen(QColor(90, 90, 90), 1))
             painter.drawLine(QPointF(x0, wy1), QPointF(x1, wy1))
 
-            # Translucent fill polygon under the peaks.
+            # Translucent fill polygon under the peaks.  Bookend with the
+            # first/last sampled X (not the full [x0, x1] span) so we
+            # don't draw a diagonal line from the scene edge to the
+            # leftmost visible peak when ``pts`` is clipped to the
+            # painter's dirty rect.
             fill_path = QPainterPath()
-            fill_path.moveTo(x0, wy1)
+            fill_path.moveTo(pts[0][0], wy1)
             for x, y in pts:
                 fill_path.lineTo(x, y)
-            fill_path.lineTo(x1, wy1)
+            fill_path.lineTo(pts[-1][0], wy1)
             fill_path.closeSubpath()
             painter.setPen(QPen(Qt.PenStyle.NoPen))
             painter.setBrush(

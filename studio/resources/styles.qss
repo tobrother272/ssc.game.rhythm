@@ -276,6 +276,18 @@ QPushButton#zoomButton {
     font-weight: 600;
 }
 QPushButton#zoomButton:hover { background-color: #2e2e2e; color: #ffffff; }
+/* Ratio is the only checkable zoomButton — light it up cyan when the
+   pps lock is active so the user can see at a glance whether the
+   waveform's pixel-shape is currently locked across resizes. */
+QPushButton#zoomButton:checked {
+    background-color: #1a3a52;
+    color: #3bb6ff;
+    border: 1px solid #3bb6ff;
+}
+QPushButton#zoomButton:checked:hover {
+    background-color: #234a68;
+    color: #ffffff;
+}
 
 /* Rule-mode toggle next to Fit — same visual family as zoom buttons,
    but lights up cyan when checked so the user can see at a glance
