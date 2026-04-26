@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -20,6 +21,208 @@ from PySide6.QtWidgets import (
 )
 
 from studio.models import MediaItem, Segment
+
+
+# ---------------------------------------------------------------------------
+# Stickman draw-box editor widget
+# ---------------------------------------------------------------------------
+class StickmanBoxOverlay(QWidget):
+    """Draggable + resizable rectangle for setting the stickman draw-box.
+
+    This widget is used as a **dedicated page inside the player
+    stage_stack** so it is never layered over the native QVideoWidget
+    HWND (which would make it invisible on Windows).  When the user
+    toggles "Stick Box" the stage switches to this page; toggling off
+    restores the previous page.
+
+    Coordinates are stored as fractions (0..1) of the widget rect so
+    the value is resolution-independent.  The same fractions are saved
+    on :class:`Segment.stickman_location` and forwarded to
+    ``rhythm.py`` as ``--stick_x0/y0/w/h`` pixels at render time.
+
+    Emits ``box_committed`` on mouse release; ``box_changing`` while
+    dragging.  Both carry ``(x, y, w, h)`` floats in [0, 1].
+    """
+
+    box_committed = Signal(float, float, float, float)
+    box_changing = Signal(float, float, float, float)
+
+    _HANDLE_SIZE = 14
+    _MIN_FRAC = 0.02
+
+    def __init__(self, parent: QWidget) -> None:
+        # Tool window owned by `parent` so it is destroyed with the
+        # panel, but floating independently of the Qt widget hierarchy.
+        # FramelessWindowHint + WA_TranslucentBackground → a DWM-
+        # composited layered HWND that can be placed above QVideoWidget's
+        # native HWND on Windows.  WindowStaysOnTopHint keeps it in
+        # front even while the video is playing.
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self._x: float = 0.010
+        self._y: float = 0.090
+        self._w: float = 0.135
+        self._h: float = 0.540
+        self._drag_kind: Optional[str] = None
+        self._drag_anchor: QPoint = QPoint()
+        self._drag_x0 = 0.0
+        self._drag_y0 = 0.0
+        self._drag_w0 = 0.0
+        self._drag_h0 = 0.0
+
+    # ----- public API ---------------------------------------------------
+    def set_normalized(self, x: float, y: float, w: float, h: float) -> None:
+        """Set the box to the given fractional rect and repaint."""
+        x = max(0.0, min(1.0 - self._MIN_FRAC, float(x)))
+        y = max(0.0, min(1.0 - self._MIN_FRAC, float(y)))
+        w = max(self._MIN_FRAC, min(1.0 - x, float(w)))
+        h = max(self._MIN_FRAC, min(1.0 - y, float(h)))
+        self._x, self._y, self._w, self._h = x, y, w, h
+        self.update()
+
+    def normalized(self) -> tuple[float, float, float, float]:
+        """Return the current box as ``(x, y, w, h)`` fractions."""
+        return self._x, self._y, self._w, self._h
+
+    # ----- internals ----------------------------------------------------
+    def _box_rect_px(self) -> QRect:
+        s = self.rect()
+        return QRect(
+            int(self._x * s.width()),
+            int(self._y * s.height()),
+            max(1, int(self._w * s.width())),
+            max(1, int(self._h * s.height())),
+        )
+
+    def _hit_test(self, pos: QPoint) -> Optional[str]:
+        bx = self._box_rect_px()
+        hs = self._HANDLE_SIZE
+        # Corner handles centered on each corner — listed before the
+        # body check so resizing a tiny box from a corner takes
+        # precedence over moving it.
+        corners = {
+            "tl": QRect(bx.left() - hs // 2, bx.top() - hs // 2, hs, hs),
+            "tr": QRect(bx.right() - hs // 2, bx.top() - hs // 2, hs, hs),
+            "bl": QRect(bx.left() - hs // 2, bx.bottom() - hs // 2, hs, hs),
+            "br": QRect(bx.right() - hs // 2, bx.bottom() - hs // 2, hs, hs),
+        }
+        for kind, r in corners.items():
+            if r.contains(pos):
+                return kind
+        if bx.contains(pos):
+            return "move"
+        return None
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        kind = self._hit_test(event.position().toPoint())
+        if kind is None:
+            return
+        self._drag_kind = kind
+        self._drag_anchor = event.position().toPoint()
+        self._drag_x0, self._drag_y0 = self._x, self._y
+        self._drag_w0, self._drag_h0 = self._w, self._h
+        event.accept()
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._drag_kind is None:
+            kind = self._hit_test(event.position().toPoint())
+            cursors = {
+                "tl": Qt.CursorShape.SizeFDiagCursor,
+                "br": Qt.CursorShape.SizeFDiagCursor,
+                "tr": Qt.CursorShape.SizeBDiagCursor,
+                "bl": Qt.CursorShape.SizeBDiagCursor,
+                "move": Qt.CursorShape.SizeAllCursor,
+            }
+            self.setCursor(cursors.get(kind, Qt.CursorShape.ArrowCursor))
+            return
+        s = self.rect()
+        if s.width() <= 0 or s.height() <= 0:
+            return
+        cur = event.position().toPoint()
+        dx = (cur.x() - self._drag_anchor.x()) / float(s.width())
+        dy = (cur.y() - self._drag_anchor.y()) / float(s.height())
+        x, y, w, h = self._drag_x0, self._drag_y0, self._drag_w0, self._drag_h0
+        if self._drag_kind == "move":
+            x = max(0.0, min(1.0 - w, x + dx))
+            y = max(0.0, min(1.0 - h, y + dy))
+        elif self._drag_kind == "tl":
+            new_x = max(0.0, min(x + w - self._MIN_FRAC, x + dx))
+            new_y = max(0.0, min(y + h - self._MIN_FRAC, y + dy))
+            w = w - (new_x - x)
+            h = h - (new_y - y)
+            x, y = new_x, new_y
+        elif self._drag_kind == "tr":
+            new_y = max(0.0, min(y + h - self._MIN_FRAC, y + dy))
+            new_w = max(self._MIN_FRAC, min(1.0 - x, w + dx))
+            h = h - (new_y - y)
+            y, w = new_y, new_w
+        elif self._drag_kind == "bl":
+            new_x = max(0.0, min(x + w - self._MIN_FRAC, x + dx))
+            new_h = max(self._MIN_FRAC, min(1.0 - y, h + dy))
+            w = w - (new_x - x)
+            x, h = new_x, new_h
+        elif self._drag_kind == "br":
+            w = max(self._MIN_FRAC, min(1.0 - x, w + dx))
+            h = max(self._MIN_FRAC, min(1.0 - y, h + dy))
+        self._x, self._y, self._w, self._h = x, y, w, h
+        self.update()
+        self.box_changing.emit(self._x, self._y, self._w, self._h)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._drag_kind is None:
+            return
+        self._drag_kind = None
+        self.box_committed.emit(self._x, self._y, self._w, self._h)
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # WA_TranslucentBackground: the widget window is fully transparent
+        # except for what we explicitly paint here.  The video playing
+        # behind shows through the unpainted areas.
+        bx = self._box_rect_px()
+
+        # Semi-transparent cyan fill so the region is recognisable but
+        # the video underneath is still legible (~50% opacity).
+        p.fillRect(bx, QBrush(QColor(0, 200, 255, 80)))
+
+        # Bright dashed outline
+        pen = QPen(QColor(0, 230, 255), 2.5, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(bx)
+
+        # Corner resize handles — solid so they are easy to grab
+        hs = self._HANDLE_SIZE
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        p.setBrush(QBrush(QColor(0, 210, 255, 230)))
+        for cx, cy in [
+            (bx.left(), bx.top()),
+            (bx.right(), bx.top()),
+            (bx.left(), bx.bottom()),
+            (bx.right(), bx.bottom()),
+        ]:
+            p.drawRect(cx - hs // 2, cy - hs // 2, hs, hs)
+
+        # Coordinate label — dark shadow then bright text for readability
+        # regardless of what's playing beneath.
+        label = (f"x:{self._x*100:.1f}%  y:{self._y*100:.1f}%  "
+                 f"w:{self._w*100:.1f}%  h:{self._h*100:.1f}%")
+        lx, ly = bx.left() + 7, bx.top() + 17
+        p.setPen(QColor(0, 0, 0, 160))
+        p.drawText(lx + 1, ly + 1, label)
+        p.setPen(QColor(220, 245, 255))
+        p.drawText(lx, ly, label)
 
 
 def format_ms(ms: int) -> str:
@@ -39,6 +242,12 @@ class PreviewPanel(QWidget):
     # only allow the user to scrub the red playhead while the preview
     # is in Playing or Paused state, never when it's Stopped.
     playback_state_changed = Signal(int)
+    # Emitted when the user finishes adjusting the stickman draw-box
+    # overlay (mouse release).  Carries ``(segment_id, location_dict)``
+    # where ``location_dict`` is ``{"x", "y", "w", "h"}`` fractions
+    # (0..1) of the rendered video frame.  MainWindow listens, writes
+    # to ``segment.stickman_location``, and triggers a project save.
+    stickman_location_changed = Signal(str, dict)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -70,6 +279,104 @@ class PreviewPanel(QWidget):
         self._playhead_offset_sec = 0.0
         if self.source_combo.currentData() == "media":
             self._load_active_source()
+
+    # ------------------------------------------------------------------
+    # Stickman overlay
+    # ------------------------------------------------------------------
+    def _segment_stick_fractions(
+        self, segment: Optional[Segment]
+    ) -> tuple[float, float, float, float]:
+        """Resolve a segment's stickman fractions or return safe defaults."""
+        defaults = (0.010, 0.090, 0.135, 0.540)
+        if segment is None:
+            return defaults
+        loc = getattr(segment, "stickman_location", None) or {}
+        try:
+            return (
+                float(loc.get("x", defaults[0])),
+                float(loc.get("y", defaults[1])),
+                float(loc.get("w", defaults[2])),
+                float(loc.get("h", defaults[3])),
+            )
+        except (TypeError, ValueError):
+            return defaults
+
+    def _segment_stickman_enabled(self, segment: Optional[Segment]) -> bool:
+        """True when the segment's render settings have stickman on."""
+        if segment is None:
+            return False
+        rs = getattr(segment, "render_settings", None) or {}
+        # Default in BaseRenderSettings is True, so a missing key is
+        # treated as enabled — only an explicit ``False`` disables it.
+        val = rs.get("stickman", True)
+        return bool(val)
+
+    def _refresh_stickman_button_state(self) -> None:
+        """Enable/disable the toolbar toggle based on current segment."""
+        seg = self._selected_segment
+        enabled = self._segment_stickman_enabled(seg)
+        self.stickman_button.setEnabled(enabled)
+        if not enabled and self.stickman_button.isChecked():
+            # Auto-untoggle when leaving a stickman-enabled segment so a
+            # stale overlay doesn't linger over an unrelated source.
+            self.stickman_button.setChecked(False)
+        if enabled and seg is not None:
+            self.stickman_overlay.set_normalized(
+                *self._segment_stick_fractions(seg)
+            )
+
+    def _sync_stickman_overlay_pos(self) -> None:
+        """Keep the floating overlay snapped to the stage_stack area.
+
+        Called by ``_stickman_pos_timer`` at 50ms intervals while the
+        editor is active, and once immediately when toggled on, so the
+        overlay follows window moves and resize events automatically.
+        """
+        if not self._stickman_edit_active:
+            return
+        tl = self.stage_stack.mapToGlobal(QPoint(0, 0))
+        sz = self.stage_stack.size()
+        self.stickman_overlay.setGeometry(tl.x(), tl.y(), sz.width(), sz.height())
+
+    def _on_stickman_edit_toggled(self, checked: bool) -> None:
+        """Show / hide the floating transparent stickman draw-box overlay."""
+        self._stickman_edit_active = bool(checked)
+        if checked:
+            seg = self._selected_segment
+            if seg is None or not self._segment_stickman_enabled(seg):
+                self.stickman_button.setChecked(False)
+                return
+            self.stickman_overlay.set_normalized(
+                *self._segment_stick_fractions(seg)
+            )
+            self._sync_stickman_overlay_pos()
+            self.stickman_overlay.show()
+            self._stickman_pos_timer.start()
+        else:
+            self._stickman_pos_timer.stop()
+            self.stickman_overlay.hide()
+
+    def _on_stickman_box_committed(
+        self, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Persist the user's drag/resize back onto the segment."""
+        seg = self._selected_segment
+        if seg is None:
+            return
+        location = {
+            "x": float(x),
+            "y": float(y),
+            "w": float(w),
+            "h": float(h),
+        }
+        # Update the in-memory segment immediately so subsequent UI
+        # reads (e.g. switching sources and back) see the new values
+        # even before MainWindow finishes the project save.
+        try:
+            seg.stickman_location = location
+        except AttributeError:
+            pass
+        self.stickman_location_changed.emit(seg.id, location)
 
     def set_source_segment(self, segment: Segment | None) -> None:
         """Set selected segment and load the most useful source for preview.
@@ -106,6 +413,7 @@ class PreviewPanel(QWidget):
             # The rendered video starts at project-time = segment.start.
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
             self._load_path(segment.video_path)  # type: ignore[arg-type]
+            self._refresh_stickman_button_state()
             return
 
         if segment.audio_path:
@@ -113,9 +421,15 @@ class PreviewPanel(QWidget):
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = 0.0
             self._load_path(segment.audio_path)
+            self._refresh_stickman_button_state()
             return
 
         self.clear()
+        # ``clear()`` resets the stickman toggle as a safety net when
+        # the player is genuinely empty, but a segment is still
+        # selected here — re-enable the toggle so the user can adjust
+        # the box even before any audio / render is attached.
+        self._refresh_stickman_button_state()
 
     def _set_source_combo_silently(self, data_value: str) -> None:
         """Set the source combo to the given userData value without firing
@@ -143,6 +457,18 @@ class PreviewPanel(QWidget):
         self.play_button.setEnabled(False)
         self.seek_slider.setRange(0, 0)
         self.time_label.setText("00:00 / 00:00")
+        # Hide the floating stickman overlay and disable the toggle button.
+        if hasattr(self, "_stickman_pos_timer"):
+            self._stickman_pos_timer.stop()
+        if hasattr(self, "stickman_overlay"):
+            self._stickman_edit_active = False
+            self.stickman_overlay.hide()
+        if hasattr(self, "stickman_button"):
+            if self.stickman_button.isChecked():
+                self.stickman_button.blockSignals(True)
+                self.stickman_button.setChecked(False)
+                self.stickman_button.blockSignals(False)
+            self.stickman_button.setEnabled(False)
 
     def _build_ui(self) -> None:
         self.setObjectName("PanelRoot")
@@ -246,6 +572,25 @@ class PreviewPanel(QWidget):
         self.stage_stack.setCurrentIndex(2)  # start on empty page
         body_layout.addWidget(self.stage_stack, 1)
 
+        # Stickman draw-box overlay — a floating Tool window with
+        # WA_TranslucentBackground so the video playing on QVideoWidget
+        # (native HWND) shows through at ~50% opacity while the user
+        # drags the cyan box to set the stickman position.
+        # Position is kept in sync with stage_stack via a 50ms timer
+        # (``_stickman_pos_timer``) so the box tracks the video area
+        # even as the application window is moved or resized.
+        self.stickman_overlay = StickmanBoxOverlay(self)
+        self.stickman_overlay.box_committed.connect(
+            self._on_stickman_box_committed
+        )
+        self._stickman_edit_active: bool = False
+        # Timer that keeps the floating overlay snapped to stage_stack.
+        self._stickman_pos_timer = QTimer(self)
+        self._stickman_pos_timer.setInterval(50)
+        self._stickman_pos_timer.timeout.connect(
+            self._sync_stickman_overlay_pos
+        )
+
         # Dots animation timer for loading label.
         self._loading_dots = 0
         self._loading_timer = QTimer(self)
@@ -290,6 +635,19 @@ class PreviewPanel(QWidget):
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.full_button = QPushButton("Fullscreen")
         self.full_button.clicked.connect(self._toggle_fullscreen)
+        # Checkable toggle that exposes the draggable stickman draw-box
+        # overlay on top of the player.  Disabled when no segment is
+        # selected (or the segment has stickman rendering turned off).
+        self.stickman_button = QPushButton("Stick Box")
+        self.stickman_button.setCheckable(True)
+        self.stickman_button.setToolTip(
+            "Toggle the stickman draw-box overlay on the player.\n"
+            "Drag the box to move it; drag the corner handles to resize."
+        )
+        self.stickman_button.toggled.connect(
+            self._on_stickman_edit_toggled
+        )
+        self.stickman_button.setEnabled(False)
 
         self.play_button.setEnabled(False)
 
@@ -301,6 +659,7 @@ class PreviewPanel(QWidget):
         vol_label.setStyleSheet("color:#8a8a8a;")
         control_row.addWidget(vol_label)
         control_row.addWidget(self.volume_slider)
+        control_row.addWidget(self.stickman_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
 

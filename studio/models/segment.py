@@ -59,6 +59,22 @@ class Segment:
     # (we keep the last good list so a transient ffmpeg blip doesn't
     # wipe their preview).
     beat_events: list = field(default_factory=list)
+    # Position + size of the stickman draw-box, expressed as fractions
+    # of the rendered video frame (0..1) so the value is resolution-
+    # independent and survives changes to project output_width /
+    # output_height.  Defaults match StickmanHUD's left-column HUD
+    # (``x=W*1%, y=H*9%, w=W*13.5%, h=H*54%``) which is what
+    # rhythm.py uses when no ``--stick_*`` CLI flag is provided.
+    # When the user drags / resizes the overlay on the Player panel,
+    # the new fractions are saved here and forwarded to rhythm.py as
+    # ``--stick_x0/y0/w/h <pixel>`` at render time
+    # (pixels = fraction × output_width / output_height).
+    stickman_location: dict = field(default_factory=lambda: {
+        "x": 0.010,
+        "y": 0.090,
+        "w": 0.135,
+        "h": 0.540,
+    })
 
     @property
     def duration_sec(self) -> float:

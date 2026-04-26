@@ -55,6 +55,14 @@ class RenderJob:
     # honours the user's timeline edits instead of re-running onset
     # detection (which can drift slightly from the saved positions).
     beat_times: list[float] = field(default_factory=list)
+    # Stickman draw-box position+size as fractions of the rendered
+    # frame (``{"x","y","w","h"}`` each in [0,1]).  Empty / None =
+    # use rhythm.py's built-in default (left-column HUD).  Forwarded
+    # to ``rhythm.py`` as ``--stick_x0/y0/w/h <pixel>`` after
+    # multiplying by ``output_width`` / ``output_height``.  Resolution-
+    # independent on purpose: the user's edit on a 1920x1080 project
+    # is preserved when the project is later re-exported at 4K.
+    stickman_location: dict = field(default_factory=dict)
 
 
 class RenderService(QObject):
@@ -124,6 +132,25 @@ class RenderService(QObject):
             except (TypeError, ValueError, IndexError):
                 continue
             beat_times.append(t)
+        # Stickman draw-box overrides — only forwarded when stickman
+        # rendering is actually enabled in the segment's settings.
+        # Otherwise rhythm.py's StickmanHUD never instantiates, so
+        # the ``--stick_*`` flags would be silently ignored anyway,
+        # and we keep the CLI line shorter for the easier-to-read
+        # log lines.
+        stick_loc: dict = {}
+        rs = segment.render_settings or {}
+        if bool(rs.get("stickman", True)):
+            sl = getattr(segment, "stickman_location", None) or {}
+            try:
+                stick_loc = {
+                    "x": float(sl.get("x", 0.010)),
+                    "y": float(sl.get("y", 0.090)),
+                    "w": float(sl.get("w", 0.135)),
+                    "h": float(sl.get("h", 0.540)),
+                }
+            except (TypeError, ValueError):
+                stick_loc = {}
         return RenderJob(
             segment_id=segment.id,
             mode=segment.mode,
@@ -139,6 +166,7 @@ class RenderService(QObject):
             trimmed_audio_path=segment.trimmed_audio_path,
             project_temps_dir=project_temps_dir,
             beat_times=beat_times,
+            stickman_location=stick_loc,
         )
 
     def _run_loop(self) -> None:
@@ -328,6 +356,46 @@ class RenderService(QObject):
                     )
 
             # ----------------------------------------------------------------
+            # Stickman draw-box override — when the user dragged/resized
+            # the draggable box on the Player panel, the segment carries
+            # a ``stickman_location`` dict (fractions of the rendered
+            # frame).  Translate to pixels using the ACTUAL output
+            # resolution that this job is rendering at (``-W`` / ``-H``
+            # appended above) so a 0.135 width fraction becomes ~260 px
+            # at 1920p, ~520 px at 3840p, etc.  Falls back to the
+            # project's configured resolution and ultimately rhythm.py's
+            # internal 1920x1080 default if none is supplied.  Each
+            # ``--stick_*`` flag accepts -1 to mean "auto", so a missing
+            # key in the dict cleanly defers to rhythm.py's left-column
+            # HUD layout for that one component.
+            # ----------------------------------------------------------------
+            if job.stickman_location:
+                w_px = int(job.output_width or 1920)
+                h_px = int(job.output_height or 1080)
+                if w_px > 0 and h_px > 0:
+                    sl = job.stickman_location
+                    sx = max(-1, int(round(float(sl.get("x", -1)) * w_px))) \
+                        if sl.get("x", None) is not None else -1
+                    sy = max(-1, int(round(float(sl.get("y", -1)) * h_px))) \
+                        if sl.get("y", None) is not None else -1
+                    sw = max(-1, int(round(float(sl.get("w", -1)) * w_px))) \
+                        if sl.get("w", None) is not None else -1
+                    sh = max(-1, int(round(float(sl.get("h", -1)) * h_px))) \
+                        if sl.get("h", None) is not None else -1
+                    command.extend([
+                        "--stick_x0", str(sx),
+                        "--stick_y0", str(sy),
+                        "--stick_w",  str(sw),
+                        "--stick_h",  str(sh),
+                    ])
+                    print(
+                        f"[RenderService] Stickman box override: "
+                        f"x0={sx} y0={sy} w={sw} h={sh} "
+                        f"(frame {w_px}x{h_px})",
+                        flush=True,
+                    )
+
+            # ----------------------------------------------------------------
             # Fast-preview overrides — applied ONLY when this is a Preview
             # render (is_preview=True).  We deliberately keep the gameplay
             # parameters (mode, beats, density, speed, lanes, …) identical
@@ -462,6 +530,7 @@ class RenderService(QObject):
         "speed",
         "floor_panels",
         "stickman",
+        "line_zigzag",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
@@ -475,6 +544,11 @@ class RenderService(QObject):
             if key in cls._SKIP_KEYS:
                 continue
             if key not in cls._ALLOWED_KEYS:
+                continue
+            # Skip Optional fields explicitly set to None — the CLI flag
+            # is omitted so rhythm.py falls back to its own default (e.g.
+            # line_zigzag=None means "Off", i.e. no zigzag pattern).
+            if value is None:
                 continue
             cli_key = f"--{key}"
 

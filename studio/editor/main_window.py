@@ -239,6 +239,9 @@ class MainWindow(QMainWindow):
         self.preview_panel.playback_state_changed.connect(
             self._on_preview_playback_state_changed
         )
+        self.preview_panel.stickman_location_changed.connect(
+            self._on_stickman_location_edited
+        )
         self.segment_panel.segment_changed.connect(self._on_segment_changed_by_form)
         self.segment_panel.render_requested.connect(self._on_render_segment_requested)
         self.segment_panel.preview_requested.connect(self._on_preview_segment_requested)
@@ -699,11 +702,18 @@ class MainWindow(QMainWindow):
             return
 
         rs = segment.render_settings or {}
+        # ``rhythm.py --detect_only`` uses ``_parse_modes()`` which only
+        # understands single-mode names ("punch","dance","line","relax") or
+        # comma-combined specs ("punch,dance").  The UI's "combo" meta-mode
+        # is not a valid CLI value and raises ValueError.  For beat detection
+        # purposes combo = punch + dance cycling, so always use "punch,dance".
+        raw_mode = str(segment.mode or "punch")
+        detect_mode = "punch,dance" if raw_mode == "combo" else raw_mode
         job = BeatDetectJob(
             segment_id=segment.id,
             audio_path=trimmed,
             duration_sec=float(segment.duration_sec),
-            mode=str(segment.mode or "punch"),
+            mode=detect_mode,
             beat_source=str(rs.get("beat_source", "onset")),
             beat_sens=float(rs.get("beat_sens", 0.7)),
             beat_min_gap=int(rs.get("beat_min_gap", 4)),
@@ -758,6 +768,43 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Beats edited for {seg.name}: {len(events)} block(s)",
             2000,
+        )
+
+    def _on_stickman_location_edited(
+        self, segment_id: str, location: dict
+    ) -> None:
+        """Persist a player-overlay drag/resize back onto the segment.
+
+        ``location`` is ``{"x", "y", "w", "h"}`` fractions (0..1) of
+        the rendered frame, exactly the shape stored on
+        :attr:`Segment.stickman_location` and consumed by
+        :meth:`RenderService._run_job` when building the
+        ``--stick_x0/y0/w/h`` CLI flags.  We round to 4 decimals so
+        the JSON file stays readable / diff-friendly without losing
+        sub-pixel precision at the project's max resolution.
+        """
+        if not segment_id:
+            return
+        seg = self.project.get_segment(segment_id)
+        if seg is None:
+            return
+        try:
+            seg.stickman_location = {
+                "x": round(float(location.get("x", 0.0)), 4),
+                "y": round(float(location.get("y", 0.0)), 4),
+                "w": round(float(location.get("w", 0.0)), 4),
+                "h": round(float(location.get("h", 0.0)), 4),
+            }
+        except (TypeError, ValueError):
+            return
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Stickman box updated for {seg.name}: "
+            f"x={seg.stickman_location['x']*100:.1f}% "
+            f"y={seg.stickman_location['y']*100:.1f}% "
+            f"w={seg.stickman_location['w']*100:.1f}% "
+            f"h={seg.stickman_location['h']*100:.1f}%",
+            2500,
         )
 
     def _on_beats_failed(self, segment_id: str, message: str) -> None:
@@ -909,6 +956,12 @@ class MainWindow(QMainWindow):
         # resulting block layout on the timeline.
         if current:
             self._request_audio_trim(current)
+        # Re-sync the preview panel's stickman toggle in case the
+        # form just flipped ``render_settings.stickman`` — without
+        # this the toolbar button can stay enabled / disabled with
+        # stale state until the user re-selects the segment.
+        if hasattr(self, "preview_panel"):
+            self.preview_panel._refresh_stickman_button_state()
         self._update_status()
 
     def _sync_timeline_positions(self) -> None:

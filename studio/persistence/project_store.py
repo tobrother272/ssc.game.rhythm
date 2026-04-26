@@ -112,6 +112,22 @@ class ProjectStore:
                     beat_events.append((float(row[0]), str(row[1])))
                 except (TypeError, ValueError):
                     pass
+        # Stickman draw-box (fractions of rendered frame).  Coerce
+        # to floats and clamp to [0,1] so a hand-edited / corrupt
+        # project file can't crash the renderer or push the box
+        # off-screen.  Missing keys fall back to the StickmanHUD
+        # default left-column HUD layout so existing projects
+        # auto-upgrade with a sensible value the first time they
+        # are loaded.
+        raw_stick = payload.get("stickman_location") or {}
+        defaults = {"x": 0.010, "y": 0.090, "w": 0.135, "h": 0.540}
+        stickman_location: dict = {}
+        for key, fallback in defaults.items():
+            try:
+                v = float(raw_stick.get(key, fallback))
+            except (TypeError, ValueError):
+                v = fallback
+            stickman_location[key] = max(0.0, min(1.0, v))
         return Segment(
             id=payload.get("id", ""),
             name=payload.get("name", "Segment"),
@@ -129,6 +145,7 @@ class ProjectStore:
             last_render_error=payload.get("last_render_error"),
             thumbnail_path=self._to_absolute(payload.get("thumbnail_path"), project_dir),
             beat_events=beat_events,
+            stickman_location=stickman_location,
         )
 
     @staticmethod

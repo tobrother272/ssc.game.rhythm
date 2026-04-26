@@ -1091,6 +1091,7 @@ class TimelinePanel(QWidget):
         # Sync action-button enable state explicitly.
         self.split_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
+        self.clear_beats_button.setEnabled(True)
         # Scroll the view to the very beginning so the segment always starts
         # at the left edge — regardless of where the user had previously scrolled.
         self.view.horizontalScrollBar().setValue(0)
@@ -1661,6 +1662,16 @@ class TimelinePanel(QWidget):
         )
         self.auto_gen_button.clicked.connect(self._on_auto_gen_clicked)
         top.addWidget(self.auto_gen_button)
+
+        self.clear_beats_button = QPushButton("Clear Beats")
+        self.clear_beats_button.setObjectName("clearBeatsButton")
+        self.clear_beats_button.setEnabled(False)
+        self.clear_beats_button.setToolTip(
+            "Remove ALL beat block markers from the selected segment.\n"
+            "This action cannot be undone."
+        )
+        self.clear_beats_button.clicked.connect(self._on_clear_beats_clicked)
+        top.addWidget(self.clear_beats_button)
 
         # CapCut-style zoom bar:  [Fit]  [−]  [====O======]  [+]
         # The slider is log-scale so each pixel of slider travel feels
@@ -2526,6 +2537,7 @@ class TimelinePanel(QWidget):
             # Genuine deselect (came via _on_empty_clicked).
             self.split_button.setEnabled(False)
             self.auto_gen_button.setEnabled(False)
+            self.clear_beats_button.setEnabled(False)
             self.overview_bar.set_selected(None)
             self.segment_selected.emit(None)
             return
@@ -2556,6 +2568,7 @@ class TimelinePanel(QWidget):
         self._selected_segment_id = segment.id
         self.split_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
+        self.clear_beats_button.setEnabled(True)
         self.overview_bar.set_selected(segment.id)
         self.segment_selected.emit(segment)
 
@@ -2569,6 +2582,7 @@ class TimelinePanel(QWidget):
         self.scene.clearSelection()
         self.split_button.setEnabled(False)
         self.auto_gen_button.setEnabled(False)
+        self.clear_beats_button.setEnabled(False)
         self.overview_bar.set_selected(None)
         self.segment_selected.emit(None)
 
@@ -2582,6 +2596,19 @@ class TimelinePanel(QWidget):
         if self._selected_segment_id is None:
             return
         self.auto_gen_block_requested.emit(self._selected_segment_id)
+
+    def _on_clear_beats_clicked(self) -> None:
+        """Remove every beat event from the currently selected segment."""
+        if self._selected_segment_id is None:
+            return
+        seg_id = self._selected_segment_id
+        events = self._beat_events.get(seg_id)
+        if not events:
+            return
+        events.clear()
+        self._focused_beat = None
+        self._pending_tick_select_after_refresh = []
+        self._schedule_beat_commit(seg_id)
 
     def _on_split_clicked(self) -> None:
         """Split the selected segment at the current playhead position."""

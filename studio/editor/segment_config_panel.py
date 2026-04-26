@@ -29,6 +29,40 @@ from PySide6.QtWidgets import (
 from studio.models import Project, Segment, build_settings
 
 
+class _ModeListWidget(QWidget):
+    """Row of checkboxes for selecting the sub-modes in combo mode.
+
+    Emits ``changed`` whenever any checkbox is toggled so the parent
+    form can call ``_commit_settings()`` immediately.
+    """
+
+    changed = Signal()
+    _ALL_MODES = ("punch", "dance", "line", "relax")
+
+    def __init__(self, value: list, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        current: set[str] = set(value) if isinstance(value, list) else {"punch"}
+        self._boxes: dict[str, QCheckBox] = {}
+        for mode in self._ALL_MODES:
+            cb = QCheckBox(mode.capitalize())
+            cb.setChecked(mode in current)
+            cb.stateChanged.connect(self.changed)
+            row.addWidget(cb)
+            self._boxes[mode] = cb
+        row.addStretch()
+        self.setToolTip(
+            "Select the sub-modes that alternate each beat in combo mode.\n"
+            "At least one must be checked (defaults to Punch if all unchecked)."
+        )
+
+    def get_value(self) -> list:
+        selected = [m for m in self._ALL_MODES if self._boxes[m].isChecked()]
+        return selected or ["punch"]
+
+
 def format_sec(value: float) -> str:
     total = max(0, int(value))
     mm, ss = divmod(total, 60)
@@ -408,10 +442,7 @@ class SegmentConfigPanel(QWidget):
             self.dynamic_layout.removeRow(0)
         self._setting_widgets.clear()
 
-    # Fields to expose in the Properties panel, in display order.
-    # All other render_settings keys are kept internally (saved/restored
-    # from project files) but never shown in the UI — simplifies the form
-    # so users only see the parameters that have a direct, audible impact.
+    # Fields always shown in the Properties panel, in display order.
     _VISIBLE_FIELDS = (
         "beat_source",
         "beat_sens",
@@ -421,6 +452,15 @@ class SegmentConfigPanel(QWidget):
         "stickman",
     )
 
+    # Extra fields shown only for specific modes.  Keys must exist on the
+    # corresponding Settings model (see studio/models/render_settings.py).
+    # Values are ordered tuples of field names, inserted after the common
+    # fields.
+    _MODE_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
+        "combo": ("mode_list",),
+        "line":  ("line_zigzag",),
+    }
+
     _FIELD_LABELS = {
         "beat_source": "Beat source",
         "beat_sens":   "Beat sens",
@@ -428,6 +468,8 @@ class SegmentConfigPanel(QWidget):
         "speed":       "Speed",
         "floor_panels":"Floor panels",
         "stickman":    "Stickman",
+        "mode_list":   "Sub-modes",
+        "line_zigzag": "Zigzag",
     }
 
     def _rebuild_dynamic_settings(self) -> None:
@@ -436,14 +478,24 @@ class SegmentConfigPanel(QWidget):
             return
         self._clear_dynamic()
         model = build_settings(segment.mode, segment.render_settings)
-        defaults = model.model_dump(mode="json", exclude_none=True)
-        # Persist all values (so hidden params survive save/reload) but
-        # only build widgets for the whitelisted visible fields.
-        segment.render_settings = defaults
-        for key in self._VISIBLE_FIELDS:
-            value = defaults.get(key)
-            if value is None:
-                continue
+        # ``exclude_none=True`` keeps the persisted dict clean (no null
+        # noise), but Optional fields like ``line_zigzag`` have a valid
+        # ``None`` state we still want to display.  Keep a full dump for
+        # widget-value lookup, and only the non-None dump for persistence.
+        persist_defaults = model.model_dump(mode="json", exclude_none=True)
+        all_defaults = model.model_dump(mode="json")
+        segment.render_settings = persist_defaults
+
+        mode_extras = self._MODE_EXTRA_FIELDS.get(segment.mode, ())
+        for key in self._VISIBLE_FIELDS + mode_extras:
+            # Prefer the full dump so Optional fields with value=None still
+            # get a widget (their key may be absent from persist_defaults).
+            if key in all_defaults:
+                value = all_defaults[key]
+            else:
+                value = persist_defaults.get(key)
+                if value is None:
+                    continue
             widget = self._build_widget_for_value(key, value)
             if widget is None:
                 continue
@@ -522,6 +574,30 @@ class SegmentConfigPanel(QWidget):
             widget.valueChanged.connect(self._commit_settings)
             return widget
 
+        if key == "mode_list":
+            # Combo sub-mode selector: list of punch/dance/line/relax.
+            modes = value if isinstance(value, list) else ["punch"]
+            widget = _ModeListWidget(modes, self)
+            widget.changed.connect(self._commit_settings)
+            return widget
+
+        # line_zigzag is Optional[Literal] — value can be None or a string.
+        if key == "line_zigzag":
+            combo = QComboBox()
+            combo.addItem("Off", None)
+            combo.addItem("Vertical", "vertical")
+            combo.addItem("Horizontal", "horizontal")
+            idx = combo.findData(value)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.setToolTip(
+                "Zigzag pattern for line mode.\n"
+                "Off      = straight chain of blocks\n"
+                "Vertical = chain alternates up/down lanes\n"
+                "Horizontal = chain alternates left/right lanes"
+            )
+            combo.currentIndexChanged.connect(self._commit_settings)
+            return combo
+
         if isinstance(value, str):
             if key == "beat_source":
                 combo = QComboBox()
@@ -547,6 +623,8 @@ class SegmentConfigPanel(QWidget):
         return None
 
     def _collect_setting_widget_value(self, key: str, widget: QWidget):
+        if isinstance(widget, _ModeListWidget):
+            return widget.get_value()
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
         if isinstance(widget, QSpinBox):

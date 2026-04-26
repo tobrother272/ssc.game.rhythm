@@ -159,8 +159,35 @@ class _BeatDetectWorker(QRunnable):
                 return
 
             if proc.returncode != 0:
-                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-                msg = tail[-1] if tail else f"exit {proc.returncode}"
+                output = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+                lines = [l.strip() for l in output.splitlines() if l.strip()]
+                # Try to find the most informative error line instead of
+                # blindly taking the last line (which is often a librosa /
+                # numpy ``warnings.warn(`` call that fires on process startup
+                # and is completely unrelated to the actual failure).
+                _ERROR_PREFIXES = (
+                    "ValueError", "RuntimeError", "TypeError",
+                    "FileNotFoundError", "ImportError",
+                    "[--mode]", "[--lanes]", "[color]", "Error:", "error:",
+                    "Traceback",
+                )
+                msg = ""
+                for line in reversed(lines):
+                    if any(line.startswith(p) or p in line for p in _ERROR_PREFIXES):
+                        msg = line
+                        break
+                if not msg:
+                    # No recognisable error line — fall back to last non-
+                    # warning, non-whitespace line so we at least show
+                    # something useful.
+                    _NOISE = ("warnings.warn", "UserWarning", "FutureWarning",
+                              "DeprecationWarning", "site-packages")
+                    for line in reversed(lines):
+                        if not any(n in line for n in _NOISE):
+                            msg = line
+                            break
+                if not msg:
+                    msg = f"exit {proc.returncode}"
                 self._service._on_failed(job, msg)
                 return
 

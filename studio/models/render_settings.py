@@ -93,6 +93,10 @@ class RelaxSettings(BaseRenderSettings):
 class ComboSettings(PunchSettings, DanceSettings, LineSettings, RelaxSettings):
     """Settings used when mode_list contains multiple modes."""
 
+    mode_list: list[Literal["punch", "dance", "line", "relax"]] = Field(
+        default_factory=lambda: ["punch", "dance"]
+    )
+
 
 SETTINGS_BY_MODE: dict[str, type[BaseRenderSettings]] = {
     RenderMode.PUNCH.value: PunchSettings,

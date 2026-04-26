@@ -3979,6 +3979,17 @@ class RhythmVisualizer:
         # -- scene toggles --
         self.SHOW_FLOOR_PANELS: bool = True   # receding grey tile rows
         self.SHOW_STICKMAN:     bool = True   # left-column punching fighter
+        # -- stickman draw-box override (top-left corner + size, in PIXELS).
+        #    Any value < 0 means "use the StickmanHUD default for that
+        #    component" (left-column HUD: x=W*1%, y=H*9%, w=W*13.5%,
+        #    h=H*54%).  All four values are independent so callers can
+        #    pin just one (e.g. only re-position) and let the others
+        #    auto-derive.  Resolved into a `box=(x, y, w, h)` tuple at
+        #    StickmanHUD construction time below.
+        self.STICK_X0:          int = -1
+        self.STICK_Y0:          int = -1
+        self.STICK_W:           int = -1
+        self.STICK_H:           int = -1
         # -- color overrides (None = use built-in defaults) --
         self.CUBE_COLOR_LEFT:   tuple | None = None
         self.CUBE_COLOR_RIGHT:  tuple | None = None
@@ -4404,7 +4415,34 @@ class RhythmVisualizer:
             stick_action = 'relax'
         else:
             stick_action = mode
-        stick     = StickmanHUD(cam, action=stick_action) if self.SHOW_STICKMAN else None
+
+        # Resolve the stickman's draw-box.  StickmanHUD's default is the
+        # left-column HUD strip (x=W*1%, y=H*9%, w=W*13.5%, h=H*54%);
+        # any of --stick_x0 / --stick_y0 / --stick_w / --stick_h that
+        # the caller passed (>= 0) overrides that component while the
+        # rest stay on the legacy default.  Pass `box=None` only when
+        # ALL four are negative so StickmanHUD keeps its old behaviour
+        # for callers that didn't opt in.
+        _stick_box: tuple[int, int, int, int] | None = None
+        if any(v >= 0 for v in (self.STICK_X0, self.STICK_Y0,
+                                self.STICK_W,  self.STICK_H)):
+            _def_x = int(self.WIDTH  * 0.010)
+            _def_y = int(self.HEIGHT * 0.09)
+            _def_w = int(self.WIDTH  * 0.135)
+            _def_h = int(self.HEIGHT * 0.54)
+            bx = self.STICK_X0 if self.STICK_X0 >= 0 else _def_x
+            by = self.STICK_Y0 if self.STICK_Y0 >= 0 else _def_y
+            bw = self.STICK_W  if self.STICK_W  > 0 else _def_w
+            bh = self.STICK_H  if self.STICK_H  > 0 else _def_h
+            _stick_box = (int(bx), int(by), int(bw), int(bh))
+            print(f"[stickman] custom box: x0={bx} y0={by} "
+                  f"w={bw} h={bh} (frame {self.WIDTH}x{self.HEIGHT})")
+
+        if self.SHOW_STICKMAN:
+            stick = StickmanHUD(cam, action=stick_action,
+                                box=_stick_box)
+        else:
+            stick = None
         combo     = ComboHUD(cam)
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
                                   mode=mode)
@@ -4789,10 +4827,34 @@ class RhythmVisualizer:
             return
 
         # ── render loop ──────────────────────────────────────────────
-        all_frames: list[np.ndarray] = []
-        print("Rendering frames...")
+        # Frames are streamed directly to the encoder as they are built so
+        # peak RAM stays at O(1) per frame regardless of video length.
+        # Previously all frames were buffered in a list before writing,
+        # which caused ArrayMemoryError on long segments (e.g. a 3-minute
+        # clip at 1920×1080 requires ~30 GB of RAM for the buffer alone).
+        codec_label = "NVENC" if _CUPY else ("avc1" if self.is_mac else "libx264")
+        print(f"Rendering + streaming frames to encoder ({codec_label})...")
         t_render = time.time()
         last_pct = 0
+
+        temp_video = 'temp_rhythm.mp4'
+        if self.is_mac:
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            _vwriter = cv2.VideoWriter(temp_video, fourcc, self.FPS,
+                                       (self.WIDTH, self.HEIGHT))
+            _vproc = None
+        else:
+            vcodec = 'h264_nvenc' if _CUPY else 'libx264'
+            preset = 'p4' if vcodec == 'h264_nvenc' else 'fast'
+            _vcmd = (f'ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt bgr24 '
+                     f'-s {self.WIDTH}x{self.HEIGHT} -r {self.FPS} -i pipe:0 '
+                     f'-vcodec {vcodec} -preset {preset} -b:v 3500k '
+                     f'-bf 0 -vsync cfr -pix_fmt yuv420p '
+                     f'-r {self.FPS} "{temp_video}"')
+            _vproc = subprocess.Popen(shlex.split(_vcmd), stdin=subprocess.PIPE,
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            _vwriter = None
 
         for fi in range(total_frames):
             pct = int(fi / total_frames * 100)
@@ -4967,42 +5029,25 @@ class RhythmVisualizer:
                                      (70, 110, 170), lineType=cv2.LINE_AA)
                         canvas = cv2.addWeighted(ov, 0.35, canvas, 0.65, 0)
 
-            all_frames.append(canvas)
+            # Stream the finished frame to the encoder immediately.
+            # This keeps memory at O(1) regardless of video duration.
+            if _vwriter is not None:
+                _vwriter.write(canvas)
+            elif _vproc is not None and _vproc.stdin is not None:
+                _vproc.stdin.write(canvas.tobytes())
 
         t_done = time.time()
         print(f"\nFrame rendering done in {t_done - t_render:.2f}s  |  "
               f"avg {total_frames/(t_done-t_render):.1f} FPS")
 
-        # ── write video ──────────────────────────────────────────────
-        temp_video = 'temp_rhythm.mp4'
-        print("Writing video (NVENC)..." if (not self.is_mac and _CUPY) else "Writing video...")
-        t_write = time.time()
+        # ── finalise encoder ─────────────────────────────────────────
+        if _vwriter is not None:
+            _vwriter.release()
+        if _vproc is not None:
+            if _vproc.stdin:
+                _vproc.stdin.close()
+            _vproc.wait()
 
-        if self.is_mac:
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(temp_video, fourcc, self.FPS, (self.WIDTH, self.HEIGHT))
-            for frm in all_frames:
-                out.write(frm)
-            out.release()
-        else:
-            vcodec = 'h264_nvenc' if _CUPY else 'libx264'
-            preset = 'p4'         if vcodec == 'h264_nvenc' else 'fast'
-            # -bf 0   : no B-frames (avoid reorder delays)
-            # -vsync cfr: constant frame rate (1:1 pipe frame -> 1/FPS timestamp)
-            # -pix_fmt yuv420p: broad compatibility
-            cmd = (f'ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt bgr24 '
-                   f'-s {self.WIDTH}x{self.HEIGHT} -r {self.FPS} -i pipe:0 '
-                   f'-vcodec {vcodec} -preset {preset} -b:v 3500k '
-                   f'-bf 0 -vsync cfr -pix_fmt yuv420p '
-                   f'-r {self.FPS} "{temp_video}"')
-            proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for frm in all_frames:
-                proc.stdin.write(frm.tobytes())
-            proc.stdin.close()
-            proc.wait()
-
-        print(f"Video written in {time.time()-t_write:.2f}s")
         print(f"\nTotal time: {time.time()-t0:.2f}s")
         return temp_video
 
@@ -5082,6 +5127,24 @@ def parse_arguments():
                    help=('Show the left-column stickman fighter. 0 = hide '
                          '(useful when compositing a standalone stickman '
                          'video rendered via stickman.py on top). Default 1.'))
+    p.add_argument('--stick_x0', type=int, default=-1, metavar='PX',
+                   help=('Stickman draw-box left edge in PIXELS. -1 = '
+                         'auto (left-column HUD: ~W*1%%). Use together '
+                         'with --stick_y0 / --stick_w / --stick_h to '
+                         'place the stickman anywhere in the frame.'))
+    p.add_argument('--stick_y0', type=int, default=-1, metavar='PX',
+                   help=('Stickman draw-box top edge in PIXELS. -1 = '
+                         'auto (~H*9%%).'))
+    p.add_argument('--stick_w',  type=int, default=-1, metavar='PX',
+                   help=('Stickman draw-box width in PIXELS. -1 = '
+                         'auto (~W*13.5%%). Pose dimensions auto-scale '
+                         'to fit; the body envelope keeps its '
+                         '_REF_W:_REF_H ≈ 260:340 aspect ratio so very '
+                         'wide boxes leave horizontal padding rather '
+                         'than stretching the stickman.'))
+    p.add_argument('--stick_h',  type=int, default=-1, metavar='PX',
+                   help=('Stickman draw-box height in PIXELS. -1 = '
+                         'auto (~H*54%%).'))
     p.add_argument('--travel',  type=int, default=-1,
                    help=('Frames for target to fly from spawn to hit. '
                          'Default = -1 (auto: matches one L↔R beat cycle so '
@@ -5350,6 +5413,10 @@ if __name__ == '__main__':
     viz.MESH_WIREFRAME    = args.mesh_wireframe
     viz.SHOW_FLOOR_PANELS = bool(args.floor_panels)
     viz.SHOW_STICKMAN     = bool(args.stickman)
+    viz.STICK_X0          = int(args.stick_x0)
+    viz.STICK_Y0          = int(args.stick_y0)
+    viz.STICK_W           = int(args.stick_w)
+    viz.STICK_H           = int(args.stick_h)
     try:
         viz.CUBE_COLOR_LEFT   = _parse_color(args.cube_color_left)
         viz.CUBE_COLOR_RIGHT  = _parse_color(args.cube_color_right)
