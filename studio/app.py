@@ -14,7 +14,12 @@ from studio.editor.main_window import MainWindow
 
 def apply_stylesheet(app: QApplication) -> None:
     """Load QSS stylesheet if available."""
-    stylesheet_path = Path(__file__).parent / "resources" / "styles.qss"
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        # PyInstaller bundle: data files live inside _MEIPASS, but __file__
+        # for the main entry script points to sys.executable, not the module.
+        stylesheet_path = Path(sys._MEIPASS) / "studio" / "resources" / "styles.qss"  # type: ignore[attr-defined]
+    else:
+        stylesheet_path = Path(__file__).parent / "resources" / "styles.qss"
     if not stylesheet_path.exists():
         return
     app.setStyleSheet(stylesheet_path.read_text(encoding="utf-8"))
