@@ -1349,6 +1349,15 @@ class TimelinePanel(QWidget):
     # edits survive a reload.
     beat_events_edited = Signal(str)  # segment_id
 
+    # Emitted when the user finishes dragging the red waveform threshold
+    # line and the resulting :pyattr:`Segment.beat_height_threshold`
+    # actually moved.  MainWindow listens for this and re-runs
+    # :class:`BeatDetectService` so the rhythm core returns a freshly
+    # filtered events list — the timeline preview then matches the
+    # filtered set the rendered video will use, with no client-side
+    # opacity hacks needed.  Carries ``(segment_id, threshold)``.
+    beat_threshold_changed = Signal(str, float)  # segment_id, 0..1
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._project: Optional[Project] = None
@@ -1553,6 +1562,7 @@ class TimelinePanel(QWidget):
         # Sync action-button enable state explicitly.
         self.split_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
+        self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
         # Scroll the view to the very beginning so the segment always starts
         # at the left edge — regardless of where the user had previously scrolled.
@@ -2054,15 +2064,29 @@ class TimelinePanel(QWidget):
     def _on_threshold_line_drag_finished(self, segment_id: str) -> None:
         """Left-button release after interacting with the threshold line.
 
-        One ``beat_events_edited`` emit syncs ``beat_events`` from the
-        panel dict into the :class:`Segment` and runs the normal dirty
-        / autosave path — exactly once per completed drag gesture.
+        Two things happen here, in order:
+
+        1. ``beat_events_edited`` is emitted so the host
+           :class:`MainWindow` copies the panel's ``_beat_events``
+           dict into :pyattr:`Segment.beat_events` and runs the
+           normal dirty / autosave path — exactly once per
+           completed drag gesture.
+        2. ``beat_threshold_changed`` is emitted with the new
+           threshold value so the host re-fires
+           :class:`BeatDetectService` against the rhythm core; the
+           subprocess applies ``--beat_height_threshold`` and
+           returns a fresh, server-filtered events list.  When the
+           ``ready`` signal fires, the timeline ticks rebuild from
+           that list — no client-side dim-and-keep hack needed.
         """
         if self._project is None:
             return
-        if self._project.get_segment(segment_id) is None:
+        seg = self._project.get_segment(segment_id)
+        if seg is None:
             return
         self.beat_events_edited.emit(segment_id)
+        thr = float(getattr(seg, "beat_height_threshold", 0.0) or 0.0)
+        self.beat_threshold_changed.emit(segment_id, thr)
 
     def _update_beat_strip_opacity(
         self, segment_id: str, threshold: float
@@ -2248,6 +2272,27 @@ class TimelinePanel(QWidget):
         )
         self.auto_gen_button.clicked.connect(self._on_auto_gen_clicked)
         top.addWidget(self.auto_gen_button)
+
+        # "Gen by Chart" — local peak-detector that derives one beat
+        # tick per RMS chart peak, no rhythm.py subprocess.  Useful
+        # when the user wants strict 1-tick-per-visible-peak (the
+        # spawner's lane-spacing rules in rhythm.py drop some peaks
+        # on dense passages, which manifests as missing ticks even
+        # above the threshold line).  Operates entirely on the
+        # already-loaded ``_waveform_rms`` so it's instant.
+        self.gen_by_chart_button = QPushButton("Gen by Chart")
+        self.gen_by_chart_button.setObjectName("genByChartButton")
+        self.gen_by_chart_button.setEnabled(False)
+        self.gen_by_chart_button.setToolTip(
+            "Generate beat ticks straight from the waveform chart\n"
+            "below: one tick per RMS peak, computed locally without\n"
+            "spawning rhythm.py.  Honours the segment's threshold\n"
+            "slider — peaks below the red line are skipped."
+        )
+        self.gen_by_chart_button.clicked.connect(
+            self._on_gen_by_chart_clicked
+        )
+        top.addWidget(self.gen_by_chart_button)
 
         self.clear_beats_button = QPushButton("Clear Beats")
         self.clear_beats_button.setObjectName("clearBeatsButton")
@@ -3286,21 +3331,50 @@ class TimelinePanel(QWidget):
         fps = float(getattr(self._project, "output_fps", 30) or 30)
         t_now = float(self._playhead_time_sec)
 
-        # ── Loading hint(s) ────────────────────────────────────────────
+        # ── Loading placeholder(s) ─────────────────────────────────────
+        # Drawn for every segment currently in ``_beat_events_loading``
+        # (set by *Auto Gen Block* and *Gen by Chart* before they kick
+        # off generation).  The placeholder spans the segment's full
+        # beat-strip width with a translucent fill, a dashed border and
+        # a centred "Generating beats… (segment_name)" caption so the
+        # user can clearly see *which* segment is being processed and
+        # that the strip is intentionally empty for the duration.
+        loading_top    = float(tick_top)
+        loading_bottom = float(tick_bottom)
+        loading_height = max(1.0, loading_bottom - loading_top)
         for seg_id in list(self._beat_events_loading):
             seg = self._project.get_segment(seg_id)
             if seg is None:
                 continue
-            x = self._time_to_x(seg.start_time_sec + 0.05)
-            if 0 <= x <= scene_w:
-                lbl = QGraphicsSimpleTextItem(
-                    f"Detecting beats…  ({seg.name})"
-                )
-                lbl.setBrush(QColor("#8ab4f8"))
-                lbl.setOpacity(0.85)
-                lbl.setPos(x + 4, num_y - 1.0)
-                lbl.setZValue(11)
-                self.scene.addItem(lbl)
+            x_lo = max(0.0, self._time_to_x(seg.start_time_sec))
+            x_hi = min(float(scene_w), self._time_to_x(seg.end_time_sec))
+            if x_hi <= x_lo:
+                continue
+
+            holder = QGraphicsRectItem(
+                x_lo, loading_top, x_hi - x_lo, loading_height
+            )
+            holder.setBrush(QBrush(QColor(138, 180, 248, 55)))
+            pen = QPen(QColor(138, 180, 248, 200))
+            pen.setWidthF(1.2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            holder.setPen(pen)
+            holder.setZValue(10.5)
+            holder.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            holder.setData(0, "beat_loading_holder")
+            self.scene.addItem(holder)
+
+            caption = QGraphicsSimpleTextItem(
+                f"Generating beats…  ({seg.name})"
+            )
+            caption.setBrush(QColor("#e8eaed"))
+            cap_rect = caption.boundingRect()
+            cx = x_lo + (x_hi - x_lo) * 0.5 - cap_rect.width() * 0.5
+            cy = loading_top + (loading_height - cap_rect.height()) * 0.5
+            caption.setPos(cx, cy)
+            caption.setZValue(11)
+            caption.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene.addItem(caption)
 
         # ── One BEAT-DBG strip + threshold line per segment ─────────────
         # We iterate ALL segments — not just the ones that already have
@@ -3674,6 +3748,7 @@ class TimelinePanel(QWidget):
         self._selected_segment_id = segment.id
         self.split_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
+        self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
         self.overview_bar.set_selected(segment.id)
         self.segment_selected.emit(segment)
@@ -3690,6 +3765,7 @@ class TimelinePanel(QWidget):
         self.scene.clearSelection()
         self.split_button.setEnabled(False)
         self.auto_gen_button.setEnabled(False)
+        self.gen_by_chart_button.setEnabled(False)
         self.clear_beats_button.setEnabled(False)
         self.overview_bar.set_selected(None)
         self.segment_selected.emit(None)
@@ -3697,13 +3773,22 @@ class TimelinePanel(QWidget):
     def _on_auto_gen_clicked(self) -> None:
         """Forward the click as :pyattr:`auto_gen_block_requested`.
 
+        Wipes existing beats (panel + persisted segment list) and
+        flips the segment into the "Detecting beats…" loading hint
+        *before* the request fires, so the user never sees a frame
+        of stale ticks while the rhythm-core subprocess spins up.
+        See :meth:`_wipe_beats_and_show_loading` for the wipe
+        rationale.
+
         Guards against the (theoretically impossible because the button is
         disabled then) "no selected segment" case so MainWindow never sees
         a stray empty-id signal.
         """
         if self._selected_segment_id is None:
             return
-        self.auto_gen_block_requested.emit(self._selected_segment_id)
+        seg_id = self._selected_segment_id
+        self._wipe_beats_and_show_loading(seg_id)
+        self.auto_gen_block_requested.emit(seg_id)
 
     def _on_clear_beats_clicked(self) -> None:
         """Remove every beat event from the currently selected segment."""
@@ -3717,6 +3802,230 @@ class TimelinePanel(QWidget):
         self._focused_beat = None
         self._pending_tick_select_after_refresh = []
         self._schedule_beat_commit(seg_id)
+
+    def _on_gen_by_chart_clicked(self) -> None:
+        """Derive beat ticks 1-for-1 from every peak in the RMS chart.
+
+        Click flow (the ``…WIPE → LOADING → COMPUTE → COMMIT`` chain
+        is shared with *Auto Gen Block* — see :meth:`_wipe_beats_and_show_loading`
+        for the wipe details):
+
+        1. Wipe both ``_beat_events[seg_id]`` and the *persisted*
+           :pyattr:`Segment.beat_events` so the user sees a clean
+           strip the moment the click registers — no half-stale
+           ticks lingering during generation.
+        2. Flip the segment into the "Detecting beats…" loading
+           hint via :meth:`set_beat_events_loading`.
+        3. Defer the actual peak-detection work to the next
+           event-loop tick using ``QTimer.singleShot(0, …)``.  The
+           defer is essential: the wipe + loading repaint won't
+           reach the screen until Qt drains the current event,
+           and the synchronous numpy work below would block that
+           paint indefinitely without it.
+
+        Detection itself: every ``rms[i]`` sample where
+        ``rms[i] > rms[i-1] AND rms[i] >= rms[i+1]`` is a "peak
+        tip" on the chart.  No ``distance`` / ``prominence``
+        filter — the goal is one tick per visible peak — only a
+        small ``AMP_FLOOR`` to ignore floating-point ripple in
+        silent stretches.  Honours
+        :pyattr:`Segment.beat_height_threshold` (red slider).
+        """
+        if self._selected_segment_id is None:
+            return
+        seg_id = self._selected_segment_id
+        if not self._waveform_rms or self._waveform_rms_per_sec <= 0:
+            return
+        if self._project is None:
+            return
+        if self._project.get_segment(seg_id) is None:
+            return
+
+        # Step 1+2: wipe + loading hint, repaint immediately.
+        self._wipe_beats_and_show_loading(seg_id)
+
+        # Step 3: defer compute so the loading hint paints first.
+        QTimer.singleShot(
+            0, lambda sid=seg_id: self._run_gen_by_chart(sid)
+        )
+
+    def _run_gen_by_chart(self, seg_id: str) -> None:
+        """Synchronous body of the *Gen by Chart* peak detector.
+
+        Always called from a deferred ``QTimer.singleShot`` callback
+        so the prior wipe + loading-hint paint has had a chance to
+        flush.  Safe to call once per click; no-ops if the segment
+        was deleted while we were waiting our turn.
+
+        Detection algorithm — *prominence-based peak picking*:
+
+        1. **Light smoothing** (3-sample uniform moving average,
+           ≈30 ms at 100 Hz RMS) suppresses single-sample
+           quantisation noise without blurring real transients.
+        2. ``scipy.signal.find_peaks`` with a **prominence** floor
+           keeps every peak that rises at least
+           ``PROMINENCE_FLOOR`` above its neighbouring valleys —
+           the same definition humans use when eyeballing "is
+           that a real peak".  Crucially we do **not** pass
+           ``distance`` (or pass only a 2-sample minimum) so peaks
+           clustered tightly together are *all* preserved.
+        3. **Threshold filter** (red bar) on the *original* RMS
+           amplitude so the user-visible chart and the detected
+           ticks share the same vertical scale.
+
+        ``PROMINENCE_FLOOR`` is picked as
+        ``max(ABSOLUTE_FLOOR, RELATIVE * np.std(rms))`` so quiet
+        clips (low std) still get picky-enough detection while
+        loud clips don't drown in micro-bumps.
+        """
+        if self._project is None:
+            return
+        seg = self._project.get_segment(seg_id)
+        if seg is None:
+            self._beat_events_loading.discard(seg_id)
+            self.refresh()
+            return
+        rms_full = np.asarray(self._waveform_rms, dtype=np.float32)
+        rps = float(self._waveform_rms_per_sec)
+        seg_dur = float(seg.duration_sec or 0.0)
+        if rms_full.size < 5 or rps <= 0 or seg_dur <= 0.0:
+            self._beat_events_loading.discard(seg_id)
+            self.refresh()
+            return
+
+        # ── Slice rms to JUST the segment's media-time window ────────
+        # ``_waveform_rms`` holds the *entire* media file (indexed by
+        # media-time), but the waveform-track painter only renders the
+        # slice ``rms[_offset_sec * rps … _offset_sec * rps + view]``
+        # which, in focus mode, equals ``rms[start_time_sec * rps : …]``.
+        # Detecting peaks on the full array would (a) emit ticks for
+        # peaks outside the segment's window and (b) yield ``t_local``
+        # values that don't line up with the visible waveform when
+        # ``seg.start_time_sec > 0`` — exactly the misalignment the
+        # user reported.  Slicing here makes the local peak index
+        # directly equal ``t_local * rps`` so every detected tick lands
+        # under its peak regardless of where the segment sits on the
+        # timeline.
+        start_sample = int(round(float(seg.start_time_sec) * rps))
+        end_sample   = int(round(
+            (float(seg.start_time_sec) + seg_dur) * rps
+        ))
+        start_sample = max(0, min(int(rms_full.size), start_sample))
+        end_sample   = max(start_sample, min(int(rms_full.size), end_sample))
+        rms = rms_full[start_sample:end_sample]
+        if rms.size < 5:
+            self._beat_events_loading.discard(seg_id)
+            self.refresh()
+            return
+
+        # ── 1. Smooth (3-sample box, mode='same' keeps length) ───────
+        kernel = np.ones(3, dtype=np.float32) / 3.0
+        smoothed = np.convolve(rms, kernel, mode="same")
+
+        # ── 2. Prominence floor — adaptive but with a hard minimum ──
+        # ABSOLUTE_FLOOR = 1.5 % of full-scale amplitude (peaks
+        # smaller than this are imperceptible on a 0-1 chart).
+        # RELATIVE  = ¼ of the signal std-dev so a track with
+        # large dynamic range still demands somewhat-prominent
+        # peaks while a near-silent track keeps the absolute floor.
+        ABSOLUTE_FLOOR = 0.015
+        RELATIVE = 0.25
+        sig_std = float(np.std(smoothed))
+        prominence = max(ABSOLUTE_FLOOR, RELATIVE * sig_std)
+        # Tiny distance gate: 2 samples (~20 ms) prevents adjacent-
+        # sample double counting after smoothing. Kept tight so
+        # tightly-spaced real transients (rolls, fast hi-hats) are
+        # still emitted as separate ticks.
+        min_distance = max(1, int(round(rps * 0.02)))
+
+        try:
+            from scipy.signal import find_peaks  # type: ignore
+            peak_idx_arr, _props = find_peaks(
+                smoothed,
+                prominence=prominence,
+                distance=min_distance,
+            )
+        except Exception:
+            # Defensive fallback: pure-numpy local max if scipy is
+            # unavailable for any reason. Same prominence intent
+            # but cheaper — use the smoothed signal and reject
+            # peaks whose left/right valley delta is below floor.
+            is_peak = (smoothed[1:-1] > smoothed[:-2]) & (
+                smoothed[1:-1] >= smoothed[2:]
+            )
+            cand = np.flatnonzero(is_peak) + 1
+            kept: list[int] = []
+            for p in cand:
+                lo = max(0, int(p) - max(2, min_distance))
+                hi = min(int(smoothed.size), int(p) + max(2, min_distance) + 1)
+                local_min = float(np.min(smoothed[lo:hi]))
+                if float(smoothed[int(p)]) - local_min >= prominence:
+                    kept.append(int(p))
+            peak_idx_arr = np.asarray(kept, dtype=np.int64)
+
+        new_events: list[tuple[float, str, float]] = []
+        if peak_idx_arr.size > 0:
+            AMP_FLOOR = 0.01
+            max_h = float(np.max(rms))
+            max_h = max(max_h, 1e-9)
+            thr = float(getattr(seg, "beat_height_threshold", 0.0) or 0.0)
+            thr = max(0.0, min(1.0, thr))
+            for p in peak_idx_arr:
+                # Use the raw (un-smoothed) RMS for amplitude so
+                # the height stored on the event matches what the
+                # waveform chart shows — smoothing was only used
+                # to find the *position* of the peak.
+                amp = float(rms[int(p)])
+                if amp < AMP_FLOOR:
+                    continue
+                t_local = float(int(p)) / rps
+                if t_local < 0.0 or t_local >= seg_dur:
+                    continue
+                h_norm = max(0.0, min(1.0, amp / max_h))
+                if h_norm < thr - 1e-6:
+                    continue
+                new_events.append((t_local, "L", h_norm))
+            new_events.sort(key=lambda e: e[0])
+
+        self._beat_events[seg_id] = new_events
+        self._beat_events_loading.discard(seg_id)
+        self._focused_beat = None
+        self._pending_tick_select_after_refresh = []
+        self._schedule_beat_commit(seg_id)
+
+    def _wipe_beats_and_show_loading(self, seg_id: str) -> None:
+        """Empty both panel and segment beat lists, then show loading.
+
+        Called by *both* gen entrypoints (*Auto Gen Block* in
+        :class:`MainWindow`, *Gen by Chart* in this panel) so the
+        user always sees a clean strip + "Detecting beats…" hint
+        the moment they click — never a frame of stale ticks while
+        the new ones are being computed.
+
+        The persistent :pyattr:`Segment.beat_events` is also
+        cleared and ``beat_events_edited`` is emitted so MainWindow
+        syncs the empty list to disk via autosave.  If the
+        downstream gen never produces a result (subprocess crash,
+        no waveform, etc.) the segment is left empty — same end
+        state the user would get from clicking *Clear Beats*
+        directly, which matches the explicit "wipe to regenerate"
+        intent.
+        """
+        if self._project is None:
+            return
+        seg = self._project.get_segment(seg_id)
+        if seg is None:
+            return
+        self._beat_events[seg_id] = []
+        if seg.beat_events:
+            seg.beat_events = []
+        self._focused_beat = None
+        self._pending_tick_select_after_refresh = []
+        self.set_beat_events_loading(seg_id)
+        # Persist the wipe immediately so the project is dirty
+        # even if gen never completes; autosave snapshots the
+        # cleared state.
+        self.beat_events_edited.emit(seg_id)
 
     def _on_split_clicked(self) -> None:
         """Split the selected segment at the current playhead position."""

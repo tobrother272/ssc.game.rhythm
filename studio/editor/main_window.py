@@ -235,6 +235,9 @@ class MainWindow(QMainWindow):
         self.timeline_panel.beat_events_edited.connect(
             self._on_beat_events_edited
         )
+        self.timeline_panel.beat_threshold_changed.connect(
+            self._on_beat_threshold_changed
+        )
         self.preview_panel.playhead_changed.connect(self.timeline_panel.set_playhead)
         self.preview_panel.playback_state_changed.connect(
             self._on_preview_playback_state_changed
@@ -724,6 +727,9 @@ class MainWindow(QMainWindow):
             density=float(rs.get("density", 0.5)),
             speed=float(rs.get("speed", 0.8)),
             fps=int(self.project.output_fps or 30),
+            beat_height_threshold=float(getattr(
+                segment, "beat_height_threshold", 0.0
+            ) or 0.0),
         )
         self.timeline_panel.set_beat_events_loading(segment.id)
         self.statusBar().showMessage(
@@ -886,6 +892,38 @@ class MainWindow(QMainWindow):
             )
             return
         self._request_beat_detect(segment)
+
+    def _on_beat_threshold_changed(
+        self, segment_id: str, threshold: float
+    ) -> None:
+        """Persist the new threshold without re-running detection.
+
+        Per explicit user request: the red threshold line is now a
+        passive *configuration* knob — only the toolbar's
+        *Auto Gen Block* and *Gen by Chart* buttons (re)generate
+        beat sticks.  Dragging the line just stores the value on
+        the segment so the next gen run picks it up.
+
+        The actual write to :pyattr:`Segment.beat_height_threshold`
+        happens live inside the panel's
+        ``_on_beat_threshold_dragged`` slot; the dirty / autosave
+        flush is taken care of by the sibling
+        ``beat_events_edited`` emit on drag release (see
+        :meth:`_on_beat_events_edited`).  This handler therefore
+        only needs to surface a brief status hint so the user
+        knows the value was captured but no detection ran.
+        """
+        if not segment_id:
+            return
+        segment = self.project.get_segment(segment_id)
+        if segment is None:
+            return
+        thr = max(0.0, min(1.0, float(threshold or 0.0)))
+        self.statusBar().showMessage(
+            f"Threshold for {segment.name}: {thr:.2f} "
+            f"— click Auto Gen / Gen by Chart to apply",
+            3000,
+        )
 
     def _on_create_segment_requested(self, media_id: str, start_time: float) -> None:
         media = self.project.get_media(media_id)
