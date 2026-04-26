@@ -1,4 +1,10 @@
-"""Queued rendering service that wraps src.rhythm in subprocess."""
+"""Queued rendering service that wraps src.rhythm in subprocess.
+
+This service is the **final-export** path only.  Live preview was
+moved fully in-process (see :mod:`src.live_renderer`) so this module
+no longer carries any HLS / streaming / IPC plumbing — every job
+encodes one MP4 and emits ``finished`` once.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +40,11 @@ class RenderJob:
     start_time_sec: float = 0.0
     duration_sec: Optional[float] = None
     # Mark a job as a preview so the caller can auto-play on completion.
+    # Live preview no longer goes through this service — it runs
+    # in-process via ``src.live_renderer``.  ``is_preview`` is kept
+    # purely as a fast-quality hint for short throw-away renders that
+    # the user might still want to kick off here (e.g. "render a
+    # quick draft and watch it"), but Studio currently never sets it.
     is_preview: bool = False
     # Output resolution & frame-rate — forwarded directly to rhythm.py via
     # -W / -H / --fps.  If None, rhythm.py uses its own defaults (1920×1080
@@ -195,9 +206,20 @@ class RenderService(QObject):
                 self.progress.emit(job.segment_id, 1)
                 self._run_job(job)
                 self.progress.emit(job.segment_id, 100)
-                self.finished.emit(job.segment_id, job.output_path)
+                if job.segment_id in self._cancelled:
+                    self._cancelled.discard(job.segment_id)
+                else:
+                    self.finished.emit(job.segment_id, job.output_path)
             except Exception as exc:  # noqa: BLE001
-                self.failed.emit(job.segment_id, str(exc))
+                if job.segment_id in self._cancelled:
+                    self._cancelled.discard(job.segment_id)
+                    print(
+                        f"[RenderService] Render cancelled for "
+                        f"{job.segment_id} (user-triggered)",
+                        flush=True,
+                    )
+                else:
+                    self.failed.emit(job.segment_id, str(exc))
             finally:
                 self._queue.task_done()
 
@@ -468,6 +490,7 @@ class RenderService(QObject):
                 command,
                 cwd=self._repo_root,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # merge stderr into stdout
                 text=True,
@@ -478,6 +501,7 @@ class RenderService(QObject):
 
             tail_lines: deque[str] = deque(maxlen=120)
             assert proc.stdout is not None  # for type-checkers
+
             for line in proc.stdout:
                 line = line.rstrip("\r\n")
                 if not line:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
+import cv2
 from PySide6.QtCore import QPoint, QRect, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -21,6 +22,14 @@ from PySide6.QtWidgets import (
 )
 
 from studio.models import MediaItem, Segment
+
+if TYPE_CHECKING:
+    # Imported only at type-check time so the heavyweight ``rhythm.py``
+    # dependency chain (librosa, OpenCV, ffmpeg-python) doesn't get
+    # pulled in just by importing :mod:`preview_panel`.  At runtime the
+    # ``LiveFrameRenderer`` instance arrives via ``start_live_preview``
+    # so we never need the type at module-load.
+    from src.live_renderer import LiveFrameRenderer
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +257,14 @@ class PreviewPanel(QWidget):
     # (0..1) of the rendered video frame.  MainWindow listens, writes
     # to ``segment.stickman_location``, and triggers a project save.
     stickman_location_changed = Signal(str, dict)
+    # Emitted whenever the panel exits live-preview mode, whether the
+    # caller explicitly invoked ``stop_live_preview`` or the panel
+    # auto-stopped because a different source was loaded (user
+    # selected another segment / switched the source-combo / a
+    # rendered video auto-loaded after export).  MainWindow listens
+    # so its ``_preview_mode_active`` flag stays in sync with the
+    # panel's actual state.
+    live_preview_stopped = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -270,6 +287,19 @@ class PreviewPanel(QWidget):
         # tracks the *project* time as the video plays, not the video's
         # internal 0..duration_sec range.
         self._playhead_offset_sec: float = 0.0
+        # ----- live-preview state -----
+        # When ``_live_active`` is True the panel is in "draw-on-demand"
+        # mode: the QMediaPlayer plays only the audio track of the
+        # active segment, while a QTimer polls the player position and
+        # asks ``_live_renderer.render_at(pos)`` for the frame to show
+        # in ``_live_label``.  All of this lives next to the existing
+        # video-playback path (which still owns ``self.video_widget``)
+        # so users can toggle Preview on/off without us tearing down
+        # the panel.  See ``start_live_preview`` / ``stop_live_preview``
+        # for the lifecycle.
+        self._live_active: bool = False
+        self._live_renderer: Optional["LiveFrameRenderer"] = None
+        self._live_buffer_rgb: object = None  # holds QImage backing array alive
         self._build_ui()
 
     def set_source_media(self, media: MediaItem | None) -> None:
@@ -326,17 +356,71 @@ class PreviewPanel(QWidget):
             )
 
     def _sync_stickman_overlay_pos(self) -> None:
-        """Keep the floating overlay snapped to the stage_stack area.
+        """Keep the floating overlay snapped to the rendered-image rect.
 
-        Called by ``_stickman_pos_timer`` at 50ms intervals while the
-        editor is active, and once immediately when toggled on, so the
-        overlay follows window moves and resize events automatically.
+        IMPORTANT: snap to the **letterboxed image rect**, not the full
+        ``stage_stack``.  The live frame is rendered at the renderer's
+        canvas size (typically 1280×720) and shown via
+        :meth:`QPixmap.scaled` with ``Qt.KeepAspectRatio`` inside
+        ``live_label`` — which centres the pixmap and pads the
+        non-matching dimension with empty space.  If the overlay
+        covered the full stage_stack the user's fractional box would
+        be interpreted against a LARGER rect than the renderer uses,
+        and the dashed cyan box would visibly drift away from the
+        actual stickman (e.g. user puts box at x=8% of the panel, but
+        the renderer draws stickman at x=8% of only the centred image
+        area, which sits ~10–60 px to the right of the panel's left
+        edge depending on aspect mismatch).
+
+        Re-runs at ~50 ms via ``_stickman_pos_timer`` so window
+        resizes / splitter drags are tracked automatically.
         """
         if not self._stickman_edit_active:
             return
-        tl = self.stage_stack.mapToGlobal(QPoint(0, 0))
+        rect = self._rendered_image_rect_global()
+        if rect is None:
+            # Fallback: cover the full stage_stack so the box is at
+            # least visible — happens before the first frame is
+            # rendered or when the live renderer isn't attached yet.
+            tl = self.stage_stack.mapToGlobal(QPoint(0, 0))
+            sz = self.stage_stack.size()
+            self.stickman_overlay.setGeometry(
+                tl.x(), tl.y(), sz.width(), sz.height()
+            )
+            return
+        self.stickman_overlay.setGeometry(rect)
+
+    def _rendered_image_rect_global(self) -> Optional["QRect"]:
+        """Compute the on-screen rect of the centred rendered image.
+
+        Returns global-coordinate ``QRect`` matching where the live
+        frame's pixels actually appear inside ``stage_stack``.  Returns
+        ``None`` if the renderer isn't running or the stage has zero
+        area — caller falls back to a full-stage overlay.
+
+        Math mirrors :meth:`QPixmap.scaled` with ``KeepAspectRatio``:
+        scale the renderer's native (W, H) into the stage rect by the
+        smaller of the two ratios, then centre the result.
+        """
         sz = self.stage_stack.size()
-        self.stickman_overlay.setGeometry(tl.x(), tl.y(), sz.width(), sz.height())
+        if sz.width() <= 0 or sz.height() <= 0:
+            return None
+        # Renderer aspect — fall back to 16:9 when nothing is loaded
+        # so toggling the overlay before the first frame still places
+        # a sensible rect (the renderer's default canvas is 1280×720).
+        rdr = self._live_renderer
+        if rdr is not None:
+            src_w = max(1, int(rdr.width))
+            src_h = max(1, int(rdr.height))
+        else:
+            src_w, src_h = 1280, 720
+        scale = min(sz.width() / src_w, sz.height() / src_h)
+        img_w = max(1, int(src_w * scale))
+        img_h = max(1, int(src_h * scale))
+        off_x = (sz.width() - img_w) // 2
+        off_y = (sz.height() - img_h) // 2
+        tl = self.stage_stack.mapToGlobal(QPoint(off_x, off_y))
+        return QRect(tl.x(), tl.y(), img_w, img_h)
 
     def _on_stickman_edit_toggled(self, checked: bool) -> None:
         """Show / hide the floating transparent stickman draw-box overlay."""
@@ -446,6 +530,13 @@ class PreviewPanel(QWidget):
 
     def clear(self) -> None:
         """Clear loaded media and reset player state."""
+        # If we're currently in live-preview mode, route through the
+        # dedicated tear-down so the renderer + frame timer + ndarray
+        # buffer reference all get released cleanly.  ``stop_live_preview``
+        # re-enters ``_show_empty`` for us so we can early-return.
+        if self._live_active or self._live_renderer is not None:
+            self.stop_live_preview()
+            return
         self._pending_play = False
         self._media_ready = False
         self._current_url = QUrl()
@@ -569,6 +660,36 @@ class PreviewPanel(QWidget):
         self.stage_stack.addWidget(render_page)                # index 3
         self._render_page_index = 3
 
+        # Page 4 — live drawing surface.  A plain QLabel that owns the
+        # most-recently-rendered ``QPixmap`` from
+        # :class:`LiveFrameRenderer`.  Sized to fill the stage area;
+        # the per-tick render scales the pixmap to the label's current
+        # size with ``KeepAspectRatio`` so the preview never stretches.
+        # ``setScaledContents(False)`` ensures the pixmap rasterisation
+        # we do (smooth-scale on the QPixmap itself) is not undone by
+        # Qt's much cheaper nearest-neighbour stretch path.
+        live_page = QWidget()
+        live_page.setStyleSheet("background:#0a0a0a;")
+        lvp_layout = QVBoxLayout(live_page)
+        lvp_layout.setContentsMargins(0, 0, 0, 0)
+        lvp_layout.setSpacing(0)
+        self.live_label = QLabel()
+        self.live_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_label.setStyleSheet("background:#0a0a0a;")
+        # Keep our own scaling; let the label stay at its natural ratio.
+        self.live_label.setScaledContents(False)
+        lvp_layout.addWidget(self.live_label, 1)
+        self.stage_stack.addWidget(live_page)                  # index 4
+        self._live_page_index = 4
+
+        # Frame-pump timer for live preview.  Driven by ``renderer.fps``
+        # so we don't render faster than the renderer can compose
+        # (wasted CPU) or slower (visible stutter).  Stays stopped
+        # outside of live-preview mode.
+        self._live_frame_timer = QTimer(self)
+        self._live_frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._live_frame_timer.timeout.connect(self._on_live_frame_tick)
+
         self.stage_stack.setCurrentIndex(2)  # start on empty page
         body_layout.addWidget(self.stage_stack, 1)
 
@@ -689,12 +810,21 @@ class PreviewPanel(QWidget):
         self.empty_label.setText("Main timeline preview is TODO in skeleton")
 
     def _load_path(self, raw_path: str, *, force_reload: bool = False) -> None:
+        # When live-preview is active, ANY call to load a different
+        # video/audio source is a deliberate choice by the caller
+        # (user picked another segment, switched the source-combo,
+        # auto-loaded a freshly-rendered file…) that supersedes live
+        # mode.  Tear it down first so the renderer + frame timer
+        # release cleanly before we start a new probe.
+        if self._live_active:
+            self.stop_live_preview()
+        # ``raw_path`` is always a local filesystem path now that live
+        # preview is in-process and HLS streaming has been removed.
         path = Path(raw_path)
         if not path.exists():
             self.clear()
             self._show_empty("Source not found")
             return
-
         url = QUrl.fromLocalFile(str(path.resolve()))
 
         # Dedup: same URL already requested. Avoid calling setSource() again
@@ -806,11 +936,20 @@ class PreviewPanel(QWidget):
         MS = QMediaPlayer.MediaStatus
 
         if status in {MS.LoadedMedia, MS.BufferedMedia}:
-            # Source is ready — switch to video page and enable playback.
+            # Source is ready — switch to video page (unless we're in
+            # live-render mode, which owns the stage_stack with its own
+            # QLabel page; flipping to the QVideoWidget page would
+            # paint a black native HWND over our live frames) and
+            # enable playback.
             self._load_watchdog.stop()
             self._media_ready = True
             self._load_retries = 0
-            self._show_video()
+            if not self._live_active:
+                self._show_video()
+            else:
+                # Stop the loading-dots animation; the live page is
+                # already current and we don't want it switched away.
+                self._loading_timer.stop()
             self.play_button.setEnabled(True)
             if self._pending_seek_ms >= 0:
                 self.player.setPosition(self._pending_seek_ms)
@@ -856,9 +995,15 @@ class PreviewPanel(QWidget):
         # LoadingMedia / BufferingMedia / StalledMedia
         # Only disable and show loading page during the *initial* load.
         # Once _media_ready is True, don't interrupt playback view.
+        # In live mode the live-page (rendered frames) is already the
+        # current stack page and must not be replaced by the loading
+        # placeholder — the user has been clicking edits and the
+        # frame from the prior renderer is more useful than "Loading
+        # media..." spinner text.
         if not self._media_ready:
             self.play_button.setEnabled(False)
-            self._show_loading()
+            if not self._live_active:
+                self._show_loading()
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         """Keep play/pause button label in sync with the actual player state."""
@@ -1043,4 +1188,221 @@ class PreviewPanel(QWidget):
     def _toggle_fullscreen(self) -> None:
         """Toggle preview video fullscreen mode."""
         self.video_widget.setFullScreen(not self.video_widget.isFullScreen())
+
+    # ------------------------------------------------------------------
+    # Live preview (in-process draw-on-demand)
+    # ------------------------------------------------------------------
+    def start_live_preview(
+        self,
+        renderer: "LiveFrameRenderer",
+        audio_path: str,
+        *,
+        start_local_sec: float = 0.0,
+        project_offset_sec: float = 0.0,
+    ) -> None:
+        """Switch the panel into live-render mode.
+
+        ``renderer`` is a fully-constructed :class:`LiveFrameRenderer`
+        already loaded with audio + initial beats.  We treat its
+        ``render_at`` as the source of every frame from now on; the
+        existing ``QMediaPlayer`` is repurposed to play **only the
+        audio track** of ``audio_path`` so the live frames stay locked
+        to the OS audio clock without us having to roll our own
+        ``QAudioSink`` pipeline.
+
+        Why we reuse ``self.player`` (audio-only) instead of spawning a
+        second player:
+          * one source-of-truth playhead means ``seek_slider`` /
+            ``time_label`` / ``playback_state_changed`` Just Work
+            without duplicating wiring,
+          * pause/resume/scrub controls already wired to the player
+            instantly behave as expected,
+          * ``QMediaPlayer`` is happy with a video output attached even
+            for an audio-only source — it simply emits no frames, and
+            the QVideoWidget stays hidden behind ``stage_stack``'s
+            live-page index.
+
+        Parameters
+        ----------
+        start_local_sec:
+            Where in the segment audio (segment-local seconds) playback
+            should resume.  Mapped to ``QMediaPlayer.setPosition`` once
+            the audio source is ready.
+        project_offset_sec:
+            Project-timeline seconds that map to ``start_local_sec``;
+            used so the timeline's red playhead tracks correctly during
+            live preview.
+        """
+        # Tear down any in-flight video playback so we don't compete
+        # with the live-mode audio source for the same player.
+        self.player.stop()
+
+        self._live_active = True
+        self._live_renderer = renderer
+        self._playhead_offset_sec = float(project_offset_sec)
+
+        # Hand the audio track to the existing player.  We deliberately
+        # bypass ``_load_path`` here because we already know the file
+        # exists (the caller analysed it for the renderer) and we do
+        # NOT want ``_load_active_source`` paths to fire when the user
+        # later flips the source-combo back to "Selected media".
+        audio_url = QUrl.fromLocalFile(str(Path(audio_path).resolve()))
+        self._current_url = audio_url
+        self._media_ready = False
+        self._load_retries = 0
+        self._pending_seek_ms = max(0, int(start_local_sec * 1000))
+        self._pending_play = True
+        self.play_button.setEnabled(False)
+        self._set_play_button_state(playing=True)
+        self.player.setSource(audio_url)
+        self._load_watchdog.start()
+
+        # Switch the stage stack to the live drawing page IMMEDIATELY
+        # so the user gets the first frame even before the audio probe
+        # finishes (which on a fresh MP3 can take 200–800 ms).
+        self.stage_stack.setCurrentIndex(self._live_page_index)
+        self._loading_timer.stop()
+        self._render_live_frame(start_local_sec)
+
+        # Pump frames at the renderer's fps.  Sub-1 ms timer overhead in
+        # PySide6 so we don't need to clamp the interval lower bound.
+        interval_ms = max(8, int(round(1000.0 / max(1, renderer.fps))))
+        self._live_frame_timer.setInterval(interval_ms)
+        self._live_frame_timer.start()
+
+    def stop_live_preview(self) -> None:
+        """Tear down live-render mode and return the panel to idle.
+
+        Idempotent.  Releases the renderer (its NumPy buffers add up to
+        ~50–150 MB on long segments) and stops the audio player.  The
+        stage_stack reverts to the empty page; the next interaction
+        (e.g. selecting a segment) will repopulate it through the
+        normal video / audio-source paths.
+        """
+        if not self._live_active and self._live_renderer is None:
+            return
+        self._live_active = False
+        self._live_frame_timer.stop()
+        # Stop audio playback before dropping the renderer so the timer
+        # tick that already fired (if any) doesn't land in a half-torn
+        # state.
+        self.player.stop()
+        self.player.setSource(QUrl())
+        if self._live_renderer is not None:
+            self._live_renderer.close()
+            self._live_renderer = None
+        # Drop the QImage backing buffer reference so the underlying
+        # ndarray can be garbage-collected.
+        self._live_buffer_rgb = None
+        self.live_label.clear()
+        # Reset all the QMediaPlayer-tracked state to "idle" so the
+        # user can pick a new source without inheriting flags from the
+        # live session.
+        self._media_ready = False
+        self._pending_play = False
+        self._pending_seek_ms = -1
+        self._current_url = QUrl()
+        self._show_empty("No preview source selected")
+        self.play_button.setEnabled(False)
+        self._set_play_button_state(playing=False)
+        # Notify MainWindow so its toggle state mirrors ours regardless
+        # of who initiated the stop.  ``Qt.QueuedConnection`` is
+        # implicit between thread boundaries, but we're on the GUI
+        # thread here so the slot runs synchronously after this line.
+        self.live_preview_stopped.emit()
+
+    def update_live_beats(self, beat_times: list[float]) -> None:
+        """Hot-reload the renderer's beat schedule and redraw current frame.
+
+        No-op when not in live mode.  The first frame after this call
+        replays the schedule from the segment start which can take a
+        few hundred ms on long clips — well below the 200 ms latency
+        target for editor-style preview.
+        """
+        if not self._live_active or self._live_renderer is None:
+            return
+        self._live_renderer.update_beats(list(beat_times))
+        self._render_live_frame(self.player.position() / 1000.0)
+
+    def update_live_mode(
+        self,
+        mode: str,
+        *,
+        show_stickman: Optional[bool] = None,
+        stickman_box: Optional[tuple[int, int, int, int]] = None,
+        show_floor_panels: Optional[bool] = None,
+    ) -> None:
+        """Hot-reload the renderer's gameplay mode + decor and redraw.
+
+        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels``
+        are pass-through overrides for :meth:`LiveFrameRenderer.update_mode`;
+        ``None`` keeps the renderer's current value.  The editor folds
+        the segment-config "Sticky Man / Floor panels / mode" form
+        edits into a single call so the scene is rebuilt exactly once.
+        """
+        if not self._live_active or self._live_renderer is None:
+            return
+        self._live_renderer.update_mode(
+            mode,
+            show_stickman=show_stickman,
+            stickman_box=stickman_box,
+            show_floor_panels=show_floor_panels,
+        )
+        self._render_live_frame(self.player.position() / 1000.0)
+
+    def is_live_preview_active(self) -> bool:
+        """``True`` while live-render mode is currently on."""
+        return self._live_active
+
+    def _on_live_frame_tick(self) -> None:
+        """Timer callback: render the frame matching the audio playhead."""
+        if not self._live_active or self._live_renderer is None:
+            self._live_frame_timer.stop()
+            return
+        # Audio is the master clock — render whichever frame matches
+        # ``player.position()`` so visuals stay locked to the audio
+        # output even if the OS scheduler skews the timer interval.
+        pos_ms = self.player.position()
+        # ``QMediaPlayer.position`` may briefly overshoot duration on
+        # EndOfMedia; LiveFrameRenderer.render_at clamps internally so
+        # we don't have to repeat that here.
+        self._render_live_frame(pos_ms / 1000.0)
+
+    def _render_live_frame(self, t_sec: float) -> None:
+        """Pull one frame from the renderer and show it on ``live_label``.
+
+        Heavy-lifting funnel for both the timer tick and the
+        ``update_*`` hot-reload paths.  Skipped if the live renderer
+        has been torn down between scheduling and execution.
+        """
+        rdr = self._live_renderer
+        if rdr is None:
+            return
+        # Render returns BGR uint8 — convert to RGB for QImage.  We
+        # could pre-allocate a contiguous swap buffer to avoid the
+        # alloc each tick, but at 720p the BGR→RGB cost is ~0.4 ms in
+        # OpenCV and negligible compared to the actual compose.
+        bgr = rdr.render_at(float(t_sec))
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # Force a contiguous C-order copy so QImage's memory view has
+        # a deterministic stride; without this, ``cvtColor`` can in
+        # rare cases return a view that QImage's stride probe rejects.
+        rgb = rgb.copy()
+        self._live_buffer_rgb = rgb  # keep alive for QImage lifetime
+        h, w, _ = rgb.shape
+        bytes_per_line = w * 3
+        img = QImage(
+            rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888
+        )
+        pix = QPixmap.fromImage(img)
+        # Scale to the label size with aspect-fit so resizing the
+        # window or dragging splitters reflows cleanly.
+        target = self.live_label.size()
+        if target.width() > 0 and target.height() > 0:
+            pix = pix.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.live_label.setPixmap(pix)
 

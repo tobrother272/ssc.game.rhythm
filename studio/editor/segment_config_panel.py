@@ -287,12 +287,16 @@ class SegmentConfigPanel(QWidget):
 
         self.preview_button = QPushButton("▶  Preview")
         self.preview_button.setObjectName("previewButton")
-        self.preview_button.setToolTip(
-            "Fast preview render: 960×540 @ 24 fps, bloom off.\n"
-            "Same gameplay/beats/mode as the full render — only pixel\n"
-            "cost is reduced so you can iterate on settings quickly.\n"
-            "Result auto-plays in the player and is NOT saved to the project."
+        self.preview_button.setCheckable(True)
+        self._preview_default_tooltip = (
+            "Toggle live preview mode.\n"
+            "When ON, every edit (beat ticks, mode, density…) clears "
+            "the buffered render and restarts from the current "
+            "playhead so you watch the latest version without "
+            "regenerating the whole segment.\n"
+            "Click again to stop and free the renderer."
         )
+        self.preview_button.setToolTip(self._preview_default_tooltip)
         self.preview_button.setEnabled(False)
         self.preview_button.clicked.connect(self._on_preview_clicked)
         footer.addWidget(self.preview_button, 1)
@@ -711,8 +715,36 @@ class SegmentConfigPanel(QWidget):
 
     def _on_preview_clicked(self) -> None:
         if self._segment is None:
+            # The button is checkable; without a segment selected there's
+            # nothing to toggle on, so make sure the visual stays unchecked.
+            self.preview_button.setChecked(False)
             return
         self.preview_requested.emit(self._segment.id)
+
+    def set_preview_active(self, active: bool) -> None:
+        """Sync the Preview button's checked state + label with main window.
+
+        Called from MainWindow whenever the live-preview mode flips on
+        or off (either via this button OR programmatically — e.g. when
+        the user switches segments while preview was running).  We
+        avoid emitting ``clicked`` by using ``setChecked`` directly.
+        """
+        if not hasattr(self, "preview_button"):
+            return
+        # ``blockSignals`` would also work, but Qt's QAbstractButton
+        # only fires ``clicked`` from a real user click — programmatic
+        # ``setChecked`` does not — so we don't need the guard.
+        self.preview_button.setChecked(bool(active))
+        if active:
+            self.preview_button.setText("■  Stop Preview")
+            self.preview_button.setToolTip(
+                "Live preview is ON.\n"
+                "Edits restart the render from the current playhead.\n"
+                "Click to stop preview and free the renderer."
+            )
+        else:
+            self.preview_button.setText("▶  Preview")
+            self.preview_button.setToolTip(self._preview_default_tooltip)
 
     def _on_render_clicked(self) -> None:
         if self._segment is None:

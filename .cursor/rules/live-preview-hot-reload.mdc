@@ -1,0 +1,92 @@
+---
+description: Mandatory hot-reload contract for any segment config or visual element that affects the final rendered video — every new knob/toggle/asset must update live preview in-place without a restart.
+alwaysApply: true
+---
+
+# Live-Preview Hot-Reload — Absolute Principle
+
+**Bất kỳ thành phần nào ảnh hưởng đến video render cuối cùng PHẢI hot-reload trong live preview.** Người dùng không được phép tắt-bật preview hoặc seek về 0 chỉ để thấy thay đổi.
+
+## Scope (cái gì PHẢI hot-reload)
+
+Mọi thuộc tính/asset sau đây, dù mới thêm hay đã có, đều bắt buộc:
+
+- **Segment config** (`Segment.render_settings`, `Segment.mode`, `Segment.beat_events`, `Segment.stickman_location`, `Segment.beat_height_threshold`, `Segment.min_beat_spacing_sec`, …) — bất kỳ field nào RenderService đọc khi build job.
+- **Visual elements**: cubes, walls, stickman, floor panels, viewport frame, particles, HUD, tunnel, lane tiles, background video/image, overlay textures, mesh/cube assets.
+- **Audio config** ảnh hưởng tới schedule (BPM, beat_source, beat_min_gap, density, threshold, lane filter, …).
+- **Camera/world** (lane count, floor spread, travel frames, block speed, mode-driven dressing).
+
+Nếu một thay đổi sẽ làm output `.mp4` khác đi → BẮT BUỘC hot-reload trong preview.
+
+## Hot-Reload Contract — 4 nơi BẮT BUỘC wire
+
+Khi thêm bất cứ knob/asset/toggle nào, đi qua đủ 4 lớp:
+
+1. **`src/live_renderer.py`** — chấp nhận giá trị mới
+   - Thêm constructor kwarg, lưu vào `self._<name>`, dùng trong `_build_scene` (không hardcode).
+   - Mở rộng `update_mode(...)` (hoặc method `update_*` phù hợp) để nhận `Optional[T] = None` (None = giữ giá trị hiện tại).
+
+2. **`studio/editor/preview_panel.py`** — pass-through API
+   - Mở rộng `update_live_mode(...)` / thêm `update_live_*` để forward vào `self._live_renderer.update_*`, sau đó gọi `self._render_live_frame(self.player.position()/1000.0)`.
+
+3. **`studio/editor/main_window.py`** — wire signals
+   - `_live_renderer_kwargs(segment)` đọc field mới từ `segment.render_settings`/segment.
+   - `_perform_live_preview_update` gather param mới từ segment khi `do_mode` (hoặc thêm `_live_preview_pending_<flag>` nếu chỉ cần rebuild một phần).
+   - Mọi handler thay đổi config (form `_on_segment_changed_by_form`, drag overlay `_on_stickman_location_edited`, …) PHẢI gọi `self._request_preview_restart(segment_id)`.
+
+4. **`src/rhythm.py` (`process_video`)** — final render dùng cùng giá trị
+   - Nếu preview thấy nhưng render `.mp4` không thấy ⇒ **bug nghiêm trọng** (preview lừa user). Render path phải đọc cùng segment field/CLI flag với preview.
+
+## Cấm tuyệt đối
+
+- ❌ Hardcode giá trị trong `_build_scene` thay vì đọc từ `self._<name>` (vd cũ: `show_floor_panels=True`).
+- ❌ Bắt user `_stop_preview_mode()` rồi `_start_live_preview()` chỉ để áp dụng config mới.
+- ❌ Chỉ cập nhật `process_video` mà quên live_renderer (preview lệch render).
+- ❌ Emit `segment_selected` / `_load_path` / `seek_to_seconds(0)` trong code path của một config edit (sẽ kill preview + reset playhead — xem fix add-beat regression đã làm).
+- ❌ Thêm asset (background video, image overlay, mesh) mà không cho phép swap-in-place (phải có method `update_<asset>()` hoặc fold vào `update_mode`).
+
+## Checklist khi PR thêm config/component mới
+
+- [ ] Field được đọc trong `live_renderer._build_scene` qua `self._<name>` (không hardcode).
+- [ ] `update_mode` (hoặc `update_*` mới) chấp nhận override với default `None`.
+- [ ] `preview_panel.update_live_*` forward đúng kwarg.
+- [ ] `_live_renderer_kwargs` map `render_settings[<key>]` → constructor kwarg cho preview khởi tạo.
+- [ ] `_perform_live_preview_update` truyền field mới khi `do_mode` (hoặc thêm flag riêng).
+- [ ] Handler signal (form/drag/click) gọi `_request_preview_restart`.
+- [ ] `process_video` (final render) đọc CÙNG field — preview ≡ render.
+- [ ] Test thủ công: đổi config khi preview đang chạy → kết quả thay đổi ngay frame kế tiếp, playhead/audio không reset.
+
+## Ví dụ chuẩn (commit "Sticky Man + Floor panels + Mode hot-reload")
+
+Bốn lớp wire-up cho `floor_panels`:
+
+```python
+# 1. live_renderer.py — accept + use
+def __init__(self, ..., show_floor_panels: bool = True, ...):
+    self._show_floor_panels = bool(show_floor_panels)
+
+def _build_scene(self):
+    self._tunnel = TunnelRenderer(self._cam,
+                                  show_floor_panels=self._show_floor_panels,
+                                  lane_tiles=True)
+
+def update_mode(self, mode, *, show_floor_panels: Optional[bool] = None, ...):
+    if show_floor_panels is not None:
+        self._show_floor_panels = bool(show_floor_panels)
+    self._build_scene()
+
+# 2. preview_panel.py — forward
+def update_live_mode(self, mode, *, show_floor_panels=None, ...):
+    self._live_renderer.update_mode(mode, show_floor_panels=show_floor_panels, ...)
+    self._render_live_frame(self.player.position() / 1000.0)
+
+# 3. main_window.py — wire
+kwargs["show_floor_panels"] = bool(rs.get("floor_panels", True))  # initial
+# in _perform_live_preview_update:
+self.preview_panel.update_live_mode(segment.mode,
+    show_floor_panels=bool(rs.get("floor_panels", True)), ...)
+
+# 4. rhythm.py — render path uses same field (already wired via CLI flag)
+```
+
+Form checkbox toggle → `segment_changed.emit` → `_request_preview_restart` → debounce 80ms → scene rebuild → frame update. **Zero subprocess, zero seek reset.**
