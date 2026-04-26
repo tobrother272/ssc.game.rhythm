@@ -4790,11 +4790,39 @@ class RhythmVisualizer:
                 ts = ", ".join(f"{f/self.FPS:.3f}" for f, _ in line_dbg_events)
                 print(f"[beat-debug] events={len(line_dbg_events)}  t=[{ts}]")
 
+        # Per-event audio amplitude (0..1) — derived from the rise→peak
+        # column closest to each event's frame.  Studio uses this to
+        # power its waveform threshold slider so the user can mute weak
+        # ticks without re-running detect.  Always emitted (even when
+        # ``wave_columns`` is empty) so the loader's array-shape
+        # contract is stable: same length as ``stick_events`` and all
+        # 1.0 when no column data is available (i.e. nothing to
+        # filter, every beat is "loud").
+        event_heights: list[float] = []
+        if wave_columns:
+            _max_h = max(float(c.get('height', 0.0))
+                         for c in wave_columns)
+            _max_h = max(_max_h, 1e-9)
+            _col_frames = np.array(
+                [int(c['rise_f']) for c in wave_columns], dtype=np.int64
+            )
+            _col_h = np.array(
+                [float(c['height']) / _max_h for c in wave_columns],
+                dtype=np.float32,
+            )
+            for ev in stick_events:
+                f_ev = int(round(float(ev[0]) * self.FPS))
+                idx = int(np.argmin(np.abs(_col_frames - f_ev)))
+                event_heights.append(float(np.clip(_col_h[idx], 0.0, 1.0)))
+        else:
+            event_heights = [1.0] * len(stick_events)
+
         # Persist events so stickman.py can render a standalone video that
         # lines up frame-for-frame with THIS rhythm render.
         if getattr(self, 'EXPORT_EVENTS', None):
             from stickman import save_events
             save_events(self.EXPORT_EVENTS, stick_events, meta={
+                'event_heights':    event_heights,
                 'fps':      self.FPS,
                 'duration': float(total_duration),
                 'tempo':    float(tempo_val),

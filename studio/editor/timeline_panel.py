@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
@@ -285,7 +285,24 @@ class SegmentBlockMeta:
 
 
 class SegmentRectItem(QGraphicsRectItem):
-    """Draggable timeline block bound to one segment."""
+    """Draggable timeline block bound to one segment.
+
+    The visible fill / outline / selection halo are *not* drawn by
+    this item — they are painted by the scene's ``drawBackground``
+    pass (see :meth:`TimelinePanel._paint_segment_blocks`).  The
+    item itself only carries the geometry, drag/select flags and
+    child items (status badge + name label).
+
+    Why?  An earlier Qt regression caused translucent / decorated
+    ``QGraphicsItem`` instances to occasionally drop their painted
+    output from the cache when a mouse press landed on them — the
+    user could see the segment's fill briefly vanish on click.
+    Moving the visuals into the background pass guarantees they are
+    re-rendered on every paint event regardless of mouse handling.
+    """
+
+    # Y locked to the segment track body (ruler_h + 2px padding).
+    SEGMENT_Y = 40.0
 
     def __init__(self, segment: Segment, pixels_per_second: float):
         super().__init__()
@@ -297,25 +314,304 @@ class SegmentRectItem(QGraphicsRectItem):
             | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
         self.setAcceptHoverEvents(True)
-
-    # Y locked to the segment track body (ruler_h + 2px padding).
-    SEGMENT_Y = 40.0
+        # Item is invisible — visuals come from ``drawBackground``.
+        # We still need a non-empty rect (set later by ``_draw_segment``)
+        # so Qt's hit-testing and drag mechanics work as expected.
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setPen(QPen(Qt.PenStyle.NoPen))
 
     def itemChange(self, change, value):  # type: ignore[override]
         if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
             new_pos = value
             return QPointF(max(0.0, new_pos.x()), self.SEGMENT_Y)
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionHasChanged:
+            # Drag updates pos but no item paint runs in our scene
+            # (the item itself is invisible) — invalidate the
+            # background layer so the block's painted fill follows
+            # the drag in real time.
+            scene = self.scene()
+            if scene is not None:
+                try:
+                    scene.invalidate(
+                        scene.sceneRect(),
+                        QGraphicsScene.SceneLayer.BackgroundLayer,
+                    )
+                except RuntimeError:
+                    pass
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemSelectedHasChanged:
+            # Selection halo is painted in ``_paint_segment_blocks``
+            # — repaint when select state flips so the halo appears
+            # / disappears immediately.
+            scene = self.scene()
+            if scene is not None:
+                try:
+                    scene.invalidate(
+                        scene.sceneRect(),
+                        QGraphicsScene.SceneLayer.BackgroundLayer,
+                    )
+                except RuntimeError:
+                    pass
         return super().itemChange(change, value)
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        # No-op: fill, outline, and selection state are painted by
+        # :meth:`TimelinePanel._paint_segment_blocks` during the
+        # scene's ``drawBackground`` pass so the visuals can never be
+        # hidden by mouse events on this item.  Children (badge,
+        # label) paint themselves on top of the background layer
+        # via Qt's normal item recursion.
+        return
+
+
+class WaveformThresholdLine(QGraphicsRectItem):
+    """Threshold line over the waveform — **double-click to focus**, then drag.
+
+    The bar is thin (1 px, one-third of the old 3-px stroke) so it
+    does not obscure the audio.  ``ItemIsMovable`` stays **off** until
+    the user double-clicks the line: then a yellow halo highlights it
+    and vertical dragging is enabled.  Double-click again on the same
+    line to drop focus (and end drag mode).
+
+    Y is constrained to ``[wy_top .. wy_bottom - LINE_BASELINE_OFFSET]``.
+    X is locked to the segment's visible-clipped range.
+
+    Live drag updates ``panel._on_threshold_line_moved``; persistence
+    still batches on release / blur via ``_on_threshold_line_drag_finished``.
+    """
+
+    # Cosmetic stroke — bumped to 2 px (2× the previous 1-px) so the
+    # bar is easy to see and click without obscuring the audio.
+    LINE_THICKNESS        = 2.0
+    HIT_HALF_HEIGHT       = 12.0
+    HANDLE_SIZE           = 12.0
+    LINE_BASELINE_OFFSET  = 3.0    # min px above baseline so it stays visible
+    LABEL_BG_HEIGHT       = 16.0   # pill label height (drawn above the bar)
+    LINE_COLOR            = QColor(255, 60, 60)
+    FOCUS_HALO_COLOR      = QColor(255, 214, 10, 110)
+
+    def __init__(
+        self,
+        panel: "TimelinePanel",
+        segment_id: str,
+        x_left: float,
+        x_right: float,
+        wy_top: float,
+        wy_bottom: float,
+        threshold: float,
+    ) -> None:
+        width = max(1.0, float(x_right) - float(x_left))
+        super().__init__(
+            0.0,
+            -self.HIT_HALF_HEIGHT,
+            width,
+            2 * self.HIT_HALF_HEIGHT,
+        )
+        self._panel = panel
+        self._segment_id = segment_id
+        self._x_left = float(x_left)
+        self._wy_top = float(wy_top)
+        self._wy_bottom = float(wy_bottom)
+        self._width = float(width)
+        self._threshold = max(0.0, min(1.0, float(threshold)))
+        self._suppress_emit = False
+        # The line is always interactive — no double-click toggle, no
+        # disappearing on focus changes.  ``_interaction_focused`` is
+        # kept as a constant ``True`` purely so legacy code paths
+        # (paint halo / drag-finish gating) still see the same state.
+        self._interaction_focused = True
+        self._drag_dirty = False
+        self.setBrush(QBrush(QColor(0, 0, 0, 0)))
+        self.setPen(Qt.PenStyle.NoPen)
+        self.setZValue(15)  # above waveform fill (3) + outline (4)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
+        )
+        self.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True
+        )
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip(
+            "Drag vertically to set the amplitude threshold.\n"
+            "Beats under the line are dimmed and skipped at render."
+        )
+        self.set_threshold(threshold)
+
+    # ── Custom paint (no child items) ───────────────────────────────
+    # Drawing the line / handles / pill ourselves keeps the entire
+    # WaveformThresholdLine a single QGraphicsItem from Qt's POV —
+    # which is critical because child items intercept mouse presses
+    # and Qt's scene does NOT auto-fall-through to the parent when a
+    # child has ``setAcceptedMouseButtons(Qt.NoButton)`` (it walks
+    # SIBLINGS, not the parent chain).  With zero children, every
+    # click in the 20-px-tall drag zone reaches our ``itemChange``
+    # directly via ``ItemIsMovable``.
+    def boundingRect(self):  # type: ignore[override]
+        # Extend the bounding rect upward so the "thr 0.42" pill drawn
+        # above the bar isn't clipped (and gets repainted on threshold
+        # changes).  Width is ``self._width``; height is the 20-px hit
+        # zone plus the pill above plus a 1-px gap.
+        pill_h = self.LABEL_BG_HEIGHT + 1.0
+        return QRectF(
+            -2.0,
+            -self.HIT_HALF_HEIGHT - pill_h,
+            self._width + 4.0,
+            2 * self.HIT_HALF_HEIGHT + pill_h,
+        )
+
+    def shape(self):  # type: ignore[override]
+        # ``QGraphicsRectItem.shape()`` still follows the *constructor*
+        # rect, not our wider :meth:`boundingRect`, so clicks on the
+        # pill / handles would miss the item.  Match hit-testing to the
+        # painted bounds so the whole control is one draggable surface.
+        path = QPainterPath()
+        path.addRect(self.boundingRect())
+        return path
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        # No-op: the focus halo, main red stroke, end-handle squares
+        # and "thr 0.42" pill are all painted by
+        # :meth:`TimelinePanel._paint_threshold_lines` during the
+        # scene's ``drawBackground`` pass.  Painting in the
+        # background guarantees the visuals are regenerated on every
+        # repaint so the bar can never be hidden by a click landing
+        # on it (the same Qt cache regression that motivated the
+        # waveform / segment-block / beat-tick refactors).
+        return
+
+    # ── Geometry helpers ────────────────────────────────────────────
+    def _y_for_threshold(self, threshold: float) -> float:
+        """Map a 0..1 threshold to a scene Y in the waveform track.
+
+        ``threshold = 0`` → bar sits ``LINE_BASELINE_OFFSET`` px above
+        ``wy_bottom`` (so it never melts into the baseline);
+        ``threshold = 1`` → bar sits at ``wy_top`` (filter everything).
+        """
+        thr = max(0.0, min(1.0, float(threshold)))
+        usable_bottom = self._wy_bottom - self.LINE_BASELINE_OFFSET
+        return usable_bottom - thr * (usable_bottom - self._wy_top)
+
+    def _threshold_for_y(self, y: float) -> float:
+        usable_bottom = self._wy_bottom - self.LINE_BASELINE_OFFSET
+        span = max(1e-6, usable_bottom - self._wy_top)
+        thr = (usable_bottom - float(y)) / span
+        return max(0.0, min(1.0, thr))
+
+    def _update_label(self, threshold: float) -> None:
+        """Cache the new threshold value and force a repaint of the pill.
+
+        With the visuals painted in the scene's ``drawBackground`` pass
+        we invalidate the background layer instead of calling
+        :meth:`QGraphicsItem.update` (which would only refresh the
+        item's own paint output — and that is intentionally a no-op).
+        """
+        self._threshold = max(0.0, min(1.0, float(threshold)))
+        scene = self.scene()
+        if scene is not None:
+            try:
+                scene.invalidate(
+                    scene.sceneRect(),
+                    QGraphicsScene.SceneLayer.BackgroundLayer,
+                )
+            except RuntimeError:
+                pass
+
+    def set_threshold(self, threshold: float) -> None:
+        """Reposition without firing the panel callback (used during refresh)."""
+        self._suppress_emit = True
+        try:
+            self.setPos(self._x_left, self._y_for_threshold(threshold))
+            self._update_label(threshold)
+        finally:
+            self._suppress_emit = False
+
+    # ── Qt overrides ────────────────────────────────────────────────
+    def itemChange(self, change, value):  # type: ignore[override]
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value
+            usable_bottom = self._wy_bottom - self.LINE_BASELINE_OFFSET
+            clamped_y = max(self._wy_top,
+                            min(usable_bottom, float(new_pos.y())))
+            return QPointF(self._x_left, clamped_y)
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionHasChanged:
+            if (
+                not self._suppress_emit
+                and self._interaction_focused
+            ):
+                self._drag_dirty = True
+                thr = self._threshold_for_y(self.pos().y())
+                self._update_label(thr)
+                self._panel._on_threshold_line_moved(
+                    self._segment_id, thr
+                )
+        try:
+            return super().itemChange(change, value)
+        except RuntimeError:
+            # The scene can clear / delete this line mid-gesture; Qt may
+            # still call ``itemChange`` (e.g. on mouse move) on the C++ item.
+            return value
+
+    def set_interaction_focus(self, on: bool) -> None:
+        """No-op kept for legacy callers.
+
+        The line is always interactive (always movable, always shows
+        the focus halo / handles).  Older code paths called this to
+        toggle a double-click "focus mode" — that mode caused the
+        line to vanish on double-click in some corner cases, so it
+        was removed.  We still flush persistence on a *blur* request
+        if a drag is dirty so the bar's last position is saved.
+        """
+        if not on and self._drag_dirty:
+            self._panel._on_threshold_line_drag_finished(self._segment_id)
+            self._drag_dirty = False
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        """After a drag, flush project save **after** Qt unwinds.
+
+        Persistence triggers ``MainWindow._on_project_changed`` which
+        ``scene.clear()``s every item — including this one.  Calling
+        ``super().mouseReleaseEvent`` on an already-deleted C++ wrapper
+        then raises ``RuntimeError`` (PySide6).  We let Qt's release
+        path complete first by deferring the emit to the next event-
+        loop tick, and we wrap ``super`` in a ``try/except`` so the
+        rare case of a refresh fired from elsewhere never bubbles up.
+        """
+        flush = (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._drag_dirty
+        )
+        if flush:
+            self._drag_dirty = False
+            seg_id = self._segment_id
+            panel = self._panel
+            QTimer.singleShot(
+                0,
+                lambda: panel._on_threshold_line_drag_finished(seg_id),
+            )
+        try:
+            super().mouseReleaseEvent(event)
+        except RuntimeError:
+            pass
 
 
 class BeatStripBgItem(QGraphicsRectItem):
-    """Background strip for one segment's beat-event row.
+    """Invisible hit-test rectangle for one segment's beat-event row.
 
-    Visually identical to the original :class:`QGraphicsRectItem` we used
-    before (RGB 65/65/65 fill, RGB 140/140/140 border, ``zValue=10``) but
-    intercepts double-clicks so the user can insert a new beat event at
-    the click position. Single-clicks are left alone so the timeline can
-    still scrub the playhead through the strip area.
+    The visible RGB 65/65/65 strip + RGB 140/140/140 1-px border that
+    used to be painted by this item is now drawn during the scene's
+    ``drawBackground`` pass (see
+    :meth:`TimelinePanel._paint_beat_strip_decorations`).  This item
+    keeps the same geometry purely so Qt can route mouse events to
+    it: the user's double-click "insert beat" gesture and the
+    right-click "add beat block" menu both rely on the press landing
+    on a real :class:`QGraphicsRectItem`.
+
+    Painting moved to the background to dodge a Qt regression where
+    a click on a translucent / decorated item would occasionally
+    remove the item's paint output until the next forced repaint.
+    The decoration was the entire visible part of the strip; with
+    that gone, the only Qt item left here is invisible and clicks
+    cannot "hide" anything visually.
     """
 
     def __init__(
@@ -327,8 +623,9 @@ class BeatStripBgItem(QGraphicsRectItem):
         super().__init__(rect)
         self._panel = panel
         self._segment_id = segment_id
-        self.setBrush(QBrush(QColor(65, 65, 65)))
-        self.setPen(QPen(QColor(140, 140, 140), 1))
+        # Fully transparent — visuals come from drawBackground.
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setPen(QPen(Qt.PenStyle.NoPen))
         self.setZValue(10)
         self.setToolTip("Double-click to insert a beat event")
 
@@ -367,25 +664,46 @@ class BeatStripBgItem(QGraphicsRectItem):
 class BeatTickItem(QGraphicsRectItem):
     """Interactive vertical tick on the BEAT-DBG strip.
 
-    The visual is a thicker cosmetic line (3 px when idle, 5 px when
-    selected) with an optional index label above for the first 12
-    events.  The bounding rect is a wider ±``HIT_HALF_WIDTH``-pixel
-    zone so dragging stays comfortable even when ticks pile up at
-    high zoom.  The item is *movable* on the X axis only (Y is locked
-    to ``tick_top`` in scene coords) and *selectable* so the
-    Delete-key shortcut hooks in cleanly.  All commits are routed
-    back to the owning :class:`TimelinePanel` which mutates
-    ``_beat_events`` and emits the persistence signal — the item
-    itself stays display-only.
+    The item itself is **invisible** — its only job is to host the
+    drag / select / focus logic for one beat event.  The vertical
+    stroke (3 px idle, 5 px selected) and optional index-number
+    label are painted by the scene's ``drawBackground`` pass via
+    :meth:`TimelinePanel._paint_beat_ticks`.  The bounding rect
+    stays a ±``HIT_HALF_WIDTH``-pixel hit zone so dragging is
+    comfortable even when ticks pile up at high zoom.
+
+    Why move the visuals?  An earlier user video showed beat-strip
+    ticks vanishing when the user clicked on the strip — Qt's hit
+    path occasionally drops translucent / decorated child items
+    (the ``QGraphicsLineItem`` we used to nest here) from the paint
+    cache when a press lands on their parent.  Painting in
+    ``drawBackground`` makes the stroke immune to that regression
+    because it is regenerated on every paint event.
+
+    The item is movable on the X axis only (Y is locked to
+    ``tick_top`` in scene coords) and selectable so the Delete-key
+    shortcut hooks in cleanly.  All commits are routed back to the
+    owning :class:`TimelinePanel` which mutates ``_beat_events`` and
+    emits the persistence signal — the item itself stays
+    display-only.
     """
 
-    # Visual + interactive dimensions doubled vs the original 1-px line
-    # so the ticks are unmistakable both as a target (12-px hit halo on
-    # each side ⇒ 24-px wide drag zone) and as a marker (6-px stroke
-    # idle, 10-px when selected).
+    # Hit halo stays comfortable (12 px on each side ⇒ 24-px wide
+    # drag zone) so dragging is easy even when ticks pile up at high
+    # zoom.  The stroke itself was halved from 6/10 px to 3/5 px so
+    # the markers don't dominate the beat strip while remaining
+    # easy to see (3-px idle, 5-px when selected).
     HIT_HALF_WIDTH = 12.0
-    TICK_WIDTH_IDLE = 6.0
-    TICK_WIDTH_SELECTED = 10.0
+    TICK_WIDTH_IDLE = 3.0
+    TICK_WIDTH_SELECTED = 5.0
+    # Pixel distance the cursor must travel before a click is treated as
+    # a real drag-retime.  Anything smaller is absorbed as click-jitter
+    # (and during double-clicks the cursor easily wanders 2-4 px between
+    # the two presses).  Below this threshold, on release we also SNAP
+    # the tick back to its press-x so any micro-shift Qt's default drag
+    # handler imposed never reaches the user as a "tick disappearing
+    # for a frame and reappearing one pixel over" flicker.
+    DRAG_COMMIT_PX = 6.0
 
     def __init__(
         self,
@@ -404,7 +722,7 @@ class BeatTickItem(QGraphicsRectItem):
         # Local coords: the item is positioned via ``setPos(scene_x,
         # tick_top)`` so local origin (0, 0) aligns with the top of the
         # tick line. The bounding rect must include the label area
-        # above so child items render without clipping.
+        # above so the painted label isn't clipped.
         line_height = float(tick_bottom) - float(tick_top)
         if idx_label and num_y is not None:
             label_top_local = float(num_y) - float(tick_top) - 2.0
@@ -426,8 +744,14 @@ class BeatTickItem(QGraphicsRectItem):
         self._x_min = float(x_min)
         self._x_max = float(x_max)
         self._scene_y_top = float(tick_top)
-        # Invisible bbox — the line and label live as child items so they
-        # follow the tick automatically while it is dragged.
+        # Visual data read by ``_paint_beat_ticks`` — line height,
+        # label text, and label offset are computed once here and
+        # painted from the scene's background pass on every repaint
+        # so the stroke can never be lost to Qt's hit-test cache.
+        self._line_height = float(line_height)
+        self._label_text: Optional[str] = idx_label
+        self._label_top_local = float(label_top_local)
+        # Fully transparent — visuals come from drawBackground.
         self.setPen(Qt.PenStyle.NoPen)
         self.setBrush(Qt.BrushStyle.NoBrush)
         self.setFlag(
@@ -442,49 +766,44 @@ class BeatTickItem(QGraphicsRectItem):
         self.setCursor(Qt.CursorShape.SizeHorCursor)
         self.setZValue(12)
 
-        line = QGraphicsLineItem(0.0, 0.0, 0.0, line_height, self)
-        pen = QPen(self._base_color)
-        pen.setCosmetic(True)
-        pen.setWidthF(self.TICK_WIDTH_IDLE)
-        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        line.setPen(pen)
-        self._line_item = line
-
-        if idx_label and num_y is not None:
-            text = QGraphicsSimpleTextItem(idx_label, self)
-            text.setBrush(self._base_color)
-            f = text.font()
-            f.setPointSize(7)
-            text.setFont(f)
-            text.setPos(-4.0, label_top_local)
-            self._label_item: Optional[QGraphicsSimpleTextItem] = text
-        else:
-            self._label_item = None
-
-    # -- Helpers --------------------------------------------------------
-    def _apply_selection_visual(self, selected: bool) -> None:
-        """Bold the tick line whenever it's the active selection.
-
-        The colour stays mode-derived (upcoming/active/passed) so users
-        keep their visual reference; only the stroke width changes.
-        """
-        pen = QPen(self._base_color)
-        pen.setCosmetic(True)
-        pen.setWidthF(
-            self.TICK_WIDTH_SELECTED if selected else self.TICK_WIDTH_IDLE
-        )
-        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        self._line_item.setPen(pen)
-
     # -- Qt overrides ---------------------------------------------------
+    def _invalidate_background(self) -> None:
+        """Force the scene's background pass to repaint this tick."""
+        scene = self.scene()
+        if scene is not None:
+            try:
+                scene.invalidate(
+                    scene.sceneRect(),
+                    QGraphicsScene.SceneLayer.BackgroundLayer,
+                )
+            except RuntimeError:
+                pass
+
     def itemChange(self, change, value):  # type: ignore[override]
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
             new = QPointF(value)
             x = max(self._x_min, min(self._x_max, float(new.x())))
             return QPointF(x, self._scene_y_top)
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            # Live-drag: the painted stroke / label live in
+            # drawBackground, so refresh the background layer to
+            # follow the drag in real time.
+            self._invalidate_background()
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
-            self._apply_selection_visual(bool(value))
-        return super().itemChange(change, value)
+            # Stroke width depends on selection state — repaint the
+            # background so the bold/un-bold flips immediately.
+            self._invalidate_background()
+        try:
+            return super().itemChange(change, value)
+        except RuntimeError:
+            return value
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        # No-op: the visible stroke + label are painted by
+        # :meth:`TimelinePanel._paint_beat_ticks` during the scene's
+        # ``drawBackground`` pass so they cannot be hidden by mouse
+        # events on this item.
+        return
 
     def mousePressEvent(self, event):  # type: ignore[override]
         """Take focus when the user clicks the tick.
@@ -506,9 +825,9 @@ class BeatTickItem(QGraphicsRectItem):
             self._drag_press_x = float(self.pos().x())
             events = self._panel._beat_events.get(self._segment_id, [])
             if 0 <= self._event_idx < len(events):
-                t_local, _ = events[self._event_idx]
+                t_local = float(events[self._event_idx][0])
                 self._panel._set_focused_beat(
-                    self._segment_id, float(t_local)
+                    self._segment_id, t_local
                 )
             scene = self.scene()
             if scene is not None:
@@ -519,19 +838,31 @@ class BeatTickItem(QGraphicsRectItem):
 
     def mouseReleaseEvent(self, event):  # type: ignore[override]
         super().mouseReleaseEvent(event)
-        # ``itemChange`` already clamped X; only commit if the tick
-        # actually moved by more than ~1.5 px since the last press.
-        # A bare click (or a sub-pixel cursor jiggle in the middle of
-        # a double-click) used to land a tiny drag commit, which then
-        # scheduled a deferred ``refresh()`` that destroyed and
-        # recreated the tick — the user perceived this as the tick
-        # "disappearing for a moment".  The pixel-based threshold is
-        # zoom-independent and lets the user still nudge by 1 px via
-        # the arrow keys, which take a separate code path.
+        # Only commit if the tick actually moved by more than
+        # :attr:`DRAG_COMMIT_PX` since the press.  Below that we treat
+        # the gesture as a click (single or part of a double-click)
+        # and SNAP the tick back to the press-x so Qt's default drag
+        # handler can't leave the tick sitting a couple of pixels off
+        # while we wait for the next refresh.  Without the snap-back,
+        # a stray 2-3 px jitter during a double-click landed on
+        # ``mouseReleaseEvent`` first, scheduled a deferred
+        # ``refresh()`` (destroying and recreating the tick), and the
+        # user perceived the tick as "vanishing then reappearing
+        # shifted" — exactly the bug reported.
         new_x = float(self.pos().x())
         press_x = getattr(self, "_drag_press_x", None)
         self._drag_press_x = None
-        if press_x is None or abs(new_x - press_x) < 1.5:
+        if press_x is None or abs(new_x - press_x) < self.DRAG_COMMIT_PX:
+            if press_x is not None and abs(new_x - press_x) > 0.05:
+                # Snap back inside ``ItemSendsGeometryChanges`` —
+                # ``itemChange`` will simply pass the value through
+                # since the X is already inside ``_x_min/_x_max``.
+                try:
+                    self.setPos(
+                        QPointF(float(press_x), float(self._scene_y_top))
+                    )
+                except RuntimeError:
+                    pass
             return
         self._panel._on_beat_tick_drag_finished(
             self._segment_id, self._event_idx, new_x
@@ -546,12 +877,13 @@ class BeatTickItem(QGraphicsRectItem):
         tracker.  On an already-selected movable item that
         manifests as a brief
         ``Selected → (cleared) → Selected`` toggle — each toggle
-        runs :meth:`_apply_selection_visual`, so the user sees the
-        line collapse from the 10-px "selected" stroke to the 6-px
-        "idle" one and back.  Combined with any sub-pixel cursor
-        jiggle (which arms a tiny drag and triggers a deferred
-        :meth:`refresh` that destroys + recreates the C++ item),
-        the tick *visually disappears* for one or two frames.
+        re-invalidates the background pass that paints the tick, so
+        the user briefly sees the line collapse from the 10-px
+        "selected" stroke to the 6-px "idle" one and back.
+        Combined with any sub-pixel cursor jiggle (which arms a tiny
+        drag and triggers a deferred :meth:`refresh` that destroys +
+        recreates the C++ item), the tick *visually disappears* for
+        one or two frames.
 
         We override this to a no-op (apart from re-asserting the
         focus / selection state) so the double-click is now a pure
@@ -565,9 +897,9 @@ class BeatTickItem(QGraphicsRectItem):
                 self.setSelected(True)
             events = self._panel._beat_events.get(self._segment_id, [])
             if 0 <= self._event_idx < len(events):
-                t_local, _ = events[self._event_idx]
+                t_local = float(events[self._event_idx][0])
                 self._panel._set_focused_beat(
-                    self._segment_id, float(t_local)
+                    self._segment_id, t_local
                 )
             scene = self.scene()
             if scene is not None:
@@ -609,6 +941,71 @@ class BeatTickItem(QGraphicsRectItem):
             self._panel._on_beat_tick_kind_changed(
                 self._segment_id, self._event_idx, str(new_kind)
             )
+
+
+class TimelineScene(QGraphicsScene):
+    """Scene that paints the waveform chart in :meth:`drawBackground`.
+
+    The waveform RMS envelope used to be assembled out of four
+    ``QGraphicsItem`` instances (track-bg rectangle, baseline, fill
+    polygon, outline polyline).  Single-clicks inside the waveform
+    area kept "removing" one of those layers per click — fill first,
+    then outline, until only the dark track background remained;
+    resizing the panel or clicking the timeline header brought them
+    all back.  The chart was *visually* gone but the items were still
+    in the scene — a Qt rendering / hit-test regression where mouse
+    presses on a translucent item with ``setAcceptedMouseButtons(NoButton)``
+    occasionally invalidates the item's paint cache without a matching
+    repaint.
+
+    Painting the chart in the scene's *background pass* avoids the
+    issue entirely: ``drawBackground`` runs on every viewport paint
+    event, has no per-item state Qt can lose, and is not affected by
+    selection / focus / hit-test paths.  The user's reported "click
+    hides the waveform" bug becomes structurally impossible because
+    the waveform is no longer an item that *can* be hidden.
+
+    The interactive overlays (red ``WaveformThresholdLine``, beat
+    ticks, segment blocks, playhead) stay as scene items so their
+    drag / select behaviour is unchanged.
+    """
+
+    def __init__(self, panel: "TimelinePanel") -> None:
+        super().__init__(panel)
+        self._panel = panel
+
+    def drawBackground(self, painter, rect):  # type: ignore[override]
+        super().drawBackground(painter, rect)
+        # ``_panel`` is set before any paint event happens (the panel
+        # constructs the scene first, then wires the view), but guard
+        # anyway so a stray paint during teardown can't crash.
+        try:
+            # Paint *all* non-interactive decorations here so they can
+            # never be hidden / removed by mouse events on scene items
+            # (Qt's hit-test path occasionally drops translucent items
+            # from the paint cache when an empty press lands on them —
+            # see :class:`TimelineScene` docstring).  Order matches
+            # zValue stacking the items used to have:
+            #   1. segment / waveform track strips + section labels
+            #   2. segment block fills + outlines + selection halos
+            #   3. waveform chart (bg + baseline + fill + outline)
+            #   4. per-segment beat-strip backgrounds
+            #   5. rule-mode dashed guide lines
+            #   6. white beat-strip "now" cursor
+            #   7. beat-event tick strokes + index labels
+            #   8. waveform threshold line (halo + stroke + handles + pill)
+            # Interactive overlays (segment block hit zones, beat
+            # tick hit zones, threshold-line hit zones, playhead,
+            # segment children like badge / label) are still scene
+            # items and paint on top of this background pass.
+            self._panel._paint_track_decorations(painter, rect)
+            self._panel._paint_segment_blocks(painter, rect)
+            self._panel._paint_waveform_background(painter, rect)
+            self._panel._paint_beat_strip_decorations(painter, rect)
+            self._panel._paint_beat_ticks(painter, rect)
+            self._panel._paint_threshold_lines(painter, rect)
+        except RuntimeError:
+            pass
 
 
 class TimelineView(QGraphicsView):
@@ -657,6 +1054,27 @@ class TimelineView(QGraphicsView):
         # want the segment to perfectly fill the viewport). Force top-left so
         # any leftover slack is harmless and scenes stick to the left edge.
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # ── Force full-viewport repaints ─────────────────────────────
+        # Qt's default ``MinimalViewportUpdate`` only invalidates the
+        # bounding rect of items that explicitly changed, then unions
+        # the resulting region.  That works for opaque scenes, but our
+        # waveform is layered translucent items (background ``#151515``
+        # + 35 %-alpha brown fill + 1 px outline) with the
+        # ``WaveformThresholdLine`` pulsing on top (its bounding rect
+        # extends well above the bar to host the "thr 0.42" pill, so
+        # every drag invalidates a tall slice of the chart).  The
+        # combination triggers a Qt regression where the translucent
+        # fill is *not* recomposited under the moved line — the user
+        # sees the chart "vanish" leaving only the dark bg until the
+        # next forced full repaint (panel resize, scrollbar appear,
+        # clicking the segment chrome above the chart).  Switching to
+        # ``FullViewportUpdate`` paints the whole visible area on every
+        # change, which is the price of correctness here — the
+        # timeline scene is small (a few hundred items), so the extra
+        # CPU is negligible vs. the bug.
+        self.setViewportUpdateMode(
+            QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+        )
         # StrongFocus is the QGraphicsView default but we re-assert it
         # here so future Qt versions can't quietly downgrade us — the
         # arrow-key nudging in :meth:`keyPressEvent` only fires while
@@ -706,15 +1124,42 @@ class TimelineView(QGraphicsView):
         hit_item = self.itemAt(event.position().toPoint())
         on_tick = isinstance(hit_item, BeatTickItem)
         on_segment = isinstance(hit_item, SegmentRectItem)
+        # Threshold line (no child items — hit is the line itself).
+        thr_line_hit: Optional[WaveformThresholdLine] = None
+        _probe = hit_item
+        while _probe is not None:
+            if isinstance(_probe, WaveformThresholdLine):
+                thr_line_hit = _probe
+                break
+            _probe = _probe.parentItem()
+        on_threshold = thr_line_hit is not None
 
-        # ── Playhead drag handle (within 8 px of red line) ────────────
-        # Only takes priority when scrubbing is allowed; otherwise we
-        # let the click fall through to the regular selection path so
-        # the user can still grab a segment that happens to sit under
-        # the playhead.
+        # ── Waveform-area guard ───────────────────────────────────────
+        # The user explicitly asked that clicks on the waveform render
+        # never alter the chart (no color change, no fill loss, no
+        # selection drop, no scrub).  Detect any press whose scene-Y
+        # falls inside the waveform track and which is **not** routed
+        # to a real interactive overlay (beat tick or threshold line)
+        # — and turn it into a complete no-op.  Decoration items
+        # (bg / fill / outline / baseline) all carry
+        # ``setAcceptedMouseButtons(NoButton)`` already, so this guard
+        # also matches when ``itemAt`` returns ``None`` because Qt
+        # filtered them out of hit-testing.
+        panel = self._panel_ref
+        if panel is not None and not on_tick and not on_threshold and not on_segment:
+            wave_top = float(panel._WAVE_TRACK_Y)
+            wave_bot = wave_top + float(panel._WAVE_TRACK_H)
+            if wave_top <= scene_pos.y() <= wave_bot:
+                event.accept()
+                return
+
+        if self._panel_ref is not None:
+            self._panel_ref._defocus_other_threshold_lines(thr_line_hit)
+
         if (
             self._scrub_enabled
             and not on_tick
+            and not on_threshold
             and abs(scene_pos.x() - self._playhead_x) <= 8
         ):
             self._dragging_playhead = True
@@ -724,46 +1169,24 @@ class TimelineView(QGraphicsView):
             event.accept()
             return
 
-        # ── Scrub on bare timeline / decoration click ─────────────────
-        # We deliberately swallow scrub when the click is on a beat
-        # tick (the user is grabbing it for drag) and when scrubbing
-        # is disabled (preview player in StoppedState — see
-        # :meth:`set_scrub_enabled`).
         if (
             self._scrub_enabled
             and not on_tick
+            and not on_threshold
             and scene_pos.y() <= self.sceneRect().height()
         ):
             self.playhead_scrubbed.emit(
                 max(0.0, self._x_to_time(scene_pos.x()))
             )
 
-        # ── Beat-focus management ─────────────────────────────────────
-        # Any click that does *not* land on a beat tick clears the
-        # focused-beat marker so subsequent arrow-key presses fall
-        # through to the View's default handler (timeline scroll)
-        # again.  Clicks that DO land on a tick let
-        # :meth:`BeatTickItem.mousePressEvent` set the new focus.
         if not on_tick and self._panel_ref is not None:
             self._panel_ref._clear_focused_beat()
 
-        # ── Selection routing ─────────────────────────────────────────
-        # Forward to QGraphicsScene only when the click is on a
-        # *selectable* item (segment block or beat tick).  For every
-        # other case (decoration backgrounds like the waveform / beat
-        # strip / ruler / segment-track fill, or truly empty area) we
-        # consume the event ourselves so the scene's default behaviour
-        # of clearSelection() on a non-selectable hit doesn't quietly
-        # tank the segment focus — which used to make the waveform
-        # vanish whenever the user clicked the waveform itself.
-        if on_segment or on_tick:
+        if on_segment or on_tick or on_threshold:
             super().mousePressEvent(event)
             return
 
         if hit_item is None:
-            # Truly empty area — explicit deselect path (handled by
-            # TimelinePanel._on_empty_clicked which sets
-            # _selected_segment_id = None and broadcasts deselect).
             self.empty_clicked.emit()
 
         event.accept()
@@ -877,11 +1300,20 @@ class TimelineView(QGraphicsView):
             if panel is not None:
                 events = panel._beat_events.get(tick._segment_id, [])
                 if 0 <= tick._event_idx < len(events):
-                    t_local, _ = events[tick._event_idx]
-                    panel._set_focused_beat(
-                        tick._segment_id, float(t_local)
-                    )
+                    t_local = float(events[tick._event_idx][0])
+                    panel._set_focused_beat(tick._segment_id, t_local)
             self.setFocus(Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+
+        walk_thr: Optional[WaveformThresholdLine] = None
+        _w = self.itemAt(event.position().toPoint())
+        while _w is not None:
+            if isinstance(_w, WaveformThresholdLine):
+                walk_thr = _w
+                break
+            _w = _w.parentItem()
+        if walk_thr is not None:
             event.accept()
             return
 
@@ -921,6 +1353,17 @@ class TimelinePanel(QWidget):
         super().__init__(parent)
         self._project: Optional[Project] = None
         self._block_map: dict[str, SegmentRectItem] = {}
+        # Maps ``(segment_id, event_idx)`` → the BeatTickItem so the
+        # background paint pass can read each tick's current
+        # position / selection state without scanning ``scene.items()``.
+        # Cleared in lockstep with ``_block_map`` whenever the scene
+        # is rebuilt.
+        self._tick_map: dict[tuple[str, int], "BeatTickItem"] = {}
+        # Maps ``segment_id`` → the WaveformThresholdLine so the
+        # background paint pass can render the red line + handles +
+        # "thr 0.42" pill at the line's current scene position.
+        # Cleared together with ``_block_map`` / ``_tick_map``.
+        self._threshold_map: dict[str, "WaveformThresholdLine"] = {}
         self.pixels_per_second = 60.0  # base zoom in overview mode
         self._effective_pps = 60.0     # scaled when in focus mode
         self._offset_sec = 0.0          # >0 in focus mode (focused segment start)
@@ -947,10 +1390,16 @@ class TimelinePanel(QWidget):
         self._waveform_loading_dots: int = 0
 
         # Beat-event preview overlay.  Maps ``segment_id`` → list of
-        # ``(time_sec_local, kind)`` produced by ``rhythm.py --detect_only``.
-        # ``time_sec_local`` is relative to the segment's trimmed audio
-        # (== ``Segment.start_time_sec`` in project time).
-        self._beat_events: dict[str, list[tuple[float, str]]] = {}
+        # ``(time_sec_local, kind, height_0_1)`` produced by
+        # ``rhythm.py --detect_only``.  ``time_sec_local`` is relative
+        # to the segment's trimmed audio (== ``Segment.start_time_sec``
+        # in project time). ``height_0_1`` is the per-beat audio
+        # amplitude (1.0 == loudest peak in the segment) used by the
+        # waveform threshold slider; legacy 2-tuples are normalised to
+        # height=1.0 on entry so older projects keep every tick.
+        self._beat_events: dict[
+            str, list[tuple[float, str, float]]
+        ] = {}
         self._beat_events_loading: set[str] = set()
         # Toggle for the "Rule" button. When ON, every beat tick draws a
         # dashed vertical guide line that extends below the strip down
@@ -986,6 +1435,17 @@ class TimelinePanel(QWidget):
         #     when the focused tick is deleted.
         self._focused_beat: Optional[tuple[str, float]] = None
         self._refresh_pending: bool = False  # guard against re-entrant refresh
+        # Set True only in :meth:`_on_empty_clicked` *before*
+        # ``clearSelection()``.  Used to distinguish a deliberate
+        # click-to-deselect from a spurious "nothing selected" signal
+        # (e.g.  ``QGraphicsItem`` was deleted mid-gesture) so we never
+        # broadcast :signal:`segment_selected` ``None`` to
+        # :class:`MainWindow` unless the user *actually* deselected.
+        # Otherwise ``_request_waveform_for(None)`` would wipe the RMS
+        # data and the waveform / inner track fill would *vanish* on
+        # a harmless click on a non-selectable surface (waveform fill,
+        # track chrome, etc.).
+        self._intentional_segment_deselect: bool = False
         self._build_ui()
 
     # -- Coordinate helpers --------------------------------------------------
@@ -1035,6 +1495,8 @@ class TimelinePanel(QWidget):
             try:
                 self.scene.clear()
                 self._block_map.clear()
+                self._tick_map.clear()
+                self._threshold_map.clear()
                 self._update_scene_width()
                 self._draw_ruler()
                 self._draw_tracks()
@@ -1157,19 +1619,44 @@ class TimelinePanel(QWidget):
         self.refresh()
 
     # ── Beat-event preview API ──────────────────────────────────────────
+    @staticmethod
+    def _normalise_event(ev: tuple) -> tuple[float, str, float]:
+        """Coerce a 2-/3-tuple beat row to canonical ``(t, kind, h)``.
+
+        Legacy projects (and older detect runs) only carry ``(t, kind)``;
+        we treat their height as 1.0 so existing ticks stay visible
+        regardless of the threshold slider.  Heights coming in from
+        :class:`BeatDetectService` or the project store are clamped to
+        [0,1] so a corrupt JSON / stale value can't push the slider's
+        domain out of range.
+        """
+        if len(ev) >= 3:
+            t = float(ev[0]); k = str(ev[1])
+            try:
+                h = max(0.0, min(1.0, float(ev[2])))
+            except (TypeError, ValueError):
+                h = 1.0
+            return (t, k, h)
+        return (float(ev[0]), str(ev[1]), 1.0)
+
     def set_beat_events(
         self,
         segment_id: str,
-        events: list[tuple[float, str]],
+        events: list,
     ) -> None:
         """Attach detected beat events for ``segment_id`` and redraw.
 
-        ``events`` is a list of ``(time_sec, kind)`` where ``time_sec`` is
-        the offset within the segment's trimmed audio (the same convention
-        ``rhythm.py --export_events`` uses).  The kind string drives the
-        marker colour (punch / dance / line / wall / paired).
+        ``events`` is a list of ``(time_sec, kind[, height])`` where
+        ``time_sec`` is the offset within the segment's trimmed audio
+        (the same convention ``rhythm.py --export_events`` uses) and
+        the optional ``height`` is the audio amplitude (0..1) used by
+        the waveform threshold slider.  Older 2-tuple rows are
+        normalised to height=1.0 so they always pass the threshold.
         """
-        self._beat_events[segment_id] = list(events) if events else []
+        self._beat_events[segment_id] = (
+            [self._normalise_event(ev) for ev in events]
+            if events else []
+        )
         self._beat_events_loading.discard(segment_id)
         self.refresh()
 
@@ -1229,6 +1716,27 @@ class TimelinePanel(QWidget):
         """
         self._focused_beat = None
 
+    def _defocus_other_threshold_lines(
+        self, keep: Optional[WaveformThresholdLine]
+    ) -> None:
+        """Clear edit-focus on every :class:`WaveformThresholdLine` except *keep*.
+
+        *keep* is the line (if any) under the current mouse press; it
+        keeps its focused/unfocused state so a double-click can still
+        arm it.  Passing ``None`` clears **all** bars (empty click /
+        segment selection).
+        """
+        for it in self.scene.items():
+            if isinstance(it, WaveformThresholdLine) and it is not keep:
+                it.set_interaction_focus(False)
+
+    def _set_threshold_line_interaction_focus(
+        self, line: WaveformThresholdLine
+    ) -> None:
+        """Double-click entry: solo-focus *line* and enable vertical drag."""
+        self._defocus_other_threshold_lines(line)
+        line.set_interaction_focus(True)
+
     def _focused_event_idx(self, seg_id: str) -> int:
         """Resolve the focused beat's *current* index in ``_beat_events``.
 
@@ -1254,8 +1762,9 @@ class TimelinePanel(QWidget):
             return -1
         best_idx = -1
         best_dt = float("inf")
-        for i, (t, _kind) in enumerate(events):
-            dt = abs(float(t) - float(target_t))
+        for i, ev in enumerate(events):
+            t = float(ev[0])
+            dt = abs(t - float(target_t))
             if dt < best_dt:
                 best_dt = dt
                 best_idx = i
@@ -1315,8 +1824,9 @@ class TimelinePanel(QWidget):
             return
         best_idx = -1
         best_dt = 1e-6
-        for i, (t, _kind) in enumerate(events):
-            dt = abs(float(t) - float(target_t))
+        for i, ev in enumerate(events):
+            t = float(ev[0])
+            dt = abs(t - float(target_t))
             if dt < best_dt:
                 best_dt = dt
                 best_idx = i
@@ -1354,14 +1864,14 @@ class TimelinePanel(QWidget):
             0.0,
             min(seg.duration_sec, new_t_proj - seg.start_time_sec),
         )
-        old_t, kind = events[event_idx]
+        old_ev = events[event_idx]
+        old_t = float(old_ev[0])
+        kind = str(old_ev[1])
+        height = float(old_ev[2]) if len(old_ev) >= 3 else 1.0
         if abs(new_t_local - old_t) < 1e-4:
-            # Click without a real drag (or move under 0.1 ms) — no-op.
             return
-        # Drag is a fresh edit intent — drop any leftover arrow-key
-        # selection target so we don't re-select an unrelated tick.
         self._pending_tick_select_after_refresh = []
-        events[event_idx] = (new_t_local, kind)
+        events[event_idx] = (new_t_local, kind, height)
         events.sort(key=lambda e: e[0])
         # Keep focus on the dragged tick so arrow keys keep targeting
         # it (the index may have shifted after the sort, but the
@@ -1478,18 +1988,19 @@ class TimelinePanel(QWidget):
             return
 
         delta_sec = float(delta_px) / max(1.0, float(self._effective_pps))
-        t, kind = events[idx]
+        ev = events[idx]
+        t = float(ev[0])
+        kind = str(ev[1])
+        height = float(ev[2]) if len(ev) >= 3 else 1.0
         new_t = max(
             0.0,
-            min(float(seg.duration_sec), float(t) + delta_sec),
+            min(float(seg.duration_sec), t + delta_sec),
         )
-        if abs(new_t - float(t)) < 1e-9:
-            # Pinned at the segment edge — keep focus pegged so the
-            # very next press resumes nudging from the same place.
-            self._focused_beat = (seg_id, float(t))
+        if abs(new_t - t) < 1e-9:
+            self._focused_beat = (seg_id, t)
             return
 
-        events[idx] = (new_t, kind)
+        events[idx] = (new_t, kind, height)
         events.sort(key=lambda e: e[0])
         # Track new target for re-selection across the deferred
         # refresh, *and* update the focused-beat marker so further
@@ -1505,9 +2016,80 @@ class TimelinePanel(QWidget):
         if events is None or not (0 <= event_idx < len(events)):
             return
         self._pending_tick_select_after_refresh = []
-        t, _ = events[event_idx]
-        events[event_idx] = (t, kind)
+        ev = events[event_idx]
+        t = float(ev[0])
+        height = float(ev[2]) if len(ev) >= 3 else 1.0
+        events[event_idx] = (t, kind, height)
         self._schedule_beat_commit(segment_id)
+
+    def _on_threshold_line_moved(
+        self, segment_id: str, threshold: float
+    ) -> None:
+        """Live drag of the red waveform line — update model + tick opacity.
+
+        ``threshold`` is the normalised 0..1 value emitted by
+        :class:`WaveformThresholdLine`.  We mutate the segment model
+        directly (the line is bound to a single segment) and re-tint
+        each ``BeatTickItem`` so dimmed/visible ticks track the line.
+
+        We deliberately do **not** emit ``beat_events_edited`` here:
+        that signal is connected to :meth:`MainWindow._on_project_changed`,
+        which calls :meth:`refresh` and would rebuild the whole scene
+        on every pixel of vertical motion — destroying the line item
+        that owns the mouse grab and breaking the drag.  Persistence
+        is deferred to :meth:`_on_threshold_line_drag_finished` on
+        mouse release.
+        """
+        if self._project is None:
+            return
+        seg = self._project.get_segment(segment_id)
+        if seg is None:
+            return
+        thr = max(0.0, min(1.0, float(threshold)))
+        if abs(getattr(seg, "beat_height_threshold", 0.0) - thr) < 1e-4:
+            return
+        seg.beat_height_threshold = thr
+        self._update_beat_strip_opacity(segment_id, thr)
+
+    def _on_threshold_line_drag_finished(self, segment_id: str) -> None:
+        """Left-button release after interacting with the threshold line.
+
+        One ``beat_events_edited`` emit syncs ``beat_events`` from the
+        panel dict into the :class:`Segment` and runs the normal dirty
+        / autosave path — exactly once per completed drag gesture.
+        """
+        if self._project is None:
+            return
+        if self._project.get_segment(segment_id) is None:
+            return
+        self.beat_events_edited.emit(segment_id)
+
+    def _update_beat_strip_opacity(
+        self, segment_id: str, threshold: float
+    ) -> None:
+        """Re-apply the threshold-driven opacity to existing tick items.
+
+        Used during a live drag of the red threshold line so the
+        scene doesn't have to be rebuilt (which would destroy the
+        line's mouse grab).  Walks the scene once and toggles each
+        :class:`BeatTickItem` belonging to ``segment_id``.
+        """
+        events = self._beat_events.get(segment_id, [])
+        if not events:
+            return
+        # Build {event_idx → height} lookup since the tick stores
+        # only its event_idx + segment_id, not the height directly.
+        idx_to_height = {
+            i: (float(ev[2]) if len(ev) >= 3 else 1.0)
+            for i, ev in enumerate(events)
+        }
+        for it in self.scene.items():
+            if (
+                isinstance(it, BeatTickItem)
+                and it._segment_id == segment_id
+            ):
+                h = idx_to_height.get(it._event_idx, 1.0)
+                it.setOpacity(0.25 if h < threshold - 1e-6 else 1.0)
 
     def _insert_beat_at(
         self,
@@ -1554,14 +2136,18 @@ class TimelinePanel(QWidget):
         if skip_if_near_existing and events:
             min_gap_px = 2.0 * float(BeatTickItem.HIT_HALF_WIDTH)
             min_gap_sec = min_gap_px / max(1.0, self._effective_pps)
-            if any(abs(t - t_local) <= min_gap_sec for t, _ in events):
+            if any(abs(float(ev[0]) - t_local) <= min_gap_sec
+                   for ev in events):
                 return False
 
         nearest_kind = "L"
         if events:
-            nearest = min(events, key=lambda e: abs(e[0] - t_local))
-            nearest_kind = nearest[1] or "L"
-        events.append((t_local, nearest_kind))
+            nearest = min(events, key=lambda e: abs(float(e[0]) - t_local))
+            nearest_kind = str(nearest[1]) or "L"
+        # User-inserted ticks always carry full amplitude (1.0) so
+        # they're never silently filtered out by the threshold slider
+        # — the user explicitly asked for this beat to exist.
+        events.append((t_local, nearest_kind, 1.0))
         events.sort(key=lambda e: e[0])
         self._set_focused_beat(segment_id, t_local)
         self._schedule_beat_commit(segment_id)
@@ -1755,9 +2341,28 @@ class TimelinePanel(QWidget):
         root.setSpacing(4)
         outer.addWidget(body, 1)
 
-        self.scene = QGraphicsScene(self)
+        self.scene = TimelineScene(self)
         self.scene.setBackgroundBrush(QColor("#141414"))
         self.scene.setSceneRect(0, 0, 3600, self._SCENE_H)
+        # ── Disable BSP indexing ──────────────────────────────────────
+        # Qt's default ``BspTreeIndex`` aggressively prunes hit-tests
+        # by bucketing items into a binary-space-partition tree.  The
+        # tree is rebuilt lazily on the next ``itemAt`` / paint event,
+        # but if the tree is stale at the moment a click is dispatched
+        # it can return *no* item even when one is sitting at the
+        # cursor — and Qt's default ``mousePressEvent`` then takes the
+        # "empty space click" branch (which clears the selection and,
+        # in some regressions, schedules an internal repaint that
+        # skips the translucent waveform fill).  ``NoIndex`` simply
+        # iterates every item on every hit-test; the scene only has
+        # a few hundred items so the linear scan is unmeasurable, and
+        # the click semantics are now deterministic — the user clicks
+        # the fill, ``itemAt`` returns the fill, our wave-area guard
+        # turns it into a no-op, and the chart never gets repainted
+        # without its translucent layer.
+        self.scene.setItemIndexMethod(
+            QGraphicsScene.ItemIndexMethod.NoIndex
+        )
         self.view = TimelineView(self.scene, self.pixels_per_second, self)
         # Adding the view into the layout below reparents it to the
         # layout's owner widget (PanelRoot), so ``self.view.parent()``
@@ -1967,79 +2572,527 @@ class TimelinePanel(QWidget):
     _SCENE_H = 314        # ruler + segment + beat-strip + waveform + padding
 
     def _draw_tracks(self) -> None:
-        width = self.scene.sceneRect().width()
-        # Segment track
-        self.scene.addRect(
-            0, self._SEGMENT_TRACK_Y, width, self._SEGMENT_TRACK_H,
-            QPen(QColor("#1f1f1f")),
-            QBrush(QColor("#181818")),
-        )
-        # "Segments" label — small, z above segment blocks.
-        lbl = QGraphicsSimpleTextItem("Segments")
-        lbl.setBrush(QBrush(QColor("#ffffff")))
-        lbl.setOpacity(0.25)
-        lbl.setPos(4, self._SEGMENT_TRACK_Y + 2)
-        lbl.setZValue(5)
-        self.scene.addItem(lbl)
+        """No-op kept for call-site compatibility.
 
-        # Waveform track background
-        self.scene.addRect(
-            0, self._WAVE_TRACK_Y, width, self._WAVE_TRACK_H,
-            QPen(QColor("#1f1f1f")),
-            QBrush(QColor("#151515")),
-        )
-        # "Waveform" label overlay — top-left, semi-transparent.
-        wlbl = QGraphicsSimpleTextItem("Waveform")
-        wlbl.setBrush(QBrush(QColor("#ffffff")))
-        wlbl.setOpacity(0.25)
-        wlbl.setPos(4, self._WAVE_TRACK_Y + 2)
-        wlbl.setZValue(5)
-        self.scene.addItem(wlbl)
+        The segment track background, the "Segments" / "Waveform"
+        lane labels, and the waveform-track strip are all painted in
+        the scene's ``drawBackground`` pass now (see
+        :meth:`_paint_track_decorations` and
+        :meth:`_paint_waveform_background`).  Painting them as
+        background instead of stacking ``QGraphicsItem`` instances
+        sidesteps a Qt regression where mouse presses inside a track
+        would occasionally remove the track's translucent / opaque
+        decorations from the paint cache (the user could "click the
+        chart away" and only get it back with a panel resize).
+
+        We still trigger a background-layer invalidation here so the
+        chrome re-renders even when nothing else in the scene
+        changed (e.g. zoom-only updates).
+        """
+        try:
+            self.scene.invalidate(
+                self.scene.sceneRect(),
+                QGraphicsScene.SceneLayer.BackgroundLayer,
+            )
+        except RuntimeError:
+            pass
 
     def _draw_waveform(self) -> None:
-        """Render the RMS envelope EXACTLY like ``rhythm.py``'s LINE-DEBUG overlay.
+        """No-op kept for call-site compatibility.
 
-        Reference (``src/rhythm.py``):
+        The waveform is now painted by :meth:`_paint_waveform_background`
+        during the scene's ``drawBackground`` pass — see
+        :class:`TimelineScene` for the rationale (clicks inside the
+        waveform area used to remove the fill / outline scene items
+        layer-by-layer; making the chart part of the background pass
+        sidesteps every item-level interaction path).
+
+        ``refresh()`` still calls this; we just trigger a background
+        repaint via :meth:`QGraphicsScene.invalidate` so the chart
+        re-renders with the latest RMS data after a reload / zoom /
+        scroll without going through the scene-item tree.
+        """
+        try:
+            self.scene.invalidate(
+                self.scene.sceneRect(),
+                QGraphicsScene.SceneLayer.BackgroundLayer,
+            )
+        except RuntimeError:
+            pass
+        if not self._waveform_rms:
+            self._draw_waveform_placeholder()
+
+    def _paint_track_decorations(self, painter, rect) -> None:
+        """Paint non-interactive track chrome during the background pass.
+
+        Covers the dark **Segment** track strip and the **Segments** /
+        **Waveform** lane labels.  These used to be ``QGraphicsItem``
+        instances added in :meth:`_draw_tracks`, but the same Qt
+        regression that affected the waveform fill / outline also
+        affected these decorations: clicks inside the segment row
+        could remove the lane background, leaving the dark scene
+        backdrop visible until the next forced repaint.  Painting
+        here makes the chrome part of the background pass — it is
+        always rendered before any item, on every paint event, and
+        cannot be hidden by mouse handling.
+        """
+        scene_w = self.scene.sceneRect().width()
+        if scene_w <= 0:
+            return
+        painter.save()
+        try:
+            # ── Segment track strip ─────────────────────────────────
+            painter.setBrush(QBrush(QColor("#181818")))
+            painter.setPen(QPen(QColor("#1f1f1f")))
+            painter.drawRect(QRectF(
+                0.0,
+                float(self._SEGMENT_TRACK_Y),
+                float(scene_w),
+                float(self._SEGMENT_TRACK_H),
+            ))
+
+            # ── Lane labels ("Segments" / "Waveform") ───────────────
+            painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            fm = painter.fontMetrics()
+            label_baseline_offset = float(fm.ascent()) + 2.0
+            painter.drawText(
+                QPointF(4.0, float(self._SEGMENT_TRACK_Y) + label_baseline_offset),
+                "Segments",
+            )
+            painter.drawText(
+                QPointF(4.0, float(self._WAVE_TRACK_Y) + label_baseline_offset),
+                "Waveform",
+            )
+        finally:
+            painter.restore()
+
+    def _paint_segment_blocks(self, painter, rect) -> None:
+        """Paint segment-block fills, outlines and selection halos.
+
+        :class:`SegmentRectItem` instances themselves render nothing
+        (their ``paint`` is a no-op) — this method walks
+        ``_block_map`` and paints each block at the item's *current*
+        scene position, so the visual follows live drag input via
+        the ``ItemPositionHasChanged`` invalidation in
+        :meth:`SegmentRectItem.itemChange`.
+
+        Painting here makes the fill / outline immune to a Qt
+        regression where a click on a translucent / decorated
+        ``QGraphicsItem`` could remove its visual output from the
+        paint cache (the user reported clicking a segment made its
+        cyan / pink / orange fill disappear, leaving only the
+        outline).  The background pass runs unconditionally on every
+        repaint so the fill cannot be "lost" by mouse handling.
+        """
+        if not self._block_map:
+            return
+        painter.save()
+        try:
+            for seg_id, block in list(self._block_map.items()):
+                try:
+                    rect_local = block.rect()
+                    pos = block.pos()
+                except RuntimeError:
+                    # Item was deleted between scene.clear() and the
+                    # next refresh — skip it.
+                    continue
+                if rect_local.isEmpty():
+                    continue
+                scene_rect = QRectF(
+                    pos.x() + rect_local.x(),
+                    pos.y() + rect_local.y(),
+                    rect_local.width(),
+                    rect_local.height(),
+                )
+                fill = getattr(block, "_fill_color", None)
+                if fill is None:
+                    fill = QColor("#3bb6ff")
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(QColor("#0b0b0b"), 1))
+                painter.drawRect(scene_rect)
+                # Selection halo — Qt's default
+                # ``QGraphicsRectItem.paint`` would draw a 1-px
+                # dashed outline when ``ItemIsSelectable`` & state is
+                # selected; we replicate that here so the user still
+                # sees which block they have selected.
+                try:
+                    is_selected = bool(block.isSelected())
+                except RuntimeError:
+                    is_selected = False
+                if is_selected:
+                    halo_pen = QPen(QColor("#ffffff"))
+                    halo_pen.setWidth(1)
+                    halo_pen.setStyle(Qt.PenStyle.DashLine)
+                    painter.setPen(halo_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(scene_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+        finally:
+            painter.restore()
+
+    def _paint_threshold_lines(self, painter, rect) -> None:
+        """Paint each segment's red threshold bar in the background pass.
+
+        :class:`WaveformThresholdLine` is invisible (its ``paint``
+        is a no-op) — we walk ``_threshold_map`` here and render
+        the focus halo + main red stroke + end-handle squares +
+        "thr 0.42" pill at the line's current scene position so
+        live drags follow without delay.
+
+        Visual layers (matches the original
+        :meth:`WaveformThresholdLine.paint` we replaced):
+
+        1. 9-px focus halo (yellow translucent) when focused.
+        2. 2-px main red stroke (cosmetic) at the bar Y.
+        3. End-handle squares (red fill, white border) when focused.
+        4. "thr 0.42" pill (red fill, white text) above the bar.
+
+        Painting in the background pass makes the bar immune to the
+        Qt cache regression where a click on the line previously
+        left the user staring at empty space until the next forced
+        repaint (resize / scroll).
+        """
+        if not self._threshold_map:
+            return
+        painter.save()
+        try:
+            base_opacity = painter.opacity()
+            for seg_id, line in list(self._threshold_map.items()):
+                try:
+                    pos = line.pos()
+                    width = float(line._width)
+                except (RuntimeError, AttributeError):
+                    continue
+                if width <= 0:
+                    continue
+
+                x_left = float(pos.x())
+                y = float(pos.y())
+                x_right = x_left + width
+
+                # Mirror the item's own opacity (always 1.0 today,
+                # but future code might dim it like beat ticks).
+                try:
+                    item_opacity = float(line.opacity())
+                except RuntimeError:
+                    item_opacity = 1.0
+                painter.setOpacity(base_opacity * item_opacity)
+
+                focused = bool(getattr(line, "_interaction_focused", True))
+
+                # 1. Focus halo — wide soft stroke.
+                if focused:
+                    halo = QPen(line.FOCUS_HALO_COLOR)
+                    halo.setCosmetic(True)
+                    halo.setWidthF(9.0)
+                    painter.setPen(halo)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawLine(QPointF(x_left, y), QPointF(x_right, y))
+
+                # 2. Main threshold stroke.
+                col = line.LINE_COLOR
+                if not focused:
+                    col = QColor(255, 130, 130)
+                pen = QPen(col)
+                pen.setCosmetic(True)
+                pen.setWidthF(line.LINE_THICKNESS)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawLine(QPointF(x_left, y), QPointF(x_right, y))
+
+                # 3. Grab handles only while focused.
+                if focused:
+                    hs = line.HANDLE_SIZE
+                    painter.setBrush(QBrush(line.LINE_COLOR))
+                    painter.setPen(QPen(QColor(255, 255, 255), 1.5))
+                    painter.drawRect(
+                        QRectF(x_left - hs / 2, y - hs / 2, hs, hs)
+                    )
+                    painter.drawRect(
+                        QRectF(x_right - hs / 2, y - hs / 2, hs, hs)
+                    )
+
+                # 4. "thr 0.42" pill.
+                threshold = float(getattr(line, "_threshold", 0.0))
+                text = f"thr {threshold:.2f}"
+                fm = painter.fontMetrics()
+                text_w = fm.horizontalAdvance(text)
+                text_h = fm.height()
+                pad_x = 4.0
+                pad_y = 1.0
+                bg_w = text_w + 2 * pad_x
+                bg_h = text_h + 2 * pad_y
+                bg_x = x_left + 4.0
+                bg_y = y - line.HIT_HALF_HEIGHT - bg_h - 1.0
+                painter.setBrush(QBrush(line.LINE_COLOR))
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.drawRect(QRectF(bg_x, bg_y, bg_w, bg_h))
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                painter.drawText(
+                    QPointF(bg_x + pad_x, bg_y + pad_y + fm.ascent()),
+                    text,
+                )
+
+            painter.setOpacity(base_opacity)
+        finally:
+            painter.restore()
+
+    def _paint_beat_ticks(self, painter, rect) -> None:
+        """Paint beat-event tick strokes + index labels.
+
+        :class:`BeatTickItem` instances are invisible (their
+        ``paint`` is a no-op) — we walk ``_tick_map`` here and paint
+        each tick at the item's *current* scene position so live
+        drags follow without delay.  The stroke width depends on
+        the item's selection state (10 px when selected, 6 px idle)
+        and below-threshold ticks are dimmed to 25 % via
+        ``QPainter.setOpacity`` to mirror the old
+        ``QGraphicsItem.setOpacity(0.25)`` behaviour.
+
+        Painting in the background pass is what kept the strokes
+        from disappearing on click in the user's video — Qt's
+        hit-test path used to drop the child :class:`QGraphicsLineItem`
+        from the paint cache when a press landed on the parent
+        ``BeatTickItem``.  With the visual generated fresh on every
+        repaint, that regression is no longer reachable.
+        """
+        if not self._tick_map:
+            return
+        scene_w = self.scene.sceneRect().width()
+        if scene_w <= 0:
+            return
+        painter.save()
+        try:
+            base_opacity = painter.opacity()
+            for (seg_id, event_idx), tick in list(self._tick_map.items()):
+                try:
+                    pos = tick.pos()
+                    rect_local = tick.rect()
+                except RuntimeError:
+                    # Item was deleted between scene.clear() and the
+                    # next refresh — skip silently.
+                    continue
+                if rect_local.isEmpty():
+                    continue
+
+                x = float(pos.x())
+                y_top = float(pos.y())
+                line_height = float(getattr(tick, "_line_height", 0.0))
+                if line_height <= 0:
+                    continue
+                if x < -tick.HIT_HALF_WIDTH or x > scene_w + tick.HIT_HALF_WIDTH:
+                    continue
+
+                # Per-tick opacity — below-threshold ticks set
+                # ``QGraphicsItem.setOpacity(0.25)`` on the item,
+                # mirror that on the painter so the stroke matches.
+                try:
+                    item_opacity = float(tick.opacity())
+                except RuntimeError:
+                    item_opacity = 1.0
+                painter.setOpacity(base_opacity * item_opacity)
+
+                try:
+                    is_selected = bool(tick.isSelected())
+                except RuntimeError:
+                    is_selected = False
+
+                pen = QPen(tick._base_color)
+                pen.setCosmetic(True)
+                pen.setWidthF(
+                    BeatTickItem.TICK_WIDTH_SELECTED
+                    if is_selected
+                    else BeatTickItem.TICK_WIDTH_IDLE
+                )
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawLine(
+                    QPointF(x, y_top),
+                    QPointF(x, y_top + line_height),
+                )
+
+                label_text = getattr(tick, "_label_text", None)
+                if label_text:
+                    label_top = y_top + float(
+                        getattr(tick, "_label_top_local", 0.0)
+                    )
+                    f = painter.font()
+                    f.setPointSize(7)
+                    painter.setFont(f)
+                    painter.setPen(QPen(tick._base_color))
+                    fm = painter.fontMetrics()
+                    painter.drawText(
+                        QPointF(x - 4.0, label_top + float(fm.ascent())),
+                        label_text,
+                    )
+
+            painter.setOpacity(base_opacity)
+        finally:
+            painter.restore()
+
+    def _paint_beat_strip_decorations(self, painter, rect) -> None:
+        """Paint per-segment beat-strip backgrounds, rule guides and cursor.
+
+        These decorations track project state (segment ranges, beat
+        events, playhead position) but are *not* interactive — the
+        actual hit zones for inserting / dragging beats live on
+        :class:`BeatStripBgItem` and :class:`BeatTickItem` scene
+        items.  Painting the visuals here keeps them immune to the
+        same click-hides-item bug that the waveform fix sidestepped
+        (see :class:`TimelineScene` docstring).
+
+        Order matches the original z-stack:
+
+        1. Beat-strip background rectangle (RGB 65/65/65 fill + 1-px
+           grey border) for every visible segment.
+        2. Rule-mode dashed guide line per beat event, coloured by
+           the same upcoming / active / passed state as the tick.
+        3. White "now" cursor through the strip when the playhead is
+           inside a segment's time range.
+        """
+        if self._project is None:
+            return
+        scene_w = self.scene.sceneRect().width()
+        if scene_w <= 0:
+            return
+
+        y0 = float(self._BEAT_STRIP_Y)
+        y1 = y0 + float(self._BEAT_STRIP_H)
+        tick_bottom = y1 + 12.0
+        cursor_top    = y0 - 16.0
+        cursor_bottom = y1 + 16.0
+        wave_bottom = float(
+            self._WAVE_TRACK_Y + self._WAVE_TRACK_H
+        ) - 2.0
+
+        fps = float(getattr(self._project, "output_fps", 30) or 30)
+        t_now = float(self._playhead_time_sec)
+
+        painter.save()
+        try:
+            for seg in self._project.sorted_segments():
+                seg_id = seg.id
+                base_t = float(seg.start_time_sec)
+                end_t  = float(seg.end_time_sec)
+                full_x0 = self._time_to_x(base_t)
+                full_x1 = self._time_to_x(end_t)
+                sx0 = max(0.0, full_x0)
+                sx1 = min(scene_w, full_x1)
+                if sx1 < 0 or full_x0 > scene_w:
+                    continue
+                if sx1 - sx0 < 2.0:
+                    continue
+
+                # 1. Beat-strip background (replicates the old
+                #    ``BeatStripBgItem`` visual — same RGB 65/65/65
+                #    fill, RGB 140/140/140 1-px border).
+                painter.setBrush(QBrush(QColor(65, 65, 65)))
+                painter.setPen(QPen(QColor(140, 140, 140), 1))
+                painter.drawRect(QRectF(sx0, y0, sx1 - sx0, y1 - y0))
+
+                events = self._beat_events.get(seg_id, [])
+                threshold = float(getattr(seg, "beat_height_threshold", 0.0))
+
+                # 2. Rule-mode dashed guides.
+                if self._rule_mode_enabled and events and wave_bottom > tick_bottom + 1.0:
+                    for ev in events:
+                        t_local = float(ev[0])
+                        height = float(ev[2]) if len(ev) >= 3 else 1.0
+                        t_proj = base_t + t_local
+                        if t_proj > end_t + 1e-3:
+                            continue
+                        x = self._time_to_x(t_proj)
+                        if x < sx0 - 4 or x > sx1 + 4:
+                            continue
+                        below_thresh = height < threshold - 1e-6
+                        col = QColor(self._beat_strip_color(t_proj, t_now, fps))
+                        col.setAlphaF(0.2 if below_thresh else 0.7)
+                        guide_pen = QPen(col)
+                        guide_pen.setCosmetic(True)
+                        guide_pen.setWidthF(1.0)
+                        guide_pen.setStyle(Qt.PenStyle.DashLine)
+                        painter.setPen(guide_pen)
+                        painter.drawLine(
+                            QPointF(x, tick_bottom),
+                            QPointF(x, wave_bottom),
+                        )
+
+                # 3. White "now" cursor through the strip.
+                if base_t - 1e-3 <= t_now <= end_t + 1e-3:
+                    px_now = self._time_to_x(t_now)
+                    if sx0 - 4 <= px_now <= sx1 + 4:
+                        cur_pen = QPen(self._BEAT_COL_CURSOR)
+                        cur_pen.setCosmetic(True)
+                        cur_pen.setWidthF(1.0)
+                        painter.setPen(cur_pen)
+                        painter.drawLine(
+                            QPointF(px_now, cursor_top),
+                            QPointF(px_now, cursor_bottom),
+                        )
+        finally:
+            painter.restore()
+
+    def _paint_waveform_background(self, painter, rect) -> None:
+        """Paint the waveform chart directly during the background pass.
+
+        Called from :meth:`TimelineScene.drawBackground` on every
+        repaint of the visible viewport.  ``painter`` is positioned in
+        scene coordinates; ``rect`` is the scene-rect being painted.
+
+        Two passes:
+
+        1. **Track background** — the dark ``#151515`` strip that used
+           to be a scene item in ``_draw_tracks``.  Always painted,
+           even before any RMS data has loaded, so the user sees the
+           dedicated waveform lane regardless of state.
+        2. **Chart** — bg-rect, baseline, translucent fill polygon,
+           outline polyline.  Only painted when ``_waveform_rms`` has
+           samples.  Mirrors the original ``_draw_waveform`` geometry
+           exactly so the visual is identical to the previous
+           scene-item version.
+
+        Layout reference (game ``src/rhythm.py``):
 
             wy0 = y1 + 30
             wy1 = wy0 + int(HEIGHT * 0.10)
             cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (40,40,40), -1)
             cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (120,120,120), 1)
             cv2.line(canvas, (x0, wy1), (x1, wy1), (90,90,90), 1)
-            step = max(1, (x1 - x0) // 360)
-            pts = []
-            for x in range(x0, x1 + 1, step):
-                frac = (x - x0) / max(1, (x1 - x0))
-                wf_i = min(total_frames-1, max(0, round(frac*(total_frames-1))))
-                amp  = line_dbg_wave[wf_i]
-                yv   = int(wy1 - amp * (wy1 - wy0 - 2))
-                pts.append((x, yv))
             cv2.polylines(canvas, [pts], False, (130,170,255), 1)
-            ov   = canvas.copy()
-            poly = [(x0, wy1)] + pts + [(x1, wy1)]
-            cv2.fillPoly(ov, [poly], (70,110,170))
-            canvas = cv2.addWeighted(ov, 0.35, canvas, 0.65, 0)
-
-        We reproduce this 1:1, treating the visible time window as the
-        analogue of the game's ``[x0, x1]`` strip.
+            cv2.fillPoly(ov, [poly], (70,110,170)); addWeighted(ov, 0.35, ...)
         """
+        scene_width = self.scene.sceneRect().width()
+        if scene_width <= 0:
+            return
+
+        # ── Pass 1: dark waveform-track strip (always present). ──────
+        painter.save()
+        try:
+            painter.setBrush(QBrush(QColor("#151515")))
+            painter.setPen(QPen(QColor("#1f1f1f")))
+            painter.drawRect(QRectF(
+                0.0,
+                float(self._WAVE_TRACK_Y),
+                float(scene_width),
+                float(self._WAVE_TRACK_H),
+            ))
+        finally:
+            painter.restore()
+
         if not self._waveform_rms:
-            self._draw_waveform_placeholder()
             return
 
         rms = self._waveform_rms
         n = len(rms)
         pps = self._effective_pps
         rms_per_sec = self._waveform_rms_per_sec
+        if pps <= 0 or rms_per_sec <= 0:
+            return
         px_per_tick = pps / rms_per_sec
         if px_per_tick <= 0:
             return
 
-        scene_width = self.scene.sceneRect().width()
-        if scene_width <= 0:
-            return
-
-        # ── Visible time window ──────────────────────────────────────────
         start_sec = self._offset_sec
         end_sec   = start_sec + scene_width / pps
         start_idx = max(0, int(start_sec * rms_per_sec))
@@ -2047,31 +3100,15 @@ class TimelinePanel(QWidget):
         if start_idx >= end_idx:
             return
 
-        # ── Vertical geometry — game uses [wy0 (top), wy1 (bottom)]. ────
-        wy0 = float(self._WAVE_TRACK_Y) + 2          # top
-        wy1 = float(self._WAVE_TRACK_Y + self._WAVE_TRACK_H) - 2  # bottom
+        wy0 = float(self._WAVE_TRACK_Y) + 2
+        wy1 = float(self._WAVE_TRACK_Y + self._WAVE_TRACK_H) - 2
 
-        # x0 = 0 (start of visible window), x1 = pixel-end of visible peaks
         x0 = 0.0
         wave_end_x = (end_idx - start_idx) * px_per_tick
         x1 = float(min(wave_end_x, scene_width))
         if x1 <= x0:
             return
 
-        # ── Background rectangle + 1-px outline (game: (40,40,40)/(120,120,120)). ─
-        bg_rect = QGraphicsRectItem(x0, wy0, x1 - x0, wy1 - wy0)
-        bg_rect.setBrush(QBrush(QColor(40, 40, 40)))
-        bg_rect.setPen(QPen(QColor(120, 120, 120), 1))
-        bg_rect.setZValue(1)
-        self.scene.addItem(bg_rect)
-
-        # ── Baseline at wy1 (game: (90,90,90)). ─────────────────────────
-        baseline = self.scene.addLine(
-            x0, wy1, x1, wy1, QPen(QColor(90, 90, 90), 1)
-        )
-        baseline.setZValue(2)
-
-        # ── Sampled point list — game step = (x1-x0)//360 ───────────────
         span_px = max(1, int(x1 - x0))
         step    = max(1, span_px // 360)
 
@@ -2092,34 +3129,45 @@ class TimelinePanel(QWidget):
         if len(pts) < 2:
             return
 
-        # ── Fill path (game: cv2.fillPoly(ov, BGR(70,110,170)) → RGB(170,110,70)
-        #    then 35% addWeighted). ───────────────────────────────────────
-        fill_path = QPainterPath()
-        fill_path.moveTo(x0, wy1)
-        for x, y in pts:
-            fill_path.lineTo(x, y)
-        fill_path.lineTo(x1, wy1)
-        fill_path.closeSubpath()
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        fill_item = QGraphicsPathItem(fill_path)
-        fill_item.setPen(QPen(Qt.PenStyle.NoPen))
-        fill_item.setBrush(QBrush(QColor(170, 110, 70, int(255 * 0.35))))
-        fill_item.setZValue(3)
-        self.scene.addItem(fill_item)
+            # Background rectangle + 1-px outline.
+            painter.setBrush(QBrush(QColor(40, 40, 40)))
+            painter.setPen(QPen(QColor(120, 120, 120), 1))
+            painter.drawRect(QRectF(x0, wy0, x1 - x0, wy1 - wy0))
 
-        # ── Outline polyline (game: cv2.polylines BGR(130,170,255) → RGB(255,170,130), 1px). ─
-        outline_path = QPainterPath()
-        outline_path.moveTo(pts[0][0], pts[0][1])
-        for x, y in pts[1:]:
-            outline_path.lineTo(x, y)
+            # Baseline at wy1.
+            painter.setPen(QPen(QColor(90, 90, 90), 1))
+            painter.drawLine(QPointF(x0, wy1), QPointF(x1, wy1))
 
-        outline_item = QGraphicsPathItem(outline_path)
-        pen = QPen(QColor(255, 170, 130))
-        pen.setCosmetic(True)
-        pen.setWidthF(1.0)
-        outline_item.setPen(pen)
-        outline_item.setZValue(4)
-        self.scene.addItem(outline_item)
+            # Translucent fill polygon under the peaks.
+            fill_path = QPainterPath()
+            fill_path.moveTo(x0, wy1)
+            for x, y in pts:
+                fill_path.lineTo(x, y)
+            fill_path.lineTo(x1, wy1)
+            fill_path.closeSubpath()
+            painter.setPen(QPen(Qt.PenStyle.NoPen))
+            painter.setBrush(
+                QBrush(QColor(170, 110, 70, int(255 * 0.35)))
+            )
+            painter.drawPath(fill_path)
+
+            # 1-px cosmetic outline polyline tracing the peaks.
+            outline_path = QPainterPath()
+            outline_path.moveTo(pts[0][0], pts[0][1])
+            for x, y in pts[1:]:
+                outline_path.lineTo(x, y)
+            pen = QPen(QColor(255, 170, 130))
+            pen.setCosmetic(True)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(outline_path)
+        finally:
+            painter.restore()
 
     def _draw_waveform_placeholder(self) -> None:
         """Show loading or empty placeholder in the waveform track."""
@@ -2202,20 +3250,19 @@ class TimelinePanel(QWidget):
     def _draw_beat_events(self) -> None:
         """Render the BEAT-DBG strip identical to ``rhythm.py``'s overlay.
 
-        Each segment with detected events draws its own strip spanning
-        the segment's [start, end] window so multi-segment projects keep
-        events visually attached to their owning segment.
+        Every segment of the project draws its own strip + threshold
+        line spanning the segment's [start, end] window, **even when no
+        beats have been detected yet**: the threshold line is the
+        primary tool for tuning ``beat_height_threshold`` BEFORE Auto
+        Gen Block runs, so it must be available immediately.
 
-        Strip background and per-event ticks are now interactive
+        Strip background and per-event ticks are interactive
         (:class:`BeatStripBgItem` + :class:`BeatTickItem`) so the user
         can double-click an empty area to insert an event, drag a tick
         horizontally to retime, or right-click for a context menu
         (delete / set kind). All edits flow through ``_on_beat_tick_*``
         / ``_on_beat_strip_*`` handlers below.
         """
-        if (not self._beat_events
-                and not self._beat_events_loading):
-            return
         if self._project is None:
             return
 
@@ -2255,15 +3302,14 @@ class TimelinePanel(QWidget):
                 lbl.setZValue(11)
                 self.scene.addItem(lbl)
 
-        # ── One BEAT-DBG strip per segment with detected events ────────
-        # NB: strips are drawn even when ``events`` is empty so the user
-        # who deleted every tick still has a target for double-click
-        # insertion.  Segments without an entry in ``_beat_events`` at
-        # all (i.e. Auto Gen Block was never run) stay clean.
-        for seg_id, events in self._beat_events.items():
-            seg = self._project.get_segment(seg_id)
-            if seg is None:
-                continue
+        # ── One BEAT-DBG strip + threshold line per segment ─────────────
+        # We iterate ALL segments — not just the ones that already have
+        # detected events — so the threshold line is available before
+        # Auto Gen Block has ever run.  ``events`` falls back to an
+        # empty list for segments without an entry in ``_beat_events``.
+        for seg in self._project.sorted_segments():
+            seg_id = seg.id
+            events = self._beat_events.get(seg_id, [])
             base_t = float(seg.start_time_sec)
             end_t  = float(seg.end_time_sec)
 
@@ -2276,26 +3322,56 @@ class TimelinePanel(QWidget):
             if sx1 - sx0 < 2.0:
                 continue
 
-            # 1. Strip background — RGB(65,65,65) fill, RGB(140,140,140)
-            #    border. Now interactive: double-click inserts a tick.
             strip = BeatStripBgItem(
                 self, seg_id, QRectF(sx0, y0, sx1 - sx0, y1 - y0),
             )
             self.scene.addItem(strip)
+
+            # 1b. Draggable red threshold line over the waveform.
+            #     Always drawn so the user can tune
+            #     ``beat_height_threshold`` BEFORE running Auto Gen
+            #     Block — that's the threshold the detector uses to
+            #     decide which onsets become beats in the first place.
+            wy_top = float(self._WAVE_TRACK_Y) + 2.0
+            wy_bot = float(
+                self._WAVE_TRACK_Y + self._WAVE_TRACK_H
+            ) - 2.0
+            if wy_bot > wy_top + 4.0 and sx1 > sx0 + 4.0:
+                thr_line = WaveformThresholdLine(
+                    self,
+                    seg_id,
+                    x_left=sx0,
+                    x_right=sx1,
+                    wy_top=wy_top,
+                    wy_bottom=wy_bot,
+                    threshold=float(getattr(
+                        seg, "beat_height_threshold", 0.0
+                    )),
+                )
+                self.scene.addItem(thr_line)
+                self._threshold_map[seg_id] = thr_line
 
             # 2. Per-event interactive tick (movable + selectable).
             #    Tick travel is clamped to the segment's full range
             #    [full_x0, full_x1] (not the visible-clipped one) so
             #    dragging out of the viewport doesn't truncate at the
             #    visible edge.
-            for event_idx, (t_local, kind) in enumerate(events):
-                t_proj = base_t + float(t_local)
+            # Threshold from the segment model — beats below it are
+            # drawn dimmed (so the user still sees what's being
+            # filtered) but excluded from rendering downstream.
+            threshold = float(getattr(seg, "beat_height_threshold", 0.0))
+            for event_idx, ev in enumerate(events):
+                t_local = float(ev[0])
+                kind = str(ev[1])
+                height = float(ev[2]) if len(ev) >= 3 else 1.0
+                t_proj = base_t + t_local
                 if t_proj > end_t + 1e-3:
                     continue
                 x = self._time_to_x(t_proj)
                 if x < sx0 - 4 or x > sx1 + 4:
                     continue
 
+                below_thresh = height < threshold - 1e-6
                 col = self._beat_strip_color(t_proj, t_now, fps)
                 display_idx = event_idx + 1
                 label = str(display_idx) if display_idx <= 12 else None
@@ -2316,49 +3392,27 @@ class TimelinePanel(QWidget):
                 tick.setPos(x, tick_top)
                 tick.setToolTip(
                     f"#{display_idx} {kind} @ {t_proj:.3f}s "
-                    f"(local {t_local:.3f}s)\n"
+                    f"(local {t_local:.3f}s)  height={height:.2f}\n"
                     "Drag to retime · Right-click for menu"
                 )
+                # Beats whose audio amplitude is below the user's
+                # threshold are drawn dimmed (25 %) so the user can
+                # still see WHAT got filtered out — they remain
+                # interactive (drag / kind change / delete) so dragging
+                # the threshold line back down restores them at 100 %
+                # opacity without re-running detect.
+                if below_thresh:
+                    tick.setOpacity(0.25)
                 self.scene.addItem(tick)
+                self._tick_map[(seg_id, event_idx)] = tick
 
-                # Rule-mode visual aid: a dashed vertical line that
-                # extends from the tick down through the waveform
-                # area so the user can eyeball whether the tick
-                # lands on an audio peak. Drawn separately from the
-                # tick (not part of its hit zone) so clicks below
-                # the strip still pass through to the waveform /
-                # the underlying view.
-                if self._rule_mode_enabled:
-                    guide_y0 = tick_bottom
-                    guide_y1 = float(
-                        self._WAVE_TRACK_Y + self._WAVE_TRACK_H
-                    ) - 2.0
-                    if guide_y1 > guide_y0 + 1.0:
-                        guide_pen = QPen(col)
-                        guide_pen.setCosmetic(True)
-                        guide_pen.setWidthF(1.0)
-                        guide_pen.setStyle(Qt.PenStyle.DashLine)
-                        guide = self.scene.addLine(
-                            x, guide_y0, x, guide_y1, guide_pen
-                        )
-                        # Above strip background (10) and waveform
-                        # (default 0), below the tick itself (12)
-                        # so a hovered tick still wins the eye.
-                        guide.setZValue(11)
-                        guide.setOpacity(0.7)
-
-            # 3. White playhead cursor — only drawn if the playhead is
-            #    currently INSIDE this segment's strip range.
-            if base_t - 1e-3 <= t_now <= end_t + 1e-3:
-                px_now = self._time_to_x(t_now)
-                if sx0 - 4 <= px_now <= sx1 + 4:
-                    cur_pen = QPen(self._BEAT_COL_CURSOR)
-                    cur_pen.setCosmetic(True)
-                    cur_pen.setWidthF(1.0)
-                    cursor = self.scene.addLine(
-                        px_now, cursor_top, px_now, cursor_bottom, cur_pen
-                    )
-                    cursor.setZValue(14)
+                # Rule-mode dashed guide lines and the white "now"
+                # cursor through the strip are painted in
+                # :meth:`_paint_beat_strip_decorations` (the scene's
+                # background pass) — keeping them out of the scene's
+                # item list means a click on the strip can never
+                # accidentally hide them via the same Qt regression
+                # that motivated the waveform refactor.
 
     def _update_scene_width(self) -> None:
         """Resize scene to fit the visible time window.
@@ -2429,9 +3483,14 @@ class TimelinePanel(QWidget):
         block_h = self._SEGMENT_TRACK_H - 8  # fills track with 4px top+bottom margin
         block.setRect(0, 0, width, block_h)
         block.setPos(x, SegmentRectItem.SEGMENT_Y)
+        # Brush / pen are intentionally NOT set here — the visible
+        # fill + outline are painted by :meth:`_paint_segment_blocks`
+        # during the scene's ``drawBackground`` pass so they cannot
+        # be hidden by mouse handling.  We still stash the mode
+        # colour on the item so that pass can read it back without
+        # another segment lookup.
         color = MODE_COLORS.get(segment.mode, QColor("#3bb6ff"))
-        block.setBrush(color)
-        block.setPen(QPen(QColor("#0b0b0b"), 1))
+        block._fill_color = color  # type: ignore[attr-defined]
         self.scene.addItem(block)
         self._block_map[segment.id] = block
 
@@ -2497,6 +3556,7 @@ class TimelinePanel(QWidget):
             )
             self._playhead.setZValue(10)
 
+    @Slot()
     def _on_selection_changed(self) -> None:
         """Reconcile Qt's scene selection with our segment focus state.
 
@@ -2510,11 +3570,15 @@ class TimelinePanel(QWidget):
            silently nuke the waveform — exactly the bug the user
            reported.
 
-        2. The intentional deselect path goes through
-           :meth:`_on_empty_clicked`, which clears
-           ``_selected_segment_id`` *before* invoking
-           ``scene.clearSelection()``.  We use that ordering as the
-           signal to broadcast the deselect.
+        2. A deliberate "click the void" deselect goes through
+           :meth:`_on_empty_clicked` — it sets
+           ``_intentional_segment_deselect = True`` and
+           ``_selected_segment_id = None`` *before* calling
+           ``clearSelection()``.  The handler must **not** call
+           :signal:`segment_selected` ``(None)`` a second time (that
+           is reserved for the panel method itself) and must not treat
+           a *failed* re-select as a deselect, or the preview would
+           clear the waveform on every non-selectable hit.
         """
         if not self._project:
             return
@@ -2534,12 +3598,54 @@ class TimelinePanel(QWidget):
                 finally:
                     self.scene.blockSignals(False)
                 return
-            # Genuine deselect (came via _on_empty_clicked).
-            self.split_button.setEnabled(False)
-            self.auto_gen_button.setEnabled(False)
-            self.clear_beats_button.setEnabled(False)
-            self.overview_bar.set_selected(None)
-            self.segment_selected.emit(None)
+            if (
+                self._selected_segment_id
+                and self._selected_segment_id not in self._block_map
+            ):
+                # The panel still has a *logical* current segment, but
+                # :attr:`_block_map` is stale (race, mid-refresh) — *never*
+                # broadcast a fake deselect.  Rebuild the scene on the next
+                # event-loop tick (not inside this ``selectionChanged``) so
+                # we do not re-enter a full ``refresh`` mid-callback.  Skip
+                # when the user is intentionally clearing via empty-click
+                # (we already nulled :attr:`_selected_segment_id`).
+                if (
+                    not self._intentional_segment_deselect
+                    and self._project is not None
+                ):
+                    seg = self._project.get_segment(
+                        self._selected_segment_id
+                    )
+                    if seg is not None:
+                        def _deferred_rebuild_selection() -> None:
+                            if self._intentional_segment_deselect:
+                                return
+                            sid = self._selected_segment_id
+                            if not sid:
+                                return
+                            if sid in self._block_map:
+                                b = self._block_map[sid]
+                                self.scene.blockSignals(True)
+                                try:
+                                    b.setSelected(True)
+                                finally:
+                                    self.scene.blockSignals(False)
+                                return
+                            self.refresh()
+                            if (
+                                self._selected_segment_id == sid
+                                and sid in self._block_map
+                            ):
+                                b2 = self._block_map[sid]
+                                self.scene.blockSignals(True)
+                                try:
+                                    b2.setSelected(True)
+                                finally:
+                                    self.scene.blockSignals(False)
+
+                        QTimer.singleShot(0, _deferred_rebuild_selection)
+            if self._intentional_segment_deselect:
+                self._intentional_segment_deselect = False
             return
 
         if not seg_blocks:
@@ -2577,8 +3683,10 @@ class TimelinePanel(QWidget):
         # clearSelection() so the resulting selectionChanged hook
         # recognises this as a genuine deselect.  See
         # :meth:`_on_selection_changed` for the contract.
+        self._intentional_segment_deselect = True
         self._selected_segment_id = None
         self._focused_beat = None
+        self._defocus_other_threshold_lines(None)
         self.scene.clearSelection()
         self.split_button.setEnabled(False)
         self.auto_gen_button.setEnabled(False)

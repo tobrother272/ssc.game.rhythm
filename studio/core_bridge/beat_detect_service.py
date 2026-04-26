@@ -203,11 +203,19 @@ class _BeatDetectWorker(QRunnable):
                 self._service._on_failed(job, f"events JSON parse: {exc}")
                 return
 
-            events: list[tuple[float, str]] = []
-            for row in payload.get("events", []):
+            events: list[tuple[float, str, float]] = []
+            raw_rows = payload.get("events", []) or []
+            heights = (
+                payload.get("meta", {}).get("event_heights") or []
+            )
+            for i, row in enumerate(raw_rows):
                 if len(row) >= 2:
                     try:
-                        events.append((float(row[0]), str(row[1])))
+                        h = float(heights[i]) if i < len(heights) else 1.0
+                        h = max(0.0, min(1.0, h))
+                        events.append(
+                            (float(row[0]), str(row[1]), h)
+                        )
                     except (TypeError, ValueError):
                         pass
             self._service._on_ready(job, events)
@@ -216,7 +224,7 @@ class _BeatDetectWorker(QRunnable):
 class BeatDetectService(QObject):
     """Async wrapper around ``rhythm.py --detect_only``."""
 
-    # segment_id, events list of (time_sec, kind)
+    # segment_id, events list of (time_sec, kind, height_0_1)
     ready  = Signal(str, object)
     failed = Signal(str, str)
 

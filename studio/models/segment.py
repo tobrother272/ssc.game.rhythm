@@ -59,6 +59,16 @@ class Segment:
     # (we keep the last good list so a transient ffmpeg blip doesn't
     # wipe their preview).
     beat_events: list = field(default_factory=list)
+    # Audio-amplitude threshold (0..1) for the timeline waveform's
+    # red threshold line.  Beats whose ``height`` (the per-event audio
+    # amplitude exported by ``rhythm.py --detect_only``) is below this
+    # value are visually muted in the timeline AND excluded when the
+    # segment is rendered (``render_service`` filters ``beat_events``
+    # against this threshold before it builds ``--beat_times``).  A
+    # value of 0.0 (default) keeps every detected beat — i.e. behaves
+    # identically to the legacy "no-threshold" pipeline.  Persisted so
+    # the user's tuning survives a project close/re-open.
+    beat_height_threshold: float = 0.0
     # Position + size of the stickman draw-box, expressed as fractions
     # of the rendered video frame (0..1) so the value is resolution-
     # independent and survives changes to project output_width /

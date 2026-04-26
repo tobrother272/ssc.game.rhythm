@@ -123,13 +123,28 @@ class RenderService(QObject):
         timeline preview tick-for-tick.
         """
         dur = segment.duration_sec if segment.duration_sec and segment.duration_sec > 0 else None
+        # Threshold from the waveform red line (0..1).  Beats whose
+        # exported audio amplitude falls below the threshold are
+        # filtered out here BEFORE we hand the list to rhythm.py, so
+        # the rendered video matches what the user sees on the
+        # timeline strip exactly.  Old projects without per-event
+        # heights stored 1.0 during deserialise (see project_store)
+        # so they always pass the threshold.
+        thr = max(0.0, min(1.0, float(getattr(
+            segment, "beat_height_threshold", 0.0
+        ) or 0.0)))
         beat_times: list[float] = []
         for ev in (segment.beat_events or []):
             try:
-                # ``ev`` is a (t_local, kind) tuple after deserialise
-                # but legacy data could be a bare float — accept both.
-                t = float(ev[0]) if isinstance(ev, (tuple, list)) else float(ev)
+                if isinstance(ev, (tuple, list)):
+                    t = float(ev[0])
+                    h = float(ev[2]) if len(ev) >= 3 else 1.0
+                else:
+                    t = float(ev)
+                    h = 1.0
             except (TypeError, ValueError, IndexError):
+                continue
+            if h < thr - 1e-6:
                 continue
             beat_times.append(t)
         # Stickman draw-box overrides — only forwarded when stickman

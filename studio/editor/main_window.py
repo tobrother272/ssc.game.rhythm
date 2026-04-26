@@ -516,11 +516,15 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _request_waveform_for(self, audio_path: Optional[str]) -> None:
-        """Show waveform for audio_path — uses MediaItem cache when available."""
+        """Show waveform for ``audio_path`` (cached MediaItem RMS when available).
+
+        A missing path does **not** clear the strip. Deselecting a segment
+        (or a harmless click that does not retarget a segment) should leave
+        the last RMS draw intact so the fill/outline never vanish. Callers
+        that truly need an empty track (e.g. segment with no audio, failed
+        extraction) use :meth:`TimelinePanel.clear_waveform` explicitly.
+        """
         if not audio_path:
-            if self._current_waveform_path is not None:
-                self._current_waveform_path = None
-                self.timeline_panel.clear_waveform()
             return
         if audio_path == self._current_waveform_path:
             return
@@ -739,8 +743,21 @@ class MainWindow(QMainWindow):
         # timeline draw helpers; the project store rewrites them as
         # JSON arrays on save and rehydrates back to tuples on load.
         if seg is not None:
-            seg.beat_events = [(float(t), str(k)) for t, k in evs]
-            # Mark project dirty so autosave picks up the change.
+            # Events from BeatDetectService are 3-tuples
+            # ``(t, kind, height)``; legacy code paths that only emit
+            # 2-tuples are supported by treating missing height as 1.0
+            # so they survive the round-trip without being filtered
+            # out by the threshold slider.
+            normalised: list[tuple[float, str, float]] = []
+            for ev in evs:
+                if len(ev) >= 3:
+                    normalised.append(
+                        (float(ev[0]), str(ev[1]),
+                         max(0.0, min(1.0, float(ev[2]))))
+                    )
+                elif len(ev) == 2:
+                    normalised.append((float(ev[0]), str(ev[1]), 1.0))
+            seg.beat_events = normalised
             self._on_project_changed()
         self.statusBar().showMessage(
             f"Beats ready for {seg_name}: {len(evs)} block(s)", 3000
@@ -754,6 +771,19 @@ class MainWindow(QMainWindow):
         :attr:`Segment.beat_events` and marks the project dirty so the
         autosave timer flushes the edit to disk. Without this, every
         drag / delete / kind-change would be lost on reload.
+
+        We deliberately do **not** call :meth:`_on_project_changed`
+        here, because the timeline panel already manages its own
+        scene rebuild for beat edits (see
+        :meth:`TimelinePanel._commit_beat_edit`) and the threshold
+        line release path explicitly does NOT want a refresh (the
+        line + waveform are still valid as drawn).  An extra
+        ``refresh()`` from this handler would call ``scene.clear()``
+        a second time, wiping the line/waveform/ticks and rebuilding
+        them — visually identical to the elements being "hidden by my
+        click" the user reported.  Persistence is still kept: we
+        update ``project.updated_at`` and mark dirty via
+        :meth:`_update_status` directly.
         """
         if not segment_id:
             return
@@ -761,10 +791,20 @@ class MainWindow(QMainWindow):
         if seg is None:
             return
         events = self.timeline_panel.get_beat_events(segment_id)
-        seg.beat_events = [
-            (float(t), str(k)) for t, k in events
-        ]
-        self._on_project_changed()
+        normalised: list[tuple[float, str, float]] = []
+        for ev in events:
+            if len(ev) >= 3:
+                normalised.append(
+                    (float(ev[0]), str(ev[1]),
+                     max(0.0, min(1.0, float(ev[2]))))
+                )
+            elif len(ev) == 2:
+                normalised.append((float(ev[0]), str(ev[1]), 1.0))
+        seg.beat_events = normalised
+        self.project.updated_at = datetime.now(timezone.utc).replace(
+            microsecond=0
+        ).isoformat()
+        self._update_status()
         self.statusBar().showMessage(
             f"Beats edited for {seg.name}: {len(events)} block(s)",
             2000,
@@ -913,12 +953,15 @@ class MainWindow(QMainWindow):
     def _on_segment_selected(self, segment: Segment | None) -> None:
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
-        # Switch waveform to this segment's audio (uses cache if already extracted).
-        audio = segment.audio_path if segment and segment.audio_path else None
-        self._request_waveform_for(audio)
-        # Move playhead to the start of the newly selected segment so the red
-        # line always sits at the segment boundary, and seek the preview player
-        # to the same position so playback starts from segment start.
+        # Load waveform for this segment’s audio, or show empty for a segment
+        # that has no file.  Deselect (``segment is None``) keeps the last
+        # painted RMS so clicks on the timeline chrome never blank the strip.
+        if segment is not None and segment.audio_path:
+            self._request_waveform_for(segment.audio_path)
+        elif segment is not None and not segment.audio_path:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
+        # else: deselect — leave :attr:`_current_waveform_path` + strip as-is
         if segment is not None:
             start = segment.start_time_sec
             self.timeline_panel.set_playhead(start)
@@ -946,9 +989,12 @@ class MainWindow(QMainWindow):
     def _on_segment_changed_by_form(self, _segment_id: str) -> None:
         self.timeline_panel.refresh()
         current = self.segment_panel.current_segment
-        # If the form changed the audio source, trigger/switch the waveform.
         audio = current.audio_path if current and current.audio_path else None
-        self._request_waveform_for(audio)
+        if audio:
+            self._request_waveform_for(audio)
+        else:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
         # Re-trim: the user may have changed start/end or the audio source.
         # Beat-detect is NOT triggered here either — the user iterates on
         # mode/sens/density/… without paying for a subprocess each tweak,

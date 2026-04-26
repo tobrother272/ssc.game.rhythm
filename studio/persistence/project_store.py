@@ -109,7 +109,19 @@ class ProjectStore:
         for row in raw_events:
             if isinstance(row, (list, tuple)) and len(row) >= 2:
                 try:
-                    beat_events.append((float(row[0]), str(row[1])))
+                    t = float(row[0])
+                    k = str(row[1])
+                    # Optional 3rd element = audio height (0..1) emitted
+                    # by ``rhythm.py --detect_only`` so the timeline can
+                    # filter against the user's red-line threshold.
+                    # Older projects (no height) get 1.0 so every tick
+                    # is considered "loud" until the user re-runs Auto
+                    # Gen — i.e. nothing is filtered out by surprise.
+                    if len(row) >= 3:
+                        h = max(0.0, min(1.0, float(row[2])))
+                    else:
+                        h = 1.0
+                    beat_events.append((t, k, h))
                 except (TypeError, ValueError):
                     pass
         # Stickman draw-box (fractions of rendered frame).  Coerce
@@ -145,6 +157,9 @@ class ProjectStore:
             last_render_error=payload.get("last_render_error"),
             thumbnail_path=self._to_absolute(payload.get("thumbnail_path"), project_dir),
             beat_events=beat_events,
+            beat_height_threshold=max(0.0, min(1.0, float(
+                payload.get("beat_height_threshold", 0.0) or 0.0
+            ))),
             stickman_location=stickman_location,
         )
 
