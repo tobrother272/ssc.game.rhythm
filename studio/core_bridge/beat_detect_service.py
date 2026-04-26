@@ -28,6 +28,8 @@ from typing import List
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
+from src.bundle_paths import get_rhythm_command as _get_rhythm_command
+
 
 @dataclass
 class BeatDetectJob:
@@ -91,16 +93,8 @@ class BeatDetectJob:
 
 def _build_command(job: BeatDetectJob, repo_root: Path, events_path: Path,
                    dummy_out: Path) -> list[str]:
-    """Build the argv for the detection-only rhythm invocation.
-
-    Runs ``rhythm.py`` as a script (not ``-m src.rhythm``) so the
-    sibling-style imports inside it (``from stickman import …``) resolve
-    against ``src/`` on ``sys.path``.  Mirrors the same pattern used by
-    :class:`RenderService`.
-    """
-    rhythm_script = repo_root / "src" / "rhythm.py"
-    cmd: list[str] = [
-        sys.executable, "-u", str(rhythm_script),
+    """Build the argv for the detection-only rhythm invocation."""
+    cmd: list[str] = _get_rhythm_command(repo_root) + [
         "-i", job.audio_path,
         "-o", str(dummy_out),
         "--audio", "0",                # don't try to mux audio

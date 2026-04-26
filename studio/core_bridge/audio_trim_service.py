@@ -11,32 +11,13 @@ works with the exact same audio data the user hears in any media player.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
-
-def _find_ffmpeg() -> str:
-    """Return path to the ffmpeg binary, raising if not found."""
-    # 1. Look in PATH (covers system installs and conda/venv envs).
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    # 2. Common Windows install locations.
-    candidates = [
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
-    raise FileNotFoundError(
-        "ffmpeg not found. Install ffmpeg and make sure it is on PATH."
-    )
+from src.bundle_paths import find_ffmpeg as _find_ffmpeg
 
 
 def trim_audio_ffmpeg(

@@ -1,14 +1,25 @@
 /sound_sample
 /sound_sample/*
 
-/src/__pycache__
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
 
 /env
 /env/*
 /zoomenv
+
+# Build & distribution artifacts
+/build/
+/dist/
+
+# Runtime temp files
+/temp/
+/temps/
 output/
 
-/temp
-/temp/*
-
 *.sh
+
+# PyInstaller
+*.spec.bak

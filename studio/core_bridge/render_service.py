@@ -23,6 +23,7 @@ from typing import Callable, Optional
 from PySide6.QtCore import QObject, Signal
 
 from studio.models import Segment, build_settings
+from src.bundle_paths import get_rhythm_command as _get_rhythm_command
 
 
 @dataclass
@@ -324,9 +325,7 @@ class RenderService(QObject):
             # script puts src/ on sys.path automatically; -m would only put
             # the repo root on sys.path and the imports would fail with
             # "ModuleNotFoundError: No module named 'authorization'".
-            rhythm_script = self._repo_root / "src" / "rhythm.py"
-            command = [
-                sys.executable, str(rhythm_script),
+            command = _get_rhythm_command(self._repo_root) + [
                 "-i", audio_path,
                 "-o", job.output_path,
                 "--audio", "1",   # always mux audio so preview is watchable
