@@ -35,6 +35,7 @@ from studio.core_bridge import (
     ThumbnailService,
     WaveformService,
 )
+from studio.editor.export_dialog import ExportDialog
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
 from studio.editor.segment_config_panel import SegmentConfigPanel
@@ -90,6 +91,7 @@ class _RendererWorker(QThread):
             self.ready.emit(renderer)
         else:
             renderer.close()
+
 
 
 class MainWindow(QMainWindow):
@@ -164,6 +166,8 @@ class MainWindow(QMainWindow):
         self._inflight_trim_segments: set[str] = set()
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
+        # ── Export dialog (kept alive while open so user can monitor progress)
+        self._export_dialog: Optional[ExportDialog] = None
         # ── Live preview mode (Preview button as a TOGGLE) ────────────
         # The preview button now drives an in-process drawing renderer
         # (:class:`src.live_renderer.LiveFrameRenderer`) instead of a
@@ -298,8 +302,8 @@ class MainWindow(QMainWindow):
 
         self.export_button = QPushButton("Export")
         self.export_button.setObjectName("accentButton")
-        self.export_button.setToolTip("Render all segments and export")
-        self.export_button.clicked.connect(self._render_all_segments)
+        self.export_button.setToolTip("Configure and export all segments to a single video file")
+        self.export_button.clicked.connect(self._on_export_button_clicked)
         toolbar.addWidget(self.export_button)
 
     def _build_status_bar(self) -> None:
@@ -1402,6 +1406,52 @@ class MainWindow(QMainWindow):
     def _render_all_segments(self) -> None:
         for segment in self.project.sorted_segments():
             self._enqueue_segment(segment)
+
+    # ── Export flow ──────────────────────────────────────────────────────────
+
+    def _on_export_button_clicked(self) -> None:
+        """Show the detailed Export dialog (stays open; user closes manually)."""
+        if not self.project.segments:
+            QMessageBox.information(self, "Export", "No segments to export.")
+            return
+
+        # Re-use an existing open dialog if one is already showing.
+        if getattr(self, "_export_dialog", None) is not None:
+            dlg = self._export_dialog
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+
+        dlg = ExportDialog(
+            self,
+            project=self.project,
+            app_root=self._app_root,
+            temps_dir=self._app_temps_dir(),
+            token_provider=self._current_auth_token,
+            url_provider=self._current_auth_url,
+        )
+        # When the dialog renders a segment, update video_path and persist.
+        dlg.segment_rendered.connect(self._on_export_segment_rendered)
+        dlg.destroyed.connect(self._on_export_dialog_closed)
+        self._export_dialog = dlg
+
+        # Set a reasonable default output path
+        if self.project_path:
+            default_out = str(Path(self.project_path).with_suffix(".mp4"))
+        else:
+            default_out = str(self._app_temps_dir() / "export.mp4")
+        dlg._path_edit.setText(default_out)
+
+        dlg.show()
+
+    def _on_export_segment_rendered(self, segment_id: str, output_path: str) -> None:
+        """Called by ExportDialog when a segment finishes rendering."""
+        # Delegate to the normal render-finished handler so video_path is
+        # persisted, the timeline refreshes, and autosave fires.
+        self._on_render_finished(segment_id, output_path)
+
+    def _on_export_dialog_closed(self) -> None:
+        self._export_dialog = None  # type: ignore[assignment]
 
     def _on_preview_segment_requested(self, segment_id: str) -> None:
         """Toggle live preview mode for the segment.

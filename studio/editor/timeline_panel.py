@@ -519,10 +519,11 @@ class OverviewBar(QWidget):
     empty_clicked = Signal()
 
     HEIGHT = 28
-    # Segments are drawn at SCALE × the scroll-area viewport width so
-    # the blocks appear 2× wider than a plain overview fit, and the bar
-    # scrolls horizontally to reveal the rest.
-    SCALE = 2
+    # Each segment block is exactly this many pixels wide regardless of
+    # its duration — the overview is just for counting / navigating, not
+    # for showing proportional lengths.
+    BLOCK_W = 200
+    BLOCK_GAP = 2
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -540,13 +541,15 @@ class OverviewBar(QWidget):
         self.update()
 
     def _update_minimum_width(self) -> None:
-        """Resize the widget to SCALE × parent scroll-area viewport width."""
+        """Resize widget so all fixed-width segment blocks fit without clipping."""
+        n = len(self._project.segments) if self._project else 0
+        margin = 4
+        target = max(1, margin * 2 + n * (self.BLOCK_W + self.BLOCK_GAP))
+        # Always at least as wide as the scroll-area viewport so the bar
+        # doesn't look empty when there are only a few segments.
         sa = self.parent()
         if sa is not None and hasattr(sa, "viewport"):
-            vp_w = sa.viewport().width()
-        else:
-            vp_w = self.width() or 600
-        target = max(1, int(vp_w * self.SCALE))
+            target = max(target, sa.viewport().width())
         self.setMinimumWidth(target)
         self.setFixedWidth(target)
 
@@ -596,21 +599,13 @@ class OverviewBar(QWidget):
             )
             return
 
-        max_end = max((s.end_time_sec for s in self._project.segments), default=0.0)
-        if max_end <= 0:
-            return
-
         margin = 4
-        # self.width() is SCALE × viewport width (set by _update_minimum_width)
-        # so segments are drawn stretched across the full widget width and the
-        # scroll area reveals the right half on scroll.
-        usable_w = max(1, self.width() - margin * 2)
         block_y = 5
         block_h = self.height() - 10
+        w = self.BLOCK_W
 
-        for seg in self._project.segments:
-            x = margin + int(seg.start_time_sec / max_end * usable_w)
-            w = max(3, int(seg.duration_sec / max_end * usable_w))
+        for i, seg in enumerate(self._project.sorted_segments()):
+            x = margin + i * (w + self.BLOCK_GAP)
             base = MODE_COLORS.get(seg.mode, QColor("#3bb6ff"))
             color = QColor(base)
             border = QColor("#0a0a0a")
@@ -3306,11 +3301,9 @@ class TimelinePanel(QWidget):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        # Keep overview bar width = SCALE × scroll-area viewport width.
-        if hasattr(self, "_overview_scroll") and hasattr(self, "overview_bar"):
-            vp_w = self._overview_scroll.viewport().width()
-            self.overview_bar.setMinimumWidth(max(1, int(vp_w * OverviewBar.SCALE)))
-            self.overview_bar.setFixedWidth(max(1, int(vp_w * OverviewBar.SCALE)))
+        # Recompute overview bar width whenever the panel is resized.
+        if hasattr(self, "overview_bar"):
+            self.overview_bar._update_minimum_width()
 
     def _sync_ratio_button_state(self) -> None:
         """Light up the Ratio button iff current zoom matches the lock value.
