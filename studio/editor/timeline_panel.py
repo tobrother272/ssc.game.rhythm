@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QUndoCommand,
+    QUndoStack,
+)
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
@@ -58,6 +69,31 @@ def format_ruler_time(time_sec: float, major_step_sec: float) -> str:
     return f"{mm:02d}:{ss:02d}.{int(round(frac * 100)) % 100:02d}"
 
 
+class _Cmd(QUndoCommand):
+    """Generic post-hoc undo/redo command backed by callables.
+
+    The action is assumed to have already been performed before the command
+    is pushed onto the stack, so the first ``redo()`` call (which Qt issues
+    automatically on push) is skipped.  Subsequent redo calls (real redo
+    after an undo) invoke ``redo_fn``.
+    """
+
+    def __init__(self, text: str, undo_fn, redo_fn) -> None:
+        super().__init__(text)
+        self._undo_fn = undo_fn
+        self._redo_fn = redo_fn
+        self._first = True
+
+    def undo(self) -> None:
+        self._undo_fn()
+
+    def redo(self) -> None:
+        if self._first:
+            self._first = False
+            return
+        self._redo_fn()
+
+
 MODE_COLORS = {
     "punch": QColor("#3bb6ff"),   # CapCut-like cyan-blue
     "dance": QColor("#f59e0b"),
@@ -65,6 +101,315 @@ MODE_COLORS = {
     "relax": QColor("#a78bfa"),
     "combo": QColor("#ec4899"),
 }
+
+
+def _timeline_tool_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap, QPixmap]:
+    """Return (split, join, delete) outline pixmaps for one stroke color."""
+    s = float(size)
+    m = s * 0.12  # margin
+
+    def _blank() -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    pen = QPen(stroke)
+    pen.setWidthF(1.15)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    # --- Split: outward ][ ---
+    pm_split = _blank()
+    p = QPainter(pm_split)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    x_spine_l = m + s * 0.22
+    y0, y1 = m + s * 0.18, m + s * 0.82
+    p.drawLine(QPointF(x_spine_l, y0), QPointF(x_spine_l, y1))
+    p.drawLine(QPointF(x_spine_l, y0), QPointF(m + s * 0.08, y0))
+    p.drawLine(QPointF(x_spine_l, y1), QPointF(m + s * 0.08, y1))
+    x_spine_r = m + s * 0.78
+    p.drawLine(QPointF(x_spine_r, y0), QPointF(x_spine_r, y1))
+    p.drawLine(QPointF(x_spine_r, y0), QPointF(m + s * 0.92, y0))
+    p.drawLine(QPointF(x_spine_r, y1), QPointF(m + s * 0.92, y1))
+    p.end()
+
+    # --- Join: inward [] ---
+    pm_join = _blank()
+    p = QPainter(pm_join)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    y0j, y1j = m + s * 0.18, m + s * 0.82
+    xl_j, xr_j = m + s * 0.18, m + s * 0.82
+    p.drawLine(QPointF(xl_j, y0j), QPointF(xl_j, y1j))
+    p.drawLine(QPointF(xl_j, y0j), QPointF(m + s * 0.32, y0j))
+    p.drawLine(QPointF(xl_j, y1j), QPointF(m + s * 0.32, y1j))
+    p.drawLine(QPointF(xr_j, y0j), QPointF(xr_j, y1j))
+    p.drawLine(QPointF(xr_j, y0j), QPointF(m + s * 0.68, y0j))
+    p.drawLine(QPointF(xr_j, y1j), QPointF(m + s * 0.68, y1j))
+    p.end()
+
+    # --- Delete: outline trash ---
+    pm_del = _blank()
+    p = QPainter(pm_del)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    lid_l, lid_r = m + s * 0.22, m + s * 0.78
+    lid_y = m + s * 0.22
+    p.drawLine(QPointF(lid_l, lid_y), QPointF(lid_r, lid_y))
+    cx = (lid_l + lid_r) * 0.5
+    p.drawLine(QPointF(cx, lid_y), QPointF(cx, lid_y - s * 0.07))
+    body_l, body_r = m + s * 0.28, m + s * 0.72
+    body_top = lid_y + s * 0.04
+    body_bot = m + s * 0.88
+    p.drawLine(QPointF(body_l, body_top), QPointF(body_l, body_bot))
+    p.drawLine(QPointF(body_r, body_top), QPointF(body_r, body_bot))
+    p.drawLine(QPointF(body_l, body_bot), QPointF(body_r, body_bot))
+    p.end()
+
+    return pm_split, pm_join, pm_del
+
+
+def _timeline_header_tool_icons(size: int = 20) -> tuple[QIcon, QIcon, QIcon]:
+    """Thin outline icons for Split / Join / Delete (CapCut-style toolbar)."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+    ps, pj, pd = _timeline_tool_pixmaps(size, c_on)
+    ps_d, pj_d, pd_d = _timeline_tool_pixmaps(size, c_off)
+
+    def _mk(pm: QPixmap, pm_d: QPixmap) -> QIcon:
+        ic = QIcon(pm)
+        ic.addPixmap(pm_d, QIcon.Mode.Disabled, QIcon.State.Off)
+        return ic
+
+    return _mk(ps, ps_d), _mk(pj, pj_d), _mk(pd, pd_d)
+
+
+def _duplicate_segment_icon(size: int = 20) -> QIcon:
+    """Thin outline icon for Duplicate Segment (two overlapping rectangles)."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+
+    def _mk_pm(stroke: QColor) -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        s = float(size)
+        m = s * 0.12
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(stroke)
+        pen.setWidthF(1.15)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # Back rect (offset upper-right)
+        off = s * 0.18
+        p.drawRect(QRectF(m + off, m, s - m * 2 - off, s - m * 2 - off))
+        # Front rect (offset lower-left)
+        p.drawRect(QRectF(m, m + off, s - m * 2 - off, s - m * 2 - off))
+        p.end()
+        return pm
+
+    pm_on = _mk_pm(c_on)
+    pm_off = _mk_pm(c_off)
+    ic = QIcon(pm_on)
+    ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+    return ic
+
+
+def _beat_tool_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap, QPixmap]:
+    """Auto Gen / Gen by Chart / Clear Beats icon pixmaps."""
+    s = float(size)
+    m = s * 0.10
+
+    def _blank() -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    pen = QPen(stroke)
+    pen.setWidthF(1.1)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    # --- Auto Gen: waveform baseline + 3 rising ticks (detect beats) ---
+    pm_gen = _blank()
+    p = QPainter(pm_gen)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    base_y = m + s * 0.72
+    p.drawLine(QPointF(m, base_y), QPointF(s - m, base_y))
+    for xi, h in ((0.25, 0.50), (0.50, 0.72), (0.75, 0.40)):
+        tx = m + s * xi
+        p.drawLine(QPointF(tx, base_y), QPointF(tx, base_y - s * h))
+    # small arrow-head up on the tallest tick
+    tx2 = m + s * 0.50
+    top_y = base_y - s * 0.72
+    p.drawLine(QPointF(tx2 - s * 0.08, top_y + s * 0.12), QPointF(tx2, top_y))
+    p.drawLine(QPointF(tx2 + s * 0.08, top_y + s * 0.12), QPointF(tx2, top_y))
+    p.end()
+
+    # --- Gen by Chart: mini waveform curve ---
+    pm_chart = _blank()
+    p = QPainter(pm_chart)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    base_y2 = m + s * 0.76
+    p.drawLine(QPointF(m, base_y2), QPointF(s - m, base_y2))
+    pts = [
+        (0.08, 0.72), (0.18, 0.55), (0.28, 0.30), (0.38, 0.58),
+        (0.48, 0.20), (0.58, 0.45), (0.68, 0.28), (0.78, 0.52),
+        (0.88, 0.65), (0.92, 0.72),
+    ]
+    path = QPainterPath()
+    path.moveTo(m + s * pts[0][0], m + s * pts[0][1])
+    for xi, yi in pts[1:]:
+        path.lineTo(m + s * xi, m + s * yi)
+    p.drawPath(path)
+    p.end()
+
+    # --- Clear Beats: eraser / crossed ticks ---
+    pm_clear = _blank()
+    p = QPainter(pm_clear)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    base_y3 = m + s * 0.72
+    p.drawLine(QPointF(m, base_y3), QPointF(s - m, base_y3))
+    for xi in (0.28, 0.55, 0.78):
+        tx = m + s * xi
+        p.drawLine(QPointF(tx, base_y3), QPointF(tx, base_y3 - s * 0.44))
+    # X marks-the-spot over the ticks
+    cx2, cy2 = s * 0.50, s * 0.36
+    d = s * 0.20
+    p.drawLine(QPointF(cx2 - d, cy2 - d), QPointF(cx2 + d, cy2 + d))
+    p.drawLine(QPointF(cx2 + d, cy2 - d), QPointF(cx2 - d, cy2 + d))
+    p.end()
+
+    return pm_gen, pm_chart, pm_clear
+
+
+def _beat_tool_icons(size: int = 18) -> tuple[QIcon, QIcon, QIcon]:
+    """Return (auto_gen, gen_by_chart, clear_beats) icons."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+    pms_on = _beat_tool_pixmaps(size, c_on)
+    pms_off = _beat_tool_pixmaps(size, c_off)
+
+    def _mk(pm_on: QPixmap, pm_off: QPixmap) -> QIcon:
+        ic = QIcon(pm_on)
+        ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+        return ic
+
+    return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
+
+
+def _zoom_control_pixmaps(size: int, stroke: QColor) -> tuple[
+    QPixmap, QPixmap, QPixmap, QPixmap, QPixmap
+]:
+    """Fit / Ratio / Rule / ZoomOut / ZoomIn pixmaps."""
+    s = float(size)
+    m = s * 0.08
+
+    def _blank() -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    pen = QPen(stroke)
+    pen.setWidthF(1.1)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    # --- Fit: 4 corner arrows pointing inward ---
+    pm_fit = _blank()
+    p = QPainter(pm_fit)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    aw = s * 0.22   # arrow arm length
+    for sx_, sy_, dx_, dy_ in [
+        (m,       m,       1,  1),   # top-left
+        (s - m,   m,      -1,  1),   # top-right
+        (m,       s - m,   1, -1),   # bottom-left
+        (s - m,   s - m,  -1, -1),   # bottom-right
+    ]:
+        ox, oy = sx_ + dx_ * aw * 0.5, sy_ + dy_ * aw * 0.5
+        p.drawLine(QPointF(sx_, sy_), QPointF(ox, sy_))
+        p.drawLine(QPointF(sx_, sy_), QPointF(sx_, oy))
+    p.end()
+
+    # --- Ratio: 16:9-ish box with inner tick marks ---
+    pm_ratio = _blank()
+    p = QPainter(pm_ratio)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    bx0, by0 = m + s * 0.06, m + s * 0.18
+    bx1, by1 = s - m - s * 0.06, s - m - s * 0.18
+    p.drawRect(QRectF(bx0, by0, bx1 - bx0, by1 - by0))
+    cx = (bx0 + bx1) * 0.5
+    p.drawLine(QPointF(cx, by0), QPointF(cx, by0 + s * 0.08))
+    p.drawLine(QPointF(cx, by1), QPointF(cx, by1 - s * 0.08))
+    p.end()
+
+    # --- Rule: vertical dashed guide through tick marks ---
+    pm_rule = _blank()
+    p = QPainter(pm_rule)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    dash_pen = QPen(stroke)
+    dash_pen.setWidthF(1.1)
+    dash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    dash_pen.setDashPattern([2.0, 2.0])
+    p.setPen(dash_pen)
+    for xi in (m + s * 0.28, m + s * 0.50, m + s * 0.72):
+        p.drawLine(QPointF(xi, m + s * 0.08), QPointF(xi, s - m - s * 0.08))
+    solid_pen = QPen(stroke, 1.1)
+    solid_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(solid_pen)
+    p.drawLine(QPointF(m, m + s * 0.18), QPointF(s - m, m + s * 0.18))
+    p.end()
+
+    # --- ZoomOut: circle − ---
+    pm_zout = _blank()
+    p = QPainter(pm_zout)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    r = s * 0.36
+    cx, cy = s * 0.5, s * 0.5
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    hl = r * 0.55
+    p.drawLine(QPointF(cx - hl, cy), QPointF(cx + hl, cy))
+    p.end()
+
+    # --- ZoomIn: circle + ---
+    pm_zin = _blank()
+    p = QPainter(pm_zin)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    p.drawLine(QPointF(cx - hl, cy), QPointF(cx + hl, cy))
+    p.drawLine(QPointF(cx, cy - hl), QPointF(cx, cy + hl))
+    p.end()
+
+    return pm_fit, pm_ratio, pm_rule, pm_zout, pm_zin
+
+
+def _zoom_control_icons(size: int = 18) -> tuple[QIcon, QIcon, QIcon, QIcon, QIcon]:
+    """Return (fit, ratio, rule, zoom_out, zoom_in) icons."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+    pms_on = _zoom_control_pixmaps(size, c_on)
+    pms_off = _zoom_control_pixmaps(size, c_off)
+
+    def _mk(pm_on: QPixmap, pm_off: QPixmap) -> QIcon:
+        ic = QIcon(pm_on)
+        ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+        return ic
+
+    return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1462,14 @@ class TimelineView(QGraphicsView):
         self._offset_sec = 0.0
         self._playhead_x = 0.0
         self._dragging_playhead = False
+
+        # Segment drag tracking.
+        # ``_seg_drag_pending``:  (segment_id, press_scene_x) captured on press;
+        #                         drag activates once the mouse moves > 5 px.
+        # ``_seg_drag_active``:   True once threshold is crossed.
+        self._seg_drag_pending: Optional[tuple[str, float]] = None
+        self._seg_drag_active: bool = False
+
         # Set right after construction by :class:`TimelinePanel` —
         # ``self.parent()`` does NOT return the panel because adding
         # the view to a layout reparents it to the layout's owner
@@ -1262,12 +1615,25 @@ class TimelineView(QGraphicsView):
         if self._panel_ref is not None:
             self._panel_ref._defocus_other_threshold_lines(thr_line_hit)
 
+        ruler_h = float(panel._RULER_H) if panel is not None else 22.0
+        handle_h = float(panel._PLAYHEAD_HANDLE_H) if panel is not None else 16.0
+        ph_x = self._playhead_x
+        ph_hw = float(panel._PLAYHEAD_HANDLE_W) / 2.0 if panel is not None else 7.0
+        # The hit zone covers the full ruler height PLUS the protruding pin
+        # cap below it (so the user can grab the handle from the segment track).
+        on_playhead_handle = (
+            abs(scene_pos.x() - ph_x) <= ph_hw
+            and scene_pos.y() <= ruler_h + handle_h
+        )
+        in_ruler = scene_pos.y() <= ruler_h or on_playhead_handle
+
+        # ── Drag playhead — ruler zone + handle cap ───────────────────────
         if (
             self._scrub_enabled
             and not on_tick
             and not on_threshold
             and not on_beat_strip
-            and abs(scene_pos.x() - self._playhead_x) <= 8
+            and in_ruler
         ):
             self._dragging_playhead = True
             self.playhead_scrubbed.emit(
@@ -1276,21 +1642,23 @@ class TimelineView(QGraphicsView):
             event.accept()
             return
 
-        if (
-            self._scrub_enabled
-            and not on_tick
-            and not on_threshold
-            and not on_beat_strip
-            and scene_pos.y() <= self.sceneRect().height()
-        ):
-            self.playhead_scrubbed.emit(
-                max(0.0, self._x_to_time(scene_pos.x()))
-            )
-
         if not on_tick and self._panel_ref is not None:
             self._panel_ref._clear_focused_beat()
 
         if on_segment or on_tick or on_threshold:
+            # Start a potential segment drag on plain left-click of a segment block
+            # (Ctrl+click is reserved for join-partner selection — skip drag there).
+            panel = self._panel_ref
+            if (
+                on_segment
+                and not on_tick
+                and not on_threshold
+                and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                and panel is not None
+                and panel._focus_segment_id is None  # drag disabled in focus mode
+            ):
+                self._seg_drag_pending = (hit_item.segment_id, scene_pos.x())
+                self._seg_drag_active = False
             super().mousePressEvent(event)
             return
 
@@ -1305,11 +1673,78 @@ class TimelineView(QGraphicsView):
             self.playhead_scrubbed.emit(max(0.0, self._x_to_time(scene_pos.x())))
             event.accept()
             return
+
+        # ── Segment drag ─────────────────────────────────────────────────────
+        if self._seg_drag_pending is not None:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            seg_id, press_x = self._seg_drag_pending
+            delta_px = scene_pos.x() - press_x
+            panel = self._panel_ref
+
+            if not self._seg_drag_active:
+                if abs(delta_px) < 5:
+                    super().mouseMoveEvent(event)
+                    return
+                # Threshold crossed — activate drag
+                self._seg_drag_active = True
+                if panel is not None:
+                    panel._drag_seg_id = seg_id
+                    panel._drag_ghost_x = scene_pos.x()
+                    panel._drag_insert_idx = panel._compute_drag_insert_idx(
+                        seg_id, scene_pos.x()
+                    )
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+            if self._seg_drag_active and panel is not None:
+                panel._drag_ghost_x = scene_pos.x()
+                panel._drag_insert_idx = panel._compute_drag_insert_idx(
+                    seg_id, scene_pos.x()
+                )
+                # Repaint background to show drag ghost + insertion indicator
+                try:
+                    panel.scene.invalidate(
+                        panel.scene.sceneRect(),
+                        QGraphicsScene.SceneLayer.BackgroundLayer,
+                    )
+                except Exception:
+                    pass
+            event.accept()
+            return
+
+        # ── Playhead handle hover — show SizeHor cursor ──────────────────────
+        if not self._dragging_playhead and not self._seg_drag_active:
+            vp = event.position()
+            scene_pos_h = self.mapToScene(vp.toPoint())
+            panel_h = self._panel_ref
+            ph_x = self._playhead_x
+            ruler_h = float(panel_h._RULER_H) if panel_h is not None else 22.0
+            hw = float(panel_h._PLAYHEAD_HANDLE_W) / 2.0 if panel_h is not None else 7.0
+            handle_h = float(panel_h._PLAYHEAD_HANDLE_H) if panel_h is not None else 16.0
+            near_x = abs(scene_pos_h.x() - ph_x) <= hw
+            in_handle_y = scene_pos_h.y() <= ruler_h + 2
+            if near_x and in_handle_y:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                if self.cursor().shape() == Qt.CursorShape.SizeHorCursor:
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging_playhead = False
+
+            if self._seg_drag_active and self._panel_ref is not None:
+                self._panel_ref._commit_segment_drag()
+                self._seg_drag_active = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                event.accept()
+                self._seg_drag_pending = None
+                return
+
+            self._seg_drag_pending = None
+            self._seg_drag_active = False
+
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
@@ -1357,6 +1792,16 @@ class TimelineView(QGraphicsView):
             step_px = 10.0 if shift else 1.0
             direction = -1.0 if event.key() == Qt.Key.Key_Left else 1.0
             panel._on_arrow_nudge_selected_ticks(direction * step_px)
+            event.accept()
+            return
+
+        # Ctrl+D — duplicate selected segment
+        if (
+            event.key() == Qt.Key.Key_D
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and panel is not None
+        ):
+            panel._do_duplicate_segment()
             event.accept()
             return
 
@@ -1442,7 +1887,8 @@ class TimelinePanel(QWidget):
     segment_changed = Signal(str)  # segment_id
     create_segment_requested = Signal(str, float)  # media_id, start_time
     playhead_seek_requested = Signal(float)  # time_sec
-    segment_split = Signal(str, str)  # original_id, new_id (for MainWindow to handle)
+    segment_split = Signal(str, str)   # original_id, new_id
+    segment_joined = Signal(str, str)  # kept_id, removed_id
     # Manual beat-detection trigger.  Beat-detect runs only when the user
     # explicitly clicks the "Auto Gen Block" toolbar button — never on
     # selection / drag / form-change — so the user controls when the
@@ -1471,6 +1917,13 @@ class TimelinePanel(QWidget):
     # filtered set the rendered video will use, with no client-side
     # opacity hacks needed.  Carries ``(segment_id, threshold)``.
     beat_threshold_changed = Signal(str, float)  # segment_id, 0..1
+
+    # Emitted after Ctrl+D duplicates a segment.  Carries the new segment id.
+    segment_duplicated = Signal(str)  # new_segment_id
+
+    # Emitted after a drag moves a segment to a new time position.
+    # Carries segment_id, new_start_time_sec, new_end_time_sec.
+    segment_moved = Signal(str, float, float)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1501,6 +1954,7 @@ class TimelinePanel(QWidget):
         # from a clean fit-to-viewport.
         self._focus_manual_zoom: bool = False
         self._selected_segment_id: str | None = None
+        self._join_partner_id: str | None = None
         self._playhead_time_sec = 0.0
         self._playhead_x = 0.0
         # Waveform state — RMS envelope only (matches rhythm.py LINE-DEBUG).
@@ -1569,6 +2023,21 @@ class TimelinePanel(QWidget):
         # a harmless click on a non-selectable surface (waveform fill,
         # track chrome, etc.).
         self._intentional_segment_deselect: bool = False
+
+        # Undo/redo stack — covers segment-level ops (split, join, delete,
+        # duplicate, move) and beat-level ops (insert, drag, delete).
+        self.undo_stack = QUndoStack(self)
+
+        # CapCut-style segment drag state.
+        # ``_drag_seg_id``:      id of the segment being dragged
+        # ``_drag_ghost_x``:     scene-X of the left edge of the drag ghost
+        # ``_drag_insert_idx``:  insertion index into sorted-segments (excluding
+        #                        the dragged segment).  0 = before the first
+        #                        remaining segment, len = after the last.
+        self._drag_seg_id: Optional[str] = None
+        self._drag_ghost_x: float = 0.0
+        self._drag_insert_idx: int = 0
+
         self._build_ui()
 
     # -- Coordinate helpers --------------------------------------------------
@@ -1614,6 +2083,7 @@ class TimelinePanel(QWidget):
             prev_selected_id = self._selected_segment_id
             # scene.clear() deletes all C++ items, so drop stale playhead reference first
             self._playhead = None
+            self._playhead_handle = None
             self.scene.blockSignals(True)
             try:
                 self.scene.clear()
@@ -1673,12 +2143,15 @@ class TimelinePanel(QWidget):
         self.view._offset_sec = self._offset_sec
         # Auto-select the focused segment so inspector + preview follow.
         self._selected_segment_id = segment_id
+        self._join_partner_id = None
         self.refresh()
         # ``refresh()`` re-applies the selection while signals are blocked,
         # so ``_on_selection_changed`` never fires for this entry path.
         # Sync action-button enable state explicitly.
         self.split_button.setEnabled(True)
+        self.join_button.setEnabled(False)  # requires Ctrl+click of a second segment
         self.delete_segment_button.setEnabled(True)
+        self.duplicate_segment_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
         self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
@@ -1998,9 +2471,11 @@ class TimelinePanel(QWidget):
         height = float(old_ev[2]) if len(old_ev) >= 3 else 1.0
         if abs(new_t_local - old_t) < 1e-4:
             return
+        events_before = list(events)
         self._pending_tick_select_after_refresh = []
         events[event_idx] = (new_t_local, kind, height)
         events.sort(key=lambda e: e[0])
+        events_after = list(events)
         # Keep focus on the dragged tick so arrow keys keep targeting
         # it (the index may have shifted after the sort, but the
         # closest-time lookup in :meth:`_focused_event_idx` resolves
@@ -2013,15 +2488,31 @@ class TimelinePanel(QWidget):
             self._focused_beat = (segment_id, new_t_local)
         self._schedule_beat_commit(segment_id)
 
+        def _undo_drag() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_before
+            self._schedule_beat_commit(segment_id)
+
+        def _redo_drag() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_after
+            self._schedule_beat_commit(segment_id)
+
+        self.undo_stack.push(_Cmd("Move Beat", _undo_drag, _redo_drag))
+
     def _on_beat_tick_delete_requested(
         self, segment_id: str, event_idx: int
     ) -> None:
         events = self._beat_events.get(segment_id)
         if events is None or not (0 <= event_idx < len(events)):
             return
+        events_before = list(events)
         deleted_t = float(events[event_idx][0])
         self._pending_tick_select_after_refresh = []
         del events[event_idx]
+        events_after = list(events)
         if (
             self._focused_beat is not None
             and self._focused_beat[0] == segment_id
@@ -2029,6 +2520,20 @@ class TimelinePanel(QWidget):
         ):
             self._focused_beat = None
         self._schedule_beat_commit(segment_id)
+
+        def _undo_del() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_before
+            self._schedule_beat_commit(segment_id)
+
+        def _redo_del() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_after
+            self._schedule_beat_commit(segment_id)
+
+        self.undo_stack.push(_Cmd("Delete Beat", _undo_del, _redo_del))
 
     def _on_delete_selected_beat_ticks(self) -> None:
         """Delete every selected :class:`BeatTickItem` in the scene.
@@ -2051,6 +2556,12 @@ class TimelinePanel(QWidget):
         ]
         if not selected:
             return
+        # Snapshot state per segment before any deletion
+        affected_seg_ids = list({tick._segment_id for tick in selected})
+        snapshots_before: dict[str, list] = {
+            sid: list(self._beat_events.get(sid, []))
+            for sid in affected_seg_ids
+        }
         self._pending_tick_select_after_refresh = []
         by_seg: dict[str, list[int]] = {}
         focused_t: dict[str, float] = {}
@@ -2074,8 +2585,31 @@ class TimelinePanel(QWidget):
                         self._focused_beat = None
                     del events[idx]
             touched.append(seg_id)
+        # Capture state after deletion
+        snapshots_after: dict[str, list] = {
+            sid: list(self._beat_events.get(sid, []))
+            for sid in touched
+        }
         for seg_id in touched:
             self._schedule_beat_commit(seg_id)
+
+        def _undo_multi_del() -> None:
+            for sid, evs_before in snapshots_before.items():
+                evs = self._beat_events.get(sid)
+                if evs is not None:
+                    evs[:] = evs_before
+                self._schedule_beat_commit(sid)
+
+        def _redo_multi_del() -> None:
+            for sid, evs_after in snapshots_after.items():
+                evs = self._beat_events.get(sid)
+                if evs is not None:
+                    evs[:] = evs_after
+                self._schedule_beat_commit(sid)
+
+        self.undo_stack.push(
+            _Cmd("Delete Beats", _undo_multi_del, _redo_multi_del)
+        )
 
     def _on_arrow_nudge_selected_ticks(self, delta_px: float) -> None:
         """Move the *focused* beat by ``delta_px`` pixels along X.
@@ -2286,13 +2820,31 @@ class TimelinePanel(QWidget):
         if events:
             nearest = min(events, key=lambda e: abs(float(e[0]) - t_local))
             nearest_kind = str(nearest[1]) or "L"
+        # Snapshot before insert for undo
+        events_before = list(events)
         # User-inserted ticks always carry full amplitude (1.0) so
         # they're never silently filtered out by the threshold slider
         # — the user explicitly asked for this beat to exist.
         events.append((t_local, nearest_kind, 1.0))
         events.sort(key=lambda e: e[0])
+        events_after = list(events)
         self._set_focused_beat(segment_id, t_local)
         self._schedule_beat_commit(segment_id)
+
+        # Push undo command (post-hoc: beat already inserted above).
+        def _undo_insert() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_before
+            self._schedule_beat_commit(segment_id)
+
+        def _redo_insert() -> None:
+            evs = self._beat_events.get(segment_id)
+            if evs is not None:
+                evs[:] = events_after
+            self._schedule_beat_commit(segment_id)
+
+        self.undo_stack.push(_Cmd("Add Beat", _undo_insert, _redo_insert))
         return True
 
     def _on_beat_strip_double_clicked(
@@ -2349,129 +2901,180 @@ class TimelinePanel(QWidget):
         top.addWidget(title)
         top.addSpacing(10)
 
-        self.split_button = QPushButton("Split")
-        self.split_button.setToolTip(
-            "Split selected segment at current playhead position (S)"
-        )
+        _ic_split, _ic_join, _ic_del = _timeline_header_tool_icons(20)
+        _icon_sz = QSize(20, 20)
+
+        self.split_button = QPushButton()
+        self.split_button.setIcon(_ic_split)
+        self.split_button.setIconSize(_icon_sz)
+        self.split_button.setText("")
+        self.split_button.setFlat(True)
+        self.split_button.setToolTip("Split — cut selected segment at playhead (S)")
         self.split_button.setEnabled(False)
         self.split_button.setObjectName("splitButton")
+        self.split_button.setFixedSize(30, 30)
         self.split_button.clicked.connect(self._on_split_clicked)
         top.addWidget(self.split_button)
 
-        top.addStretch()
+        self.join_button = QPushButton()
+        self.join_button.setIcon(_ic_join)
+        self.join_button.setIconSize(_icon_sz)
+        self.join_button.setText("")
+        self.join_button.setFlat(True)
+        self.join_button.setToolTip(
+            "Join — Ctrl+click a second segment, then click to merge.\n"
+            "Both segments must be adjacent and share the same audio."
+        )
+        self.join_button.setEnabled(False)
+        self.join_button.setObjectName("joinButton")
+        self.join_button.setFixedSize(30, 30)
+        self.join_button.clicked.connect(self._on_join_clicked)
+        top.addWidget(self.join_button)
 
-        # "Delete Segment" — drop the currently selected segment from the
-        # project after a confirm prompt.  Disabled until a segment is
-        # selected (mirrors the other selection-dependent buttons below
-        # — toggled in ``_on_selection_changed`` / ``_on_empty_clicked``).
-        self.delete_segment_button = QPushButton("Delete Segment")
+        self.delete_segment_button = QPushButton()
+        self.delete_segment_button.setIcon(_ic_del)
+        self.delete_segment_button.setIconSize(_icon_sz)
+        self.delete_segment_button.setText("")
+        self.delete_segment_button.setFlat(True)
         self.delete_segment_button.setObjectName("deleteSegmentButton")
         self.delete_segment_button.setEnabled(False)
         self.delete_segment_button.setToolTip(
-            "Remove the selected segment from the project.\n"
-            "Beat events, render settings and the trimmed audio cache\n"
-            "for this segment are dropped.  This cannot be undone."
+            "Delete Segment — remove selected segment from project.\n"
+            "Beat events, render settings and trimmed audio are dropped.\n"
+            "Use Ctrl+Z to undo."
         )
+        self.delete_segment_button.setFixedSize(30, 30)
         self.delete_segment_button.clicked.connect(
             self._on_delete_segment_clicked
         )
         top.addWidget(self.delete_segment_button)
+
+        _ic_dup = _duplicate_segment_icon(20)
+        self.duplicate_segment_button = QPushButton()
+        self.duplicate_segment_button.setIcon(_ic_dup)
+        self.duplicate_segment_button.setIconSize(_icon_sz)
+        self.duplicate_segment_button.setText("")
+        self.duplicate_segment_button.setFlat(True)
+        self.duplicate_segment_button.setObjectName("zoomIconButton")
+        self.duplicate_segment_button.setEnabled(False)
+        self.duplicate_segment_button.setToolTip(
+            "Duplicate Segment (Ctrl+D) — copy selected segment,\n"
+            "placing the duplicate immediately after the original."
+        )
+        self.duplicate_segment_button.setFixedSize(30, 30)
+        self.duplicate_segment_button.clicked.connect(self._do_duplicate_segment)
+        top.addWidget(self.duplicate_segment_button)
+
+        top.addStretch()
 
         # "Auto Gen Block" — manual trigger for ``rhythm.py --detect_only``.
         # Detection no longer fires on segment selection / drag / form
         # change so the user can iterate on settings without paying for a
         # subprocess each tweak.  Disabled until a segment is selected;
         # enabled in ``_on_selection_changed``.
-        self.auto_gen_button = QPushButton("Auto Gen Block")
-        self.auto_gen_button.setObjectName("autoGenButton")
+        _ic_agen, _ic_gchart, _ic_clr = _beat_tool_icons(18)
+        _beat_icon_sz = QSize(18, 18)
+        _beat_btn_sz = 28
+
+        self.auto_gen_button = QPushButton()
+        self.auto_gen_button.setIcon(_ic_agen)
+        self.auto_gen_button.setIconSize(_beat_icon_sz)
+        self.auto_gen_button.setFlat(True)
+        self.auto_gen_button.setObjectName("zoomIconButton")
+        self.auto_gen_button.setFixedSize(_beat_btn_sz, _beat_btn_sz)
         self.auto_gen_button.setEnabled(False)
         self.auto_gen_button.setToolTip(
-            "Generate the predicted block-spawn markers for the selected\n"
-            "segment.  Runs rhythm.py --detect_only on the trimmed audio\n"
-            "so the timeline preview matches the eventual render — without\n"
-            "spending the full render time."
+            "Auto Gen Block — run rhythm.py --detect_only on this segment\n"
+            "and place beat markers that match the eventual render."
         )
         self.auto_gen_button.clicked.connect(self._on_auto_gen_clicked)
         top.addWidget(self.auto_gen_button)
 
-        # "Gen by Chart" — local peak-detector that derives one beat
-        # tick per RMS chart peak, no rhythm.py subprocess.  Useful
-        # when the user wants strict 1-tick-per-visible-peak (the
-        # spawner's lane-spacing rules in rhythm.py drop some peaks
-        # on dense passages, which manifests as missing ticks even
-        # above the threshold line).  Operates entirely on the
-        # already-loaded ``_waveform_rms`` so it's instant.
-        self.gen_by_chart_button = QPushButton("Gen by Chart")
-        self.gen_by_chart_button.setObjectName("genByChartButton")
+        self.gen_by_chart_button = QPushButton()
+        self.gen_by_chart_button.setIcon(_ic_gchart)
+        self.gen_by_chart_button.setIconSize(_beat_icon_sz)
+        self.gen_by_chart_button.setFlat(True)
+        self.gen_by_chart_button.setObjectName("zoomIconButton")
+        self.gen_by_chart_button.setFixedSize(_beat_btn_sz, _beat_btn_sz)
         self.gen_by_chart_button.setEnabled(False)
         self.gen_by_chart_button.setToolTip(
-            "Generate beat ticks straight from the waveform chart\n"
-            "below: one tick per RMS peak, computed locally without\n"
-            "spawning rhythm.py.  Honours the segment's threshold\n"
-            "slider — peaks below the red line are skipped."
+            "Gen by Chart — place one beat tick per waveform RMS peak\n"
+            "instantly, without spawning rhythm.py.\n"
+            "Honours the threshold slider."
         )
-        self.gen_by_chart_button.clicked.connect(
-            self._on_gen_by_chart_clicked
-        )
+        self.gen_by_chart_button.clicked.connect(self._on_gen_by_chart_clicked)
         top.addWidget(self.gen_by_chart_button)
 
-        self.clear_beats_button = QPushButton("Clear Beats")
-        self.clear_beats_button.setObjectName("clearBeatsButton")
+        self.clear_beats_button = QPushButton()
+        self.clear_beats_button.setIcon(_ic_clr)
+        self.clear_beats_button.setIconSize(_beat_icon_sz)
+        self.clear_beats_button.setFlat(True)
+        self.clear_beats_button.setObjectName("zoomIconButton")
+        self.clear_beats_button.setFixedSize(_beat_btn_sz, _beat_btn_sz)
         self.clear_beats_button.setEnabled(False)
         self.clear_beats_button.setToolTip(
-            "Remove ALL beat block markers from the selected segment.\n"
-            "This action cannot be undone."
+            "Clear Beats — remove ALL beat markers from this segment.\n"
+            "Cannot be undone."
         )
         self.clear_beats_button.clicked.connect(self._on_clear_beats_clicked)
         top.addWidget(self.clear_beats_button)
 
-        # CapCut-style zoom bar:  [Fit]  [−]  [====O======]  [+]
-        # The slider is log-scale so each pixel of slider travel feels
-        # like a roughly equal "zoom step" across the whole 30 000× range.
-        self.zoom_fit_button = QPushButton("Fit")
-        self.zoom_fit_button.setObjectName("zoomButton")
-        self.zoom_fit_button.setFixedWidth(36)
+        # CapCut-style zoom bar:  [Fit] [Ratio] [Rule]  [−]  [===O===]  [+]
+        _ic_fit, _ic_ratio, _ic_rule, _ic_zout, _ic_zin = _zoom_control_icons(18)
+        _zoom_icon_sz = QSize(18, 18)
+        _zoom_btn_sz = 28
+
+        self.zoom_fit_button = QPushButton()
+        self.zoom_fit_button.setIcon(_ic_fit)
+        self.zoom_fit_button.setIconSize(_zoom_icon_sz)
+        self.zoom_fit_button.setFlat(True)
+        self.zoom_fit_button.setObjectName("zoomIconButton")
+        self.zoom_fit_button.setFixedSize(_zoom_btn_sz, _zoom_btn_sz)
         self.zoom_fit_button.setToolTip(
-            "Zoom to fit: scale the timeline so the whole project is\n"
-            "visible from start to end."
+            "Fit — zoom so the whole project is visible."
         )
         self.zoom_fit_button.clicked.connect(self._on_zoom_fit_clicked)
         top.addWidget(self.zoom_fit_button)
 
-        self.zoom_ratio_button = QPushButton("Ratio")
-        self.zoom_ratio_button.setObjectName("zoomButton")
-        self.zoom_ratio_button.setFixedWidth(48)
+        self.zoom_ratio_button = QPushButton()
+        self.zoom_ratio_button.setIcon(_ic_ratio)
+        self.zoom_ratio_button.setIconSize(_zoom_icon_sz)
+        self.zoom_ratio_button.setFlat(True)
+        self.zoom_ratio_button.setObjectName("zoomIconButton")
         self.zoom_ratio_button.setCheckable(True)
+        self.zoom_ratio_button.setFixedSize(_zoom_btn_sz, _zoom_btn_sz)
         self.zoom_ratio_button.setToolTip(
-            f"Lock zoom to a fixed {RATIO_LOCK_PPS:.0f} px/s "
-            f"({RATIO_LOCK_VIEW_SEC:.0f}s in {RATIO_LOCK_VIEW_WIDTH_PX:.0f}px).\n"
-            "Wider viewports show more seconds, narrower ones less — the\n"
-            "waveform's visual shape is identical across window sizes.\n"
-            "Button stays highlighted while the lock is active."
+            f"Ratio — lock zoom to {RATIO_LOCK_PPS:.0f} px/s "
+            f"({RATIO_LOCK_VIEW_SEC:.0f}s = {RATIO_LOCK_VIEW_WIDTH_PX:.0f}px).\n"
+            "Stays lit while active."
         )
         self.zoom_ratio_button.clicked.connect(self._on_zoom_ratio_clicked)
         top.addWidget(self.zoom_ratio_button)
 
-        # Rule mode toggle — pulls each beat tick downward as a dashed
-        # vertical guide that overlays the waveform, making it easy to
-        # eyeball whether a tick lines up with the audio peaks beneath
-        # it. Toggling refreshes the timeline; no model change.
-        self.rule_button = QPushButton("Rule")
-        self.rule_button.setObjectName("ruleButton")
-        self.rule_button.setFixedWidth(44)
+        # Rule mode toggle
+        self.rule_button = QPushButton()
+        self.rule_button.setIcon(_ic_rule)
+        self.rule_button.setIconSize(_zoom_icon_sz)
+        self.rule_button.setFlat(True)
+        self.rule_button.setObjectName("zoomIconButton")
         self.rule_button.setCheckable(True)
         self.rule_button.setChecked(False)
+        self.rule_button.setFixedSize(_zoom_btn_sz, _zoom_btn_sz)
         self.rule_button.setToolTip(
-            "Rule mode: extend each beat tick as a dashed vertical\n"
-            "guide line down through the waveform so you can verify\n"
-            "tick positions against the audio envelope."
+            "Rule — extend beat ticks as dashed vertical guides\n"
+            "through the waveform."
         )
         self.rule_button.toggled.connect(self._on_rule_toggled)
         top.addWidget(self.rule_button)
 
-        self.zoom_out_button = QPushButton("−")
-        self.zoom_out_button.setObjectName("zoomButton")
-        self.zoom_out_button.setFixedWidth(28)
+        top.addSpacing(4)
+
+        self.zoom_out_button = QPushButton()
+        self.zoom_out_button.setIcon(_ic_zout)
+        self.zoom_out_button.setIconSize(_zoom_icon_sz)
+        self.zoom_out_button.setFlat(True)
+        self.zoom_out_button.setObjectName("zoomIconButton")
+        self.zoom_out_button.setFixedSize(_zoom_btn_sz, _zoom_btn_sz)
         self.zoom_out_button.setToolTip(
             f"Zoom out (max step: {ZOOM_MAX_STEP_SEC/60:.0f} min)"
         )
@@ -2481,16 +3084,19 @@ class TimelinePanel(QWidget):
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setObjectName("zoomSlider")
         self.zoom_slider.setRange(0, ZOOM_SLIDER_RES)
-        self.zoom_slider.setFixedWidth(140)
+        self.zoom_slider.setFixedWidth(120)
         self.zoom_slider.setSingleStep(max(1, ZOOM_SLIDER_RES // 100))
         self.zoom_slider.setPageStep(max(1, ZOOM_SLIDER_RES // 20))
         self.zoom_slider.setValue(pps_to_slider_value(self.pixels_per_second))
         self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
         top.addWidget(self.zoom_slider)
 
-        self.zoom_in_button = QPushButton("+")
-        self.zoom_in_button.setObjectName("zoomButton")
-        self.zoom_in_button.setFixedWidth(28)
+        self.zoom_in_button = QPushButton()
+        self.zoom_in_button.setIcon(_ic_zin)
+        self.zoom_in_button.setIconSize(_zoom_icon_sz)
+        self.zoom_in_button.setFlat(True)
+        self.zoom_in_button.setObjectName("zoomIconButton")
+        self.zoom_in_button.setFixedSize(_zoom_btn_sz, _zoom_btn_sz)
         self.zoom_in_button.setToolTip(
             f"Zoom in (max step: {ZOOM_MIN_STEP_SEC*1000:.0f} ms)"
         )
@@ -2574,6 +3180,7 @@ class TimelinePanel(QWidget):
         root.addWidget(self.view, 1)
 
         self._playhead: QGraphicsLineItem | None = None
+        self._playhead_handle: QGraphicsPathItem | None = None
 
         # Loading animation timer for waveform extraction.
         self._waveform_loading_timer = QTimer(self)
@@ -2938,6 +3545,8 @@ class TimelinePanel(QWidget):
         """
         if not self._block_map:
             return
+        drag_id = self._drag_seg_id
+        drag_active = drag_id is not None
         painter.save()
         try:
             for seg_id, block in list(self._block_map.items()):
@@ -2945,13 +3554,12 @@ class TimelinePanel(QWidget):
                     rect_local = block.rect()
                     pos = block.pos()
                 except RuntimeError:
-                    # Item was deleted between scene.clear() and the
-                    # next refresh — skip it.
                     continue
                 if rect_local.isEmpty():
                     continue
+                block_x = pos.x() + rect_local.x()
                 scene_rect = QRectF(
-                    pos.x() + rect_local.x(),
+                    block_x,
                     pos.y() + rect_local.y(),
                     rect_local.width(),
                     rect_local.height(),
@@ -2959,25 +3567,90 @@ class TimelinePanel(QWidget):
                 fill = getattr(block, "_fill_color", None)
                 if fill is None:
                     fill = QColor("#3bb6ff")
-                painter.setBrush(QBrush(fill))
-                painter.setPen(QPen(QColor("#0b0b0b"), 1))
-                painter.drawRect(scene_rect)
-                # Selection halo — Qt's default
-                # ``QGraphicsRectItem.paint`` would draw a 1-px
-                # dashed outline when ``ItemIsSelectable`` & state is
-                # selected; we replicate that here so the user still
-                # sees which block they have selected.
+
+                if seg_id == drag_id:
+                    # Original position shown as dimmed placeholder while dragging
+                    ghost_fill = QColor(fill)
+                    ghost_fill.setAlphaF(0.18)
+                    painter.setBrush(QBrush(ghost_fill))
+                    ph_pen = QPen(QColor(200, 200, 200, 50))
+                    ph_pen.setStyle(Qt.PenStyle.DashLine)
+                    painter.setPen(ph_pen)
+                    painter.drawRect(scene_rect)
+                else:
+                    painter.setBrush(QBrush(fill))
+                    painter.setPen(QPen(QColor("#0b0b0b"), 1))
+                    painter.drawRect(scene_rect)
+                    try:
+                        is_selected = bool(block.isSelected())
+                    except RuntimeError:
+                        is_selected = False
+                    if is_selected:
+                        halo_pen = QPen(QColor("#ffffff"))
+                        halo_pen.setWidth(1)
+                        halo_pen.setStyle(Qt.PenStyle.DashLine)
+                        painter.setPen(halo_pen)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRect(scene_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+                    if seg_id == self._join_partner_id:
+                        join_pen = QPen(QColor("#ff9800"))
+                        join_pen.setWidth(2)
+                        join_pen.setStyle(Qt.PenStyle.DashLine)
+                        painter.setPen(join_pen)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRect(scene_rect.adjusted(1, 1, -1, -1))
+
+            # ── Draw drag ghost + insertion indicator ────────────────────
+            if drag_active and drag_id in self._block_map:
+                drag_block = self._block_map[drag_id]
                 try:
-                    is_selected = bool(block.isSelected())
+                    drag_rect_local = drag_block.rect()
+                    drag_fill = getattr(drag_block, "_fill_color", QColor("#3bb6ff"))
                 except RuntimeError:
-                    is_selected = False
-                if is_selected:
-                    halo_pen = QPen(QColor("#ffffff"))
-                    halo_pen.setWidth(1)
-                    halo_pen.setStyle(Qt.PenStyle.DashLine)
-                    painter.setPen(halo_pen)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRect(scene_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+                    drag_fill = QColor("#3bb6ff")
+                    drag_rect_local = None
+
+                if drag_rect_local is not None and not drag_rect_local.isEmpty():
+                    w = drag_rect_local.width()
+                    h = drag_rect_local.height()
+                    ghost_x = self._drag_ghost_x - w / 2
+                    ghost_rect = QRectF(
+                        ghost_x,
+                        float(SegmentRectItem.SEGMENT_Y),
+                        w,
+                        h,
+                    )
+                    # Ghost: semi-transparent fill + white outline
+                    g_fill = QColor(drag_fill)
+                    g_fill.setAlphaF(0.72)
+                    painter.setBrush(QBrush(g_fill))
+                    g_pen = QPen(QColor("#ffffff"), 1.5)
+                    painter.setPen(g_pen)
+                    painter.drawRect(ghost_rect)
+
+                # Insertion indicator: bright cyan vertical bar
+                insert_x = self._drag_insertion_x()
+                if insert_x is not None:
+                    ind_pen = QPen(QColor("#00e5ff"), 3)
+                    ind_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    painter.setPen(ind_pen)
+                    y_top = float(SegmentRectItem.SEGMENT_Y)
+                    y_bot = y_top + float(self._SEGMENT_TRACK_H) - 8
+                    painter.drawLine(
+                        QPointF(insert_x, y_top - 4),
+                        QPointF(insert_x, y_bot + 4),
+                    )
+                    # Draw diamond handle at top
+                    painter.setBrush(QBrush(QColor("#00e5ff")))
+                    painter.setPen(QPen(Qt.PenStyle.NoPen))
+                    d = 6.0
+                    diamond = QPainterPath()
+                    diamond.moveTo(insert_x, y_top - 4 - d)
+                    diamond.lineTo(insert_x + d, y_top - 4)
+                    diamond.lineTo(insert_x, y_top - 4 + d)
+                    diamond.lineTo(insert_x - d, y_top - 4)
+                    diamond.closeSubpath()
+                    painter.drawPath(diamond)
         finally:
             painter.restore()
 
@@ -3822,32 +4495,63 @@ class TimelinePanel(QWidget):
         label.setBrush(QColor("#0b0b0b"))
         label.setPos(label_x, 4)
 
+    # Pin handle dimensions (shared with hover hit-test in TimelineView).
+    _PLAYHEAD_HANDLE_W = 14   # total width  (±7 px from centre)
+    _PLAYHEAD_HANDLE_H = 16   # height of the cap (sits inside the ruler)
+
+    def _playhead_handle_path(self, x: float) -> QPainterPath:
+        """Downward-pointing pin cap centred at ``x``, anchored to y=2."""
+        hw = self._PLAYHEAD_HANDLE_W / 2.0
+        hh = float(self._PLAYHEAD_HANDLE_H)
+        top = 2.0
+        mid = top + hh * 0.55   # where the shoulders taper inward
+        tip = top + hh          # sharp downward tip
+        path = QPainterPath()
+        path.moveTo(x - hw, top)
+        path.lineTo(x + hw, top)
+        path.lineTo(x + hw, mid)
+        path.lineTo(x,      tip)
+        path.lineTo(x - hw, mid)
+        path.closeSubpath()
+        return path
+
     def _draw_playhead(self, time_sec: float) -> None:
         x = self._time_to_x(time_sec)
         self._playhead_x = x
         self.view.set_playhead_x(x)
+        scene_h = self.scene.sceneRect().height()
+        red_pen = QPen(QColor("#ef4444"), 2)
+
+        # ── Vertical line ──────────────────────────────────────────────
         if self._playhead is None:
-            self._playhead = self.scene.addLine(
-                x,
-                0,
-                x,
-                self.scene.sceneRect().height(),
-                QPen(QColor("#ef4444"), 2),
-            )
+            self._playhead = self.scene.addLine(x, 0, x, scene_h, red_pen)
             self._playhead.setZValue(10)
-            return
-        try:
-            self._playhead.setLine(x, 0, x, self.scene.sceneRect().height())
-        except RuntimeError:
-            # Defensive path when Qt object was deleted by a recent scene.clear().
-            self._playhead = self.scene.addLine(
-                x,
-                0,
-                x,
-                self.scene.sceneRect().height(),
-                QPen(QColor("#ef4444"), 2),
+        else:
+            try:
+                self._playhead.setLine(x, 0, x, scene_h)
+            except RuntimeError:
+                self._playhead = self.scene.addLine(x, 0, x, scene_h, red_pen)
+                self._playhead.setZValue(10)
+
+        # ── Pin handle cap ─────────────────────────────────────────────
+        handle_path = self._playhead_handle_path(x)
+        if self._playhead_handle is None:
+            self._playhead_handle = self.scene.addPath(
+                handle_path,
+                QPen(Qt.PenStyle.NoPen),
+                QBrush(QColor("#ef4444")),
             )
-            self._playhead.setZValue(10)
+            self._playhead_handle.setZValue(11)
+        else:
+            try:
+                self._playhead_handle.setPath(handle_path)
+            except RuntimeError:
+                self._playhead_handle = self.scene.addPath(
+                    handle_path,
+                    QPen(Qt.PenStyle.NoPen),
+                    QBrush(QColor("#ef4444")),
+                )
+                self._playhead_handle.setZValue(11)
 
     @Slot()
     def _on_selection_changed(self) -> None:
@@ -3960,6 +4664,25 @@ class TimelinePanel(QWidget):
                         self.scene.blockSignals(False)
             return
 
+        # ── Two-segment Ctrl+click → join-partner mode ───────────────
+        if len(seg_blocks) == 2:
+            ids = {b.segment_id for b in seg_blocks}
+            if self._selected_segment_id in ids:
+                partner_id = next(
+                    b.segment_id for b in seg_blocks
+                    if b.segment_id != self._selected_segment_id
+                )
+            else:
+                self._selected_segment_id = seg_blocks[0].segment_id
+                partner_id = seg_blocks[1].segment_id
+            self._join_partner_id = partner_id
+            self._update_join_button()
+            self.scene.update()
+            return
+
+        self._join_partner_id = None
+        self.join_button.setEnabled(False)
+
         block = seg_blocks[0]
         segment = self._project.get_segment(block.segment_id)
         if segment is None:
@@ -3983,7 +4706,9 @@ class TimelinePanel(QWidget):
         same_segment = (segment.id == self._selected_segment_id)
         self._selected_segment_id = segment.id
         self.split_button.setEnabled(True)
+        self.join_button.setEnabled(False)  # need Ctrl+click a second segment
         self.delete_segment_button.setEnabled(True)
+        self.duplicate_segment_button.setEnabled(True)
         self.auto_gen_button.setEnabled(True)
         self.gen_by_chart_button.setEnabled(True)
         self.clear_beats_button.setEnabled(True)
@@ -3998,16 +4723,243 @@ class TimelinePanel(QWidget):
         # :meth:`_on_selection_changed` for the contract.
         self._intentional_segment_deselect = True
         self._selected_segment_id = None
+        self._join_partner_id = None
         self._focused_beat = None
         self._defocus_other_threshold_lines(None)
         self.scene.clearSelection()
         self.split_button.setEnabled(False)
+        self.join_button.setEnabled(False)
         self.delete_segment_button.setEnabled(False)
+        self.duplicate_segment_button.setEnabled(False)
         self.auto_gen_button.setEnabled(False)
         self.gen_by_chart_button.setEnabled(False)
         self.clear_beats_button.setEnabled(False)
         self.overview_bar.set_selected(None)
         self.segment_selected.emit(None)
+
+    # ── Segment drag helpers ────────────────────────────────────────────────
+
+    # ── CapCut-style segment drag helpers ────────────────────────────────────
+
+    def _sorted_others(self, seg_id: str) -> list:
+        """Sorted segment list excluding the dragged segment."""
+        if self._project is None:
+            return []
+        return [s for s in self._project.sorted_segments() if s.id != seg_id]
+
+    def _compute_drag_insert_idx(self, seg_id: str, scene_x: float) -> int:
+        """Return the insertion index closest to ``scene_x``.
+
+        Builds one "gap" position per possible slot (before the first
+        other, between each pair, after the last) then snaps to the
+        nearest gap.  This avoids the "wide segment" problem where the
+        naive midpoint comparison requires the cursor to travel half the
+        segment's width before the indicator switches slots.
+        """
+        others = self._sorted_others(seg_id)
+        if not others:
+            return 0
+
+        gap_xs: list[float] = []
+        # Gap 0: just before the first other segment
+        gap_xs.append(self._time_to_x(others[0].start_time_sec))
+        # Gaps 1 … N-1: centre of the boundary between consecutive others
+        for i in range(len(others) - 1):
+            mid_t = (others[i].end_time_sec + others[i + 1].start_time_sec) / 2.0
+            gap_xs.append(self._time_to_x(mid_t))
+        # Gap N: just after the last other segment
+        gap_xs.append(self._time_to_x(others[-1].end_time_sec))
+
+        # Snap to the nearest gap
+        nearest = min(range(len(gap_xs)), key=lambda k: abs(scene_x - gap_xs[k]))
+        return nearest
+
+    def _drag_insertion_x(self) -> Optional[float]:
+        """Scene-X of the gap where the drag ghost would be inserted.
+
+        Returns None when no drag is active.  The gap is either the left
+        edge of the segment at ``_drag_insert_idx``, the right edge of the
+        last segment, or 0 when inserting before everything.
+        """
+        if self._drag_seg_id is None:
+            return None
+        others = self._sorted_others(self._drag_seg_id)
+        idx = self._drag_insert_idx
+        if not others:
+            return self._time_to_x(0.0)
+        if idx == 0:
+            return self._time_to_x(others[0].start_time_sec)
+        if idx >= len(others):
+            return self._time_to_x(others[-1].end_time_sec)
+        return self._time_to_x(others[idx].start_time_sec)
+
+    def _repack_segments(self, ordered: list) -> list[tuple]:
+        """Return ``[(seg, new_start, new_end), …]`` packing *ordered* sequentially.
+
+        The pack starts at the original start time of whatever segment
+        currently sits first in time (before the drag began), so the
+        overall clip doesn't jump in the timeline.
+        """
+        if not ordered:
+            return []
+        if self._project is None:
+            return []
+        all_segs = self._project.sorted_segments()
+        base_t = all_segs[0].start_time_sec if all_segs else 0.0
+        result: list[tuple] = []
+        t = base_t
+        for s in ordered:
+            dur = s.end_time_sec - s.start_time_sec
+            result.append((s, t, t + dur))
+            t += dur
+        return result
+
+    def _commit_segment_drag(self) -> None:
+        """Reorder segments CapCut-style and push an undo command."""
+        if self._project is None or self._drag_seg_id is None:
+            self._drag_seg_id = None
+            return
+        seg = self._project.get_segment(self._drag_seg_id)
+        if seg is None:
+            self._drag_seg_id = None
+            return
+
+        others = self._sorted_others(self._drag_seg_id)
+        idx = self._drag_insert_idx
+
+        # New order: insert drag segment at idx among others
+        new_order = others[:idx] + [seg] + others[idx:]
+
+        # Check if the order is actually different
+        old_order = self._project.sorted_segments()
+        if [s.id for s in new_order] == [s.id for s in old_order]:
+            # No change — cancel drag visually
+            self._drag_seg_id = None
+            self.refresh()
+            return
+
+        # Snapshot old positions for undo
+        old_positions = {s.id: (s.start_time_sec, s.end_time_sec)
+                         for s in self._project.segments}
+
+        # Compute and apply new packed positions
+        packed = self._repack_segments(new_order)
+        for s, ns, ne in packed:
+            s.start_time_sec = ns
+            s.end_time_sec = ne
+
+        new_positions = {s.id: (s.start_time_sec, s.end_time_sec)
+                         for s in self._project.segments}
+
+        def _undo() -> None:
+            if self._project is None:
+                return
+            for s in self._project.segments:
+                if s.id in old_positions:
+                    s.start_time_sec, s.end_time_sec = old_positions[s.id]
+            self.refresh()
+            self.segment_moved.emit("", 0.0, 0.0)
+
+        def _redo() -> None:
+            if self._project is None:
+                return
+            for s in self._project.segments:
+                if s.id in new_positions:
+                    s.start_time_sec, s.end_time_sec = new_positions[s.id]
+            self.refresh()
+            self.segment_moved.emit("", 0.0, 0.0)
+
+        self.undo_stack.push(_Cmd("Reorder Segments", _undo, _redo))
+
+        self._drag_seg_id = None
+        self.refresh()
+        self.segment_moved.emit("", 0.0, 0.0)
+
+    # ── Duplicate ───────────────────────────────────────────────────────────
+
+    def _do_duplicate_segment(self) -> None:
+        """Duplicate the currently selected segment (Ctrl+D).
+
+        The duplicate is placed immediately after the original segment
+        (or, if there is not enough room, after all other segments that
+        would otherwise overlap).  Beat events are deep-copied; all
+        render artifacts are cleared so the new segment starts fresh.
+        """
+        if self._project is None or self._selected_segment_id is None:
+            return
+        orig = self._project.get_segment(self._selected_segment_id)
+        if orig is None:
+            return
+
+        from uuid import uuid4
+
+        dup = copy.deepcopy(orig)
+        dup.id = str(uuid4())
+        dup.name = f"{orig.name} (copy)"
+        duration = orig.end_time_sec - orig.start_time_sec
+
+        # Find the earliest free slot at or after orig.end_time_sec
+        start_candidate = orig.end_time_sec
+        others = [
+            s for s in self._project.sorted_segments() if s.id != orig.id
+        ]
+        # Iteratively push past any overlapping segments
+        changed = True
+        while changed:
+            changed = False
+            for s in others:
+                if s.start_time_sec < start_candidate + duration and s.end_time_sec > start_candidate:
+                    start_candidate = s.end_time_sec
+                    changed = True
+
+        dup.start_time_sec = start_candidate
+        dup.end_time_sec = start_candidate + duration
+
+        # Clear all render artifacts
+        from studio.models.segment import RenderStatus
+        dup.render_status = RenderStatus.IDLE
+        dup.video_path = None
+        dup.last_rendered_at = None
+        dup.last_render_error = None
+        dup.thumbnail_path = None
+        dup.trimmed_audio_path = None
+
+        new_id = dup.id
+        beat_snapshot = list(self._beat_events.get(orig.id, []))
+
+        self._project.segments.append(dup)
+        self._beat_events[new_id] = copy.deepcopy(beat_snapshot)
+
+        # Push undo command
+        def _undo() -> None:
+            if self._project is None:
+                return
+            self._project.segments = [
+                s for s in self._project.segments if s.id != new_id
+            ]
+            self._beat_events.pop(new_id, None)
+            self._selected_segment_id = orig.id
+            self.refresh()
+            self.segment_selected.emit(orig)
+
+        def _redo() -> None:
+            if self._project is None:
+                return
+            self._project.segments.append(copy.deepcopy(dup))
+            self._beat_events[new_id] = copy.deepcopy(beat_snapshot)
+            refreshed_dup = self._project.get_segment(new_id)
+            self.refresh()
+            self.segment_duplicated.emit(new_id)
+            if refreshed_dup is not None:
+                self.segment_selected.emit(refreshed_dup)
+
+        self.undo_stack.push(_Cmd("Duplicate Segment", _undo, _redo))
+
+        self.refresh()
+        self.segment_duplicated.emit(new_id)
+        refreshed_dup = self._project.get_segment(new_id)
+        if refreshed_dup is not None:
+            self.segment_selected.emit(refreshed_dup)
 
     def _on_delete_segment_clicked(self) -> None:
         """Confirm + forward a delete request for the selected segment.
@@ -4338,11 +5290,10 @@ class TimelinePanel(QWidget):
         self._do_split(segment, split_time)
 
     def _do_split(self, segment: "Segment", split_time: float) -> None:
-        """Perform the actual split, mutate project, emit signal."""
-        from copy import deepcopy
+        """Perform the actual split, mutate project, emit signal, push undo."""
         from uuid import uuid4
 
-        right = deepcopy(segment)
+        right = copy.deepcopy(segment)
         right.id = str(uuid4())
         right.name = f"{segment.name} B"
         right.start_time_sec = split_time
@@ -4355,12 +5306,197 @@ class TimelinePanel(QWidget):
 
         # Shorten the original segment to end at split point.
         original_name = segment.name
+        orig_end = segment.end_time_sec
         segment.name = f"{original_name} A"
         segment.end_time_sec = split_time
 
+        orig_id = segment.id
+        right_id = right.id
+        right_snapshot = copy.deepcopy(right)
+        right_beat_events = list(self._beat_events.get(orig_id, []))
+        # Beat events for right are the subset with t_local >= (split_time - orig_start)
+        # (they were deep-copied from the original segment's beat_events by deepcopy above).
+        # The right segment's beat_events will be set when beat_events_edited propagates.
+        # For undo/redo we track whatever _beat_events has for the right id post-split.
+
         self._project.segments.append(right)
-        self.segment_split.emit(segment.id, right.id)
+        self.segment_split.emit(orig_id, right_id)
         self.refresh()
+
+        # Capture right's beat events after split (populated by rhythm detection, or empty).
+        right_beats_after = list(self._beat_events.get(right_id, []))
+
+        def _undo_split() -> None:
+            if self._project is None:
+                return
+            # Restore original segment's end time and name
+            left = self._project.get_segment(orig_id)
+            if left is not None:
+                left.end_time_sec = orig_end
+                left.name = original_name
+            # Remove right segment
+            self._project.segments = [
+                s for s in self._project.segments if s.id != right_id
+            ]
+            self._beat_events.pop(right_id, None)
+            self._selected_segment_id = orig_id
+            self.segment_joined.emit(orig_id, right_id)
+            self.refresh()
+
+        def _redo_split() -> None:
+            if self._project is None:
+                return
+            left = self._project.get_segment(orig_id)
+            if left is not None:
+                left.end_time_sec = split_time
+                left.name = f"{original_name} A"
+            # Re-add right segment
+            restored_right = copy.deepcopy(right_snapshot)
+            self._project.segments.append(restored_right)
+            self._beat_events[right_id] = list(right_beats_after)
+            self.segment_split.emit(orig_id, right_id)
+            self.refresh()
+
+        self.undo_stack.push(_Cmd("Split Segment", _undo_split, _redo_split))
+
+    def _update_join_button(self) -> None:
+        """Enable Join only when the two selected segments are adjacent."""
+        if not self._selected_segment_id or not self._join_partner_id or not self._project:
+            self.join_button.setEnabled(False)
+            return
+        seg_a = self._project.get_segment(self._selected_segment_id)
+        seg_b = self._project.get_segment(self._join_partner_id)
+        if seg_a is None or seg_b is None:
+            self.join_button.setEnabled(False)
+            return
+        if seg_a.audio_path != seg_b.audio_path:
+            self.join_button.setEnabled(False)
+            return
+        left = seg_a if seg_a.start_time_sec < seg_b.start_time_sec else seg_b
+        right = seg_b if left is seg_a else seg_a
+        adjacent = abs(left.end_time_sec - right.start_time_sec) < 0.05
+        self.join_button.setEnabled(adjacent)
+
+    def _on_join_clicked(self) -> None:
+        """Confirm and join the two selected segments."""
+        if not self._project or not self._selected_segment_id or not self._join_partner_id:
+            return
+        seg_a = self._project.get_segment(self._selected_segment_id)
+        seg_b = self._project.get_segment(self._join_partner_id)
+        if seg_a is None or seg_b is None:
+            return
+        left = seg_a if seg_a.start_time_sec < seg_b.start_time_sec else seg_b
+        right = seg_b if left is seg_a else seg_a
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "Join Segments",
+            f"Join '{left.name}' and '{right.name}' into one segment?\n\n"
+            f"The merged segment will keep '{left.name}' settings.\n"
+            f"Use Ctrl+Z to undo.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._do_join(left, right)
+
+    def _do_join(self, left: "Segment", right: "Segment") -> None:
+        """Merge right into left, extending left to cover both windows."""
+        from studio.models.segment import RenderStatus
+
+        # Snapshot before mutation for undo
+        left_snapshot = copy.deepcopy(left)
+        right_snapshot = copy.deepcopy(right)
+        left_beats_before = list(self._beat_events.get(left.id, []))
+        right_beats_before = list(self._beat_events.get(right.id, []))
+
+        # Shift right's beat_events into left's local time.
+        offset = right.start_time_sec - left.start_time_sec
+        merged_events: list = list(left.beat_events or [])
+        for ev in (right.beat_events or []):
+            if isinstance(ev, (tuple, list)):
+                shifted = (float(ev[0]) + offset,) + tuple(ev[1:])
+            else:
+                shifted = float(ev) + offset
+            merged_events.append(shifted)
+
+        # Extend left to cover right.
+        left.end_time_sec = right.end_time_sec
+        left.beat_events = merged_events
+        left_name_after = left.name
+
+        # Strip " A" / " B" suffixes that split() appended.
+        for suffix in (" A", " B"):
+            if left.name.endswith(suffix):
+                left.name = left.name[: -len(suffix)]
+                break
+
+        left_name_after = left.name
+
+        # Invalidate cached artifacts — the audio window has grown.
+        left.render_status = RenderStatus.IDLE
+        left.video_path = None
+        left.last_rendered_at = None
+        left.last_render_error = None
+        left.trimmed_audio_path = None
+
+        left_id = left.id
+        removed_id = right.id
+        self._project.segments = [
+            s for s in self._project.segments if s.id != removed_id
+        ]
+        self._beat_events.pop(removed_id, None)
+        # Sync merged events into panel cache
+        self._beat_events[left_id] = list(merged_events)
+
+        self._join_partner_id = None
+        self._selected_segment_id = left_id
+        self.segment_joined.emit(left_id, removed_id)
+        self.refresh()
+
+        # Build undo/redo closures
+        def _undo_join() -> None:
+            if self._project is None:
+                return
+            # Restore left to pre-join state
+            l = self._project.get_segment(left_id)
+            if l is not None:
+                l.end_time_sec = left_snapshot.end_time_sec
+                l.beat_events = list(left_snapshot.beat_events or [])
+                l.name = left_snapshot.name
+                l.render_status = left_snapshot.render_status
+                l.video_path = left_snapshot.video_path
+                l.trimmed_audio_path = left_snapshot.trimmed_audio_path
+            self._beat_events[left_id] = list(left_beats_before)
+            # Re-add right segment
+            restored_right = copy.deepcopy(right_snapshot)
+            self._project.segments.append(restored_right)
+            self._beat_events[removed_id] = list(right_beats_before)
+            self._selected_segment_id = left_id
+            self.segment_split.emit(left_id, removed_id)
+            self.refresh()
+
+        def _redo_join() -> None:
+            if self._project is None:
+                return
+            l = self._project.get_segment(left_id)
+            if l is not None:
+                l.end_time_sec = right_snapshot.end_time_sec
+                l.beat_events = list(merged_events)
+                l.name = left_name_after
+                l.render_status = RenderStatus.IDLE
+                l.video_path = None
+                l.trimmed_audio_path = None
+            self._project.segments = [
+                s for s in self._project.segments if s.id != removed_id
+            ]
+            self._beat_events.pop(removed_id, None)
+            self._beat_events[left_id] = list(merged_events)
+            self._selected_segment_id = left_id
+            self.segment_joined.emit(left_id, removed_id)
+            self.refresh()
+
+        self.undo_stack.push(_Cmd("Join Segments", _undo_join, _redo_join))
 
     def _on_playhead_scrubbed(self, time_sec: float) -> None:
         """Handle user dragging/clicking playhead on timeline."""

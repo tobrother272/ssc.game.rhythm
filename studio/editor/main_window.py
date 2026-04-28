@@ -9,6 +9,7 @@ from typing import Optional
 from uuid import uuid4
 
 from PySide6.QtCore import QSettings, QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
@@ -316,6 +317,7 @@ class MainWindow(QMainWindow):
             self.preview_panel.seek_to_seconds
         )
         self.timeline_panel.segment_split.connect(self._on_segment_split)
+        self.timeline_panel.segment_joined.connect(self._on_segment_joined)
         self.timeline_panel.segment_delete_requested.connect(
             self._on_segment_delete_requested
         )
@@ -328,6 +330,16 @@ class MainWindow(QMainWindow):
         self.timeline_panel.beat_threshold_changed.connect(
             self._on_beat_threshold_changed
         )
+        self.timeline_panel.segment_duplicated.connect(
+            self._on_segment_duplicated
+        )
+        self.timeline_panel.segment_moved.connect(self._on_segment_moved)
+
+        # Undo / redo — delegate to the timeline panel's undo stack.
+        undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
+        undo_sc.activated.connect(self.timeline_panel.undo_stack.undo)
+        redo_sc = QShortcut(QKeySequence.StandardKey.Redo, self)
+        redo_sc.activated.connect(self.timeline_panel.undo_stack.redo)
         self.preview_panel.playhead_changed.connect(self.timeline_panel.set_playhead)
         self.preview_panel.stickman_location_changed.connect(
             self._on_stickman_location_edited
@@ -1164,6 +1176,48 @@ class MainWindow(QMainWindow):
         self._sync_preview_button_state()
         self._on_project_changed()
 
+    def _on_segment_joined(self, kept_id: str, removed_id: str) -> None:
+        """Handle timeline join: update inspector and mark project dirty."""
+        kept_segment = self.project.get_segment(kept_id)
+        self.segment_panel.set_project(self.project)
+        if kept_segment is not None:
+            self.segment_panel.set_segment(kept_segment)
+        # If preview was running on either half, stop it — the audio window
+        # has grown and the renderer would reference a stale trimmed clip.
+        if self._preview_mode_active and self._preview_active_segment_id in (
+            kept_id,
+            removed_id,
+        ):
+            self._stop_preview_mode()
+            self.statusBar().showMessage(
+                "Preview stopped — segments were joined; "
+                "click Preview again to preview the merged segment.",
+                4000,
+            )
+        # Clear any beat-event cache for the removed segment.
+        if hasattr(self.timeline_panel, "_beat_events"):
+            self.timeline_panel._beat_events.pop(removed_id, None)
+        self._sync_preview_button_state()
+        self._on_project_changed()
+
+    def _on_segment_duplicated(self, new_segment_id: str) -> None:
+        """Handle timeline Ctrl+D duplicate — update inspector and mark dirty."""
+        new_seg = self.project.get_segment(new_segment_id)
+        self.segment_panel.set_project(self.project)
+        if new_seg is not None:
+            self.segment_panel.set_segment(new_seg)
+        self._sync_preview_button_state()
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Segment duplicated", 2000
+        )
+
+    def _on_segment_moved(
+        self, segment_id: str, new_start: float, new_end: float
+    ) -> None:
+        """Handle timeline segment drag — mark project dirty."""
+        self._on_project_changed()
+
     def _on_segment_delete_requested(self, segment_id: str) -> None:
         """Drop a segment from the project after user-confirmed delete.
 
@@ -1181,10 +1235,17 @@ class MainWindow(QMainWindow):
         - Remove the segment from ``project.segments``.
         - Mark project dirty so autosave persists the deletion.
         """
+        import copy as _copy
         seg = self.project.get_segment(segment_id)
         if seg is None:
             return
         seg_name = seg.name
+        # Snapshot for undo before any mutation
+        seg_snapshot = _copy.deepcopy(seg)
+        beat_snapshot = list(
+            self.timeline_panel._beat_events.get(segment_id, [])
+        )
+
         if (
             self._preview_mode_active
             and self._preview_active_segment_id == segment_id
@@ -1201,8 +1262,45 @@ class MainWindow(QMainWindow):
         self._sync_preview_button_state()
         self._on_project_changed()
         self.statusBar().showMessage(
-            f"Segment '{seg_name}' deleted", 3000
+            f"Segment '{seg_name}' deleted — Ctrl+Z to undo", 3000
         )
+
+        # Push undo command to the timeline panel's undo stack.
+        panel = self.timeline_panel
+        main_win = self
+
+        def _undo_delete() -> None:
+            if panel._project is None:
+                return
+            panel._project.segments.append(_copy.deepcopy(seg_snapshot))
+            panel._beat_events[seg_snapshot.id] = list(beat_snapshot)
+            panel._selected_segment_id = seg_snapshot.id
+            panel.refresh()
+            restored = panel._project.get_segment(seg_snapshot.id)
+            if restored is not None:
+                panel.segment_selected.emit(restored)
+            main_win._sync_preview_button_state()
+            main_win._on_project_changed()
+
+        def _redo_delete() -> None:
+            if panel._project is None:
+                return
+            main_win_cur = main_win.segment_panel.current_segment
+            if main_win_cur is not None and main_win_cur.id == seg_snapshot.id:
+                main_win.segment_panel.set_segment(None)
+            panel._project.segments = [
+                s for s in panel._project.segments if s.id != seg_snapshot.id
+            ]
+            panel._beat_events.pop(seg_snapshot.id, None)
+            if panel._selected_segment_id == seg_snapshot.id:
+                panel._selected_segment_id = None
+                panel.segment_selected.emit(None)
+            panel.refresh()
+            main_win._sync_preview_button_state()
+            main_win._on_project_changed()
+
+        from studio.editor.timeline_panel import _Cmd
+        panel.undo_stack.push(_Cmd("Delete Segment", _undo_delete, _redo_delete))
 
     def _on_segment_changed_by_form(self, _segment_id: str) -> None:
         self.timeline_panel.refresh()

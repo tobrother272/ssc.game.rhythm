@@ -3966,7 +3966,8 @@ class GameManager:
         print(f"[GameManager] Scheduled {len(self.targets)} targets "
               f"from {len(beat_frames)} beat events  "
               f"(lanes={n_lanes}, skipped {skipped_early} too-early, "
-              f"{skipped_stacked} lane-stacked, merged {merged} too-close).")
+              f"{skipped_stacked} lane-stacked, merged {merged} too-close).",
+              flush=True)
 
     def update(self, cur_frame: int) -> list[Target]:
         """Advance time; return list of newly-hit targets."""
@@ -4574,11 +4575,11 @@ class RhythmVisualizer:
         min_lane_gap = max(1, travel // max_per_lane, base_cycle // 2)
         actual_max = max(1, travel // min_lane_gap)
         print(f"[spacing] min_lane_gap={min_lane_gap}f  "
-              f"(max {actual_max} blocks/lane visible)")
+              f"(max {actual_max} blocks/lane visible)", flush=True)
 
         if self.LANE_FILTER is not None:
             lane_list = sorted(v + 1 for v in self.LANE_FILTER)
-            print(f"[lane_filter] Enabled lanes (1-based): {lane_list}")
+            print(f"[lane_filter] Enabled lanes (1-based): {lane_list}", flush=True)
 
         # ── Solo-relax fixed-delay cadence override ────────────────────
         # When --mode is solo "relax" AND --relax_interval is set, we
@@ -4985,11 +4986,22 @@ class RhythmVisualizer:
         # which caused ArrayMemoryError on long segments (e.g. a 3-minute
         # clip at 1920×1080 requires ~30 GB of RAM for the buffer alone).
         codec_label = "NVENC" if _CUPY else ("avc1" if self.is_mac else "libx264")
-        print(f"Rendering frames to encoder ({codec_label})...")
+        print(f"Rendering frames to encoder ({codec_label})...", flush=True)
         t_render = time.time()
         last_pct = 0
 
-        temp_video = 'temp_rhythm.mp4'
+        # Use a temp file in the system temp dir so we never need write
+        # access to the cwd (which in a frozen EXE is the dist folder).
+        import tempfile as _tmpmod
+        _tmp_fd, temp_video = _tmpmod.mkstemp(suffix='.mp4', prefix='rhythm_tmp_')
+        import os as _os; _os.close(_tmp_fd)
+
+        try:
+            from bundle_paths import find_ffmpeg as _find_ffmpeg
+            _ffmpeg_bin = _find_ffmpeg()
+        except Exception:
+            _ffmpeg_bin = 'ffmpeg'
+
         if self.is_mac:
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             _vwriter = cv2.VideoWriter(temp_video, fourcc, self.FPS,
@@ -4998,14 +5010,16 @@ class RhythmVisualizer:
         else:
             vcodec = 'h264_nvenc' if _CUPY else 'libx264'
             preset = 'p4' if vcodec == 'h264_nvenc' else 'fast'
-            _vcmd = (f'ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt bgr24 '
+            _vcmd = (f'"{_ffmpeg_bin}" -y -f rawvideo -vcodec rawvideo -pix_fmt bgr24 '
                      f'-s {self.WIDTH}x{self.HEIGHT} -r {self.FPS} -i pipe:0 '
                      f'-vcodec {vcodec} -preset {preset} -b:v 3500k '
                      f'-bf 0 -vsync cfr -pix_fmt yuv420p '
                      f'-r {self.FPS} "{temp_video}"')
+            _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             _vproc = subprocess.Popen(shlex.split(_vcmd), stdin=subprocess.PIPE,
                                       stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL)
+                                      stderr=subprocess.DEVNULL,
+                                      creationflags=_creation_flags)
             _vwriter = None
 
         for fi in range(total_frames):
@@ -5217,8 +5231,14 @@ class RhythmVisualizer:
         print("\nMerging audio...")
         t0 = time.time()
         try:
+            try:
+                from bundle_paths import find_ffmpeg as _find_ffmpeg
+                _ffmpeg_bin = _find_ffmpeg()
+            except Exception:
+                _ffmpeg_bin = 'ffmpeg'
+
             # Use plain ffmpeg CLI with -c:v copy + -shortest to keep A/V aligned.
-            cmd = ['ffmpeg', '-y',
+            cmd = [_ffmpeg_bin, '-y',
                    '-i', temp_video,       # already-encoded video (keep as-is)
                    '-i', audio_file,       # source audio
                    '-map', '0:v:0',        # take video from input 0
@@ -5230,8 +5250,10 @@ class RhythmVisualizer:
                 cmd += ['-t', str(self.TIME_LIMIT)]
             cmd += [output_filename]
 
+            _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
+                                    stderr=subprocess.PIPE,
+                                    creationflags=_creation_flags)
             _, err = proc.communicate()
             if proc.returncode != 0:
                 print(f"FFmpeg error: {err.decode(errors='replace')}")

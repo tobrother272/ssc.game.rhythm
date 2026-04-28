@@ -18,6 +18,25 @@ from pathlib import Path
 
 
 def main() -> None:
+    # Force line-buffered stdout/stderr so every print() is immediately
+    # visible to the parent process (SSCStudio.exe) that reads via PIPE.
+    # Without this, frozen executables use 8 KB block-buffering and the
+    # parent sees nothing until the buffer fills or the process exits —
+    # making progress updates and error tracebacks invisible on crash.
+    import io
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except AttributeError:
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, line_buffering=True, errors="replace"
+        )
+    try:
+        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except AttributeError:
+        sys.stderr = io.TextIOWrapper(
+            sys.stderr.buffer, line_buffering=True, errors="replace"
+        )
+
     # In the frozen bundle, _MEIPASS contains the extracted package tree.
     # src/ lives directly inside _MEIPASS; put it on sys.path so that the
     # sibling imports inside rhythm.py (from stickman import ...) resolve.

@@ -1,0 +1,84 @@
+---
+description: Convention for adding buttons to the Timeline panel toolbar
+globs: studio/editor/timeline_panel.py
+alwaysApply: false
+---
+
+# Timeline Toolbar Button Convention
+
+Mọi button mới trên toolbar của `TimelinePanel` (`_build_ui`) **phải** tuân theo quy luật sau:
+
+## 1. Icon-only, không text
+
+```python
+# ✅ ĐÚNG
+btn = QPushButton()
+btn.setIcon(icon)
+btn.setIconSize(QSize(18, 18))
+btn.setFlat(True)
+btn.setText("")
+
+# ❌ SAI
+btn = QPushButton("Label Text")
+```
+
+## 2. Kích thước cố định 28×28 px
+
+```python
+btn.setFixedSize(28, 28)
+```
+
+## 3. ObjectName đồng bộ style
+
+- Nút thường / toggle: `btn.setObjectName("zoomIconButton")`
+- Nút destructive (xóa): `btn.setObjectName("deleteSegmentButton")`
+
+Không tạo objectName mới trừ khi cần màu hover đặc biệt trong QSS.
+
+## 4. Tooltip bắt buộc
+
+```python
+btn.setToolTip("Tên chức năng — mô tả ngắn gọn hành động.\nCó thể nhiều dòng nếu cần.")
+```
+
+## 5. Vẽ icon bằng QPainter (thin-stroke, outline)
+
+Thêm vào hàm `_beat_tool_pixmaps` hoặc `_zoom_control_pixmaps` (hoặc tạo hàm `_<group>_pixmaps` mới nếu nhóm chức năng khác).
+
+```python
+pen = QPen(stroke)          # stroke = QColor("#c8c8c8") bình thường
+pen.setWidthF(1.1)          # nét mảnh
+pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+```
+
+Luôn tạo cặp `(c_on, c_off)` → wrap bằng `_mk()` để có disabled state tự động:
+
+```python
+c_on  = QColor("#c8c8c8")
+c_off = QColor("#4f4f4f")
+pms_on  = _my_group_pixmaps(size, c_on)
+pms_off = _my_group_pixmaps(size, c_off)
+
+def _mk(pm_on, pm_off):
+    ic = QIcon(pm_on)
+    ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+    return ic
+```
+
+## 6. Enable/disable đồng bộ
+
+Tất cả nút cần segment được enable/disable cùng nhau trong 3 nơi:
+
+- `enter_focus_mode` → `setEnabled(True)`
+- `_on_selection_changed` (single segment) → `setEnabled(True)`
+- `_on_empty_clicked` → `setEnabled(False)`
+
+## Checklist khi thêm button mới
+
+- [ ] `setIcon(icon)` + `setIconSize(QSize(18,18))` + `setFlat(True)` + `setText("")`
+- [ ] `setFixedSize(28, 28)`
+- [ ] `setObjectName("zoomIconButton")` (hoặc destructive variant)
+- [ ] `setToolTip(...)` mô tả rõ hành động
+- [ ] Icon vẽ bằng QPainter thin-stroke với disabled pixmap
+- [ ] enable/disable đồng bộ ở 3 nơi trên
