@@ -741,7 +741,12 @@ class PreviewPanel(QWidget):
         self.play_button = QPushButton("Play")
         self.play_button.clicked.connect(self._toggle_play)
         self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.player.stop)
+        # Use Pause + rewind-to-0 instead of QMediaPlayer.stop().  A real
+        # ``stop()`` resets ``duration()`` to 0, which collapses the seek
+        # slider's range to ``(0, 0)`` and makes scrubbing impossible
+        # until the user hits Play again.  Pausing keeps the duration so
+        # the user can drag the slider around even when "stopped".
+        self.stop_button.clicked.connect(self._on_stop_clicked)
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderMoved.connect(self.player.setPosition)
@@ -772,6 +777,17 @@ class PreviewPanel(QWidget):
 
         self.play_button.setEnabled(False)
 
+        # FPS selector for live preview.  Options kept deliberately small
+        # (6 / 12 / 24 / 30) — higher means more CPU per second on the
+        # render thread.  Default 24 matches what users consider "smooth".
+        self.fps_combo = QComboBox()
+        self.fps_combo.setToolTip("Live preview frame-rate (higher = smoother but more CPU)")
+        self.fps_combo.setFixedWidth(72)
+        for fps_val in (6, 12, 24, 30):
+            self.fps_combo.addItem(f"{fps_val} fps", fps_val)
+        self.fps_combo.setCurrentIndex(2)  # default 24 fps
+        self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
+
         control_row.addWidget(self.play_button)
         control_row.addWidget(self.stop_button)
         control_row.addWidget(self.seek_slider, 1)
@@ -780,6 +796,7 @@ class PreviewPanel(QWidget):
         vol_label.setStyleSheet("color:#8a8a8a;")
         control_row.addWidget(vol_label)
         control_row.addWidget(self.volume_slider)
+        control_row.addWidget(self.fps_combo)
         control_row.addWidget(self.stickman_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
@@ -914,6 +931,17 @@ class PreviewPanel(QWidget):
 
         self.player.play()
 
+    def _on_stop_clicked(self) -> None:
+        """Stop button: pause and rewind to the start.
+
+        ``QMediaPlayer.stop()`` would reset ``duration()`` to 0 and
+        collapse the seek slider to an unusable ``(0, 0)`` range.  By
+        pausing instead we keep the duration so the user can still
+        scrub the slider while playback is parked.
+        """
+        self.player.pause()
+        self.player.setPosition(0)
+
     def _on_position_changed(self, value: int) -> None:
         self.seek_slider.blockSignals(True)
         self.seek_slider.setValue(value)
@@ -1020,6 +1048,18 @@ class PreviewPanel(QWidget):
         # ``TypeError: int() argument must be ... not 'PlaybackState'``
         # on direct ``int(...)`` conversion).
         self.playback_state_changed.emit(int(state.value))
+
+    @property
+    def preview_fps(self) -> int:
+        """Currently selected live-preview frame-rate."""
+        return int(self.fps_combo.currentData())
+
+    def _on_fps_changed(self) -> None:
+        """Apply new FPS to the running live-frame timer immediately."""
+        if self._live_active and self._live_frame_timer.isActive():
+            fps = self.preview_fps
+            interval_ms = max(8, int(round(1000.0 / max(1, fps))))
+            self._live_frame_timer.setInterval(interval_ms)
 
     def _show_loading(self) -> None:
         """Switch stage to loading page and start dot animation."""
@@ -1264,9 +1304,8 @@ class PreviewPanel(QWidget):
         self._loading_timer.stop()
         self._render_live_frame(start_local_sec)
 
-        # Pump frames at the renderer's fps.  Sub-1 ms timer overhead in
-        # PySide6 so we don't need to clamp the interval lower bound.
-        interval_ms = max(8, int(round(1000.0 / max(1, renderer.fps))))
+        # Pump frames at the user-selected preview fps (fps_combo).
+        interval_ms = max(8, int(round(1000.0 / max(1, self.preview_fps))))
         self._live_frame_timer.setInterval(interval_ms)
         self._live_frame_timer.start()
 
@@ -1331,14 +1370,16 @@ class PreviewPanel(QWidget):
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw.
 
-        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels``
-        are pass-through overrides for :meth:`LiveFrameRenderer.update_mode`;
-        ``None`` keeps the renderer's current value.  The editor folds
-        the segment-config "Sticky Man / Floor panels / mode" form
-        edits into a single call so the scene is rebuilt exactly once.
+        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels`` /
+        ``max_per_lane`` are pass-through overrides for
+        :meth:`LiveFrameRenderer.update_mode`; ``None`` keeps the
+        renderer's current value.  The editor folds the segment-config
+        "Sticky Man / Floor panels / mode / Max per lane" form edits
+        into a single call so the scene is rebuilt exactly once.
         """
         if not self._live_active or self._live_renderer is None:
             return
@@ -1347,6 +1388,7 @@ class PreviewPanel(QWidget):
             show_stickman=show_stickman,
             stickman_box=stickman_box,
             show_floor_panels=show_floor_panels,
+            max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)
 

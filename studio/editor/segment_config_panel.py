@@ -128,7 +128,15 @@ class SegmentConfigPanel(QWidget):
             self.status_label.setStyleSheet("color:#7bd88f;")
         elif status_value == "error" and segment.last_render_error:
             err = segment.last_render_error.strip().splitlines()
+            # Try to show the actual exception line rather than the last
+            # debug-print.  Scan for "Error:", "Exception:", "Traceback"
+            # from the end; fall back to the last line if none found.
             short = err[-1] if err else "(no message)"
+            for line in reversed(err):
+                l = line.strip()
+                if l and any(l.startswith(k) for k in ("Error", "Exception", "Traceback")):
+                    short = l
+                    break
             self.status_label.setText(f"Status: error — {short}")
             self.status_label.setStyleSheet("color:#ff6b6b;")
             self.status_label.setToolTip(segment.last_render_error)
@@ -447,9 +455,13 @@ class SegmentConfigPanel(QWidget):
 
         status_value = segment.render_status.value
         if status_value == "error" and segment.last_render_error:
-            # Show the first line of the error inline + full message in tooltip.
             err = segment.last_render_error.strip().splitlines()
             short = err[-1] if err else "(no message)"
+            for line in reversed(err):
+                l = line.strip()
+                if l and any(l.startswith(k) for k in ("Error", "Exception", "Traceback")):
+                    short = l
+                    break
             self.status_label.setText(f"Status: error — {short}")
             self.status_label.setStyleSheet("color:#ff6b6b;")
             self.status_label.setToolTip(segment.last_render_error)
@@ -484,6 +496,7 @@ class SegmentConfigPanel(QWidget):
         "beat_sens",
         "density",
         "speed",
+        "max_per_lane",
         "floor_panels",
         "stickman",
     )
@@ -502,6 +515,7 @@ class SegmentConfigPanel(QWidget):
         "beat_sens":   "Beat sens",
         "density":     "Density",
         "speed":       "Speed",
+        "max_per_lane":"Max / lane",
         "floor_panels":"Floor panels",
         "stickman":    "Stickman",
         "mode_list":   "Sub-modes",

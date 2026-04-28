@@ -12,6 +12,7 @@ from pydub import AudioSegment
 from PySide6.QtCore import QMimeData, QSize, Qt, Signal
 from PySide6.QtGui import QDrag, QIcon, QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -62,7 +63,6 @@ class MediaLibraryPanel(QWidget):
         self._thumbs.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumbs.thumbnail_failed.connect(self._on_thumbnail_failed)
         self._build_ui()
-        self._set_filters("all")
 
     def set_project(self, project: Project) -> None:
         """Attach project reference and refresh list model."""
@@ -77,10 +77,20 @@ class MediaLibraryPanel(QWidget):
         self.model.clear()
         if not self._project:
             return
-        filter_kind = self.filter_button.property("filter_kind") or "all"
+        show_video = self.cb_video.isChecked()
+        show_audio = self.cb_audio.isChecked()
+        show_image = self.cb_image.isChecked()
+        # When nothing (or everything) is ticked, show all items.
+        show_all = (not show_video and not show_audio and not show_image) or \
+                   (show_video and show_audio and show_image)
         for media in self._project.media_items:
-            if filter_kind != "all" and media.kind.value != filter_kind:
-                continue
+            if not show_all:
+                if media.kind.value == "video" and not show_video:
+                    continue
+                if media.kind.value == "audio" and not show_audio:
+                    continue
+                if media.kind.value == "image" and not show_image:
+                    continue
             self.model.appendRow(self._build_item(media))
 
     def _build_ui(self) -> None:
@@ -103,11 +113,12 @@ class MediaLibraryPanel(QWidget):
         self.import_button = QPushButton("Import")
         self.import_button.clicked.connect(self._on_import_clicked)
         header_row.addWidget(self.import_button)
-        self.filter_button = QPushButton("All")
-        self.filter_button.setProperty("filter_kind", "all")
-        self.filter_button.setFixedWidth(70)
-        self.filter_button.clicked.connect(self._toggle_filter)
-        header_row.addWidget(self.filter_button)
+        self.cb_video = QCheckBox("Video")
+        self.cb_audio = QCheckBox("Audio")
+        self.cb_image = QCheckBox("Image")
+        for cb in (self.cb_video, self.cb_audio, self.cb_image):
+            cb.stateChanged.connect(self.refresh)
+            header_row.addWidget(cb)
         root.addWidget(header)
 
         # Body
@@ -251,18 +262,6 @@ class MediaLibraryPanel(QWidget):
 
     def _on_thumbnail_failed(self, _media_id: str, _error: str) -> None:
         self.refresh()
-
-    def _toggle_filter(self) -> None:
-        current = self.filter_button.property("filter_kind") or "all"
-        order = ["all", "image", "video", "audio"]
-        next_kind = order[(order.index(current) + 1) % len(order)]
-        self._set_filters(next_kind)
-        self.refresh()
-
-    def _set_filters(self, kind: str) -> None:
-        label = "All" if kind == "all" else kind.capitalize()
-        self.filter_button.setText(label)
-        self.filter_button.setProperty("filter_kind", kind)
 
     def _create_media_item(self, path: Path) -> Optional[MediaItem]:
         kind = self._detect_kind(path)

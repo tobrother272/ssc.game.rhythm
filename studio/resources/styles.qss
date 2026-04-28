@@ -223,80 +223,63 @@ QPushButton#previewButton:hover  { background-color: #14b8a6; }
 QPushButton#previewButton:pressed { background-color: #0f766e; }
 QPushButton#previewButton:disabled { background-color: #0a3d38; color: #4d9e96; }
 
-/* "Auto Gen Block" — manual beat-detection trigger in the timeline
-   header.  Cyan accent matches MODE_COLORS["punch"] so the button reads
-   as "the thing that produces the cyan/yellow/green ticks on the strip
-   below the segment". */
-QPushButton#autoGenButton {
+
+/* Timeline toolbar — CapCut-like outline icon buttons (no box border) */
+QPushButton#splitButton,
+QPushButton#joinButton,
+QPushButton#deleteSegmentButton {
     background-color: transparent;
-    color: #3bb6ff;
-    border: 1px solid #3bb6ff;
-    border-radius: 4px;
-    padding: 3px 12px;
-    font-weight: 600;
+    border: none;
+    border-radius: 5px;
+    padding: 4px;
 }
-QPushButton#autoGenButton:hover {
-    background-color: #1a3a52;
-    color: #ffffff;
+QPushButton#splitButton:hover,
+QPushButton#joinButton:hover {
+    background-color: rgba(255, 255, 255, 0.08);
 }
-QPushButton#autoGenButton:pressed {
-    background-color: #0f2438;
+QPushButton#splitButton:pressed,
+QPushButton#joinButton:pressed {
+    background-color: rgba(255, 255, 255, 0.12);
 }
-QPushButton#autoGenButton:disabled {
-    color: #2a4a5a;
-    border-color: #1f2f38;
-}
-
-/* Split button in timeline */
-QPushButton#splitButton {
+QPushButton#splitButton:disabled,
+QPushButton#joinButton:disabled {
     background-color: transparent;
-    color: #d0d0d0;
-    border: 1px solid #333333;
-    border-radius: 4px;
-    padding: 3px 10px;
-    font-weight: 500;
-}
-QPushButton#splitButton:hover {
-    background-color: #262626;
-    border-color: #3b82f6;
-    color: #ffffff;
-}
-QPushButton#splitButton:disabled {
-    color: #4a4a4a;
-    border-color: #242424;
 }
 
-/* Zoom pill buttons */
-QPushButton#zoomButton {
-    background-color: #242424;
-    color: #d0d0d0;
-    border: 1px solid #2e2e2e;
-    border-radius: 4px;
-    padding: 2px 0;
-    font-weight: 600;
+QPushButton#deleteSegmentButton:hover {
+    background-color: rgba(248, 113, 113, 0.14);
 }
-QPushButton#zoomButton:hover { background-color: #2e2e2e; color: #ffffff; }
+QPushButton#deleteSegmentButton:pressed {
+    background-color: rgba(248, 113, 113, 0.22);
+}
+QPushButton#deleteSegmentButton:disabled {
+    background-color: transparent;
+}
 
-/* Rule-mode toggle next to Fit — same visual family as zoom buttons,
-   but lights up cyan when checked so the user can see at a glance
-   whether the dashed waveform guides are currently overlaid. */
-QPushButton#ruleButton {
-    background-color: #242424;
-    color: #d0d0d0;
-    border: 1px solid #2e2e2e;
-    border-radius: 4px;
-    padding: 2px 0;
-    font-weight: 600;
+/* Zoom / Fit / Ratio / Rule — icon-only ghost buttons (CapCut style) */
+QPushButton#zoomIconButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 4px;
 }
-QPushButton#ruleButton:hover { background-color: #2e2e2e; color: #ffffff; }
-QPushButton#ruleButton:checked {
-    background-color: #1a3a52;
-    color: #3bb6ff;
-    border: 1px solid #3bb6ff;
+QPushButton#zoomIconButton:hover {
+    background-color: rgba(255, 255, 255, 0.08);
 }
-QPushButton#ruleButton:checked:hover {
-    background-color: #234a68;
-    color: #ffffff;
+QPushButton#zoomIconButton:pressed {
+    background-color: rgba(255, 255, 255, 0.13);
+}
+/* Ratio / Rule checked state — subtle cyan tint */
+QPushButton#zoomIconButton:checked {
+    background-color: rgba(59, 182, 255, 0.15);
+    border: 1px solid rgba(59, 182, 255, 0.35);
+    border-radius: 5px;
+}
+QPushButton#zoomIconButton:checked:hover {
+    background-color: rgba(59, 182, 255, 0.22);
+}
+QPushButton#zoomIconButton:disabled {
+    background-color: transparent;
 }
 
 /* Zoom slider — CapCut-inspired thin track + circular handle. */

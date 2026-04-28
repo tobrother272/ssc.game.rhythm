@@ -37,7 +37,7 @@ class BaseRenderSettings(BaseModel):
     travel: int = -1
     speed: float = 0.8
     density: float = 0.5
-    max_per_lane: int = 1
+    max_per_lane: int = 2
     lanes: list[int] = Field(default_factory=lambda: [1, 2, 3, 4])
     beat_source: BeatSource = BeatSource.ONSET
     bpm: Optional[float] = None
