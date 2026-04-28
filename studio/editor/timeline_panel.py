@@ -1690,16 +1690,10 @@ class TimelineView(QGraphicsView):
                 if panel is not None:
                     panel._drag_seg_id = seg_id
                     panel._drag_ghost_x = scene_pos.x()
-                    panel._drag_insert_idx = panel._compute_drag_insert_idx(
-                        seg_id, scene_pos.x()
-                    )
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
             if self._seg_drag_active and panel is not None:
                 panel._drag_ghost_x = scene_pos.x()
-                panel._drag_insert_idx = panel._compute_drag_insert_idx(
-                    seg_id, scene_pos.x()
-                )
                 # Repaint background to show drag ghost + insertion indicator
                 try:
                     panel.scene.invalidate(
@@ -4775,23 +4769,17 @@ class TimelinePanel(QWidget):
         return nearest
 
     def _drag_insertion_x(self) -> Optional[float]:
-        """Scene-X of the gap where the drag ghost would be inserted.
-
-        Returns None when no drag is active.  The gap is either the left
-        edge of the segment at ``_drag_insert_idx``, the right edge of the
-        last segment, or 0 when inserting before everything.
-        """
+        """Scene-X of the ghost's left edge — shows where segment will land on drop."""
         if self._drag_seg_id is None:
             return None
-        others = self._sorted_others(self._drag_seg_id)
-        idx = self._drag_insert_idx
-        if not others:
-            return self._time_to_x(0.0)
-        if idx == 0:
-            return self._time_to_x(others[0].start_time_sec)
-        if idx >= len(others):
-            return self._time_to_x(others[-1].end_time_sec)
-        return self._time_to_x(others[idx].start_time_sec)
+        block = self._block_map.get(self._drag_seg_id)
+        if block is None:
+            return None
+        try:
+            seg_width_px = block.rect().width()
+        except RuntimeError:
+            return None
+        return max(0.0, self._drag_ghost_x - seg_width_px / 2.0)
 
     def _repack_segments(self, ordered: list) -> list[tuple]:
         """Return ``[(seg, new_start, new_end), …]`` packing *ordered* sequentially.
@@ -4815,7 +4803,7 @@ class TimelinePanel(QWidget):
         return result
 
     def _commit_segment_drag(self) -> None:
-        """Reorder segments CapCut-style and push an undo command."""
+        """Place segment at exact ghost position, push only overlapping segments right."""
         if self._project is None or self._drag_seg_id is None:
             self._drag_seg_id = None
             return
@@ -4824,29 +4812,50 @@ class TimelinePanel(QWidget):
             self._drag_seg_id = None
             return
 
-        others = self._sorted_others(self._drag_seg_id)
-        idx = self._drag_insert_idx
-
-        # New order: insert drag segment at idx among others
-        new_order = others[:idx] + [seg] + others[idx:]
-
-        # Check if the order is actually different
-        old_order = self._project.sorted_segments()
-        if [s.id for s in new_order] == [s.id for s in old_order]:
-            # No change — cancel drag visually
+        block = self._block_map.get(self._drag_seg_id)
+        if block is None:
+            self._drag_seg_id = None
+            self.refresh()
+            return
+        try:
+            seg_width_px = block.rect().width()
+        except RuntimeError:
             self._drag_seg_id = None
             self.refresh()
             return
 
-        # Snapshot old positions for undo
+        # Ghost left-edge → exact new start time (clamp to t≥0)
+        ghost_left_x = self._drag_ghost_x - seg_width_px / 2.0
+        new_start_t = max(0.0, self._x_to_time(ghost_left_x))
+
         old_positions = {s.id: (s.start_time_sec, s.end_time_sec)
                          for s in self._project.segments}
 
-        # Compute and apply new packed positions
-        packed = self._repack_segments(new_order)
-        for s, ns, ne in packed:
-            s.start_time_sec = ns
-            s.end_time_sec = ne
+        # Place dragged segment at the exact dropped position
+        duration = seg.end_time_sec - seg.start_time_sec
+        seg.start_time_sec = new_start_t
+        seg.end_time_sec = new_start_t + duration
+
+        # Sort all segments left-to-right (dragged seg is now at its new pos)
+        ordered = sorted(self._project.segments, key=lambda s: s.start_time_sec)
+
+        # Ripple-right: push any segment that overlaps its left neighbour
+        for i in range(1, len(ordered)):
+            prev = ordered[i - 1]
+            cur = ordered[i]
+            if cur.start_time_sec < prev.end_time_sec:
+                dur = cur.end_time_sec - cur.start_time_sec
+                cur.start_time_sec = prev.end_time_sec
+                cur.end_time_sec = prev.end_time_sec + dur
+
+        # Bail out if nothing moved
+        if all(abs(s.start_time_sec - old_positions[s.id][0]) < 0.001
+               for s in self._project.segments):
+            for s in self._project.segments:
+                s.start_time_sec, s.end_time_sec = old_positions[s.id]
+            self._drag_seg_id = None
+            self.refresh()
+            return
 
         new_positions = {s.id: (s.start_time_sec, s.end_time_sec)
                          for s in self._project.segments}
@@ -4869,7 +4878,7 @@ class TimelinePanel(QWidget):
             self.refresh()
             self.segment_moved.emit("", 0.0, 0.0)
 
-        self.undo_stack.push(_Cmd("Reorder Segments", _undo, _redo))
+        self.undo_stack.push(_Cmd("Move Segment", _undo, _redo))
 
         self._drag_seg_id = None
         self.refresh()
