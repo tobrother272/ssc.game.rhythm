@@ -147,11 +147,14 @@ class _BeatDetectWorker(QRunnable):
             child_env["PYTHONIOENCODING"] = "utf-8"
             child_env["PYTHONUTF8"]       = "1"
 
+            _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
             try:
                 proc = subprocess.run(
                     cmd, cwd=str(self._repo_root), capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     timeout=120, env=child_env,
+                    creationflags=_creation_flags,
                 )
             except subprocess.TimeoutExpired:
                 self._service._on_failed(job, "detection timed out")

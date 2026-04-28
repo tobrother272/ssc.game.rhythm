@@ -52,6 +52,7 @@ def trim_audio_ffmpeg(
         "-c",  "copy",                 # stream copy — no re-encode
         str(out_path),
     ]
+    _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -59,6 +60,7 @@ def trim_audio_ffmpeg(
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=_creation_flags,
     )
     if result.returncode != 0:
         raise RuntimeError(

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -137,6 +138,10 @@ class OverviewBar(QWidget):
     empty_clicked = Signal()
 
     HEIGHT = 28
+    # Segments are drawn at SCALE × the scroll-area viewport width so
+    # the blocks appear 2× wider than a plain overview fit, and the bar
+    # scrolls horizontally to reveal the rest.
+    SCALE = 2
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -150,6 +155,26 @@ class OverviewBar(QWidget):
 
     def set_project(self, project: Optional[Project]) -> None:
         self._project = project
+        self._update_minimum_width()
+        self.update()
+
+    def _update_minimum_width(self) -> None:
+        """Resize the widget to SCALE × parent scroll-area viewport width."""
+        sa = self.parent()
+        if sa is not None and hasattr(sa, "viewport"):
+            vp_w = sa.viewport().width()
+        else:
+            vp_w = self.width() or 600
+        target = max(1, int(vp_w * self.SCALE))
+        self.setMinimumWidth(target)
+        self.setFixedWidth(target)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._update_minimum_width()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
         self.update()
 
     def set_selected(self, segment_id: Optional[str]) -> None:
@@ -195,6 +220,9 @@ class OverviewBar(QWidget):
             return
 
         margin = 4
+        # self.width() is SCALE × viewport width (set by _update_minimum_width)
+        # so segments are drawn stretched across the full widget width and the
+        # scroll area reveals the right half on scroll.
         usable_w = max(1, self.width() - margin * 2)
         block_y = 5
         block_h = self.height() - 10
@@ -218,6 +246,63 @@ class OverviewBar(QWidget):
             rect = QRect(x, block_y, w, block_h)
             painter.drawRect(rect)
             self._segment_rects.append((rect, seg.id))
+
+            # Segment name — white text clipped to the block, with a 2 px
+            # inner margin so it never overlaps the border.  Skip when the
+            # block is narrower than ~20 px; text would be illegible anyway.
+            if w >= 20:
+                painter.save()
+                # Leave room for the rendered-video badge (top-left, ~16 px).
+                badge_d = min(14, max(6, int(block_h * 0.7)))
+                left_pad = (badge_d + 6) if getattr(seg, "video_path", None) else 4
+                inner = rect.adjusted(left_pad, 1, -3, -1)
+                painter.setClipRect(inner)
+
+                font = painter.font()
+                font.setPointSizeF(7.0)
+                font.setBold(False)
+                painter.setFont(font)
+
+                # Name — left aligned
+                name_color = QColor("#ffffff")
+                name_color.setAlpha(200)
+                painter.setPen(name_color)
+                painter.drawText(
+                    inner,
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    seg.name or "",
+                )
+
+                # Duration — right aligned, on a semi-transparent dark pill
+                # so it's readable against any segment color.
+                dur_sec = float(seg.duration_sec or 0.0)
+                mm, ss = divmod(int(dur_sec), 60)
+                dur_text = f"{mm:02d}:{ss:02d}"
+
+                fm = painter.fontMetrics()
+                dur_w = fm.horizontalAdvance(dur_text)
+                dur_h = fm.height()
+                pill_pad_x, pill_pad_y = 3, 1
+                pill_w = dur_w + pill_pad_x * 2
+                pill_h = dur_h + pill_pad_y * 2
+                pill_x = inner.right() - pill_w
+                pill_y = inner.top() + (inner.height() - pill_h) // 2
+                pill_rect = QRect(pill_x, pill_y, pill_w, pill_h)
+
+                overlay = QColor(0, 0, 0, 160)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(overlay))
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.drawRoundedRect(pill_rect, 3, 3)
+
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(
+                    pill_rect,
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    dur_text,
+                )
+
+                painter.restore()
 
             # "Has rendered video" badge — small green disc with a white
             # play triangle, drawn in the top-right corner of the block.
@@ -2421,12 +2506,25 @@ class TimelinePanel(QWidget):
 
         outer.addWidget(header)
 
-        # Overview bar — compact strip showing all segments, used for fast
-        # navigation and as the focus-mode entry/exit affordance.
+        # Overview bar — compact strip showing all segments at 2× width,
+        # wrapped in a horizontal QScrollArea for navigation.
         self.overview_bar = OverviewBar()
         self.overview_bar.segment_clicked.connect(self._on_overview_segment_clicked)
         self.overview_bar.empty_clicked.connect(self._on_overview_empty_clicked)
-        outer.addWidget(self.overview_bar)
+
+        self._overview_scroll = QScrollArea()
+        self._overview_scroll.setWidget(self.overview_bar)
+        self._overview_scroll.setWidgetResizable(False)
+        self._overview_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
+        self._overview_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._overview_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # Fix total height: bar + horizontal scrollbar (~14 px)
+        self._overview_scroll.setFixedHeight(OverviewBar.HEIGHT + 14)
+        outer.addWidget(self._overview_scroll)
 
         # Body with timeline view
         body = QWidget()
@@ -2518,6 +2616,14 @@ class TimelinePanel(QWidget):
             self.zoom_slider.blockSignals(blocked)
         self._update_zoom_slider_tooltip()
         self._sync_ratio_button_state()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        # Keep overview bar width = SCALE × scroll-area viewport width.
+        if hasattr(self, "_overview_scroll") and hasattr(self, "overview_bar"):
+            vp_w = self._overview_scroll.viewport().width()
+            self.overview_bar.setMinimumWidth(max(1, int(vp_w * OverviewBar.SCALE)))
+            self.overview_bar.setFixedWidth(max(1, int(vp_w * OverviewBar.SCALE)))
 
     def _sync_ratio_button_state(self) -> None:
         """Light up the Ratio button iff current zoom matches the lock value.

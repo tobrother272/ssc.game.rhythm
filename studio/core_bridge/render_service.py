@@ -485,6 +485,14 @@ class RenderService(QObject):
             #     `progress` signal in real time;
             #   - keep a rolling tail of the last ~120 lines for diagnostics
             #     when the subprocess fails.
+            # On Windows, spawning a console EXE (rhythm_worker.exe) from a
+            # GUI process (SSCStudio.exe, console=False) causes Windows to
+            # open a black CMD window.  CREATE_NO_WINDOW suppresses that
+            # window and keeps stdout/stderr readable via PIPE.
+            _creation_flags = 0
+            if sys.platform == "win32":
+                _creation_flags = subprocess.CREATE_NO_WINDOW
+
             proc = subprocess.Popen(
                 command,
                 cwd=self._repo_root,
@@ -496,6 +504,7 @@ class RenderService(QObject):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,  # line-buffered
+                creationflags=_creation_flags,
             )
 
             tail_lines: deque[str] = deque(maxlen=120)

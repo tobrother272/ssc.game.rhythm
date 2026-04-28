@@ -777,6 +777,17 @@ class PreviewPanel(QWidget):
 
         self.play_button.setEnabled(False)
 
+        # FPS selector for live preview.  Options kept deliberately small
+        # (6 / 12 / 24 / 30) — higher means more CPU per second on the
+        # render thread.  Default 24 matches what users consider "smooth".
+        self.fps_combo = QComboBox()
+        self.fps_combo.setToolTip("Live preview frame-rate (higher = smoother but more CPU)")
+        self.fps_combo.setFixedWidth(72)
+        for fps_val in (6, 12, 24, 30):
+            self.fps_combo.addItem(f"{fps_val} fps", fps_val)
+        self.fps_combo.setCurrentIndex(2)  # default 24 fps
+        self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
+
         control_row.addWidget(self.play_button)
         control_row.addWidget(self.stop_button)
         control_row.addWidget(self.seek_slider, 1)
@@ -785,6 +796,7 @@ class PreviewPanel(QWidget):
         vol_label.setStyleSheet("color:#8a8a8a;")
         control_row.addWidget(vol_label)
         control_row.addWidget(self.volume_slider)
+        control_row.addWidget(self.fps_combo)
         control_row.addWidget(self.stickman_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
@@ -1037,6 +1049,18 @@ class PreviewPanel(QWidget):
         # on direct ``int(...)`` conversion).
         self.playback_state_changed.emit(int(state.value))
 
+    @property
+    def preview_fps(self) -> int:
+        """Currently selected live-preview frame-rate."""
+        return int(self.fps_combo.currentData())
+
+    def _on_fps_changed(self) -> None:
+        """Apply new FPS to the running live-frame timer immediately."""
+        if self._live_active and self._live_frame_timer.isActive():
+            fps = self.preview_fps
+            interval_ms = max(8, int(round(1000.0 / max(1, fps))))
+            self._live_frame_timer.setInterval(interval_ms)
+
     def _show_loading(self) -> None:
         """Switch stage to loading page and start dot animation."""
         self._loading_dots = 0
@@ -1280,9 +1304,8 @@ class PreviewPanel(QWidget):
         self._loading_timer.stop()
         self._render_live_frame(start_local_sec)
 
-        # Pump frames at the renderer's fps.  Sub-1 ms timer overhead in
-        # PySide6 so we don't need to clamp the interval lower bound.
-        interval_ms = max(8, int(round(1000.0 / max(1, renderer.fps))))
+        # Pump frames at the user-selected preview fps (fps_combo).
+        interval_ms = max(8, int(round(1000.0 / max(1, self.preview_fps))))
         self._live_frame_timer.setInterval(interval_ms)
         self._live_frame_timer.start()
 
