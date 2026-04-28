@@ -146,7 +146,7 @@ class ProjectStore:
             start_time_sec=payload.get("start_time_sec", 0.0),
             end_time_sec=payload.get("end_time_sec", 0.0),
             audio_path=self._to_absolute(payload.get("audio_path"), project_dir) or "",
-            audio_offset_sec=payload.get("audio_offset_sec", 0.0),
+            audio_offset_sec=payload.get("audio_offset_sec", None),
             audio_duration_sec=payload.get("audio_duration_sec", 0.0),
             mode=payload.get("mode", "punch"),
             render_settings=payload.get("render_settings", {}),

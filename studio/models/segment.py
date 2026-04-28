@@ -27,7 +27,7 @@ class Segment:
     start_time_sec: float = 0.0
     end_time_sec: float = 0.0
     audio_path: str = ""
-    audio_offset_sec: float = 0.0
+    audio_offset_sec: Optional[float] = None   # None → legacy, use start_time_sec
     audio_duration_sec: float = 0.0
     mode: str = "punch"
     render_settings: dict = field(default_factory=dict)
