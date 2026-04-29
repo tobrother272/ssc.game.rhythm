@@ -17,9 +17,10 @@ __pycache__/
 # Runtime temp files
 /temp/
 /temps/
+/temps/*
 output/
 
 *.sh
-
+*.mp3
 # PyInstaller
 *.spec.bak
