@@ -467,19 +467,13 @@ class PreviewPanel(QWidget):
 
         Priority:
         1. **Rendered video on disk** (``segment.video_path`` exists AND
-           the file actually exists) — this is the user-friendly default.
-           Once a segment has been rendered, clicking it should play the
-           video, not the raw audio.  This holds across project reopens:
-           if the saved ``.htproj`` brings back a ``video_path`` whose
-           file is still in ``temps/``, we auto-load it.
-        2. Raw source audio — fallback when no render exists yet.
-        3. Nothing → clear.
-
-        The source combo is synced to whatever ends up loaded, so the
-        dropdown honestly reflects the player content.  The user can still
-        manually switch to "Selected media" (= raw media-library item) or
-        "Main timeline (stitched)" via the combo; those paths run through
-        ``_load_active_source`` and override this default.
+           the file actually exists) — plays the finished output.
+        2. **Pre-trimmed audio** (``segment.trimmed_audio_path``) — the
+           exact audio window for this segment, starts at t=0, no seek.
+        3. **Raw source audio** (``segment.audio_path``) — seeks to
+           ``audio_offset_sec`` so playback begins at the segment's
+           content, not at the start of the full source file.
+        4. Nothing → clear.
         """
         self._selected_segment = segment
 
@@ -492,16 +486,29 @@ class PreviewPanel(QWidget):
         )
 
         if rendered_ready:
-            # Sync combo so the dropdown matches what's actually playing.
             self._set_source_combo_silently("segment")
-            # The rendered video starts at project-time = segment.start.
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
             self._load_path(segment.video_path)  # type: ignore[arg-type]
             self._refresh_stickman_button_state()
             return
 
-        if segment.audio_path:
-            # Falling back to raw audio because no render exists yet.
+        # Prefer the pre-trimmed file: it covers exactly the segment's audio
+        # window starting at t=0.  The playhead offset must be the segment's
+        # timeline start so that player position 0 maps to start_time_sec on
+        # the project timeline (same convention as the rendered-video branch).
+        trimmed = getattr(segment, "trimmed_audio_path", None)
+        if trimmed and Path(trimmed).exists():
+            self._set_source_combo_silently("media")
+            self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
+            self._load_path(trimmed)
+            self._refresh_stickman_button_state()
+            return
+
+        if segment.audio_path and Path(segment.audio_path).exists():
+            # No trimmed file yet (trim still in-flight or not triggered).
+            # Load the full source file; duration will reflect the whole file
+            # but at least audio plays.  The player will reload automatically
+            # once the trim completes via _on_trim_ready → set_source_segment.
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = 0.0
             self._load_path(segment.audio_path)
@@ -509,10 +516,6 @@ class PreviewPanel(QWidget):
             return
 
         self.clear()
-        # ``clear()`` resets the stickman toggle as a safety net when
-        # the player is genuinely empty, but a segment is still
-        # selected here — re-enable the toggle so the user can adjust
-        # the box even before any audio / render is attached.
         self._refresh_stickman_button_state()
 
     def _set_source_combo_silently(self, data_value: str) -> None:

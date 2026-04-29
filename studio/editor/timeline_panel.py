@@ -219,6 +219,42 @@ def _duplicate_segment_icon(size: int = 20) -> QIcon:
     return ic
 
 
+def _pack_segments_icon(size: int = 20) -> QIcon:
+    """Icon for 'Pack Segments' — three blocks flush-left against a wall."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+
+    def _mk_pm(stroke: QColor) -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        s = float(size)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(stroke)
+        pen.setWidthF(1.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        # Left wall
+        wall_x = s * 0.10
+        p.drawLine(QPointF(wall_x, s * 0.08), QPointF(wall_x, s * 0.92))
+        # Three rows of blocks (different widths) flush to the wall
+        p.setBrush(QBrush(stroke))
+        p.setPen(Qt.PenStyle.NoPen)
+        x0 = wall_x + s * 0.05
+        rows = [(0.55, 0.12, 0.22), (0.75, 0.38, 0.22), (0.45, 0.64, 0.22)]
+        for w_frac, y_frac, h_frac in rows:
+            p.drawRect(QRectF(x0, s * y_frac, s * w_frac, s * h_frac))
+        p.end()
+        return pm
+
+    pm_on = _mk_pm(c_on)
+    pm_off = _mk_pm(c_off)
+    ic = QIcon(pm_on)
+    ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+    return ic
+
+
 def _beat_tool_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap, QPixmap]:
     """Auto Gen / Gen by Chart / Clear Beats icon pixmaps."""
     s = float(size)
@@ -483,10 +519,11 @@ class OverviewBar(QWidget):
     empty_clicked = Signal()
 
     HEIGHT = 28
-    # Segments are drawn at SCALE × the scroll-area viewport width so
-    # the blocks appear 2× wider than a plain overview fit, and the bar
-    # scrolls horizontally to reveal the rest.
-    SCALE = 2
+    # Each segment block is exactly this many pixels wide regardless of
+    # its duration — the overview is just for counting / navigating, not
+    # for showing proportional lengths.
+    BLOCK_W = 200
+    BLOCK_GAP = 2
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -504,13 +541,15 @@ class OverviewBar(QWidget):
         self.update()
 
     def _update_minimum_width(self) -> None:
-        """Resize the widget to SCALE × parent scroll-area viewport width."""
+        """Resize widget so all fixed-width segment blocks fit without clipping."""
+        n = len(self._project.segments) if self._project else 0
+        margin = 4
+        target = max(1, margin * 2 + n * (self.BLOCK_W + self.BLOCK_GAP))
+        # Always at least as wide as the scroll-area viewport so the bar
+        # doesn't look empty when there are only a few segments.
         sa = self.parent()
         if sa is not None and hasattr(sa, "viewport"):
-            vp_w = sa.viewport().width()
-        else:
-            vp_w = self.width() or 600
-        target = max(1, int(vp_w * self.SCALE))
+            target = max(target, sa.viewport().width())
         self.setMinimumWidth(target)
         self.setFixedWidth(target)
 
@@ -560,21 +599,13 @@ class OverviewBar(QWidget):
             )
             return
 
-        max_end = max((s.end_time_sec for s in self._project.segments), default=0.0)
-        if max_end <= 0:
-            return
-
         margin = 4
-        # self.width() is SCALE × viewport width (set by _update_minimum_width)
-        # so segments are drawn stretched across the full widget width and the
-        # scroll area reveals the right half on scroll.
-        usable_w = max(1, self.width() - margin * 2)
         block_y = 5
         block_h = self.height() - 10
+        w = self.BLOCK_W
 
-        for seg in self._project.segments:
-            x = margin + int(seg.start_time_sec / max_end * usable_w)
-            w = max(3, int(seg.duration_sec / max_end * usable_w))
+        for i, seg in enumerate(self._project.sorted_segments()):
+            x = margin + i * (w + self.BLOCK_GAP)
             base = MODE_COLORS.get(seg.mode, QColor("#3bb6ff"))
             color = QColor(base)
             border = QColor("#0a0a0a")
@@ -2959,6 +2990,21 @@ class TimelinePanel(QWidget):
         self.duplicate_segment_button.clicked.connect(self._do_duplicate_segment)
         top.addWidget(self.duplicate_segment_button)
 
+        _ic_pack = _pack_segments_icon(20)
+        self.pack_segments_button = QPushButton()
+        self.pack_segments_button.setIcon(_ic_pack)
+        self.pack_segments_button.setIconSize(_icon_sz)
+        self.pack_segments_button.setText("")
+        self.pack_segments_button.setFlat(True)
+        self.pack_segments_button.setObjectName("zoomIconButton")
+        self.pack_segments_button.setToolTip(
+            "Pack Segments — remove all gaps, shift segments flush-left from t=0.\n"
+            "Use Ctrl+Z to undo."
+        )
+        self.pack_segments_button.setFixedSize(30, 30)
+        self.pack_segments_button.clicked.connect(self._do_pack_segments)
+        top.addWidget(self.pack_segments_button)
+
         top.addStretch()
 
         # "Auto Gen Block" — manual trigger for ``rhythm.py --detect_only``.
@@ -3124,7 +3170,42 @@ class TimelinePanel(QWidget):
         self._overview_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         # Fix total height: bar + horizontal scrollbar (~14 px)
         self._overview_scroll.setFixedHeight(OverviewBar.HEIGHT + 14)
-        outer.addWidget(self._overview_scroll)
+
+        # "Back to overview" home button — fixed to the left of the scroll
+        # area so it never scrolls away.  Click clears focus and returns to
+        # the full-project overview.
+        self._overview_home_btn = QPushButton()
+        self._overview_home_btn.setFixedSize(22, OverviewBar.HEIGHT + 14)
+        self._overview_home_btn.setToolTip("Back to overview (show all segments)")
+        self._overview_home_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._overview_home_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a1a1a;
+                border: none;
+                border-right: 1px solid #2e2e2e;
+                color: #888888;
+                font-size: 13px;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: #2a2a2a;
+                color: #cccccc;
+            }
+            QPushButton:pressed {
+                background: #333333;
+            }
+        """)
+        # Draw a simple 2×2 grid icon via Unicode (⊞)
+        self._overview_home_btn.setText("⊞")
+        self._overview_home_btn.clicked.connect(self._on_overview_empty_clicked)
+
+        overview_row = QWidget()
+        overview_row_layout = QHBoxLayout(overview_row)
+        overview_row_layout.setContentsMargins(0, 0, 0, 0)
+        overview_row_layout.setSpacing(0)
+        overview_row_layout.addWidget(self._overview_home_btn)
+        overview_row_layout.addWidget(self._overview_scroll, 1)
+        outer.addWidget(overview_row)
 
         # Body with timeline view
         body = QWidget()
@@ -3220,11 +3301,9 @@ class TimelinePanel(QWidget):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        # Keep overview bar width = SCALE × scroll-area viewport width.
-        if hasattr(self, "_overview_scroll") and hasattr(self, "overview_bar"):
-            vp_w = self._overview_scroll.viewport().width()
-            self.overview_bar.setMinimumWidth(max(1, int(vp_w * OverviewBar.SCALE)))
-            self.overview_bar.setFixedWidth(max(1, int(vp_w * OverviewBar.SCALE)))
+        # Recompute overview bar width whenever the panel is resized.
+        if hasattr(self, "overview_bar"):
+            self.overview_bar._update_minimum_width()
 
     def _sync_ratio_button_state(self) -> None:
         """Light up the Ratio button iff current zoom matches the lock value.
@@ -3951,34 +4030,32 @@ class TimelinePanel(QWidget):
         finally:
             painter.restore()
 
+    @staticmethod
+    def _segment_audio_offset(seg) -> float:
+        """Return the audio-file start offset for *seg*, backward-compatible.
+
+        ``audio_offset_sec is None`` means the field was never explicitly set
+        (legacy segment saved before this field was tracked).  In that case we
+        fall back to ``start_time_sec``, which was historically used as the
+        implicit audio-file offset.  An explicit value of 0.0 is valid and
+        must not be collapsed to ``start_time_sec`` (e.g. a duplicated copy of
+        the very first segment legitimately starts at t=0 of the audio file).
+        """
+        if seg.audio_offset_sec is not None:
+            return seg.audio_offset_sec
+        return seg.start_time_sec
+
     def _paint_waveform_background(self, painter, rect) -> None:
-        """Paint the waveform chart directly during the background pass.
+        """Paint per-segment waveform strips in the waveform track.
 
-        Called from :meth:`TimelineScene.drawBackground` on every
-        repaint of the visible viewport.  ``painter`` is positioned in
-        scene coordinates; ``rect`` is the scene-rect being painted.
+        Each segment draws its own audio slice (keyed by audio_offset_sec)
+        at its visual position (start_time_sec … end_time_sec).  When a
+        segment is dragged the colored waveform follows it automatically
+        because the visual bounds and the audio slice are both re-read from
+        the segment on every repaint.
 
-        Two passes:
-
-        1. **Track background** — the dark ``#151515`` strip that used
-           to be a scene item in ``_draw_tracks``.  Always painted,
-           even before any RMS data has loaded, so the user sees the
-           dedicated waveform lane regardless of state.
-        2. **Chart** — bg-rect, baseline, translucent fill polygon,
-           outline polyline.  Only painted when ``_waveform_rms`` has
-           samples.  Mirrors the original ``_draw_waveform`` geometry
-           exactly so the visual is identical to the previous
-           scene-item version.
-
-        Layout reference (game ``src/rhythm.py``):
-
-            wy0 = y1 + 30
-            wy1 = wy0 + int(HEIGHT * 0.10)
-            cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (40,40,40), -1)
-            cv2.rectangle(canvas, (x0, wy0), (x1, wy1), (120,120,120), 1)
-            cv2.line(canvas, (x0, wy1), (x1, wy1), (90,90,90), 1)
-            cv2.polylines(canvas, [pts], False, (130,170,255), 1)
-            cv2.fillPoly(ov, [poly], (70,110,170)); addWeighted(ov, 0.35, ...)
+        Pass 1 — global dark track strip (always drawn).
+        Pass 2 — per-segment colored waveform (only when RMS data is loaded).
         """
         scene_width = self.scene.sceneRect().width()
         if scene_width <= 0:
@@ -3998,7 +4075,7 @@ class TimelinePanel(QWidget):
         finally:
             painter.restore()
 
-        if not self._waveform_rms:
+        if not self._waveform_rms or not self._project:
             return
 
         rms = self._waveform_rms
@@ -4007,104 +4084,102 @@ class TimelinePanel(QWidget):
         rms_per_sec = self._waveform_rms_per_sec
         if pps <= 0 or rms_per_sec <= 0:
             return
-        px_per_tick = pps / rms_per_sec
-        if px_per_tick <= 0:
-            return
-
-        start_sec = self._offset_sec
-        end_sec   = start_sec + scene_width / pps
-        start_idx = max(0, int(start_sec * rms_per_sec))
-        end_idx   = min(n, int(end_sec * rms_per_sec) + 1)
-        if start_idx >= end_idx:
-            return
 
         wy0 = float(self._WAVE_TRACK_Y) + 2
         wy1 = float(self._WAVE_TRACK_Y + self._WAVE_TRACK_H) - 2
-
-        x0 = 0.0
-        wave_end_x = (end_idx - start_idx) * px_per_tick
-        x1 = float(min(wave_end_x, scene_width))
-        if x1 <= x0:
+        if wy1 <= wy0:
             return
 
-        rms_window  = rms[start_idx:end_idx]
-        total_ticks = len(rms_window)
-        if total_ticks < 1:
-            return
-
-        # Sample each visible pixel directly against the RMS tick stream.
-        # Earlier this was ``step = span_px // 360`` which made step grow
-        # with the scene (60 inside a 200-second segment, 3 inside a
-        # 10-second one), so the same audio rendered very differently in
-        # a long vs short segment even at identical pps.  We now clip the
-        # loop to the painter's dirty rect (Qt's drawBackground passes
-        # the visible area) and sample one rms tick per pixel via
-        # ``px / px_per_tick`` — independent of total scene width.
-        draw_x0 = max(x0, float(rect.left()))
-        draw_x1 = min(x1, float(rect.right()))
-        if draw_x1 <= draw_x0:
-            return
-
-        # When pps >> rms_per_sec each tick is many pixels wide; step by
-        # tick-width so we don't redundantly sample the same tick multiple
-        # times.  Otherwise step every pixel for crisp peaks.
-        step = max(1, int(px_per_tick))
-
-        pts: list[tuple[float, float]] = []
-        for x in range(int(draw_x0), int(draw_x1) + 1, step):
-            wf_i = int(round(x / px_per_tick))
-            if wf_i < 0 or wf_i >= total_ticks:
+        # ── Pass 2: per-segment waveform. ──────────────────────────────
+        for seg in self._project.segments:
+            # Visual bounds in scene coordinates
+            seg_x0 = self._time_to_x(seg.start_time_sec)
+            seg_x1 = self._time_to_x(seg.end_time_sec)
+            seg_w_px = seg_x1 - seg_x0
+            if seg_w_px < 2:
                 continue
-            amp = float(rms_window[wf_i])
-            yv  = wy1 - amp * (wy1 - wy0 - 2)
-            pts.append((float(x), yv))
 
-        if len(pts) < 2:
-            return
-
-        painter.save()
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-            # Background rectangle + 1-px outline.
-            painter.setBrush(QBrush(QColor(40, 40, 40)))
-            painter.setPen(QPen(QColor(120, 120, 120), 1))
-            painter.drawRect(QRectF(x0, wy0, x1 - x0, wy1 - wy0))
-
-            # Baseline at wy1.
-            painter.setPen(QPen(QColor(90, 90, 90), 1))
-            painter.drawLine(QPointF(x0, wy1), QPointF(x1, wy1))
-
-            # Translucent fill polygon under the peaks.  Bookend with the
-            # first/last sampled X (not the full [x0, x1] span) so we
-            # don't draw a diagonal line from the scene edge to the
-            # leftmost visible peak when ``pts`` is clipped to the
-            # painter's dirty rect.
-            fill_path = QPainterPath()
-            fill_path.moveTo(pts[0][0], wy1)
-            for x, y in pts:
-                fill_path.lineTo(x, y)
-            fill_path.lineTo(pts[-1][0], wy1)
-            fill_path.closeSubpath()
-            painter.setPen(QPen(Qt.PenStyle.NoPen))
-            painter.setBrush(
-                QBrush(QColor(170, 110, 70, int(255 * 0.35)))
+            # Audio window in the source file
+            audio_start = self._segment_audio_offset(seg)
+            audio_dur = (
+                seg.audio_duration_sec
+                if seg.audio_duration_sec > 0
+                else (seg.end_time_sec - seg.start_time_sec)
             )
-            painter.drawPath(fill_path)
+            audio_end = audio_start + audio_dur
 
-            # 1-px cosmetic outline polyline tracing the peaks.
-            outline_path = QPainterPath()
-            outline_path.moveTo(pts[0][0], pts[0][1])
-            for x, y in pts[1:]:
-                outline_path.lineTo(x, y)
-            pen = QPen(QColor(255, 170, 130))
-            pen.setCosmetic(True)
-            pen.setWidthF(1.0)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(outline_path)
-        finally:
-            painter.restore()
+            rms_start_idx = max(0, int(audio_start * rms_per_sec))
+            rms_end_idx   = min(n, int(audio_end * rms_per_sec) + 1)
+            if rms_start_idx >= rms_end_idx:
+                continue
+
+            rms_window = rms[rms_start_idx:rms_end_idx]
+            n_ticks = len(rms_window)
+            if n_ticks < 2:
+                continue
+
+            # px per rms tick within this segment's visual width
+            px_per_tick = seg_w_px / n_ticks
+
+            # Clip to the dirty rect AND to the segment's visual bounds
+            draw_x0 = max(seg_x0, float(rect.left()))
+            draw_x1 = min(seg_x1, float(rect.right()))
+            if draw_x1 <= draw_x0:
+                continue
+
+            step = max(1, int(px_per_tick))
+
+            pts: list[tuple[float, float]] = []
+            for xi in range(int(draw_x0), int(draw_x1) + 1, step):
+                # Map scene-x to an index within this segment's rms window
+                x_rel = xi - seg_x0          # 0 … seg_w_px
+                wf_i = int(round(x_rel / px_per_tick))
+                if wf_i < 0 or wf_i >= n_ticks:
+                    continue
+                amp = float(rms_window[wf_i])
+                yv  = wy1 - amp * (wy1 - wy0 - 2)
+                pts.append((float(xi), yv))
+
+            if len(pts) < 2:
+                continue
+
+            painter.save()
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+                # Background rect for this segment's waveform slot
+                painter.setBrush(QBrush(QColor(40, 40, 40)))
+                painter.setPen(QPen(QColor(120, 120, 120), 1))
+                painter.drawRect(QRectF(seg_x0, wy0, seg_w_px, wy1 - wy0))
+
+                # Baseline
+                painter.setPen(QPen(QColor(90, 90, 90), 1))
+                painter.drawLine(QPointF(seg_x0, wy1), QPointF(seg_x1, wy1))
+
+                # Translucent fill polygon
+                fill_path = QPainterPath()
+                fill_path.moveTo(pts[0][0], wy1)
+                for px, py in pts:
+                    fill_path.lineTo(px, py)
+                fill_path.lineTo(pts[-1][0], wy1)
+                fill_path.closeSubpath()
+                painter.setPen(QPen(Qt.PenStyle.NoPen))
+                painter.setBrush(QBrush(QColor(170, 110, 70, int(255 * 0.35))))
+                painter.drawPath(fill_path)
+
+                # Outline polyline
+                outline_path = QPainterPath()
+                outline_path.moveTo(pts[0][0], pts[0][1])
+                for px, py in pts[1:]:
+                    outline_path.lineTo(px, py)
+                pen = QPen(QColor(255, 170, 130))
+                pen.setCosmetic(True)
+                pen.setWidthF(1.0)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(outline_path)
+            finally:
+                painter.restore()
 
     def _draw_waveform_placeholder(self) -> None:
         """Show loading or empty placeholder in the waveform track."""
@@ -4907,46 +4982,58 @@ class TimelinePanel(QWidget):
         dup.name = f"{orig.name} (copy)"
         duration = orig.end_time_sec - orig.start_time_sec
 
-        # Find the earliest free slot at or after orig.end_time_sec
-        start_candidate = orig.end_time_sec
-        others = [
-            s for s in self._project.sorted_segments() if s.id != orig.id
-        ]
-        # Iteratively push past any overlapping segments
-        changed = True
-        while changed:
-            changed = False
-            for s in others:
-                if s.start_time_sec < start_candidate + duration and s.end_time_sec > start_candidate:
-                    start_candidate = s.end_time_sec
-                    changed = True
+        others = [s for s in self._project.sorted_segments() if s.id != orig.id]
 
-        dup.start_time_sec = start_candidate
-        dup.end_time_sec = start_candidate + duration
+        # Snapshot positions of all other segments BEFORE any shift (for undo).
+        others_before = {s.id: (s.start_time_sec, s.end_time_sec) for s in others}
 
-        # Clear all render artifacts
+        # Place duplicate immediately adjacent to the original.
+        # Push any segment that overlaps the insertion window rightward,
+        # cascading to keep everything gap-free.
+        insert_start = orig.end_time_sec
+        insert_end   = insert_start + duration
+        for s in sorted(others, key=lambda s: s.start_time_sec):
+            if s.start_time_sec < insert_end and s.end_time_sec > insert_start:
+                shift = insert_end - s.start_time_sec
+                s.start_time_sec += shift
+                s.end_time_sec   += shift
+                insert_end = s.end_time_sec
+
+        dup.start_time_sec = insert_start
+        dup.end_time_sec   = insert_start + duration
+        # Duplicate keeps audio_offset_sec / audio_duration_sec from orig so
+        # it references the same audio content.  The trimmed file will be
+        # copied in background by MainWindow._on_segment_duplicated.
+
+        # Clear render-specific artifacts only (not audio)
         from studio.models.segment import RenderStatus
         dup.render_status = RenderStatus.IDLE
-        dup.video_path = None
         dup.last_rendered_at = None
         dup.last_render_error = None
         dup.thumbnail_path = None
-        dup.trimmed_audio_path = None
+        # trimmed_audio_path and video_path are intentionally kept; MainWindow
+        # will copy the audio file and signal back the new path.
 
         new_id = dup.id
         beat_snapshot = list(self._beat_events.get(orig.id, []))
+        # Capture shifted positions for redo
+        others_after = {s.id: (s.start_time_sec, s.end_time_sec) for s in others}
 
         self._project.segments.append(dup)
         self._beat_events[new_id] = copy.deepcopy(beat_snapshot)
 
-        # Push undo command
         def _undo() -> None:
             if self._project is None:
                 return
+            # Remove duplicate
             self._project.segments = [
                 s for s in self._project.segments if s.id != new_id
             ]
             self._beat_events.pop(new_id, None)
+            # Restore all shifted segments to their original positions
+            for s in self._project.segments:
+                if s.id in others_before:
+                    s.start_time_sec, s.end_time_sec = others_before[s.id]
             self._selected_segment_id = orig.id
             self.refresh()
             self.segment_selected.emit(orig)
@@ -4954,6 +5041,10 @@ class TimelinePanel(QWidget):
         def _redo() -> None:
             if self._project is None:
                 return
+            # Re-apply shifts
+            for s in self._project.segments:
+                if s.id in others_after:
+                    s.start_time_sec, s.end_time_sec = others_after[s.id]
             self._project.segments.append(copy.deepcopy(dup))
             self._beat_events[new_id] = copy.deepcopy(beat_snapshot)
             refreshed_dup = self._project.get_segment(new_id)
@@ -4969,6 +5060,50 @@ class TimelinePanel(QWidget):
         refreshed_dup = self._project.get_segment(new_id)
         if refreshed_dup is not None:
             self.segment_selected.emit(refreshed_dup)
+
+    def _do_pack_segments(self) -> None:
+        """Remove all gaps between segments and shift everything flush to t=0.
+
+        Segments are sorted by their current start time, then repacked
+        so each segment begins exactly where the previous one ends,
+        with the first segment starting at t=0.  The operation is
+        undoable via Ctrl+Z.
+        """
+        if self._project is None or not self._project.segments:
+            return
+
+        ordered = sorted(self._project.segments, key=lambda s: s.start_time_sec)
+
+        old_positions = {s.id: (s.start_time_sec, s.end_time_sec) for s in ordered}
+
+        # Repack from t=0
+        cursor = 0.0
+        new_positions: dict[str, tuple[float, float]] = {}
+        for s in ordered:
+            dur = s.end_time_sec - s.start_time_sec
+            new_positions[s.id] = (cursor, cursor + dur)
+            cursor += dur
+
+        # Nothing to do if already packed
+        if all(abs(new_positions[sid][0] - old_positions[sid][0]) < 0.001
+               for sid in old_positions):
+            return
+
+        def _apply(positions: dict[str, tuple[float, float]]) -> None:
+            if self._project is None:
+                return
+            for s in self._project.segments:
+                if s.id in positions:
+                    s.start_time_sec, s.end_time_sec = positions[s.id]
+            self.refresh()
+            self.segment_moved.emit("", 0.0, 0.0)
+
+        self.undo_stack.push(_Cmd(
+            "Pack Segments",
+            lambda: _apply(old_positions),
+            lambda: _apply(new_positions),
+        ))
+        _apply(new_positions)
 
     def _on_delete_segment_clicked(self) -> None:
         """Confirm + forward a delete request for the selected segment.
@@ -5302,6 +5437,15 @@ class TimelinePanel(QWidget):
         """Perform the actual split, mutate project, emit signal, push undo."""
         from uuid import uuid4
 
+        # Compute audio positions before mutating the segment.
+        orig_audio_offset = (
+            segment.audio_offset_sec
+            if segment.audio_offset_sec is not None
+            else segment.start_time_sec   # legacy: field was never explicitly set
+        )
+        left_duration = split_time - segment.start_time_sec   # seconds into segment
+        right_audio_offset = orig_audio_offset + left_duration
+
         right = copy.deepcopy(segment)
         right.id = str(uuid4())
         right.name = f"{segment.name} B"
@@ -5312,12 +5456,21 @@ class TimelinePanel(QWidget):
         right.last_rendered_at = None
         right.last_render_error = None
         right.thumbnail_path = None
+        # Audio bookkeeping for right half
+        right.audio_offset_sec = right_audio_offset
+        right.audio_duration_sec = segment.end_time_sec - split_time
 
         # Shorten the original segment to end at split point.
         original_name = segment.name
         orig_end = segment.end_time_sec
+        orig_audio_offset_saved = segment.audio_offset_sec
+        orig_audio_duration_saved = segment.audio_duration_sec
         segment.name = f"{original_name} A"
         segment.end_time_sec = split_time
+        # Audio bookkeeping for left half
+        segment.audio_offset_sec = orig_audio_offset
+        segment.audio_duration_sec = left_duration
+        segment.trimmed_audio_path = None  # will be re-trimmed in background
 
         orig_id = segment.id
         right_id = right.id
@@ -5338,12 +5491,13 @@ class TimelinePanel(QWidget):
         def _undo_split() -> None:
             if self._project is None:
                 return
-            # Restore original segment's end time and name
             left = self._project.get_segment(orig_id)
             if left is not None:
                 left.end_time_sec = orig_end
                 left.name = original_name
-            # Remove right segment
+                left.audio_offset_sec = orig_audio_offset_saved
+                left.audio_duration_sec = orig_audio_duration_saved
+                left.trimmed_audio_path = None
             self._project.segments = [
                 s for s in self._project.segments if s.id != right_id
             ]
@@ -5359,7 +5513,9 @@ class TimelinePanel(QWidget):
             if left is not None:
                 left.end_time_sec = split_time
                 left.name = f"{original_name} A"
-            # Re-add right segment
+                left.audio_offset_sec = orig_audio_offset
+                left.audio_duration_sec = left_duration
+                left.trimmed_audio_path = None
             restored_right = copy.deepcopy(right_snapshot)
             self._project.segments.append(restored_right)
             self._beat_events[right_id] = list(right_beats_after)
@@ -5442,6 +5598,9 @@ class TimelinePanel(QWidget):
 
         left_name_after = left.name
 
+        # Update audio bookkeeping: merged duration = both halves combined.
+        left.audio_duration_sec = left.audio_duration_sec + right.audio_duration_sec
+        # audio_offset_sec stays at left's original value (audio starts where left started).
         # Invalidate cached artifacts — the audio window has grown.
         left.render_status = RenderStatus.IDLE
         left.video_path = None

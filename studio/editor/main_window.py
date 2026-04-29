@@ -35,6 +35,7 @@ from studio.core_bridge import (
     ThumbnailService,
     WaveformService,
 )
+from studio.editor.export_dialog import ExportDialog
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
 from studio.editor.segment_config_panel import SegmentConfigPanel
@@ -90,6 +91,7 @@ class _RendererWorker(QThread):
             self.ready.emit(renderer)
         else:
             renderer.close()
+
 
 
 class MainWindow(QMainWindow):
@@ -164,6 +166,8 @@ class MainWindow(QMainWindow):
         self._inflight_trim_segments: set[str] = set()
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
+        # ── Export dialog (kept alive while open so user can monitor progress)
+        self._export_dialog: Optional[ExportDialog] = None
         # ── Live preview mode (Preview button as a TOGGLE) ────────────
         # The preview button now drives an in-process drawing renderer
         # (:class:`src.live_renderer.LiveFrameRenderer`) instead of a
@@ -298,8 +302,8 @@ class MainWindow(QMainWindow):
 
         self.export_button = QPushButton("Export")
         self.export_button.setObjectName("accentButton")
-        self.export_button.setToolTip("Render all segments and export")
-        self.export_button.clicked.connect(self._render_all_segments)
+        self.export_button.setToolTip("Configure and export all segments to a single video file")
+        self.export_button.clicked.connect(self._on_export_button_clicked)
         toolbar.addWidget(self.export_button)
 
     def _build_status_bar(self) -> None:
@@ -718,7 +722,20 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _request_audio_trim(self, segment: Segment) -> None:
+    @staticmethod
+    def _audio_offset(segment: "Segment") -> float:
+        """Return the segment's audio-file start offset.
+
+        ``audio_offset_sec is None`` means the field was never explicitly set
+        (legacy segment).  Fall back to ``start_time_sec`` which was the
+        implicit audio offset in all pre-existing code.  An explicit 0.0 is
+        valid and must not be treated as "unset".
+        """
+        if segment.audio_offset_sec is not None:
+            return segment.audio_offset_sec
+        return segment.start_time_sec
+
+    def _request_audio_trim(self, segment: "Segment") -> None:
         """Queue a background FFmpeg trim of *segment*'s audio window.
 
         Skipped silently if the segment has no audio source or zero duration.
@@ -737,12 +754,18 @@ class MainWindow(QMainWindow):
             return
         src_ext = Path(segment.audio_path).suffix or ".mp3"
         out_path = self._app_temps_dir() / f"audio_{segment.id}{src_ext}"
+        audio_start = self._audio_offset(segment)
+        audio_end = audio_start + (
+            segment.audio_duration_sec
+            if segment.audio_duration_sec > 0
+            else segment.duration_sec
+        )
         self._inflight_trim_segments.add(segment.id)
         self.audio_trim_service.trim(
             segment_id=segment.id,
             audio_path=segment.audio_path,
-            start_sec=segment.start_time_sec,
-            end_sec=segment.end_time_sec,
+            start_sec=audio_start,
+            end_sec=audio_end,
             out_path=out_path,
         )
 
@@ -757,6 +780,12 @@ class MainWindow(QMainWindow):
         if self.segment_panel.current_segment and \
                 self.segment_panel.current_segment.id == segment_id:
             self.segment_panel.set_segment(segment)
+        # If this segment is currently loaded in the player (e.g. after split/
+        # join/dup the trim runs in background while raw audio plays), reload
+        # the player now so it uses the correctly-trimmed file with proper duration.
+        selected = getattr(self.timeline_panel, "_selected_segment_id", None)
+        if selected == segment_id and not self._preview_mode_active:
+            self.preview_panel.set_source_segment(segment)
         self.statusBar().showMessage(
             f"Trimmed audio saved: {Path(trimmed_path).name}", 3000
         )
@@ -1075,6 +1104,7 @@ class MainWindow(QMainWindow):
             start_time_sec=start_time,
             end_time_sec=start_time + duration,
             audio_path=media.source_path if media.kind.value == "audio" else "",
+            audio_offset_sec=start_time,   # explicit: matches initial timeline position
             audio_duration_sec=duration,
             mode="punch",
             render_settings=build_settings("punch", {}).model_dump(mode="json", exclude_none=True),
@@ -1154,11 +1184,18 @@ class MainWindow(QMainWindow):
         self.segment_panel.set_preview_active(bool(active))
 
     def _on_segment_split(self, original_id: str, new_id: str) -> None:
-        """Handle timeline split: update inspector and mark project dirty."""
+        """Handle timeline split: trim both halves and mark project dirty."""
         new_segment = self.project.get_segment(new_id)
+        orig_segment = self.project.get_segment(original_id)
         self.segment_panel.set_project(self.project)
         if new_segment is not None:
             self.segment_panel.set_segment(new_segment)
+        # Immediately trim both halves in background so trimmed_audio_path is
+        # ready for render/preview without waiting for the user to click anything.
+        if orig_segment is not None:
+            self._request_audio_trim(orig_segment)
+        if new_segment is not None:
+            self._request_audio_trim(new_segment)
         # Splitting changes the segment's audio window — the renderer
         # was loaded with the pre-split clip and would now be
         # rendering against the wrong portion.  Drop out of preview;
@@ -1173,15 +1210,21 @@ class MainWindow(QMainWindow):
                 "click Preview again on the desired half.",
                 4000,
             )
+        self.statusBar().showMessage("Trimming split audio in background…", 3000)
         self._sync_preview_button_state()
         self._on_project_changed()
 
     def _on_segment_joined(self, kept_id: str, removed_id: str) -> None:
-        """Handle timeline join: update inspector and mark project dirty."""
+        """Handle timeline join: re-trim merged audio and mark project dirty."""
         kept_segment = self.project.get_segment(kept_id)
         self.segment_panel.set_project(self.project)
         if kept_segment is not None:
             self.segment_panel.set_segment(kept_segment)
+        # Immediately re-trim the merged segment's audio in background.
+        # _do_join already updated audio_offset_sec / audio_duration_sec and
+        # cleared trimmed_audio_path; this extracts the full joined window.
+        if kept_segment is not None:
+            self._request_audio_trim(kept_segment)
         # If preview was running on either half, stop it — the audio window
         # has grown and the renderer would reference a stale trimmed clip.
         if self._preview_mode_active and self._preview_active_segment_id in (
@@ -1197,20 +1240,42 @@ class MainWindow(QMainWindow):
         # Clear any beat-event cache for the removed segment.
         if hasattr(self.timeline_panel, "_beat_events"):
             self.timeline_panel._beat_events.pop(removed_id, None)
+        self.statusBar().showMessage("Trimming joined audio in background…", 3000)
         self._sync_preview_button_state()
         self._on_project_changed()
 
     def _on_segment_duplicated(self, new_segment_id: str) -> None:
-        """Handle timeline Ctrl+D duplicate — update inspector and mark dirty."""
+        """Handle timeline Ctrl+D duplicate — copy audio/video and mark dirty."""
+        import shutil
+
         new_seg = self.project.get_segment(new_segment_id)
         self.segment_panel.set_project(self.project)
         if new_seg is not None:
             self.segment_panel.set_segment(new_seg)
+
+            # Copy trimmed audio so the duplicate has its own independent file.
+            src_audio = new_seg.trimmed_audio_path
+            if src_audio and Path(src_audio).exists():
+                src_ext = Path(src_audio).suffix or ".mp3"
+                dst_audio = self._app_temps_dir() / f"audio_{new_segment_id}{src_ext}"
+                try:
+                    shutil.copy2(src_audio, dst_audio)
+                    new_seg.trimmed_audio_path = str(dst_audio)
+                except OSError:
+                    new_seg.trimmed_audio_path = None
+                    self._request_audio_trim(new_seg)
+            else:
+                # No pre-trimmed file yet — schedule a fresh trim
+                new_seg.trimmed_audio_path = None
+                self._request_audio_trim(new_seg)
+
+            # video_path: keep the same reference (the duplicate starts IDLE
+            # and will produce its own render; the original's video is read-only
+            # from its perspective until it re-renders).
+
         self._sync_preview_button_state()
         self._on_project_changed()
-        self.statusBar().showMessage(
-            f"Segment duplicated", 2000
-        )
+        self.statusBar().showMessage("Segment duplicated (audio copied)", 2000)
 
     def _on_segment_moved(
         self, segment_id: str, new_start: float, new_end: float
@@ -1341,6 +1406,52 @@ class MainWindow(QMainWindow):
     def _render_all_segments(self) -> None:
         for segment in self.project.sorted_segments():
             self._enqueue_segment(segment)
+
+    # ── Export flow ──────────────────────────────────────────────────────────
+
+    def _on_export_button_clicked(self) -> None:
+        """Show the detailed Export dialog (stays open; user closes manually)."""
+        if not self.project.segments:
+            QMessageBox.information(self, "Export", "No segments to export.")
+            return
+
+        # Re-use an existing open dialog if one is already showing.
+        if getattr(self, "_export_dialog", None) is not None:
+            dlg = self._export_dialog
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+
+        dlg = ExportDialog(
+            self,
+            project=self.project,
+            app_root=self._app_root,
+            temps_dir=self._app_temps_dir(),
+            token_provider=self._current_auth_token,
+            url_provider=self._current_auth_url,
+        )
+        # When the dialog renders a segment, update video_path and persist.
+        dlg.segment_rendered.connect(self._on_export_segment_rendered)
+        dlg.destroyed.connect(self._on_export_dialog_closed)
+        self._export_dialog = dlg
+
+        # Set a reasonable default output path
+        if self.project_path:
+            default_out = str(Path(self.project_path).with_suffix(".mp4"))
+        else:
+            default_out = str(self._app_temps_dir() / "export.mp4")
+        dlg._path_edit.setText(default_out)
+
+        dlg.show()
+
+    def _on_export_segment_rendered(self, segment_id: str, output_path: str) -> None:
+        """Called by ExportDialog when a segment finishes rendering."""
+        # Delegate to the normal render-finished handler so video_path is
+        # persisted, the timeline refreshes, and autosave fires.
+        self._on_render_finished(segment_id, output_path)
+
+    def _on_export_dialog_closed(self) -> None:
+        self._export_dialog = None  # type: ignore[assignment]
 
     def _on_preview_segment_requested(self, segment_id: str) -> None:
         """Toggle live preview mode for the segment.
