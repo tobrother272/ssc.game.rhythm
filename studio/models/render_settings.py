@@ -88,6 +88,7 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     horizon_frac: Optional[float] = None      # vanishing point height fraction (0.3-0.60)
     floor_spread_frac: Optional[float] = None # near-end runway width fraction (0.3-0.85)
     far_spread_frac: Optional[float] = None   # far-end (horizon) spread, independent of near
+    wall_floor_gap_frac: Optional[float] = None  # vertical gap between near wall bottom and floor (0-0.30)
 
 
 class PunchSettings(BaseRenderSettings):

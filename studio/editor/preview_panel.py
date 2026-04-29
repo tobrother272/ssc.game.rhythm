@@ -248,14 +248,15 @@ class FloorWallOverlay(QWidget):
     Moving near does NOT move far, and vice versa.
     """
 
-    # 4 floats: hit_frac, horizon_frac, near_spread, far_spread
-    changing  = Signal(float, float, float, float)
-    committed = Signal(float, float, float, float)
+    # 5 floats: hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac
+    changing  = Signal(float, float, float, float, float)
+    committed = Signal(float, float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
     _HORIZON_CLR = QColor(220, 170,   0)
     _WALL_CLR    = QColor(220,  60, 220)
+    _GAP_CLR     = QColor(255, 150,  50)   # orange gap handles
     # Far handles display scale: far_spread displayed at this fraction from centre
     _FAR_DISP    = 0.40
 
@@ -269,12 +270,13 @@ class FloorWallOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
 
-        self._hit_frac:     float = 0.86
-        self._horizon_frac: float = 0.45
-        self._near_spread:  float = 0.65   # controls floor_spread_frac
-        self._far_spread:   float = 0.65   # controls far_spread_frac (independent)
+        self._hit_frac:            float = 0.86
+        self._horizon_frac:        float = 0.45
+        self._near_spread:         float = 0.65   # controls floor_spread_frac
+        self._far_spread:          float = 0.65   # controls far_spread_frac (independent)
+        self._wall_floor_gap_frac: float = 0.0    # near-wall Y lifted above floor line
 
-        self._drag: str | None = None  # 'hit'|'horizon'|'wall_near'|'wall_far'
+        self._drag: str | None = None  # 'hit'|'horizon'|'wall_near'|'wall_far'|'gap_side'
 
     # ── public API ──────────────────────────────────────────────────────
     def set_fractions(
@@ -283,20 +285,24 @@ class FloorWallOverlay(QWidget):
         horizon_frac: float,
         near_spread: float,
         far_spread: float,
+        wall_floor_gap_frac: float = 0.0,
     ) -> None:
-        self._hit_frac     = max(0.70, min(0.95, float(hit_frac)))
-        self._horizon_frac = max(0.20, min(0.60, float(horizon_frac)))
-        self._near_spread  = max(0.20, min(3.00, float(near_spread)))
-        self._far_spread   = max(0.05, min(3.00, float(far_spread)))
+        self._hit_frac             = max(0.70, min(0.95, float(hit_frac)))
+        self._horizon_frac         = max(0.20, min(0.60, float(horizon_frac)))
+        self._near_spread          = max(0.20, min(3.00, float(near_spread)))
+        self._far_spread           = max(0.05, min(3.00, float(far_spread)))
+        self._wall_floor_gap_frac  = max(0.00, min(0.30, float(wall_floor_gap_frac)))
         self.update()
 
-    def get_fractions(self) -> tuple[float, float, float, float]:
-        return self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+    def get_fractions(self) -> tuple[float, float, float, float, float]:
+        return (self._hit_frac, self._horizon_frac,
+                self._near_spread, self._far_spread,
+                self._wall_floor_gap_frac)
 
     # ── geometry helpers ────────────────────────────────────────────────
     def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
     def _hz_y(self)    -> int: return int(self._horizon_frac * self.height())
-    # Near handles: at hit_y, near_spread from centre.
+    # Near handles: at hit_y (floor line), near_spread from centre.
     # "raw" = unclamped world position (may be outside widget).
     # "display" = clamped to widget edge so the circle is always clickable.
     def _near_rx_raw(self)     -> int: return int((0.5 + self._near_spread * 0.5) * self.width())
@@ -315,9 +321,24 @@ class FloorWallOverlay(QWidget):
     def _far_lx(self)  -> int:
         return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._far_lx_raw()))
 
+    # Gap handles sit at the two front-bottom wall corners:
+    # the intersection between front wall edge and wall bottom edge.
+    _GAP_MARGIN = 16   # px from widget left/right edge
+    def _gap_y(self)  -> int:
+        return int(self._hit_y() - self._wall_floor_gap_frac * self.height())
+    def _gap_lx(self) -> int: return self._GAP_MARGIN
+    def _gap_rx(self) -> int: return self.width() - self._GAP_MARGIN
+
     def _handle_at(self, pos: QPoint) -> str | None:
         r = self._HANDLE_R + 7
-        if abs(pos.y() - self._hit_y()) <= r and abs(pos.x() - self.width() // 2) <= r:
+        # Gap handles on the wall diagonal lines — checked before near handles
+        gy = self._gap_y()
+        if abs(pos.y() - gy) <= r and (
+            abs(pos.x() - self._gap_lx()) <= r or abs(pos.x() - self._gap_rx()) <= r
+        ):
+            return "gap_side"
+        ny = self._hit_y()
+        if abs(pos.y() - ny) <= r and abs(pos.x() - self.width() // 2) <= r:
             return "hit"
         if abs(pos.y() - self._hz_y()) <= r and abs(pos.x() - self.width() // 2) <= r:
             return "horizon"
@@ -326,7 +347,6 @@ class FloorWallOverlay(QWidget):
             abs(pos.x() - self._far_rx()) <= r or abs(pos.x() - self._far_lx()) <= r
         ):
             return "wall_far"
-        ny = self._hit_y()
         # Use clamped (display) positions for hit detection so handles at edge are clickable
         if abs(pos.y() - ny) <= r + 4 and (
             abs(pos.x() - self._near_rx()) <= r or abs(pos.x() - self._near_lx()) <= r
@@ -338,7 +358,6 @@ class FloorWallOverlay(QWidget):
     def mousePressEvent(self, ev) -> None:
         self._drag = self._handle_at(ev.pos())
         if self._drag in ("wall_near", "wall_far"):
-            # Grab so move events keep firing outside the widget bounds
             self.grabMouse()
 
     def mouseReleaseEvent(self, ev) -> None:
@@ -347,39 +366,47 @@ class FloorWallOverlay(QWidget):
         if self._drag:
             self._drag = None
             self.committed.emit(
-                self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+                self._hit_frac, self._horizon_frac, self._near_spread,
+                self._far_spread, self._wall_floor_gap_frac,
             )
 
     def mouseMoveEvent(self, ev) -> None:
         hover = self._handle_at(ev.pos()) if self._drag is None else None
         if hover:
-            self.setCursor(
-                Qt.CursorShape.SizeVerCursor if hover in ("hit", "horizon")
-                else Qt.CursorShape.SizeHorCursor
-            )
+            if hover in ("hit", "horizon", "gap_side"):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            elif hover == "wall_near":
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif self._drag is None:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
         if self._drag is None:
             return
         h, w = self.height(), self.width()
+
         if self._drag == "hit":
             self._hit_frac = max(0.70, min(0.95, ev.pos().y() / h))
+        elif self._drag == "gap_side":
+            # Drag the wall-bottom corner vertically: convert to wall-floor gap frac
+            gap_frac = (self._hit_y() - float(ev.pos().y())) / h
+            self._wall_floor_gap_frac = max(0.00, min(0.30, gap_frac))
         elif self._drag == "horizon":
             v = max(0.20, min(0.60, ev.pos().y() / h))
             if v < self._hit_frac - 0.05:
                 self._horizon_frac = v
         elif self._drag == "wall_near":
-            # Use raw ev.pos().x() — grabMouse() keeps events firing outside widget
             rx = float(ev.pos().x())
             self._near_spread = max(0.20, min(3.00, (rx / w - 0.5) * 2))
         elif self._drag == "wall_far":
-            # Use raw ev.pos().x() — grabMouse() keeps events firing outside widget
+            # Horizontal drag — grabMouse() keeps events firing outside widget
             rx = float(ev.pos().x())
             self._far_spread = max(0.05, min(3.00, (rx / w - 0.5) * 2 / self._FAR_DISP))
         self.update()
         self.changing.emit(
-            self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+            self._hit_frac, self._horizon_frac, self._near_spread,
+            self._far_spread, self._wall_floor_gap_frac,
         )
 
     # ── paint ────────────────────────────────────────────────────────────
@@ -419,13 +446,32 @@ class FloorWallOverlay(QWidget):
         p.setPen(QPen(self._WALL_CLR))
         p.drawText(self._far_rx() + rf + 4, fy + 4, "Far")
 
-        # Near handles (larger circles, labelled "Near")
+        # Near handles — horizontal spread only
         p.setBrush(QBrush(self._WALL_CLR))
         p.setPen(QPen(QColor(255, 255, 255), 1.5))
         for nx_pos in (self._near_lx(), self._near_rx()):
             p.drawEllipse(nx_pos - r, ny - r, r * 2, r * 2)
         p.setPen(QPen(self._WALL_CLR))
         p.drawText(self._near_rx() + r + 4, ny + 5, "Near")
+
+        # Gap handles — front-bottom wall corners (left/right)
+        # Drag vertically to change wall-floor gap.
+        rg = r + 2
+        gy = self._gap_y()
+        p.setBrush(QBrush(self._GAP_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for gx in (self._gap_lx(), self._gap_rx()):
+            p.drawEllipse(gx - rg, gy - rg, rg * 2, rg * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(gx, gy - rg + 3, gx, gy + rg - 3)
+            p.drawLine(gx - 4, gy - rg + 7, gx, gy - rg + 3)
+            p.drawLine(gx + 4, gy - rg + 7, gx, gy - rg + 3)
+            p.drawLine(gx - 4, gy + rg - 7, gx, gy + rg - 3)
+            p.drawLine(gx + 4, gy + rg - 7, gx, gy + rg - 3)
+            p.setBrush(QBrush(self._GAP_CLR))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        p.setPen(QPen(self._GAP_CLR))
+        p.drawText(self._gap_rx() + rg + 4, gy + 5, "Gap")
 
 
 def format_ms(ms: int) -> str:
@@ -452,9 +498,9 @@ class PreviewPanel(QWidget):
     # to ``segment.stickman_location``, and triggers a project save.
     stickman_location_changed = Signal(str, dict)
     # Emitted on mouse-release when the user finishes dragging a floor/wall
-    # handle.  Carries (hit_frac, horizon_frac, near_spread, far_spread).  MainWindow
-    # saves these into segment.render_settings and requests a preview update.
-    floor_wall_committed = Signal(float, float, float, float)
+    # handle.  Carries (hit, horizon, near_spread, far_spread, wall_floor_gap_frac).
+    # MainWindow saves these into segment.render_settings and requests a preview update.
+    floor_wall_committed = Signal(float, float, float, float, float)
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
     # auto-stopped because a different source was loaded (user
@@ -682,10 +728,11 @@ class PreviewPanel(QWidget):
             seg = self._selected_segment
             rs  = seg.render_settings if seg is not None else {}
             hit        = float(rs.get("floor_hit_frac")    or 0.86)
-            hz         = float(rs.get("horizon_frac")      or 0.45)
-            near_sp    = float(rs.get("floor_spread_frac") or 0.65)
-            far_sp     = float(rs.get("far_spread_frac")   or near_sp)
-            self.floor_wall_overlay.set_fractions(hit, hz, near_sp, far_sp)
+            hz         = float(rs.get("horizon_frac")         or 0.45)
+            near_sp    = float(rs.get("floor_spread_frac")    or 0.65)
+            far_sp     = float(rs.get("far_spread_frac")      or near_sp)
+            gap        = float(rs.get("wall_floor_gap_frac")  or 0.0)
+            self.floor_wall_overlay.set_fractions(hit, hz, near_sp, far_sp, gap)
             self._sync_floor_wall_overlay_pos()
             self.floor_wall_overlay.show()
             self._floor_wall_pos_timer.start()
@@ -694,7 +741,7 @@ class PreviewPanel(QWidget):
             self.floor_wall_overlay.hide()
 
     def _on_floor_wall_changing(
-        self, hit: float, hz: float, near_sp: float, far_sp: float
+        self, hit: float, hz: float, near_sp: float, far_sp: float, gap: float
     ) -> None:
         """Live-update the renderer while the user drags a handle."""
         if not self._live_active or self._live_renderer is None:
@@ -704,20 +751,22 @@ class PreviewPanel(QWidget):
             horizon_frac=hz,
             floor_spread_frac=near_sp,
             far_spread_frac=far_sp,
+            wall_floor_gap_frac=gap,
         )
         self._render_live_frame(self.player.position() / 1000.0)
 
     def _on_floor_wall_committed(
-        self, hit: float, hz: float, near_sp: float, far_sp: float
+        self, hit: float, hz: float, near_sp: float, far_sp: float, gap: float
     ) -> None:
         """Persist the final drag result and notify MainWindow."""
         seg = self._selected_segment
         if seg is not None:
-            seg.render_settings["floor_hit_frac"]    = round(hit,     4)
-            seg.render_settings["horizon_frac"]      = round(hz,      4)
-            seg.render_settings["floor_spread_frac"] = round(near_sp, 4)
-            seg.render_settings["far_spread_frac"]   = round(far_sp,  4)
-        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp)
+            seg.render_settings["floor_hit_frac"]       = round(hit,     4)
+            seg.render_settings["horizon_frac"]         = round(hz,      4)
+            seg.render_settings["floor_spread_frac"]    = round(near_sp, 4)
+            seg.render_settings["far_spread_frac"]      = round(far_sp,  4)
+            seg.render_settings["wall_floor_gap_frac"]  = round(gap,     4)
+        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp, gap)
 
     def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
         """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""

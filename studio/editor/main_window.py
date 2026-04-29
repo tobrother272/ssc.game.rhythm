@@ -1021,6 +1021,7 @@ class MainWindow(QMainWindow):
         horizon_frac: float,
         near_spread: float,
         far_spread: float,
+        wall_floor_gap_frac: float = 0.0,
     ) -> None:
         """Persist floor/wall drag result into the active segment's render_settings."""
         seg_id = self._preview_active_segment_id
@@ -1029,15 +1030,17 @@ class MainWindow(QMainWindow):
         seg = self.project.get_segment(seg_id)
         if seg is None:
             return
-        seg.render_settings["floor_hit_frac"]    = round(hit_frac,     4)
-        seg.render_settings["horizon_frac"]      = round(horizon_frac, 4)
-        seg.render_settings["floor_spread_frac"] = round(near_spread,  4)
-        seg.render_settings["far_spread_frac"]   = round(far_spread,   4)
+        seg.render_settings["floor_hit_frac"]       = round(hit_frac,            4)
+        seg.render_settings["horizon_frac"]         = round(horizon_frac,        4)
+        seg.render_settings["floor_spread_frac"]    = round(near_spread,         4)
+        seg.render_settings["far_spread_frac"]      = round(far_spread,          4)
+        seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
         self._on_project_changed()
         self.statusBar().showMessage(
             f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
             f"horizon:{horizon_frac*100:.1f}%  "
-            f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%",
+            f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%  "
+            f"gap:{wall_floor_gap_frac*100:.1f}%",
             2500,
         )
 
@@ -1776,10 +1779,11 @@ class MainWindow(QMainWindow):
             "rail_image":            _get("rail_image", None) or "",
             "rail_pulse":            str(_get("rail_pulse", "beat")),
             "rail_pulse_intensity":  float(_get("rail_pulse_intensity", 0.6)),
-            "floor_hit_frac":    _get("floor_hit_frac", None),
-            "horizon_frac":      _get("horizon_frac", None),
-            "floor_spread_frac": _get("floor_spread_frac", None),
-            "far_spread_frac":   _get("far_spread_frac", None),
+            "floor_hit_frac":       _get("floor_hit_frac", None),
+            "horizon_frac":         _get("horizon_frac", None),
+            "floor_spread_frac":    _get("floor_spread_frac", None),
+            "far_spread_frac":      _get("far_spread_frac", None),
+            "wall_floor_gap_frac":  _get("wall_floor_gap_frac", None),
             "max_per_lane": int(_get("max_per_lane", 2)),
             "block_speed": float(_get("speed", 0.8)),
             "beat_min_gap": int(_get("beat_min_gap", 4)),

@@ -407,6 +407,7 @@ class PerspectiveCamera:
                  hit_zone_frac: float = 0.86,
                  floor_spread_frac: float = 0.70,
                  far_spread_frac: float | None = None,
+                 wall_floor_gap_frac: float | None = None,
                  fov_deg: float = 55.0):
         self.W = W
         self.H = H
@@ -442,6 +443,21 @@ class PerspectiveCamera:
             (self.y_hit - self.cy_pix) * self.Z_NEAR / self.fy)
         # Tunnel-wall x at bottom of frame (~0.52*W each side)
         self.WALL_WORLD_X = (self.W * 0.52) * self.Z_NEAR / self.fx
+        # Wall bottom Y in world space.
+        # When `wall_floor_gap_frac` is provided (including 0.0) the editor
+        # is taking over the wall-floor relationship:
+        #   gap_pixels   = wall_floor_gap_frac * H
+        #   wall_screen_y = y_hit - gap_pixels
+        #   WALL_BOTTOM_WORLD_Y = (wall_screen_y - cy_pix) * Z_NEAR / fy
+        # gap=0 ⇒ wall bottom on the floor; gap>0 ⇒ wall lifted above floor.
+        # When None ⇒ legacy behaviour (renderers fall back to default).
+        if wall_floor_gap_frac is not None:
+            gap_pix = float(wall_floor_gap_frac) * H
+            wall_screen_y = self.y_hit - gap_pix
+            self.WALL_BOTTOM_WORLD_Y: float | None = (
+                (wall_screen_y - self.cy_pix) * self.Z_NEAR / self.fy)
+        else:
+            self.WALL_BOTTOM_WORLD_Y = None
 
         # Independent far-end spread: when set, the X projection is
         # linearly interpolated between 1.0 (at Z_NEAR) and the
@@ -3016,10 +3032,19 @@ class SideRailRenderer:
         self._ri_l   = -(outer_tile_x + gap)
         self._ro_l   = -(outer_tile_x + gap + box_depth)
 
-        # Box Y boundaries (lifted off floor)
-        lift         = self._height * self._BOX_LIFT_FRAC
-        self._bot_y  = cam.FLOOR_WORLD_Y - lift                   # box bottom
-        self._top_y  = cam.FLOOR_WORLD_Y - lift - self._height    # box top
+        # Box Y boundaries.  When the camera carries an explicit wall-floor
+        # gap (driven by the editor's "Gap" handles → wall_floor_gap_frac),
+        # the rail bottom snaps to that exact world Y so dragging the
+        # handles visibly moves the rail's bottom edge towards/away from
+        # the floor sides.  Without an override we use the legacy default
+        # lift (height × _BOX_LIFT_FRAC) so existing setups look identical.
+        if getattr(cam, "WALL_BOTTOM_WORLD_Y", None) is not None:
+            self._bot_y = float(cam.WALL_BOTTOM_WORLD_Y)
+            self._top_y = self._bot_y - self._height
+        else:
+            lift         = self._height * self._BOX_LIFT_FRAC
+            self._bot_y  = cam.FLOOR_WORLD_Y - lift
+            self._top_y  = cam.FLOOR_WORLD_Y - lift - self._height
 
         # Z grid
         self._z_slices = np.linspace(cam.Z_NEAR, cam.Z_FAR, 32)
@@ -4786,6 +4811,8 @@ class RhythmVisualizer:
             cam_kwargs["floor_spread_frac"] = float(self.FLOOR_SPREAD_FRAC)
         if self.FAR_SPREAD_FRAC is not None:
             cam_kwargs["far_spread_frac"] = float(self.FAR_SPREAD_FRAC)
+        if getattr(self, "WALL_FLOOR_GAP_FRAC", None) is not None:
+            cam_kwargs["wall_floor_gap_frac"] = float(self.WALL_FLOOR_GAP_FRAC)
         cam       = PerspectiveCamera(self.WIDTH, self.HEIGHT, **cam_kwargs)
         # Apply color overrides to all targets.
         Target.COLOR_LEFT  = self.CUBE_COLOR_LEFT
@@ -5686,6 +5713,9 @@ def parse_arguments():
     p.add_argument('--far_spread_frac', type=float, default=None,
                    help='Wall spread at far/horizon end (0.05-0.90). '
                         'None = same as near (standard perspective).')
+    p.add_argument('--wall_floor_gap_frac', type=float, default=None,
+                   help='Vertical gap between near-wall bottom and floor (0.0-0.30). '
+                        'None = wall sits exactly on floor.')
     p.add_argument('--floor_hit_frac', type=float, default=None,
                    help='Fraction of frame height where floor meets near-camera edge (0.70-0.95). '
                         'None = use per-mode default (0.86).')
@@ -5994,8 +6024,9 @@ if __name__ == '__main__':
     viz.FLOOR_PANEL_COLOR  = args.floor_panel_color or None
     viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
     viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
-    viz.FAR_SPREAD_FRAC        = args.far_spread_frac     # None or float
-    viz.FLOOR_HIT_FRAC         = args.floor_hit_frac     # None or float
+    viz.FAR_SPREAD_FRAC        = args.far_spread_frac        # None or float
+    viz.WALL_FLOOR_GAP_FRAC    = args.wall_floor_gap_frac   # None or float
+    viz.FLOOR_HIT_FRAC         = args.floor_hit_frac        # None or float
     viz.HORIZON_FRAC           = args.horizon_frac        # None or float
     viz.FLOOR_SPREAD_FRAC      = args.floor_spread_frac   # None or float
     viz.SHOW_SIDE_RAILS        = bool(args.side_rails)

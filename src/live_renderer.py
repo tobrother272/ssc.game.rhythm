@@ -198,6 +198,7 @@ class LiveFrameRenderer:
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
         far_spread_frac: Optional[float] = None,
+        wall_floor_gap_frac: Optional[float] = None,
         cube_color_left: Optional[tuple[int, int, int]] = None,
         cube_color_right: Optional[tuple[int, int, int]] = None,
         panel_neon_color: Optional[tuple[int, int, int]] = None,
@@ -231,10 +232,11 @@ class LiveFrameRenderer:
         self._rail_image = rail_image or None
         self._rail_pulse = str(rail_pulse)
         self._rail_pulse_intensity = float(rail_pulse_intensity)
-        self._floor_hit_frac    = float(floor_hit_frac)    if floor_hit_frac    is not None else None
-        self._horizon_frac      = float(horizon_frac)      if horizon_frac      is not None else None
-        self._floor_spread_frac = float(floor_spread_frac) if floor_spread_frac is not None else None
-        self._far_spread_frac   = float(far_spread_frac)   if far_spread_frac   is not None else None
+        self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
+        self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
+        self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
+        self._far_spread_frac     = float(far_spread_frac)     if far_spread_frac     is not None else None
+        self._wall_floor_gap_frac = float(wall_floor_gap_frac) if wall_floor_gap_frac is not None else None
         self._cube_color_left = cube_color_left
         self._cube_color_right = cube_color_right
         self._panel_neon_color = panel_neon_color
@@ -462,6 +464,7 @@ class LiveFrameRenderer:
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
         far_spread_frac: Optional[float] = None,
+        wall_floor_gap_frac: Optional[float] = None,
     ) -> None:
         """Hot-update camera perspective and rebuild the scene.
 
@@ -489,6 +492,11 @@ class LiveFrameRenderer:
             v = float(np.clip(far_spread_frac, 0.05, 3.00))
             if v != self._far_spread_frac:
                 self._far_spread_frac = v
+                changed = True
+        if wall_floor_gap_frac is not None:
+            v = float(np.clip(wall_floor_gap_frac, 0.00, 0.30))
+            if v != self._wall_floor_gap_frac:
+                self._wall_floor_gap_frac = v
                 changed = True
         if changed:
             self._build_scene()
@@ -627,6 +635,8 @@ class LiveFrameRenderer:
             cam_kwargs["floor_spread_frac"] = self._floor_spread_frac
         if self._far_spread_frac is not None:
             cam_kwargs["far_spread_frac"] = self._far_spread_frac
+        if self._wall_floor_gap_frac is not None:
+            cam_kwargs["wall_floor_gap_frac"] = self._wall_floor_gap_frac
         self._cam = PerspectiveCamera(self._width, self._height, **cam_kwargs)
         # Tunnel + decorative HUDs.  ``show_floor_panels`` is sourced
         # from the segment's render setting (default True) and is

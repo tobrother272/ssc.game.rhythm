@@ -595,6 +595,7 @@ class RenderService(QObject):
         "horizon_frac",
         "floor_spread_frac",
         "far_spread_frac",
+        "wall_floor_gap_frac",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
