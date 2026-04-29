@@ -182,6 +182,9 @@ class LiveFrameRenderer:
         show_stickman: bool = True,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: bool = True,
+        floor_panel_color: Optional[str] = None,
+        floor_panel_blink: bool = False,
+        floor_panel_image: Optional[str] = None,
         cube_color_left: Optional[tuple[int, int, int]] = None,
         cube_color_right: Optional[tuple[int, int, int]] = None,
         panel_neon_color: Optional[tuple[int, int, int]] = None,
@@ -204,6 +207,9 @@ class LiveFrameRenderer:
         self._show_stickman = bool(show_stickman)
         self._stickman_box = stickman_box
         self._show_floor_panels = bool(show_floor_panels)
+        self._floor_panel_color = floor_panel_color or None
+        self._floor_panel_blink = bool(floor_panel_blink)
+        self._floor_panel_image = floor_panel_image or None
         self._cube_color_left = cube_color_left
         self._cube_color_right = cube_color_right
         self._panel_neon_color = panel_neon_color
@@ -354,6 +360,9 @@ class LiveFrameRenderer:
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        floor_panel_color: Optional[str] = None,
+        floor_panel_blink: Optional[bool] = None,
+        floor_panel_image: Optional[str] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -386,6 +395,12 @@ class LiveFrameRenderer:
             self._stickman_box = tuple(stickman_box)  # type: ignore[assignment]
         if show_floor_panels is not None:
             self._show_floor_panels = bool(show_floor_panels)
+        if floor_panel_color is not None:
+            self._floor_panel_color = floor_panel_color or None
+        if floor_panel_blink is not None:
+            self._floor_panel_blink = bool(floor_panel_blink)
+        if floor_panel_image is not None:
+            self._floor_panel_image = floor_panel_image or None
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -530,6 +545,9 @@ class LiveFrameRenderer:
             self._cam,
             show_floor_panels=self._show_floor_panels,
             lane_tiles=True,
+            floor_panel_color=self._floor_panel_color,
+            floor_panel_blink=self._floor_panel_blink,
+            floor_panel_image=self._floor_panel_image,
         )
         self._particles = ParticleSystem()
         # Stickman action selection: combo runs use a dedicated

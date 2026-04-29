@@ -531,17 +531,38 @@ class TunnelRenderer:
     """Draws the receding 3D tunnel: floor grid + side walls with neon strips."""
 
     def __init__(self, cam: PerspectiveCamera, show_floor_panels: bool = True,
-                 lane_tiles: bool = False):
+                 lane_tiles: bool = False,
+                 floor_panel_color: str | None = None,
+                 floor_panel_blink: bool = False,
+                 floor_panel_image: str | None = None):
         """
         `lane_tiles`: when True, floor panels are drawn directly UNDER each
         lane (one column of tiles per lane, derived from `cam.lane_world_x`).
         Used by dance mode so the 4 lanes have visible "runway" tiles.
         When False (default), uses the original 2 columns flanking the
         center — matches the original punch-mode look.
+
+        `floor_panel_color`: optional hex string ("#RRGGBB") to override the
+        default grey neon color of floor tiles.
+        `floor_panel_blink`: when True tiles flash on/off each beat (derived
+        from a fixed half-second period so the preview matches the render).
+        `floor_panel_image`: optional image path; when set the image is
+        perspective-warped onto each tile instead of the flat grey fill.
         """
         self.cam = cam
         self.show_floor_panels = show_floor_panels
         self.lane_tiles = lane_tiles
+        self.floor_panel_color = floor_panel_color
+        self.floor_panel_blink = floor_panel_blink
+        # Pre-load the tile image (BGR) so we don't re-read on every frame.
+        self._tile_img: "np.ndarray | None" = None
+        if floor_panel_image:
+            try:
+                img = cv2.imread(floor_panel_image)
+                if img is not None:
+                    self._tile_img = img
+            except Exception:
+                pass
 
     def draw(self, canvas: np.ndarray, frame: int) -> np.ndarray:
         """Dark 3D tunnel with floor panels receding toward the horizon.
@@ -552,71 +573,107 @@ class TunnelRenderer:
         cam = self.cam
 
         if self.show_floor_panels:
-            # -- Floor panels (receding rows of grey tiles) ----------------
-            # `lane_tiles` mode: one tile column per lane (dance mode, 4
-            # lanes under the 4 viewport panels).  Legacy mode: two columns
-            # flanking center (punch mode).
-            tile_len  = 1.6                        # length along z
-            if self.lane_tiles and cam.n_lanes >= 2:
-                x_centers = tuple(cam.lane_world_x(i)
-                                  for i in range(cam.n_lanes))
-                # Tile half-width = 80% of lane spacing so adjacent rows
-                # almost touch but keep a visible neon seam between them.
-                step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
-                tile_w = max(0.25, step * 0.80)
+            # -- Blink: hide tiles on odd half-seconds --------------------
+            if self.floor_panel_blink and (frame // 15) % 2 == 1:
+                pass  # tiles invisible this half-second
             else:
-                x_centers = (-0.95, +0.95)
-                tile_w    = 0.55
-            z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
-            scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
+                # -- Floor panels (receding rows of grey tiles) ----------------
+                # `lane_tiles` mode: one tile column per lane (dance mode, 4
+                # lanes under the 4 viewport panels).  Legacy mode: two columns
+                # flanking center (punch mode).
+                tile_len  = 1.6                        # length along z
+                if self.lane_tiles and cam.n_lanes >= 2:
+                    x_centers = tuple(cam.lane_world_x(i)
+                                      for i in range(cam.n_lanes))
+                    # Tile half-width = 80% of lane spacing so adjacent rows
+                    # almost touch but keep a visible neon seam between them.
+                    step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+                    tile_w = max(0.25, step * 0.80)
+                else:
+                    x_centers = (-0.95, +0.95)
+                    tile_w    = 0.55
+                z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
+                scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
 
-            # Neutral grey neon for the floor panels (same hue as the tile
-            # fill, just brighter) – keeps the ground reading as ground while
-            # the punch cubes own the saturated green/red accent colors.
-            floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
+                # Resolve the glow color: custom hex or neutral grey default.
+                if self.floor_panel_color:
+                    try:
+                        hx = self.floor_panel_color.lstrip("#")
+                        r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+                        floor_glow_color = np.array([b, g, r], dtype=np.float32)
+                    except Exception:
+                        floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
+                else:
+                    # Neutral grey neon for the floor panels (same hue as the tile
+                    # fill, just brighter) – keeps the ground reading as ground while
+                    # the punch cubes own the saturated green/red accent colors.
+                    floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
 
-            floor_polys = []
-            for lane_i, xc in enumerate(x_centers):
-                for z_c in z_slots:
-                    wz = z_c - scroll
-                    if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
-                        continue
-                    corners = [
-                        (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                        (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                        (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                        (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                    ]
-                    proj = [cam.project(*c) for c in corners]
-                    if any(p is None for p in proj):
-                        continue
-                    depth_factor = max(0.08, min(1.0, 5.0 / wz))
-                    poly = np.array([(int(p[0]), int(p[1])) for p in proj],
-                                    dtype=np.int32)
-                    floor_polys.append((wz, poly, depth_factor, lane_i))
+                floor_polys = []
+                for lane_i, xc in enumerate(x_centers):
+                    for z_c in z_slots:
+                        wz = z_c - scroll
+                        if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
+                            continue
+                        corners = [
+                            (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                            (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                            (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                            (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                        ]
+                        proj = [cam.project(*c) for c in corners]
+                        if any(p is None for p in proj):
+                            continue
+                        depth_factor = max(0.08, min(1.0, 5.0 / wz))
+                        poly = np.array([(int(p[0]), int(p[1])) for p in proj],
+                                        dtype=np.int32)
+                        floor_polys.append((wz, poly, depth_factor, lane_i))
 
-            floor_polys.sort(key=lambda t: -t[0])  # far first
+                floor_polys.sort(key=lambda t: -t[0])  # far first
 
-            # Pass 1: dark grey fill for each tile (ground-panel feel).
-            for _, poly, df, _ in floor_polys:
-                base = int(45 * df)
-                cv2.fillPoly(canvas, [poly], (base, base + 2, base + 2),
-                             lineType=cv2.LINE_AA)
+                # Pass 1: fill each tile — image-warp or flat color.
+                if self._tile_img is not None:
+                    # Perspective-warp the source image onto each tile poly.
+                    ih, iw = self._tile_img.shape[:2]
+                    src_pts = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]],
+                                       dtype=np.float32)
+                    for _, poly, df, _ in floor_polys:
+                        dst_pts = poly.astype(np.float32)
+                        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                        warped = cv2.warpPerspective(
+                            self._tile_img, M, (canvas.shape[1], canvas.shape[0])
+                        )
+                        # Blend warped image into canvas only inside tile poly.
+                        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+                        cv2.fillPoly(mask, [poly], 255)
+                        alpha = min(1.0, 0.25 + 0.75 * df)
+                        canvas[mask > 0] = cv2.addWeighted(
+                            canvas, 1.0 - alpha, warped, alpha, 0
+                        )[mask > 0]
+                else:
+                    for _, poly, df, _ in floor_polys:
+                        if self.floor_panel_color:
+                            # Tint with custom color, scale by depth.
+                            fill = tuple(int(c * df * 0.4) for c in
+                                         (int(floor_glow_color[0]),
+                                          int(floor_glow_color[1]),
+                                          int(floor_glow_color[2])))
+                        else:
+                            base = int(45 * df)
+                            fill = (base, base + 2, base + 2)
+                        cv2.fillPoly(canvas, [poly], fill, lineType=cv2.LINE_AA)
 
-            # Pass 2: rim outline.  In `lane_tiles` mode we want the
-            # runway tiles to read as a QUIET grid so the bright DanceTarget
-            # stomp-pads pop on top; in legacy (punch) mode we keep the
-            # original neon glow that gives the tunnel its energetic feel.
-            if self.lane_tiles:
-                for _, poly, df, _ in floor_polys:
-                    c = int(60 + 60 * df)             # dim grey, 60..120
-                    cv2.polylines(canvas, [poly], True, (c, c, c), 1,
-                                  lineType=cv2.LINE_AA)
-            else:
-                for _, poly, df, _ in floor_polys:
-                    glow = floor_glow_color * (0.40 + 0.60 * df)
-                    thickness = max(1, int(round(1 + df * 1.2)))
-                    _draw_neon_edges(canvas, [poly], glow, thickness)
+                # Pass 2: rim outline.
+                if self.lane_tiles:
+                    for _, poly, df, _ in floor_polys:
+                        c = int(60 + 60 * df)
+                        cv2.polylines(canvas, [poly], True, (c, c, c), 1,
+                                      lineType=cv2.LINE_AA)
+                else:
+                    for _, poly, df, _ in floor_polys:
+                        glow = floor_glow_color * (0.40 + 0.60 * df)
+                        thickness = max(1, int(round(1 + df * 1.2)))
+                        _draw_neon_edges(canvas, [poly], glow, thickness)
 
         # -- Faint horizon / runway glow line (ambient neon) --
         y_hz = int(cam.cy_pix + 2)
@@ -4462,7 +4519,10 @@ class RhythmVisualizer:
         # tiles should also be drawn 1-per-lane (matches the 4 viewport
         # panels below them and the 4 rails targets fly along).
         tunnel    = TunnelRenderer(cam, show_floor_panels=self.SHOW_FLOOR_PANELS,
-                                   lane_tiles=True)
+                                   lane_tiles=True,
+                                   floor_panel_color=getattr(self, "FLOOR_PANEL_COLOR", None),
+                                   floor_panel_blink=getattr(self, "FLOOR_PANEL_BLINK", False),
+                                   floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None))
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
         # mode's action library.  Solo 'line' uses its own 'line' action
@@ -5300,6 +5360,12 @@ def parse_arguments():
                          'running down the tunnel. 0 = hide (minimal tunnel, '
                          'only the viewport panels remain on the ground). '
                          'Default 1.'))
+    p.add_argument('--floor_panel_color', type=str, default=None, metavar='#RRGGBB',
+                   help='Custom hex color for floor tile neon (e.g. #4af0c8). Default grey.')
+    p.add_argument('--floor_panel_blink', type=int, default=0, metavar='0|1',
+                   help='Flash floor tiles on/off each half-second. Default 0.')
+    p.add_argument('--floor_panel_image', type=str, default=None, metavar='PATH',
+                   help='Image file to perspective-warp onto floor tiles instead of flat fill.')
     p.add_argument('--stickman', type=int, default=1, metavar='0|1',
                    help=('Show the left-column stickman fighter. 0 = hide '
                          '(useful when compositing a standalone stickman '
@@ -5599,8 +5665,11 @@ if __name__ == '__main__':
     viz.CUBE_MODEL_LEFT   = args.cube_model_left
     viz.CUBE_MODEL_RIGHT  = args.cube_model_right
     viz.MESH_WIREFRAME    = args.mesh_wireframe
-    viz.SHOW_FLOOR_PANELS = bool(args.floor_panels)
-    viz.SHOW_STICKMAN     = bool(args.stickman)
+    viz.SHOW_FLOOR_PANELS  = bool(args.floor_panels)
+    viz.FLOOR_PANEL_COLOR  = args.floor_panel_color or None
+    viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
+    viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
+    viz.SHOW_STICKMAN      = bool(args.stickman)
     viz.STICK_X0          = int(args.stick_x0)
     viz.STICK_Y0          = int(args.stick_y0)
     viz.STICK_W           = int(args.stick_w)

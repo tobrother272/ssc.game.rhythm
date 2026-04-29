@@ -210,6 +210,19 @@ QPushButton#accentButton:hover { background-color: #4f8dff; }
 QPushButton#accentButton:pressed { background-color: #2f6fdb; }
 QPushButton#accentButton:disabled { background-color: #1e3a6e; color: #6a8fc8; }
 
+/* Update Worker button — muted amber, sits left of Export */
+QPushButton#updateWorkerButton {
+    background-color: #78530a;
+    color: #f5d078;
+    border: 1px solid #a0720e;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-weight: 600;
+    margin-right: 6px;
+}
+QPushButton#updateWorkerButton:hover { background-color: #9a6b10; color: #ffe8a0; }
+QPushButton#updateWorkerButton:pressed { background-color: #5a3d06; }
+
 /* Preview play button — teal/green accent, sits left of Render */
 QPushButton#previewButton {
     background-color: #0d9488;

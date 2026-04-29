@@ -36,6 +36,7 @@ from studio.core_bridge import (
     WaveformService,
 )
 from studio.editor.export_dialog import ExportDialog
+from studio.editor.worker_update_dialog import WorkerUpdateDialog
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
 from studio.editor.segment_config_panel import SegmentConfigPanel
@@ -279,7 +280,9 @@ class MainWindow(QMainWindow):
         render_menu.addAction("Render All", self._render_all_segments)
 
         menu.addMenu("Edit")
-        menu.addMenu("Help")
+
+        help_menu = menu.addMenu("Help")
+        help_menu.addAction("Update Worker…", self._on_update_worker_clicked)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
@@ -1409,6 +1412,11 @@ class MainWindow(QMainWindow):
 
     # ── Export flow ──────────────────────────────────────────────────────────
 
+    def _on_update_worker_clicked(self) -> None:
+        """Open the rhythm_worker.exe download dialog."""
+        dlg = WorkerUpdateDialog(parent=self)
+        dlg.exec()
+
     def _on_export_button_clicked(self) -> None:
         """Show the detailed Export dialog (stays open; user closes manually)."""
         if not self.project.segments:
@@ -1630,6 +1638,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Loading preview for '{segment.name}'…", 0
         )
+        self.segment_panel.set_preview_loading(True)
         worker.start()
 
     def _cancel_preview_worker(self) -> None:
@@ -1639,11 +1648,13 @@ class MainWindow(QMainWindow):
             self._preview_worker.quit()
             self._preview_worker = None
             self._preview_worker_segment_id = None
+            self.segment_panel.set_preview_loading(False)
 
     def _on_renderer_ready(self, renderer: object, segment: Segment, audio_path: str) -> None:
         """Called on the UI thread when the background worker finishes."""
         self._preview_worker = None
         self._preview_worker_segment_id = None
+        self.segment_panel.set_preview_loading(False)
 
         # User may have clicked Stop while we were loading.
         if self._preview_mode_active:
@@ -1684,6 +1695,7 @@ class MainWindow(QMainWindow):
         """Called on the UI thread when the background worker raises."""
         self._preview_worker = None
         self._preview_worker_segment_id = None
+        self.segment_panel.set_preview_loading(False)
         self.statusBar().showMessage(
             f"Preview failed to initialise: {error_msg}", 6000
         )
@@ -1724,6 +1736,9 @@ class MainWindow(QMainWindow):
             "bloom": False,  # always off for live preview (8–15 ms / frame)
             "show_stickman": bool(_get("stickman", True)),
             "show_floor_panels": bool(_get("floor_panels", True)),
+            "floor_panel_color": _get("floor_panel_color", None) or "",
+            "floor_panel_blink": bool(_get("floor_panel_blink", False)),
+            "floor_panel_image": _get("floor_panel_image", None) or "",
             "max_per_lane": int(_get("max_per_lane", 2)),
             "block_speed": float(_get("speed", 0.8)),
             "beat_min_gap": int(_get("beat_min_gap", 4)),
@@ -1879,6 +1894,11 @@ class MainWindow(QMainWindow):
             rs = segment.render_settings or {}
             show_stickman = bool(rs.get("stickman", True))
             show_floor_panels = bool(rs.get("floor_panels", True))
+            # Use "" (not None) so update_mode's "if x is not None" guard
+            # fires even when the user has cleared the value — "" or None → None.
+            floor_panel_color = rs.get("floor_panel_color") or ""
+            floor_panel_blink = bool(rs.get("floor_panel_blink", False))
+            floor_panel_image = rs.get("floor_panel_image") or ""
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -1896,6 +1916,9 @@ class MainWindow(QMainWindow):
                     show_stickman=show_stickman,
                     stickman_box=stickman_box,
                     show_floor_panels=show_floor_panels,
+                    floor_panel_color=floor_panel_color,
+                    floor_panel_blink=floor_panel_blink,
+                    floor_panel_image=floor_panel_image,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

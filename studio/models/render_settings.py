@@ -51,6 +51,9 @@ class BaseRenderSettings(BaseModel):
     beat_min_gap: int = 4
     bloom: bool = True
     floor_panels: bool = True
+    floor_panel_color: Optional[str] = None    # hex e.g. "#4af0c8"; None = default grey
+    floor_panel_blink: bool = False            # tiles flash on every beat
+    floor_panel_image: Optional[str] = None   # image file overlaid on tiles; None = draw shapes
     stickman: bool = True
 
 

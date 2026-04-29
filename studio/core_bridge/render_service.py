@@ -578,6 +578,9 @@ class RenderService(QObject):
         "speed",
         "max_per_lane",
         "floor_panels",
+        "floor_panel_color",
+        "floor_panel_blink",
+        "floor_panel_image",
         "stickman",
         "line_zigzag",
     })

@@ -9,13 +9,16 @@ from typing import Optional
 
 
 
-from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +30,34 @@ from PySide6.QtWidgets import (
 )
 
 from studio.models import Project, Segment, build_settings
+
+
+class _NoScrollWheelFilter(QObject):
+    """Event filter that drops wheel events unless the widget has keyboard focus.
+
+    Install this on any QSpinBox / QDoubleSpinBox / QComboBox to prevent
+    accidental value changes while the user is scrolling the config panel.
+    """
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.Wheel:
+            # Only let the wheel through when the widget is actively focused
+            # (i.e. the user clicked into it first).
+            if not obj.hasFocus():
+                event.ignore()
+                return True   # consumed — do NOT propagate to the widget
+        return super().eventFilter(obj, event)
+
+
+def _no_scroll(widget: QWidget) -> QWidget:
+    """Attach the wheel-lock filter and set StrongFocus on *widget*, then return it."""
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_NO_SCROLL_FILTER)
+    return widget
+
+
+# Single shared instance — stateless, safe to reuse across all widgets.
+_NO_SCROLL_FILTER = _NoScrollWheelFilter()
 
 
 class _ModeListWidget(QWidget):
@@ -63,6 +94,118 @@ class _ModeListWidget(QWidget):
         return selected or ["punch"]
 
 
+class _FloorPanelSection(QGroupBox):
+    """Collapsible config sub-section for floor panel customisation.
+
+    Shown/hidden by the parent form based on the "Floor panels" toggle.
+    Emits ``changed`` when any of its controls changes so the parent can
+    persist the values immediately.
+    """
+
+    changed = Signal()
+
+    def __init__(self, color: str | None, blink: bool, image: str | None,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__("Floor Panel Options", parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # ---- Color picker ----
+        # Wrap button in an HBoxLayout so it left-aligns and doesn't stretch
+        # across the full field width (a bare QPushButton in a form row
+        # stretches by default and gets clipped when the panel is narrow).
+        color_row = QWidget()
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(0)
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._color_btn.setMaximumWidth(160)
+        self._color_btn.setToolTip("Click to choose the neon color for floor tiles")
+        self._color: str | None = color
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        color_layout.addWidget(self._color_btn)
+        color_layout.addStretch()
+        form.addRow("Tile color", color_row)
+
+        # ---- Blink checkbox ----
+        blink_row = QWidget()
+        blink_layout = QHBoxLayout(blink_row)
+        blink_layout.setContentsMargins(0, 0, 0, 0)
+        self._blink_cb = QCheckBox()
+        self._blink_cb.setChecked(bool(blink))
+        self._blink_cb.setToolTip("Flash tiles on/off every half-second")
+        self._blink_cb.stateChanged.connect(self.changed)
+        blink_layout.addWidget(self._blink_cb)
+        blink_layout.addStretch()
+        form.addRow("Blink to beat", blink_row)
+
+        # ---- Image file chooser ----
+        self._img_row = QWidget()
+        img_layout = QHBoxLayout(self._img_row)
+        img_layout.setContentsMargins(0, 0, 0, 0)
+        img_layout.setSpacing(4)
+        self._img_edit = QLineEdit(image or "")
+        self._img_edit.setPlaceholderText("Image file (optional)…")
+        self._img_edit.setToolTip(
+            "Image to warp onto floor tiles instead of flat fill.\n"
+            "Leave blank to use the default shape fill."
+        )
+        self._img_edit.editingFinished.connect(self.changed)
+        img_browse = QPushButton("…")
+        img_browse.setFixedWidth(28)
+        img_browse.setToolTip("Browse for an image file")
+        img_browse.clicked.connect(self._browse_image)
+        img_layout.addWidget(self._img_edit)
+        img_layout.addWidget(img_browse)
+        form.addRow("Tile image", self._img_row)
+
+    # ------------------------------------------------------------------
+    def _refresh_color_btn(self) -> None:
+        if self._color:
+            self._color_btn.setText(self._color)
+            self._color_btn.setStyleSheet(
+                f"background-color:{self._color}; color: #fff;"
+                f" border:1px solid #888; border-radius:3px;"
+            )
+        else:
+            self._color_btn.setText("Default")
+            self._color_btn.setStyleSheet("")
+
+    def _pick_color(self) -> None:
+        initial = QColor(self._color) if self._color else QColor(170, 175, 180)
+        color = QColorDialog.getColor(initial, self, "Floor tile color")
+        if color.isValid():
+            self._color = color.name()
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _browse_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select tile image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+        )
+        if path:
+            self._img_edit.setText(path)
+            self.changed.emit()
+
+    # ------------------------------------------------------------------
+    def get_color(self) -> str | None:
+        return self._color or None
+
+    def get_blink(self) -> bool:
+        return self._blink_cb.isChecked()
+
+    def get_image(self) -> str | None:
+        t = self._img_edit.text().strip()
+        return t or None
+
+
 def format_sec(value: float) -> str:
     total = max(0, int(value))
     mm, ss = divmod(total, 60)
@@ -81,6 +224,7 @@ class SegmentConfigPanel(QWidget):
         self._project: Optional[Project] = None
         self._segment: Optional[Segment] = None
         self._setting_widgets: dict[str, QWidget] = {}
+        self._floor_panel_section: Optional[_FloorPanelSection] = None
         self._build_ui()
         self._set_empty_state(True)
 
@@ -213,6 +357,7 @@ class SegmentConfigPanel(QWidget):
 
         self.audio_combo = QComboBox()
         self.audio_combo.currentIndexChanged.connect(self._commit_general)
+        _no_scroll(self.audio_combo)
         self.form_layout.addRow("Audio source", self.audio_combo)
 
         # Trimmed audio path — read-only display + "Open" button to reveal
@@ -242,12 +387,14 @@ class SegmentConfigPanel(QWidget):
         self.start_spin.setRange(0.0, 36000.0)
         self.start_spin.setDecimals(2)
         self.start_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.start_spin)
         self.form_layout.addRow("Start (s)", self.start_spin)
 
         self.end_spin = QDoubleSpinBox()
         self.end_spin.setRange(0.0, 36000.0)
         self.end_spin.setDecimals(2)
         self.end_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.end_spin)
         self.form_layout.addRow("End (s)", self.end_spin)
 
         # Min beat spacing — anti-cluster filter for *Gen by Chart*.
@@ -276,12 +423,14 @@ class SegmentConfigPanel(QWidget):
             "0.20–0.30 s    = aggressive merge for very dense audio."
         )
         self.min_spacing_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.min_spacing_spin)
         self.form_layout.addRow("Min beat spacing", self.min_spacing_spin)
 
         self.mode_combo = QComboBox()
         for mode in ["punch", "dance", "line", "relax", "combo"]:
             self.mode_combo.addItem(mode.capitalize(), mode)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        _no_scroll(self.mode_combo)
         self.form_layout.addRow("Mode", self.mode_combo)
 
         self.dynamic_root = QWidget()
@@ -489,6 +638,7 @@ class SegmentConfigPanel(QWidget):
         while self.dynamic_layout.rowCount() > 0:
             self.dynamic_layout.removeRow(0)
         self._setting_widgets.clear()
+        self._floor_panel_section = None
 
     # Fields always shown in the Properties panel, in display order.
     _VISIBLE_FIELDS = (
@@ -537,6 +687,7 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings = persist_defaults
 
         mode_extras = self._MODE_EXTRA_FIELDS.get(segment.mode, ())
+        rs = segment.render_settings or {}
         for key in self._VISIBLE_FIELDS + mode_extras:
             # Prefer the full dump so Optional fields with value=None still
             # get a widget (their key may be absent from persist_defaults).
@@ -552,6 +703,26 @@ class SegmentConfigPanel(QWidget):
             self._setting_widgets[key] = widget
             label = self._FIELD_LABELS.get(key, key.replace("_", " ").capitalize())
             self.dynamic_layout.addRow(label, widget)
+
+            # Inject the floor panel sub-section immediately after the
+            # "floor_panels" toggle row so it appears visually grouped.
+            if key == "floor_panels":
+                section = _FloorPanelSection(
+                    color=rs.get("floor_panel_color") or None,
+                    blink=bool(rs.get("floor_panel_blink", False)),
+                    image=rs.get("floor_panel_image") or None,
+                    parent=self,
+                )
+                section.setVisible(bool(value))
+                section.changed.connect(self._commit_floor_panel_section)
+                self.dynamic_layout.addRow(section)
+                self._floor_panel_section = section
+                # Connect checkbox to show/hide the section.
+                widget.stateChanged.connect(
+                    lambda state, s=section:
+                        s.setVisible(state == Qt.CheckState.Checked.value
+                                     or state == 2)  # Qt5/Qt6 compat
+                )
 
     # Per-key UI hints (range, step, decimals, tooltip).
     # Keys not listed fall back to generic wide-range spinboxes.
@@ -607,7 +778,7 @@ class SegmentConfigPanel(QWidget):
                 widget.setRange(-100000, 100000)
             widget.setValue(value)
             widget.valueChanged.connect(self._commit_settings)
-            return widget
+            return _no_scroll(widget)
 
         if isinstance(value, float):
             widget = QDoubleSpinBox()
@@ -622,7 +793,7 @@ class SegmentConfigPanel(QWidget):
                 widget.setDecimals(3)
             widget.setValue(value)
             widget.valueChanged.connect(self._commit_settings)
-            return widget
+            return _no_scroll(widget)
 
         if key == "mode_list":
             # Combo sub-mode selector: list of punch/dance/line/relax.
@@ -646,7 +817,7 @@ class SegmentConfigPanel(QWidget):
                 "Horizontal = chain alternates left/right lanes"
             )
             combo.currentIndexChanged.connect(self._commit_settings)
-            return combo
+            return _no_scroll(combo)
 
         if isinstance(value, str):
             if key == "beat_source":
@@ -660,7 +831,7 @@ class SegmentConfigPanel(QWidget):
                     "onset = every transient"
                 )
                 combo.currentIndexChanged.connect(self._commit_settings)
-                return combo
+                return _no_scroll(combo)
             line = QLineEdit(value)
             line.editingFinished.connect(self._commit_settings)
             return line
@@ -723,8 +894,25 @@ class SegmentConfigPanel(QWidget):
             return
         for key, widget in self._setting_widgets.items():
             segment.render_settings[key] = self._collect_setting_widget_value(key, widget)
+        # Also persist floor panel sub-section values (if section exists).
+        if self._floor_panel_section is not None:
+            sec = self._floor_panel_section
+            segment.render_settings["floor_panel_color"] = sec.get_color()
+            segment.render_settings["floor_panel_blink"] = sec.get_blink()
+            segment.render_settings["floor_panel_image"] = sec.get_image()
         validated = build_settings(segment.mode, segment.render_settings)
         segment.render_settings = validated.model_dump(mode="json", exclude_none=True)
+        self.segment_changed.emit(segment.id)
+
+    def _commit_floor_panel_section(self) -> None:
+        """Called when any floor panel sub-section control changes."""
+        segment = self._segment
+        if segment is None or self._floor_panel_section is None:
+            return
+        sec = self._floor_panel_section
+        segment.render_settings["floor_panel_color"] = sec.get_color()
+        segment.render_settings["floor_panel_blink"] = sec.get_blink()
+        segment.render_settings["floor_panel_image"] = sec.get_image()
         self.segment_changed.emit(segment.id)
 
     def _on_preview_clicked(self) -> None:
@@ -745,6 +933,8 @@ class SegmentConfigPanel(QWidget):
         """
         if not hasattr(self, "preview_button"):
             return
+        # Stop any in-progress loading animation first.
+        self.set_preview_loading(False)
         # ``blockSignals`` would also work, but Qt's QAbstractButton
         # only fires ``clicked`` from a real user click — programmatic
         # ``setChecked`` does not — so we don't need the guard.
@@ -759,6 +949,52 @@ class SegmentConfigPanel(QWidget):
         else:
             self.preview_button.setText("▶  Preview")
             self.preview_button.setToolTip(self._preview_default_tooltip)
+
+    # Loading animation frames — cycled by _preview_loading_timer
+    _LOADING_FRAMES = ["⠋  Loading…", "⠙  Loading…", "⠹  Loading…",
+                       "⠸  Loading…", "⠼  Loading…", "⠴  Loading…",
+                       "⠦  Loading…", "⠧  Loading…", "⠇  Loading…", "⠏  Loading…"]
+
+    def set_preview_loading(self, loading: bool) -> None:
+        """Show/hide a spinner animation on the Preview button while the
+        renderer worker is building (~1-3 s)."""
+        if not hasattr(self, "preview_button"):
+            return
+
+        # Lazily create the animation timer once.
+        if not hasattr(self, "_preview_loading_timer"):
+            self._preview_loading_timer = QTimer(self)
+            self._preview_loading_timer.setInterval(80)
+            self._preview_loading_frame = 0
+            self._preview_loading_timer.timeout.connect(self._tick_preview_loading)
+
+        if loading:
+            if self._preview_loading_timer.isActive():
+                return  # already loading
+            self._preview_loading_frame = 0
+            self.preview_button.setChecked(False)
+            self.preview_button.setEnabled(False)
+            self.preview_button.setToolTip(
+                "Renderer is initialising (audio analysis + scene build).\n"
+                "Click to cancel."
+            )
+            self._preview_loading_timer.start()
+            self._tick_preview_loading()
+        else:
+            self._preview_loading_timer.stop()
+            # Restore normal idle state (set_preview_active will set the
+            # final label, so we only reset here if not already active).
+            if not self.preview_button.isChecked():
+                self.preview_button.setText("▶  Preview")
+                self.preview_button.setEnabled(
+                    self._segment is not None and bool(getattr(self._segment, "audio_path", None))
+                )
+                self.preview_button.setToolTip(self._preview_default_tooltip)
+
+    def _tick_preview_loading(self) -> None:
+        frames = self._LOADING_FRAMES
+        self.preview_button.setText(frames[self._preview_loading_frame % len(frames)])
+        self._preview_loading_frame += 1
 
     def _on_render_clicked(self) -> None:
         if self._segment is None:
