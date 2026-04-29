@@ -583,6 +583,18 @@ class RenderService(QObject):
         "floor_panel_image",
         "stickman",
         "line_zigzag",
+        "side_rails",
+        "rail_color",
+        "rail_shape",
+        "rail_height",
+        "rail_offset_x",
+        "rail_image",
+        "rail_pulse",
+        "rail_pulse_intensity",
+        "floor_hit_frac",
+        "horizon_frac",
+        "floor_spread_frac",
+        "far_spread_frac",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any

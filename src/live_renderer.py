@@ -98,6 +98,7 @@ from rhythm import (  # noqa: E402
     PerspectiveCamera,
     PunchTarget,
     RelaxTarget,
+    SideRailRenderer,
     StickmanHUD,
     Target,
     TunnelRenderer,
@@ -185,6 +186,18 @@ class LiveFrameRenderer:
         floor_panel_color: Optional[str] = None,
         floor_panel_blink: bool = False,
         floor_panel_image: Optional[str] = None,
+        show_side_rails: bool = False,
+        rail_color: str = "#FF60FF",
+        rail_shape: str = "chunky",
+        rail_height: float = 0.14,
+        rail_offset_x: float = 0.08,
+        rail_image: Optional[str] = None,
+        rail_pulse: str = "beat",
+        rail_pulse_intensity: float = 0.6,
+        floor_hit_frac: Optional[float] = None,
+        horizon_frac: Optional[float] = None,
+        floor_spread_frac: Optional[float] = None,
+        far_spread_frac: Optional[float] = None,
         cube_color_left: Optional[tuple[int, int, int]] = None,
         cube_color_right: Optional[tuple[int, int, int]] = None,
         panel_neon_color: Optional[tuple[int, int, int]] = None,
@@ -210,6 +223,18 @@ class LiveFrameRenderer:
         self._floor_panel_color = floor_panel_color or None
         self._floor_panel_blink = bool(floor_panel_blink)
         self._floor_panel_image = floor_panel_image or None
+        self._show_side_rails = bool(show_side_rails)
+        self._rail_color = str(rail_color)
+        self._rail_shape = str(rail_shape)
+        self._rail_height = float(rail_height)
+        self._rail_offset_x = float(rail_offset_x)
+        self._rail_image = rail_image or None
+        self._rail_pulse = str(rail_pulse)
+        self._rail_pulse_intensity = float(rail_pulse_intensity)
+        self._floor_hit_frac    = float(floor_hit_frac)    if floor_hit_frac    is not None else None
+        self._horizon_frac      = float(horizon_frac)      if horizon_frac      is not None else None
+        self._floor_spread_frac = float(floor_spread_frac) if floor_spread_frac is not None else None
+        self._far_spread_frac   = float(far_spread_frac)   if far_spread_frac   is not None else None
         self._cube_color_left = cube_color_left
         self._cube_color_right = cube_color_right
         self._panel_neon_color = panel_neon_color
@@ -363,6 +388,14 @@ class LiveFrameRenderer:
         floor_panel_color: Optional[str] = None,
         floor_panel_blink: Optional[bool] = None,
         floor_panel_image: Optional[str] = None,
+        show_side_rails: Optional[bool] = None,
+        rail_color: Optional[str] = None,
+        rail_shape: Optional[str] = None,
+        rail_height: Optional[float] = None,
+        rail_offset_x: Optional[float] = None,
+        rail_image: Optional[str] = None,
+        rail_pulse: Optional[str] = None,
+        rail_pulse_intensity: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -401,10 +434,65 @@ class LiveFrameRenderer:
             self._floor_panel_blink = bool(floor_panel_blink)
         if floor_panel_image is not None:
             self._floor_panel_image = floor_panel_image or None
+        if show_side_rails is not None:
+            self._show_side_rails = bool(show_side_rails)
+        if rail_color is not None:
+            self._rail_color = str(rail_color)
+        if rail_shape is not None:
+            self._rail_shape = str(rail_shape)
+        if rail_height is not None:
+            self._rail_height = float(rail_height)
+        if rail_offset_x is not None:
+            self._rail_offset_x = float(rail_offset_x)
+        if rail_image is not None:
+            self._rail_image = rail_image or None
+        if rail_pulse is not None:
+            self._rail_pulse = str(rail_pulse)
+        if rail_pulse_intensity is not None:
+            self._rail_pulse_intensity = float(rail_pulse_intensity)
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
         self._cur_fi = -1
+
+    def update_floor_wall(
+        self,
+        *,
+        floor_hit_frac: Optional[float] = None,
+        horizon_frac: Optional[float] = None,
+        floor_spread_frac: Optional[float] = None,
+        far_spread_frac: Optional[float] = None,
+    ) -> None:
+        """Hot-update camera perspective and rebuild the scene.
+
+        Pass ``None`` to keep the current override value unchanged.
+        Pass a float to apply a new override.  The camera is rebuilt so
+        the next ``render_at`` call reflects the new geometry.
+        """
+        changed = False
+        if floor_hit_frac is not None:
+            v = float(np.clip(floor_hit_frac, 0.70, 0.95))
+            if v != self._floor_hit_frac:
+                self._floor_hit_frac = v
+                changed = True
+        if horizon_frac is not None:
+            v = float(np.clip(horizon_frac, 0.20, 0.60))
+            if v != self._horizon_frac:
+                self._horizon_frac = v
+                changed = True
+        if floor_spread_frac is not None:
+            v = float(np.clip(floor_spread_frac, 0.20, 3.00))
+            if v != self._floor_spread_frac:
+                self._floor_spread_frac = v
+                changed = True
+        if far_spread_frac is not None:
+            v = float(np.clip(far_spread_frac, 0.05, 3.00))
+            if v != self._far_spread_frac:
+                self._far_spread_frac = v
+                changed = True
+        if changed:
+            self._build_scene()
+            self._cur_fi = -1
 
     def close(self) -> None:
         """Release references so Python can free large ndarrays sooner.
@@ -418,6 +506,7 @@ class LiveFrameRenderer:
         self._game = None  # type: ignore[assignment]
         self._cam = None  # type: ignore[assignment]
         self._tunnel = None  # type: ignore[assignment]
+        self._side_rail = None
         self._particles = None  # type: ignore[assignment]
         self._viewport = None  # type: ignore[assignment]
         self._combo = None  # type: ignore[assignment]
@@ -528,12 +617,17 @@ class LiveFrameRenderer:
             primary_mode = "punch"
         n_lanes_mode = N_LANES_DANCE if primary_mode == "dance" else N_LANES
         floor_spread = _FLOOR_SPREAD_BY_MODE.get(primary_mode, 0.50)
-        self._cam = PerspectiveCamera(
-            self._width,
-            self._height,
-            n_lanes=n_lanes_mode,
-            floor_spread_frac=floor_spread,
-        )
+        cam_kwargs: dict = dict(n_lanes=n_lanes_mode,
+                                floor_spread_frac=floor_spread)
+        if self._floor_hit_frac is not None:
+            cam_kwargs["hit_zone_frac"] = self._floor_hit_frac
+        if self._horizon_frac is not None:
+            cam_kwargs["horizon_frac"] = self._horizon_frac
+        if self._floor_spread_frac is not None:
+            cam_kwargs["floor_spread_frac"] = self._floor_spread_frac
+        if self._far_spread_frac is not None:
+            cam_kwargs["far_spread_frac"] = self._far_spread_frac
+        self._cam = PerspectiveCamera(self._width, self._height, **cam_kwargs)
         # Tunnel + decorative HUDs.  ``show_floor_panels`` is sourced
         # from the segment's render setting (default True) and is
         # hot-toggleable through :meth:`update_mode` so the user can
@@ -549,6 +643,19 @@ class LiveFrameRenderer:
             floor_panel_blink=self._floor_panel_blink,
             floor_panel_image=self._floor_panel_image,
         )
+        if self._show_side_rails:
+            self._side_rail: Optional[SideRailRenderer] = SideRailRenderer(
+                self._cam,
+                color=self._rail_color,
+                shape=self._rail_shape,
+                height=self._rail_height,
+                offset_x=self._rail_offset_x,
+                image_path=self._rail_image,
+                pulse=self._rail_pulse,
+                pulse_intensity=self._rail_pulse_intensity,
+            )
+        else:
+            self._side_rail = None
         self._particles = ParticleSystem()
         # Stickman action selection: combo runs use a dedicated
         # cross-mode pose library; solo runs match their mode's library
@@ -810,6 +917,10 @@ class LiveFrameRenderer:
                          CLR_BG, dtype=np.uint8)
         # 1. tunnel walls + floor grid
         canvas = self._tunnel.draw(canvas, fi)
+        # 1b. side rails
+        if self._side_rail is not None:
+            _bass = float(self._audio.bass_arr[fi]) if fi < len(self._audio.bass_arr) else 0.0
+            self._side_rail.draw(canvas, fi, bass_val=_bass, hit=False)
         # 2. targets (back to front so close cubes occlude far ones)
         for tg in self._game.alive_sorted(fi):
             canvas = tg.draw(canvas, self._cam, fi)

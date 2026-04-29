@@ -16,6 +16,34 @@ class BeatSource(str, Enum):
     ONSET = "onset"
 
 
+class RailShape(str, Enum):
+    """Side-rail visual style."""
+    CHUNKY  = "chunky"    # fence blocks (default)
+    TUBE    = "tube"      # continuous extruded strip
+    CHEVRON = "chevron"   # >>> inward-pointing arrows
+
+
+class RailPulse(str, Enum):
+    """Audio-reactive pulse mode for side rails."""
+    NONE = "none"   # static
+    BEAT = "beat"   # flash on each beat hit
+    RMS  = "rms"    # breathe continuously with bass RMS
+
+
+class SideRailMixin(BaseModel):
+    """Per-segment side-rail config, mixed into every mode's settings."""
+    model_config = {"extra": "ignore"}
+
+    side_rails: bool = False
+    rail_color: str = "#FF60FF"
+    rail_shape: RailShape = RailShape.CHUNKY
+    rail_height: float = 0.14     # box height (world units)
+    rail_offset_x: float = 0.08  # X gap from outer tile edge to box inner face
+    rail_image: Optional[str] = None
+    rail_pulse: RailPulse = RailPulse.BEAT
+    rail_pulse_intensity: float = 0.6
+
+
 class RenderMode(str, Enum):
     """Supported render modes."""
 
@@ -26,7 +54,7 @@ class RenderMode(str, Enum):
     COMBO = "combo"
 
 
-class BaseRenderSettings(BaseModel):
+class BaseRenderSettings(SideRailMixin, BaseModel):
     """Shared options used across all modes."""
 
     model_config = {"extra": "ignore"}
@@ -55,6 +83,11 @@ class BaseRenderSettings(BaseModel):
     floor_panel_blink: bool = False            # tiles flash on every beat
     floor_panel_image: Optional[str] = None   # image file overlaid on tiles; None = draw shapes
     stickman: bool = True
+    # Camera perspective overrides (None = use per-mode default)
+    floor_hit_frac: Optional[float] = None    # where floor meets near-camera edge (0.7-0.95)
+    horizon_frac: Optional[float] = None      # vanishing point height fraction (0.3-0.60)
+    floor_spread_frac: Optional[float] = None # near-end runway width fraction (0.3-0.85)
+    far_spread_frac: Optional[float] = None   # far-end (horizon) spread, independent of near
 
 
 class PunchSettings(BaseRenderSettings):

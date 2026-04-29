@@ -406,6 +406,7 @@ class PerspectiveCamera:
                  horizon_frac: float = 0.45,
                  hit_zone_frac: float = 0.86,
                  floor_spread_frac: float = 0.70,
+                 far_spread_frac: float | None = None,
                  fov_deg: float = 55.0):
         self.W = W
         self.H = H
@@ -442,11 +443,26 @@ class PerspectiveCamera:
         # Tunnel-wall x at bottom of frame (~0.52*W each side)
         self.WALL_WORLD_X = (self.W * 0.52) * self.Z_NEAR / self.fx
 
+        # Independent far-end spread: when set, the X projection is
+        # linearly interpolated between 1.0 (at Z_NEAR) and the
+        # far_spread/near_spread ratio (at Z_FAR).  This lets the user
+        # set how wide/narrow the tunnel appears at the horizon
+        # independently from the near (floor) width.
+        if far_spread_frac is not None and floor_spread_frac > 0:
+            self._x_stretch_far = float(far_spread_frac) / float(floor_spread_frac)
+        else:
+            self._x_stretch_far = None  # standard perspective, no stretch
+
     # ---------- 3D projection ----------
     def project(self, wx: float, wy: float, wz: float):
         """Project world point → (sx, sy, depth_scale). None if behind cam."""
         if wz <= 0.05:
             return None
+        # Apply depth-based x stretch when far_spread_frac was provided.
+        # t=0 at Z_NEAR (stretch=1.0) → t=1 at Z_FAR (stretch=_x_stretch_far).
+        if self._x_stretch_far is not None:
+            t = max(0.0, min(1.0, (wz - self.Z_NEAR) / (self.Z_FAR - self.Z_NEAR)))
+            wx = wx * (1.0 + t * (self._x_stretch_far - 1.0))
         sx = self.cx_pix + self.fx * wx / wz
         sy = self.cy_pix + self.fy * wy / wz
         return (sx, sy, 1.0 / wz)
@@ -679,15 +695,6 @@ class TunnelRenderer:
         y_hz = int(cam.cy_pix + 2)
         cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
                  lineType=cv2.LINE_AA)
-
-        # -- Dark wall edge hints (very subtle perspective lines) --
-        for side in (-1, +1):
-            pts = []
-            for z_n in [0, 0.35, 0.65, 0.85, 0.95]:
-                pts.append((int(cam.wall_x(side, z_n)),
-                            int(cam.floor_y(z_n))))
-            for a, b in zip(pts, pts[1:]):
-                cv2.line(canvas, a, b, (55, 45, 35), 1, lineType=cv2.LINE_AA)
 
         return canvas
 
@@ -2932,6 +2939,252 @@ class Particle:
         cv2.fillPoly(canvas, [pts], col)
 
 
+class SideRailRenderer:
+    """Draws 3-D floating neon barriers alongside the runway.
+
+    Each barrier segment is a 3-D box that floats ABOVE the floor with a gap
+    on both X (away from lane tiles) and Y (lifted off the floor surface), so
+    it never overlaps the floor.  Three faces are rendered per segment:
+      - inner face  (faces the runway centre — brightest, neon glow)
+      - top face    (faces the camera slightly — dimmed ~70%, gives 3-D depth)
+      - front face  (nearest Z edge of each chunk — dimmed ~55%, chunky only)
+
+    Parameters
+    ----------
+    height      : box height in world-Y units (default 0.14)
+    offset_x    : X gap from outer tile edge to inner face (default 0.08)
+    pulse       : 'none' | 'beat' | 'rms'
+    """
+
+    _tex_cache: dict[str, np.ndarray] = {}
+
+    # Box proportions relative to height
+    _BOX_LIFT_FRAC  = 0.50   # gap below box = height * this  (Y clearance)
+    _BOX_DEPTH_FRAC = 0.55   # box X thickness = height * this
+
+    def __init__(
+        self,
+        cam: "PerspectiveCamera",
+        *,
+        color: str = "#FF60FF",
+        shape: str = "chunky",
+        height: float = 0.14,
+        offset_x: float = 0.08,
+        image_path: str | None = None,
+        pulse: str = "beat",
+        pulse_intensity: float = 0.6,
+    ):
+        self._cam    = cam
+        self._shape  = shape.lower()
+        self._height = max(0.03, float(height))
+        self._pulse  = pulse.lower()
+        self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
+
+        # Color
+        try:
+            h = color.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            self._base_bgr = np.array([b, g, r], dtype=np.float32)
+        except Exception:
+            self._base_bgr = np.array([255, 96, 255], dtype=np.float32)
+
+        # Texture (optional, applied to inner face)
+        self._tex: np.ndarray | None = None
+        if image_path:
+            if image_path not in SideRailRenderer._tex_cache:
+                img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                if img is not None:
+                    SideRailRenderer._tex_cache[image_path] = img
+            self._tex = SideRailRenderer._tex_cache.get(image_path)
+
+        # Outer edge of the outermost floor tile
+        # (mirrors TunnelRenderer: tile_w = max(0.25, step*0.80))
+        if cam.n_lanes >= 2:
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+        else:
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w  = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+
+        # Box X boundaries (inner face / outer face)
+        gap          = max(0.0, float(offset_x))
+        box_depth    = self._height * self._BOX_DEPTH_FRAC
+        # right side
+        self._ri_r   =  outer_tile_x + gap              # inner face X (right)
+        self._ro_r   =  outer_tile_x + gap + box_depth  # outer face X (right)
+        # left side (mirrored)
+        self._ri_l   = -(outer_tile_x + gap)
+        self._ro_l   = -(outer_tile_x + gap + box_depth)
+
+        # Box Y boundaries (lifted off floor)
+        lift         = self._height * self._BOX_LIFT_FRAC
+        self._bot_y  = cam.FLOOR_WORLD_Y - lift                   # box bottom
+        self._top_y  = cam.FLOOR_WORLD_Y - lift - self._height    # box top
+
+        # Z grid
+        self._z_slices = np.linspace(cam.Z_NEAR, cam.Z_FAR, 32)
+
+    # ------------------------------------------------------------------
+    def _effective_color(self, bass_val: float, hit: bool) -> np.ndarray:
+        if self._pulse == "none" or self._pi == 0:
+            return self._base_bgr
+        flash = (self._pi if hit else 0.0) if self._pulse == "beat" \
+                else float(bass_val) * self._pi
+        return np.clip(
+            self._base_bgr + flash * (255 - self._base_bgr), 0, 255
+        ).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    def draw(
+        self,
+        canvas: np.ndarray,
+        frame_idx: int,
+        bass_val: float = 0.0,
+        hit: bool = False,
+    ) -> np.ndarray:
+        color  = self._effective_color(bass_val, hit)
+        bgr_t  = (int(color[0]), int(color[1]), int(color[2]))
+        # Top face is slightly dimmer (shading cue)
+        dim    = np.clip(color * 0.65, 0, 255).astype(np.float32)
+        bgr_d  = (int(dim[0]),  int(dim[1]),  int(dim[2]))
+        # Front face even dimmer
+        dim2   = np.clip(color * 0.45, 0, 255).astype(np.float32)
+        bgr_d2 = (int(dim2[0]), int(dim2[1]), int(dim2[2]))
+
+        for wx_i, wx_o in (
+            (self._ri_r, self._ro_r),   # right rail
+            (self._ri_l, self._ro_l),   # left rail
+        ):
+            if self._shape == "tube":
+                self._draw_tube(canvas, wx_i, wx_o, bgr_t, bgr_d, color)
+            elif self._shape == "chevron":
+                self._draw_chevrons(canvas, wx_i, wx_o, bgr_t, bgr_d,
+                                    color, frame_idx)
+            else:
+                self._draw_chunky(canvas, wx_i, wx_o, bgr_t, bgr_d,
+                                  bgr_d2, color)
+        return canvas
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _project_quad(self, corners4):
+        """Project 4 world points → int32 poly, or None if any behind cam."""
+        pts = [self._cam.project(x, y, z) for x, y, z in corners4]
+        if any(p is None for p in pts):
+            return None
+        return np.array([[int(p[0]), int(p[1])] for p in pts], dtype=np.int32)
+
+    def _fill_face(self, canvas, corners4, bgr, color, glow=True):
+        poly = self._project_quad(corners4)
+        if poly is None:
+            return
+        if self._tex is not None:
+            th, tw = self._tex.shape[:2]
+            src = np.float32([[0,0],[tw,0],[tw,th],[0,th]])
+            M = cv2.getPerspectiveTransform(src, np.float32(poly))
+            warped = cv2.warpPerspective(
+                self._tex, M, (canvas.shape[1], canvas.shape[0]))
+            mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            canvas[mask > 0] = warped[mask > 0]
+        else:
+            cv2.fillPoly(canvas, [poly], bgr)
+        if glow:
+            col_arr = np.array([bgr[0], bgr[1], bgr[2]], dtype=np.float32)
+            _draw_neon_edges(canvas, [poly], col_arr, 1)
+
+    # ── chunky: floating 3-D box segments ────────────────────────────────
+    def _draw_chunky(self, canvas, wx_i, wx_o, bgr_t, bgr_d, bgr_d2, color):
+        zs   = self._z_slices
+        step = zs[1] - zs[0]
+        gap  = step * 0.38
+        bot, top = self._bot_y, self._top_y
+        for i in range(len(zs) - 1):
+            z0 = zs[i]   + gap * 0.5
+            z1 = zs[i+1] - gap * 0.5
+            # Inner face (bright, faces runway)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_i, top, z1),
+                (wx_i, bot, z1), (wx_i, bot, z0),
+            ], bgr_t, color, glow=True)
+            # Top face (slightly dim, faces camera)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
+            # Front face (nearest edge, most dim)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, bot, z0), (wx_i, bot, z0),
+            ], bgr_d2, color, glow=False)
+
+    # ── tube: continuous floating strip ──────────────────────────────────
+    def _draw_tube(self, canvas, wx_i, wx_o, bgr_t, bgr_d, color):
+        zs = self._z_slices
+        bot, top = self._bot_y, self._top_y
+        # Inner face: continuous quad strip
+        prev: list | None = None
+        for z in zs:
+            pb = self._cam.project(wx_i, bot, z)
+            pt = self._cam.project(wx_i, top, z)
+            if pb is None or pt is None:
+                prev = None
+                continue
+            curr = [(int(pb[0]), int(pb[1])), (int(pt[0]), int(pt[1]))]
+            if prev is not None:
+                quad = np.array(
+                    [prev[0], prev[1], curr[1], curr[0]], dtype=np.int32)
+                cv2.fillPoly(canvas, [quad], bgr_t)
+                c = np.array([bgr_t[0], bgr_t[1], bgr_t[2]], dtype=np.float32)
+                _draw_neon_edges(canvas, [quad], c, 1)
+            prev = curr
+        # Top face
+        prev = None
+        for z in zs:
+            pi_ = self._cam.project(wx_i, top, z)
+            po_ = self._cam.project(wx_o, top, z)
+            if pi_ is None or po_ is None:
+                prev = None
+                continue
+            curr = [(int(pi_[0]), int(pi_[1])), (int(po_[0]), int(po_[1]))]
+            if prev is not None:
+                quad = np.array(
+                    [prev[0], prev[1], curr[1], curr[0]], dtype=np.int32)
+                cv2.fillPoly(canvas, [quad], bgr_d)
+            prev = curr
+
+    # ── chevron: animated arrows on inner face ────────────────────────────
+    def _draw_chevrons(self, canvas, wx_i, wx_o, bgr_t, bgr_d,
+                       color, frame_idx):
+        zs   = self._z_slices
+        step = zs[1] - zs[0]
+        scroll = (frame_idx * step * 0.4) % (step * 3)
+        bot, top = self._bot_y, self._top_y
+        mid_y = (bot + top) * 0.5
+        sign  = 1.0 if wx_i > 0 else -1.0
+
+        # Draw box base (tube-like inner strip) as background
+        self._draw_tube(canvas, wx_i, wx_o, bgr_d, bgr_d, color)
+
+        # Draw chevron arrows on the inner face
+        for i in range(0, len(zs) - 3, 3):
+            z_c = zs[i] + scroll
+            if z_c >= zs[-1]:
+                continue
+            half = step * 1.1
+            corners = [
+                (wx_i, top,   z_c + half),
+                (wx_i, bot,   z_c + half),
+                (wx_i, mid_y, z_c - half * 0.5),
+            ]
+            pts = [self._cam.project(x, y, z) for x, y, z in corners]
+            if any(p is None for p in pts):
+                continue
+            poly = np.array([[int(p[0]), int(p[1])] for p in pts],
+                             dtype=np.int32)
+            cv2.fillPoly(canvas, [poly], bgr_t)
+            _draw_neon_edges(canvas, [poly], color, 1)
+
+
 class ParticleSystem:
     def __init__(self):
         self.ps: list[Particle] = []
@@ -4172,6 +4425,20 @@ class RhythmVisualizer:
         #                 audio beats so inter-mode alternation stays
         #                 coherent.
         self.RELAX_INTERVAL:    float = 0.0
+        # ── Camera perspective overrides ────────────────────────────────
+        self.FLOOR_HIT_FRAC:    float | None = None
+        self.HORIZON_FRAC:      float | None = None
+        self.FLOOR_SPREAD_FRAC: float | None = None
+        self.FAR_SPREAD_FRAC:   float | None = None   # independent far-end spread
+        # ── Side rails ─────────────────────────────────────────────────
+        self.SHOW_SIDE_RAILS:      bool  = False
+        self.RAIL_COLOR:           str   = '#FF60FF'
+        self.RAIL_SHAPE:           str   = 'chunky'
+        self.RAIL_HEIGHT:          float = 0.14
+        self.RAIL_OFFSET_X:        float = 0.08
+        self.RAIL_IMAGE:           str | None = None
+        self.RAIL_PULSE:           str   = 'beat'
+        self.RAIL_PULSE_INTENSITY: float = 0.6
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -4508,9 +4775,18 @@ class RhythmVisualizer:
         # smaller air cubes, so lanes shouldn't fan out as far.
         n_lanes_mode = N_LANES_DANCE if mode == 'dance' else N_LANES
         floor_spread = _FLOOR_SPREAD_BY_MODE.get(mode, 0.50)
-        cam       = PerspectiveCamera(self.WIDTH, self.HEIGHT,
-                                      n_lanes=n_lanes_mode,
-                                      floor_spread_frac=floor_spread)
+        # Apply per-segment camera overrides (from drag-adjust UI)
+        cam_kwargs: dict = dict(n_lanes=n_lanes_mode,
+                                floor_spread_frac=floor_spread)
+        if self.FLOOR_HIT_FRAC is not None:
+            cam_kwargs["hit_zone_frac"] = float(self.FLOOR_HIT_FRAC)
+        if self.HORIZON_FRAC is not None:
+            cam_kwargs["horizon_frac"] = float(self.HORIZON_FRAC)
+        if self.FLOOR_SPREAD_FRAC is not None:
+            cam_kwargs["floor_spread_frac"] = float(self.FLOOR_SPREAD_FRAC)
+        if self.FAR_SPREAD_FRAC is not None:
+            cam_kwargs["far_spread_frac"] = float(self.FAR_SPREAD_FRAC)
+        cam       = PerspectiveCamera(self.WIDTH, self.HEIGHT, **cam_kwargs)
         # Apply color overrides to all targets.
         Target.COLOR_LEFT  = self.CUBE_COLOR_LEFT
         Target.COLOR_RIGHT = self.CUBE_COLOR_RIGHT
@@ -4523,6 +4799,18 @@ class RhythmVisualizer:
                                    floor_panel_color=getattr(self, "FLOOR_PANEL_COLOR", None),
                                    floor_panel_blink=getattr(self, "FLOOR_PANEL_BLINK", False),
                                    floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None))
+        side_rail: SideRailRenderer | None = None
+        if self.SHOW_SIDE_RAILS:
+            side_rail = SideRailRenderer(
+                cam,
+                color=self.RAIL_COLOR,
+                shape=self.RAIL_SHAPE,
+                height=self.RAIL_HEIGHT,
+                offset_x=self.RAIL_OFFSET_X,
+                image_path=self.RAIL_IMAGE,
+                pulse=self.RAIL_PULSE,
+                pulse_intensity=self.RAIL_PULSE_INTENSITY,
+            )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
         # mode's action library.  Solo 'line' uses its own 'line' action
@@ -5102,6 +5390,12 @@ class RhythmVisualizer:
             # 1. tunnel walls + floor grid
             canvas = tunnel.draw(canvas, fi)
 
+            # 1b. side rails (drawn just after the tunnel grid, before targets)
+            if side_rail is not None:
+                _bass_val = float(bass_arr[fi]) if fi < len(bass_arr) else 0.0
+                _hit_this = len(hits) > 0
+                side_rail.draw(canvas, fi, bass_val=_bass_val, hit=_hit_this)
+
             # 2. targets (back to front)
             for tg in game.alive_sorted(fi):
                 canvas = tg.draw(canvas, cam, fi)
@@ -5388,6 +5682,37 @@ def parse_arguments():
     p.add_argument('--stick_h',  type=int, default=-1, metavar='PX',
                    help=('Stickman draw-box height in PIXELS. -1 = '
                          'auto (~H*54%%).'))
+    # ── Side rails ─────────────────────────────────────────────────────
+    p.add_argument('--far_spread_frac', type=float, default=None,
+                   help='Wall spread at far/horizon end (0.05-0.90). '
+                        'None = same as near (standard perspective).')
+    p.add_argument('--floor_hit_frac', type=float, default=None,
+                   help='Fraction of frame height where floor meets near-camera edge (0.70-0.95). '
+                        'None = use per-mode default (0.86).')
+    p.add_argument('--horizon_frac', type=float, default=None,
+                   help='Fraction of frame height for the vanishing point / horizon (0.30-0.60). '
+                        'None = use default (0.45).')
+    p.add_argument('--floor_spread_frac', type=float, default=None,
+                   help='Fraction of frame width for the runway half-spread (0.30-0.85). '
+                        'None = use per-mode preset.')
+    p.add_argument('--side_rails', type=int, default=0, metavar='0|1',
+                   help='Draw decorative neon barriers along both sides of the runway. Default 0.')
+    p.add_argument('--rail_color', type=str, default='#FF60FF',
+                   help='Hex color for side-rail neon (e.g. "#FF60FF"). Default magenta.')
+    p.add_argument('--rail_shape', type=str, default='chunky',
+                   choices=['chunky', 'tube', 'chevron'],
+                   help='Rail style: chunky=fence blocks, tube=strip, chevron=arrows.')
+    p.add_argument('--rail_height', type=float, default=0.14,
+                   help='Box height (world units). Default 0.14.')
+    p.add_argument('--rail_offset_x', type=float, default=0.08,
+                   help='Gap from outer lane tile edge to fence face (world units). Default 0.03.')
+    p.add_argument('--rail_image', type=str, default=None,
+                   help='Optional PNG/JPG to texture rail blocks. None = solid color.')
+    p.add_argument('--rail_pulse', type=str, default='beat',
+                   choices=['none', 'beat', 'rms'],
+                   help='Audio-reactive pulse mode for rails. Default beat.')
+    p.add_argument('--rail_pulse_intensity', type=float, default=0.6, metavar='0..1',
+                   help='Pulse intensity 0=static, 1=full blink. Default 0.6.')
     p.add_argument('--travel',  type=int, default=-1,
                    help=('Frames for target to fly from spawn to hit. '
                          'Default = -1 (auto: matches one L↔R beat cycle so '
@@ -5669,6 +5994,18 @@ if __name__ == '__main__':
     viz.FLOOR_PANEL_COLOR  = args.floor_panel_color or None
     viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
     viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
+    viz.FAR_SPREAD_FRAC        = args.far_spread_frac     # None or float
+    viz.FLOOR_HIT_FRAC         = args.floor_hit_frac     # None or float
+    viz.HORIZON_FRAC           = args.horizon_frac        # None or float
+    viz.FLOOR_SPREAD_FRAC      = args.floor_spread_frac   # None or float
+    viz.SHOW_SIDE_RAILS        = bool(args.side_rails)
+    viz.RAIL_COLOR             = str(args.rail_color)
+    viz.RAIL_SHAPE             = str(args.rail_shape)
+    viz.RAIL_HEIGHT            = float(args.rail_height)
+    viz.RAIL_OFFSET_X          = float(args.rail_offset_x)
+    viz.RAIL_IMAGE             = args.rail_image or None
+    viz.RAIL_PULSE             = str(args.rail_pulse)
+    viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
     viz.SHOW_STICKMAN      = bool(args.stickman)
     viz.STICK_X0          = int(args.stick_x0)
     viz.STICK_Y0          = int(args.stick_y0)

@@ -206,6 +206,174 @@ class _FloorPanelSection(QGroupBox):
         return t or None
 
 
+class _SideRailSection(QGroupBox):
+    """Config sub-section for side-rail settings.
+
+    Shown/hidden by the parent form based on the "Side rails" toggle.
+    """
+
+    changed = Signal()
+
+    _SHAPES = [("Chunky (fence blocks)", "chunky"),
+               ("Tube (strip)", "tube"),
+               ("Chevron (arrows)", "chevron")]
+    _PULSES = [("None (static)", "none"),
+               ("Beat (flash on hit)", "beat"),
+               ("RMS (breathe with bass)", "rms")]
+
+    def __init__(
+        self,
+        color: str,
+        shape: str,
+        height: float,
+        offset_x: float,
+        image: str | None,
+        pulse: str,
+        pulse_intensity: float,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Side Rail Options", parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # ---- Color ----
+        color_row = QWidget()
+        cl = QHBoxLayout(color_row)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self._color: str = color or "#FF60FF"
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._color_btn.setMaximumWidth(160)
+        self._color_btn.setToolTip("Neon color for side rails")
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        cl.addWidget(self._color_btn)
+        cl.addStretch()
+        form.addRow("Color", color_row)
+
+        # ---- Shape ----
+        self._shape_cb = QComboBox()
+        for label, val in self._SHAPES:
+            self._shape_cb.addItem(label, val)
+        idx = next((i for i, (_, v) in enumerate(self._SHAPES) if v == shape), 0)
+        self._shape_cb.setCurrentIndex(idx)
+        _no_scroll(self._shape_cb)
+        self._shape_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Shape", self._shape_cb)
+
+        # ---- Height ----
+        self._height_sp = QDoubleSpinBox()
+        self._height_sp.setRange(0.01, 1.0)
+        self._height_sp.setSingleStep(0.01)
+        self._height_sp.setDecimals(2)
+        self._height_sp.setValue(float(height))
+        self._height_sp.setToolTip("Fence height above floor (world units, e.g. 0.12)")
+        _no_scroll(self._height_sp)
+        self._height_sp.valueChanged.connect(self.changed)
+        form.addRow("Height", self._height_sp)
+
+        # ---- Offset X ----
+        self._offset_sp = QDoubleSpinBox()
+        self._offset_sp.setRange(0.0, 1.0)
+        self._offset_sp.setSingleStep(0.01)
+        self._offset_sp.setDecimals(2)
+        self._offset_sp.setValue(float(offset_x))
+        self._offset_sp.setToolTip("Gap from outer lane tile to fence face (0 = flush with lane edge)")
+        _no_scroll(self._offset_sp)
+        self._offset_sp.valueChanged.connect(self.changed)
+        form.addRow("Offset X", self._offset_sp)
+
+        # ---- Image file ----
+        self._img_edit = QLineEdit(image or "")
+        self._img_edit.setPlaceholderText("Texture image (optional)…")
+        self._img_edit.setToolTip(
+            "Optional PNG/JPG to texture the rail blocks.\n"
+            "Leave blank to use the solid neon color."
+        )
+        self._img_edit.editingFinished.connect(self.changed)
+        img_browse = QPushButton("…")
+        img_browse.setFixedWidth(28)
+        img_browse.clicked.connect(self._browse_image)
+        img_row = QWidget()
+        ir = QHBoxLayout(img_row)
+        ir.setContentsMargins(0, 0, 0, 0)
+        ir.setSpacing(4)
+        ir.addWidget(self._img_edit)
+        ir.addWidget(img_browse)
+        form.addRow("Texture", img_row)
+
+        # ---- Pulse mode ----
+        self._pulse_cb = QComboBox()
+        for label, val in self._PULSES:
+            self._pulse_cb.addItem(label, val)
+        pidx = next((i for i, (_, v) in enumerate(self._PULSES) if v == pulse), 1)
+        self._pulse_cb.setCurrentIndex(pidx)
+        _no_scroll(self._pulse_cb)
+        self._pulse_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Pulse", self._pulse_cb)
+
+        # ---- Pulse intensity ----
+        self._intensity_sp = QDoubleSpinBox()
+        self._intensity_sp.setRange(0.0, 1.0)
+        self._intensity_sp.setSingleStep(0.05)
+        self._intensity_sp.setDecimals(2)
+        self._intensity_sp.setValue(float(pulse_intensity))
+        self._intensity_sp.setToolTip("Pulse intensity 0 = static, 1 = full flash")
+        _no_scroll(self._intensity_sp)
+        self._intensity_sp.valueChanged.connect(self.changed)
+        form.addRow("Intensity", self._intensity_sp)
+
+    # ------------------------------------------------------------------
+    def _refresh_color_btn(self) -> None:
+        self._color_btn.setText(self._color)
+        self._color_btn.setStyleSheet(
+            f"background-color:{self._color}; color: #fff;"
+            f" border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick_color(self) -> None:
+        initial = QColor(self._color)
+        color = QColorDialog.getColor(initial, self, "Rail neon color")
+        if color.isValid():
+            self._color = color.name()
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _browse_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select rail texture", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+        )
+        if path:
+            self._img_edit.setText(path)
+            self.changed.emit()
+
+    # ------------------------------------------------------------------
+    def get_color(self) -> str:
+        return self._color
+
+    def get_shape(self) -> str:
+        return self._shape_cb.currentData() or "chunky"
+
+    def get_height(self) -> float:
+        return self._height_sp.value()
+
+    def get_offset_x(self) -> float:
+        return self._offset_sp.value()
+
+    def get_image(self) -> str | None:
+        t = self._img_edit.text().strip()
+        return t or None
+
+    def get_pulse(self) -> str:
+        return self._pulse_cb.currentData() or "beat"
+
+    def get_pulse_intensity(self) -> float:
+        return self._intensity_sp.value()
+
+
 def format_sec(value: float) -> str:
     total = max(0, int(value))
     mm, ss = divmod(total, 60)
@@ -225,6 +393,7 @@ class SegmentConfigPanel(QWidget):
         self._segment: Optional[Segment] = None
         self._setting_widgets: dict[str, QWidget] = {}
         self._floor_panel_section: Optional[_FloorPanelSection] = None
+        self._side_rail_section: Optional[_SideRailSection] = None
         self._build_ui()
         self._set_empty_state(True)
 
@@ -639,6 +808,7 @@ class SegmentConfigPanel(QWidget):
             self.dynamic_layout.removeRow(0)
         self._setting_widgets.clear()
         self._floor_panel_section = None
+        self._side_rail_section = None
 
     # Fields always shown in the Properties panel, in display order.
     _VISIBLE_FIELDS = (
@@ -648,6 +818,7 @@ class SegmentConfigPanel(QWidget):
         "speed",
         "max_per_lane",
         "floor_panels",
+        "side_rails",
         "stickman",
     )
 
@@ -667,6 +838,7 @@ class SegmentConfigPanel(QWidget):
         "speed":       "Speed",
         "max_per_lane":"Max / lane",
         "floor_panels":"Floor panels",
+        "side_rails":  "Side rails",
         "stickman":    "Stickman",
         "mode_list":   "Sub-modes",
         "line_zigzag": "Zigzag",
@@ -722,6 +894,28 @@ class SegmentConfigPanel(QWidget):
                     lambda state, s=section:
                         s.setVisible(state == Qt.CheckState.Checked.value
                                      or state == 2)  # Qt5/Qt6 compat
+                )
+
+            # Inject the side rail sub-section after the "side_rails" toggle.
+            if key == "side_rails":
+                sr_section = _SideRailSection(
+                    color=rs.get("rail_color", "#FF60FF"),
+                    shape=rs.get("rail_shape", "chunky"),
+                    height=float(rs.get("rail_height", 0.14)),
+                    offset_x=float(rs.get("rail_offset_x", 0.08)),
+                    image=rs.get("rail_image") or None,
+                    pulse=rs.get("rail_pulse", "beat"),
+                    pulse_intensity=float(rs.get("rail_pulse_intensity", 0.6)),
+                    parent=self,
+                )
+                sr_section.setVisible(bool(value))
+                sr_section.changed.connect(self._commit_side_rail_section)
+                self.dynamic_layout.addRow(sr_section)
+                self._side_rail_section = sr_section
+                widget.stateChanged.connect(
+                    lambda state, s=sr_section:
+                        s.setVisible(state == Qt.CheckState.Checked.value
+                                     or state == 2)
                 )
 
     # Per-key UI hints (range, step, decimals, tooltip).
@@ -900,6 +1094,8 @@ class SegmentConfigPanel(QWidget):
             segment.render_settings["floor_panel_color"] = sec.get_color()
             segment.render_settings["floor_panel_blink"] = sec.get_blink()
             segment.render_settings["floor_panel_image"] = sec.get_image()
+        if self._side_rail_section is not None:
+            self._write_side_rail_to_rs(segment, self._side_rail_section)
         validated = build_settings(segment.mode, segment.render_settings)
         segment.render_settings = validated.model_dump(mode="json", exclude_none=True)
         self.segment_changed.emit(segment.id)
@@ -913,6 +1109,24 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["floor_panel_color"] = sec.get_color()
         segment.render_settings["floor_panel_blink"] = sec.get_blink()
         segment.render_settings["floor_panel_image"] = sec.get_image()
+        self.segment_changed.emit(segment.id)
+
+    @staticmethod
+    def _write_side_rail_to_rs(segment: "Segment", sec: "_SideRailSection") -> None:
+        segment.render_settings["rail_color"]           = sec.get_color()
+        segment.render_settings["rail_shape"]           = sec.get_shape()
+        segment.render_settings["rail_height"]          = sec.get_height()
+        segment.render_settings["rail_offset_x"]        = sec.get_offset_x()
+        segment.render_settings["rail_image"]           = sec.get_image()
+        segment.render_settings["rail_pulse"]           = sec.get_pulse()
+        segment.render_settings["rail_pulse_intensity"] = sec.get_pulse_intensity()
+
+    def _commit_side_rail_section(self) -> None:
+        """Called when any side rail sub-section control changes."""
+        segment = self._segment
+        if segment is None or self._side_rail_section is None:
+            return
+        self._write_side_rail_to_rs(segment, self._side_rail_section)
         self.segment_changed.emit(segment.id)
 
     def _on_preview_clicked(self) -> None:

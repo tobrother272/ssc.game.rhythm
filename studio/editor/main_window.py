@@ -351,6 +351,9 @@ class MainWindow(QMainWindow):
         self.preview_panel.stickman_location_changed.connect(
             self._on_stickman_location_edited
         )
+        self.preview_panel.floor_wall_committed.connect(
+            self._on_floor_wall_committed
+        )
         # The panel may auto-stop live-preview when its source is
         # forcibly replaced (e.g. user clicked another segment) — keep
         # our toggle flags + segment-panel button in sync via this
@@ -1009,6 +1012,32 @@ class MainWindow(QMainWindow):
             f"y={seg.stickman_location['y']*100:.1f}% "
             f"w={seg.stickman_location['w']*100:.1f}% "
             f"h={seg.stickman_location['h']*100:.1f}%",
+            2500,
+        )
+
+    def _on_floor_wall_committed(
+        self,
+        hit_frac: float,
+        horizon_frac: float,
+        near_spread: float,
+        far_spread: float,
+    ) -> None:
+        """Persist floor/wall drag result into the active segment's render_settings."""
+        seg_id = self._preview_active_segment_id
+        if not seg_id:
+            return
+        seg = self.project.get_segment(seg_id)
+        if seg is None:
+            return
+        seg.render_settings["floor_hit_frac"]    = round(hit_frac,     4)
+        seg.render_settings["horizon_frac"]      = round(horizon_frac, 4)
+        seg.render_settings["floor_spread_frac"] = round(near_spread,  4)
+        seg.render_settings["far_spread_frac"]   = round(far_spread,   4)
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
+            f"horizon:{horizon_frac*100:.1f}%  "
+            f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%",
             2500,
         )
 
@@ -1739,6 +1768,18 @@ class MainWindow(QMainWindow):
             "floor_panel_color": _get("floor_panel_color", None) or "",
             "floor_panel_blink": bool(_get("floor_panel_blink", False)),
             "floor_panel_image": _get("floor_panel_image", None) or "",
+            "show_side_rails":       bool(_get("side_rails", False)),
+            "rail_color":            str(_get("rail_color", "#FF60FF")),
+            "rail_shape":            str(_get("rail_shape", "chunky")),
+            "rail_height":           float(_get("rail_height", 0.14)),
+            "rail_offset_x":         float(_get("rail_offset_x", 0.08)),
+            "rail_image":            _get("rail_image", None) or "",
+            "rail_pulse":            str(_get("rail_pulse", "beat")),
+            "rail_pulse_intensity":  float(_get("rail_pulse_intensity", 0.6)),
+            "floor_hit_frac":    _get("floor_hit_frac", None),
+            "horizon_frac":      _get("horizon_frac", None),
+            "floor_spread_frac": _get("floor_spread_frac", None),
+            "far_spread_frac":   _get("far_spread_frac", None),
             "max_per_lane": int(_get("max_per_lane", 2)),
             "block_speed": float(_get("speed", 0.8)),
             "beat_min_gap": int(_get("beat_min_gap", 4)),
@@ -1899,6 +1940,14 @@ class MainWindow(QMainWindow):
             floor_panel_color = rs.get("floor_panel_color") or ""
             floor_panel_blink = bool(rs.get("floor_panel_blink", False))
             floor_panel_image = rs.get("floor_panel_image") or ""
+            show_side_rails      = bool(rs.get("side_rails", False))
+            rail_color           = str(rs.get("rail_color", "#FF60FF"))
+            rail_shape           = str(rs.get("rail_shape", "chunky"))
+            rail_height          = float(rs.get("rail_height", 0.14) or 0.14)
+            rail_offset_x        = float(rs.get("rail_offset_x", 0.08) or 0.08)
+            rail_image           = rs.get("rail_image") or ""
+            rail_pulse           = str(rs.get("rail_pulse", "beat"))
+            rail_pulse_intensity = float(rs.get("rail_pulse_intensity", 0.6) or 0.6)
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -1919,6 +1968,14 @@ class MainWindow(QMainWindow):
                     floor_panel_color=floor_panel_color,
                     floor_panel_blink=floor_panel_blink,
                     floor_panel_image=floor_panel_image,
+                    show_side_rails=show_side_rails,
+                    rail_color=rail_color,
+                    rail_shape=rail_shape,
+                    rail_height=rail_height,
+                    rail_offset_x=rail_offset_x,
+                    rail_image=rail_image,
+                    rail_pulse=rail_pulse,
+                    rail_pulse_intensity=rail_pulse_intensity,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

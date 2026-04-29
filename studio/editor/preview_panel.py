@@ -234,6 +234,200 @@ class StickmanBoxOverlay(QWidget):
         p.drawText(lx, ly, label)
 
 
+class FloorWallOverlay(QWidget):
+    """Drag handles to adjust camera perspective.
+
+    Handle types
+    ------------
+    - **Floor line** (cyan)    → ``floor_hit_frac``   (drag up/down)
+    - **Horizon line** (amber) → ``horizon_frac``     (drag up/down)
+    - **Near wall** (magenta, bottom) — INDEPENDENT → ``floor_spread_frac``
+    - **Far wall**  (magenta, top)    — INDEPENDENT → ``far_spread_frac``
+
+    Near and far handle pairs are connected by dashed lines.
+    Moving near does NOT move far, and vice versa.
+    """
+
+    # 4 floats: hit_frac, horizon_frac, near_spread, far_spread
+    changing  = Signal(float, float, float, float)
+    committed = Signal(float, float, float, float)
+
+    _HANDLE_R    = 10
+    _HIT_CLR     = QColor(0,   210, 210)
+    _HORIZON_CLR = QColor(220, 170,   0)
+    _WALL_CLR    = QColor(220,  60, 220)
+    # Far handles display scale: far_spread displayed at this fraction from centre
+    _FAR_DISP    = 0.40
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+
+        self._hit_frac:     float = 0.86
+        self._horizon_frac: float = 0.45
+        self._near_spread:  float = 0.65   # controls floor_spread_frac
+        self._far_spread:   float = 0.65   # controls far_spread_frac (independent)
+
+        self._drag: str | None = None  # 'hit'|'horizon'|'wall_near'|'wall_far'
+
+    # ── public API ──────────────────────────────────────────────────────
+    def set_fractions(
+        self,
+        hit_frac: float,
+        horizon_frac: float,
+        near_spread: float,
+        far_spread: float,
+    ) -> None:
+        self._hit_frac     = max(0.70, min(0.95, float(hit_frac)))
+        self._horizon_frac = max(0.20, min(0.60, float(horizon_frac)))
+        self._near_spread  = max(0.20, min(3.00, float(near_spread)))
+        self._far_spread   = max(0.05, min(3.00, float(far_spread)))
+        self.update()
+
+    def get_fractions(self) -> tuple[float, float, float, float]:
+        return self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+
+    # ── geometry helpers ────────────────────────────────────────────────
+    def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
+    def _hz_y(self)    -> int: return int(self._horizon_frac * self.height())
+    # Near handles: at hit_y, near_spread from centre.
+    # "raw" = unclamped world position (may be outside widget).
+    # "display" = clamped to widget edge so the circle is always clickable.
+    def _near_rx_raw(self)     -> int: return int((0.5 + self._near_spread * 0.5) * self.width())
+    def _near_lx_raw(self)     -> int: return int((0.5 - self._near_spread * 0.5) * self.width())
+    def _near_rx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._near_rx_raw()))
+    def _near_lx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._near_lx_raw()))
+    # Far handles: 22% below horizon, far_spread displayed at _FAR_DISP scale.
+    # Display positions are clamped to widget edge so handles remain clickable.
+    def _far_y(self)   -> int: return int(self._hz_y() + (self._hit_y() - self._hz_y()) * 0.22)
+    def _far_rx_raw(self) -> int: return int((0.5 + self._far_spread * 0.5 * self._FAR_DISP) * self.width())
+    def _far_lx_raw(self) -> int: return int((0.5 - self._far_spread * 0.5 * self._FAR_DISP) * self.width())
+    def _far_rx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._far_rx_raw()))
+    def _far_lx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._far_lx_raw()))
+
+    def _handle_at(self, pos: QPoint) -> str | None:
+        r = self._HANDLE_R + 7
+        if abs(pos.y() - self._hit_y()) <= r and abs(pos.x() - self.width() // 2) <= r:
+            return "hit"
+        if abs(pos.y() - self._hz_y()) <= r and abs(pos.x() - self.width() // 2) <= r:
+            return "horizon"
+        fy = self._far_y()
+        if abs(pos.y() - fy) <= r and (
+            abs(pos.x() - self._far_rx()) <= r or abs(pos.x() - self._far_lx()) <= r
+        ):
+            return "wall_far"
+        ny = self._hit_y()
+        # Use clamped (display) positions for hit detection so handles at edge are clickable
+        if abs(pos.y() - ny) <= r + 4 and (
+            abs(pos.x() - self._near_rx()) <= r or abs(pos.x() - self._near_lx()) <= r
+        ):
+            return "wall_near"
+        return None
+
+    # ── Qt events ───────────────────────────────────────────────────────
+    def mousePressEvent(self, ev) -> None:
+        self._drag = self._handle_at(ev.pos())
+        if self._drag in ("wall_near", "wall_far"):
+            # Grab so move events keep firing outside the widget bounds
+            self.grabMouse()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._drag in ("wall_near", "wall_far"):
+            self.releaseMouse()
+        if self._drag:
+            self._drag = None
+            self.committed.emit(
+                self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+            )
+
+    def mouseMoveEvent(self, ev) -> None:
+        hover = self._handle_at(ev.pos()) if self._drag is None else None
+        if hover:
+            self.setCursor(
+                Qt.CursorShape.SizeVerCursor if hover in ("hit", "horizon")
+                else Qt.CursorShape.SizeHorCursor
+            )
+        elif self._drag is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if self._drag is None:
+            return
+        h, w = self.height(), self.width()
+        if self._drag == "hit":
+            self._hit_frac = max(0.70, min(0.95, ev.pos().y() / h))
+        elif self._drag == "horizon":
+            v = max(0.20, min(0.60, ev.pos().y() / h))
+            if v < self._hit_frac - 0.05:
+                self._horizon_frac = v
+        elif self._drag == "wall_near":
+            # Use raw ev.pos().x() — grabMouse() keeps events firing outside widget
+            rx = float(ev.pos().x())
+            self._near_spread = max(0.20, min(3.00, (rx / w - 0.5) * 2))
+        elif self._drag == "wall_far":
+            # Use raw ev.pos().x() — grabMouse() keeps events firing outside widget
+            rx = float(ev.pos().x())
+            self._far_spread = max(0.05, min(3.00, (rx / w - 0.5) * 2 / self._FAR_DISP))
+        self.update()
+        self.changing.emit(
+            self._hit_frac, self._horizon_frac, self._near_spread, self._far_spread
+        )
+
+    # ── paint ────────────────────────────────────────────────────────────
+    def paintEvent(self, _ev) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = self._HANDLE_R
+
+        def _h_line_with_handle(y: int, color: QColor, label: str) -> None:
+            p.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+            p.drawLine(0, y, w, y)
+            p.setBrush(QBrush(color))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+            cx = w // 2
+            p.drawEllipse(cx - r, y - r, r * 2, r * 2)
+            p.setPen(QPen(color))
+            p.drawText(cx + r + 6, y + 5, label)
+
+        _h_line_with_handle(self._hit_y(), self._HIT_CLR,     "Floor")
+        _h_line_with_handle(self._hz_y(),  self._HORIZON_CLR, "Horizon")
+
+        ny = self._hit_y()
+        fy = self._far_y()
+
+        # Dashed lines connecting far ↔ near handles (left and right)
+        p.setPen(QPen(self._WALL_CLR, 1.2, Qt.PenStyle.DashLine))
+        p.drawLine(self._far_lx(), fy, self._near_lx(), ny)
+        p.drawLine(self._far_rx(), fy, self._near_rx(), ny)
+
+        # Far handles (smaller circles, labelled "Far")
+        rf = max(6, r - 3)
+        p.setBrush(QBrush(self._WALL_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.2))
+        for fx_pos in (self._far_lx(), self._far_rx()):
+            p.drawEllipse(fx_pos - rf, fy - rf, rf * 2, rf * 2)
+        p.setPen(QPen(self._WALL_CLR))
+        p.drawText(self._far_rx() + rf + 4, fy + 4, "Far")
+
+        # Near handles (larger circles, labelled "Near")
+        p.setBrush(QBrush(self._WALL_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for nx_pos in (self._near_lx(), self._near_rx()):
+            p.drawEllipse(nx_pos - r, ny - r, r * 2, r * 2)
+        p.setPen(QPen(self._WALL_CLR))
+        p.drawText(self._near_rx() + r + 4, ny + 5, "Near")
+
+
 def format_ms(ms: int) -> str:
     """Format milliseconds to mm:ss string."""
     seconds = max(0, ms // 1000)
@@ -257,6 +451,10 @@ class PreviewPanel(QWidget):
     # (0..1) of the rendered video frame.  MainWindow listens, writes
     # to ``segment.stickman_location``, and triggers a project save.
     stickman_location_changed = Signal(str, dict)
+    # Emitted on mouse-release when the user finishes dragging a floor/wall
+    # handle.  Carries (hit_frac, horizon_frac, near_spread, far_spread).  MainWindow
+    # saves these into segment.render_settings and requests a preview update.
+    floor_wall_committed = Signal(float, float, float, float)
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
     # auto-stopped because a different source was loaded (user
@@ -354,6 +552,8 @@ class PreviewPanel(QWidget):
             self.stickman_overlay.set_normalized(
                 *self._segment_stick_fractions(seg)
             )
+        # Floor/Wall button is available whenever a segment is loaded (live or not)
+        self.floor_wall_button.setEnabled(seg is not None)
 
     def _sync_stickman_overlay_pos(self) -> None:
         """Keep the floating overlay snapped to the rendered-image rect.
@@ -462,6 +662,69 @@ class PreviewPanel(QWidget):
             pass
         self.stickman_location_changed.emit(seg.id, location)
 
+    # ── Floor/Wall overlay methods ──────────────────────────────────────
+    def _sync_floor_wall_overlay_pos(self) -> None:
+        if not self._floor_wall_edit_active:
+            return
+        rect = self._rendered_image_rect_global()
+        if rect is None:
+            tl = self.stage_stack.mapToGlobal(QPoint(0, 0))
+            sz = self.stage_stack.size()
+            self.floor_wall_overlay.setGeometry(
+                tl.x(), tl.y(), sz.width(), sz.height()
+            )
+            return
+        self.floor_wall_overlay.setGeometry(rect)
+
+    def _on_floor_wall_edit_toggled(self, checked: bool) -> None:
+        self._floor_wall_edit_active = bool(checked)
+        if checked:
+            seg = self._selected_segment
+            rs  = seg.render_settings if seg is not None else {}
+            hit        = float(rs.get("floor_hit_frac")    or 0.86)
+            hz         = float(rs.get("horizon_frac")      or 0.45)
+            near_sp    = float(rs.get("floor_spread_frac") or 0.65)
+            far_sp     = float(rs.get("far_spread_frac")   or near_sp)
+            self.floor_wall_overlay.set_fractions(hit, hz, near_sp, far_sp)
+            self._sync_floor_wall_overlay_pos()
+            self.floor_wall_overlay.show()
+            self._floor_wall_pos_timer.start()
+        else:
+            self._floor_wall_pos_timer.stop()
+            self.floor_wall_overlay.hide()
+
+    def _on_floor_wall_changing(
+        self, hit: float, hz: float, near_sp: float, far_sp: float
+    ) -> None:
+        """Live-update the renderer while the user drags a handle."""
+        if not self._live_active or self._live_renderer is None:
+            return
+        self._live_renderer.update_floor_wall(
+            floor_hit_frac=hit,
+            horizon_frac=hz,
+            floor_spread_frac=near_sp,
+            far_spread_frac=far_sp,
+        )
+        self._render_live_frame(self.player.position() / 1000.0)
+
+    def _on_floor_wall_committed(
+        self, hit: float, hz: float, near_sp: float, far_sp: float
+    ) -> None:
+        """Persist the final drag result and notify MainWindow."""
+        seg = self._selected_segment
+        if seg is not None:
+            seg.render_settings["floor_hit_frac"]    = round(hit,     4)
+            seg.render_settings["horizon_frac"]      = round(hz,      4)
+            seg.render_settings["floor_spread_frac"] = round(near_sp, 4)
+            seg.render_settings["far_spread_frac"]   = round(far_sp,  4)
+        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp)
+
+    def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
+        """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""
+        self.floor_wall_button.setEnabled(enabled)
+        if not enabled and self._floor_wall_edit_active:
+            self.floor_wall_button.setChecked(False)
+
     def set_source_segment(self, segment: Segment | None) -> None:
         """Set selected segment and load the most useful source for preview.
 
@@ -563,6 +826,18 @@ class PreviewPanel(QWidget):
                 self.stickman_button.setChecked(False)
                 self.stickman_button.blockSignals(False)
             self.stickman_button.setEnabled(False)
+        # Also hide floor/wall overlay
+        if hasattr(self, "_floor_wall_pos_timer"):
+            self._floor_wall_pos_timer.stop()
+        if hasattr(self, "floor_wall_overlay"):
+            self._floor_wall_edit_active = False
+            self.floor_wall_overlay.hide()
+        if hasattr(self, "floor_wall_button"):
+            if self.floor_wall_button.isChecked():
+                self.floor_wall_button.blockSignals(True)
+                self.floor_wall_button.setChecked(False)
+                self.floor_wall_button.blockSignals(False)
+            self.floor_wall_button.setEnabled(False)
 
     def _build_ui(self) -> None:
         self.setObjectName("PanelRoot")
@@ -715,6 +990,15 @@ class PreviewPanel(QWidget):
             self._sync_stickman_overlay_pos
         )
 
+        # Floor/Wall drag overlay (same floating-Tool-window pattern).
+        self.floor_wall_overlay = FloorWallOverlay(self)
+        self.floor_wall_overlay.changing.connect(self._on_floor_wall_changing)
+        self.floor_wall_overlay.committed.connect(self._on_floor_wall_committed)
+        self._floor_wall_edit_active: bool = False
+        self._floor_wall_pos_timer = QTimer(self)
+        self._floor_wall_pos_timer.setInterval(50)
+        self._floor_wall_pos_timer.timeout.connect(self._sync_floor_wall_overlay_pos)
+
         # Dots animation timer for loading label.
         self._loading_dots = 0
         self._loading_timer = QTimer(self)
@@ -778,6 +1062,15 @@ class PreviewPanel(QWidget):
         )
         self.stickman_button.setEnabled(False)
 
+        self.floor_wall_button = QPushButton("Floor/Wall")
+        self.floor_wall_button.setCheckable(True)
+        self.floor_wall_button.setToolTip(
+            "Toggle drag handles to adjust floor level, horizon, and wall width.\n"
+            "Drag the cyan line (floor), amber line (horizon), or magenta lines (walls)."
+        )
+        self.floor_wall_button.toggled.connect(self._on_floor_wall_edit_toggled)
+        self.floor_wall_button.setEnabled(False)
+
         self.play_button.setEnabled(False)
 
         # FPS selector for live preview.  Options kept deliberately small
@@ -801,6 +1094,7 @@ class PreviewPanel(QWidget):
         control_row.addWidget(self.volume_slider)
         control_row.addWidget(self.fps_combo)
         control_row.addWidget(self.stickman_button)
+        control_row.addWidget(self.floor_wall_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
 
@@ -1307,6 +1601,10 @@ class PreviewPanel(QWidget):
         self._loading_timer.stop()
         self._render_live_frame(start_local_sec)
 
+        # Enable Floor/Wall drag button now that live preview is running.
+        if hasattr(self, "floor_wall_button"):
+            self.floor_wall_button.setEnabled(True)
+
         # Pump frames at the user-selected preview fps (fps_combo).
         interval_ms = max(8, int(round(1000.0 / max(1, self.preview_fps))))
         self._live_frame_timer.setInterval(interval_ms)
@@ -1347,6 +1645,16 @@ class PreviewPanel(QWidget):
         self._show_empty("No preview source selected")
         self.play_button.setEnabled(False)
         self._set_play_button_state(playing=False)
+        # Hide floor/wall overlay when live preview stops
+        if hasattr(self, "floor_wall_overlay"):
+            self._floor_wall_edit_active = False
+            self._floor_wall_pos_timer.stop()
+            self.floor_wall_overlay.hide()
+        if hasattr(self, "floor_wall_button"):
+            self.floor_wall_button.blockSignals(True)
+            self.floor_wall_button.setChecked(False)
+            self.floor_wall_button.blockSignals(False)
+            self.floor_wall_button.setEnabled(False)
         # Notify MainWindow so its toggle state mirrors ours regardless
         # of who initiated the stop.  ``Qt.QueuedConnection`` is
         # implicit between thread boundaries, but we're on the GUI
@@ -1376,6 +1684,14 @@ class PreviewPanel(QWidget):
         floor_panel_color: Optional[str] = None,
         floor_panel_blink: Optional[bool] = None,
         floor_panel_image: Optional[str] = None,
+        show_side_rails: Optional[bool] = None,
+        rail_color: Optional[str] = None,
+        rail_shape: Optional[str] = None,
+        rail_height: Optional[float] = None,
+        rail_offset_x: Optional[float] = None,
+        rail_image: Optional[str] = None,
+        rail_pulse: Optional[str] = None,
+        rail_pulse_intensity: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -1389,6 +1705,14 @@ class PreviewPanel(QWidget):
             floor_panel_color=floor_panel_color,
             floor_panel_blink=floor_panel_blink,
             floor_panel_image=floor_panel_image,
+            show_side_rails=show_side_rails,
+            rail_color=rail_color,
+            rail_shape=rail_shape,
+            rail_height=rail_height,
+            rail_offset_x=rail_offset_x,
+            rail_image=rail_image,
+            rail_pulse=rail_pulse,
+            rail_pulse_intensity=rail_pulse_intensity,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)
