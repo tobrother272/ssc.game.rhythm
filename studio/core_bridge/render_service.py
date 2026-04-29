@@ -562,6 +562,8 @@ class RenderService(QObject):
     _INT_KEYS = frozenset({
         "beat_min_gap",
         "max_per_lane",
+        "chevron_count",
+        "rail_chevron_density",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -579,6 +581,7 @@ class RenderService(QObject):
         "max_per_lane",
         "floor_panels",
         "floor_panel_color",
+        "floor_panel_opacity",
         "floor_panel_blink",
         "floor_panel_image",
         "stickman",
@@ -596,6 +599,16 @@ class RenderService(QObject):
         "floor_spread_frac",
         "far_spread_frac",
         "wall_floor_gap_frac",
+        "floor_layout",
+        "floor_bg_color",
+        "floor_bg_opacity",
+        "chevron_color",
+        "chevron_scroll",
+        "chevron_blink",
+        "chevron_width_frac",
+        "chevron_count",
+        "rail_chevron_depth",
+        "rail_chevron_density",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any

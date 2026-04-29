@@ -565,8 +565,17 @@ class TunnelRenderer:
     def __init__(self, cam: PerspectiveCamera, show_floor_panels: bool = True,
                  lane_tiles: bool = False,
                  floor_panel_color: str | None = None,
+                 floor_panel_opacity: float = 1.0,
                  floor_panel_blink: bool = False,
-                 floor_panel_image: str | None = None):
+                 floor_panel_image: str | None = None,
+                 floor_layout: str = 'auto',
+                 floor_bg_color: str | None = None,
+                 floor_bg_opacity: float = 1.0,
+                 chevron_color: str = '#FFD700',
+                 chevron_scroll: bool = True,
+                 chevron_blink: bool = False,
+                 chevron_width_frac: float = 0.45,
+                 chevron_count: int = 6):
         """
         `lane_tiles`: when True, floor panels are drawn directly UNDER each
         lane (one column of tiles per lane, derived from `cam.lane_world_x`).
@@ -580,12 +589,26 @@ class TunnelRenderer:
         from a fixed half-second period so the preview matches the render).
         `floor_panel_image`: optional image path; when set the image is
         perspective-warped onto each tile instead of the flat grey fill.
+        `floor_layout`: 'auto' (legacy lane_tiles / 2-column) or
+        'chevron_strip' (single centre column of >>>-arrow shapes).
+        `floor_bg_color`: hex "#RRGGBB" solid trapezoid drawn UNDER tiles;
+        None = transparent (default canvas black).
+        `chevron_*`: colour / animation / geometry of the chevron strip.
         """
         self.cam = cam
         self.show_floor_panels = show_floor_panels
         self.lane_tiles = lane_tiles
         self.floor_panel_color = floor_panel_color
+        self.floor_panel_opacity = float(max(0.0, min(1.0, floor_panel_opacity)))
         self.floor_panel_blink = floor_panel_blink
+        self.floor_layout = str(floor_layout)
+        self.floor_bg_color = floor_bg_color or None
+        self.floor_bg_opacity = float(max(0.0, min(1.0, floor_bg_opacity)))
+        self.chevron_color = str(chevron_color)
+        self.chevron_scroll = bool(chevron_scroll)
+        self.chevron_blink = bool(chevron_blink)
+        self.chevron_width_frac = float(max(0.1, min(1.0, chevron_width_frac)))
+        self.chevron_count = int(max(3, min(12, chevron_count)))
         # Pre-load the tile image (BGR) so we don't re-read on every frame.
         self._tile_img: "np.ndarray | None" = None
         if floor_panel_image:
@@ -601,118 +624,248 @@ class TunnelRenderer:
 
         Uses the camera's 3D projection so floor tiles are true trapezoid
         perspective (not hand-faked), matching the CapCut reference.
+
+        Z-order (bottom to top):
+          1. Floor BG trapezoid (solid color, optional).
+          2. Floor tiles / chevron strip (show_floor_panels gate).
+          3. Horizon glow line (atmospherics).
         """
         cam = self.cam
 
+        # ── Phase A: Floor BG trapezoid (solid color under tiles) ──────
+        if self.floor_bg_color:
+            self._draw_floor_bg(canvas)
+
+        # ── Phase B: Floor tiles or chevron strip ───────────────────────
         if self.show_floor_panels:
-            # -- Blink: hide tiles on odd half-seconds --------------------
-            if self.floor_panel_blink and (frame // 15) % 2 == 1:
-                pass  # tiles invisible this half-second
+            if self.floor_layout == 'chevron_strip':
+                self._draw_chevron_strip(canvas, frame)
             else:
-                # -- Floor panels (receding rows of grey tiles) ----------------
-                # `lane_tiles` mode: one tile column per lane (dance mode, 4
-                # lanes under the 4 viewport panels).  Legacy mode: two columns
-                # flanking center (punch mode).
-                tile_len  = 1.6                        # length along z
-                if self.lane_tiles and cam.n_lanes >= 2:
-                    x_centers = tuple(cam.lane_world_x(i)
-                                      for i in range(cam.n_lanes))
-                    # Tile half-width = 80% of lane spacing so adjacent rows
-                    # almost touch but keep a visible neon seam between them.
-                    step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
-                    tile_w = max(0.25, step * 0.80)
-                else:
-                    x_centers = (-0.95, +0.95)
-                    tile_w    = 0.55
-                z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
-                scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
+                self._draw_floor_tiles_legacy(canvas, frame)
 
-                # Resolve the glow color: custom hex or neutral grey default.
-                if self.floor_panel_color:
-                    try:
-                        hx = self.floor_panel_color.lstrip("#")
-                        r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-                        floor_glow_color = np.array([b, g, r], dtype=np.float32)
-                    except Exception:
-                        floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
-                else:
-                    # Neutral grey neon for the floor panels (same hue as the tile
-                    # fill, just brighter) – keeps the ground reading as ground while
-                    # the punch cubes own the saturated green/red accent colors.
-                    floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
-
-                floor_polys = []
-                for lane_i, xc in enumerate(x_centers):
-                    for z_c in z_slots:
-                        wz = z_c - scroll
-                        if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
-                            continue
-                        corners = [
-                            (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                            (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                            (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                            (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                        ]
-                        proj = [cam.project(*c) for c in corners]
-                        if any(p is None for p in proj):
-                            continue
-                        depth_factor = max(0.08, min(1.0, 5.0 / wz))
-                        poly = np.array([(int(p[0]), int(p[1])) for p in proj],
-                                        dtype=np.int32)
-                        floor_polys.append((wz, poly, depth_factor, lane_i))
-
-                floor_polys.sort(key=lambda t: -t[0])  # far first
-
-                # Pass 1: fill each tile — image-warp or flat color.
-                if self._tile_img is not None:
-                    # Perspective-warp the source image onto each tile poly.
-                    ih, iw = self._tile_img.shape[:2]
-                    src_pts = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]],
-                                       dtype=np.float32)
-                    for _, poly, df, _ in floor_polys:
-                        dst_pts = poly.astype(np.float32)
-                        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                        warped = cv2.warpPerspective(
-                            self._tile_img, M, (canvas.shape[1], canvas.shape[0])
-                        )
-                        # Blend warped image into canvas only inside tile poly.
-                        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
-                        cv2.fillPoly(mask, [poly], 255)
-                        alpha = min(1.0, 0.25 + 0.75 * df)
-                        canvas[mask > 0] = cv2.addWeighted(
-                            canvas, 1.0 - alpha, warped, alpha, 0
-                        )[mask > 0]
-                else:
-                    for _, poly, df, _ in floor_polys:
-                        if self.floor_panel_color:
-                            # Tint with custom color, scale by depth.
-                            fill = tuple(int(c * df * 0.4) for c in
-                                         (int(floor_glow_color[0]),
-                                          int(floor_glow_color[1]),
-                                          int(floor_glow_color[2])))
-                        else:
-                            base = int(45 * df)
-                            fill = (base, base + 2, base + 2)
-                        cv2.fillPoly(canvas, [poly], fill, lineType=cv2.LINE_AA)
-
-                # Pass 2: rim outline.
-                if self.lane_tiles:
-                    for _, poly, df, _ in floor_polys:
-                        c = int(60 + 60 * df)
-                        cv2.polylines(canvas, [poly], True, (c, c, c), 1,
-                                      lineType=cv2.LINE_AA)
-                else:
-                    for _, poly, df, _ in floor_polys:
-                        glow = floor_glow_color * (0.40 + 0.60 * df)
-                        thickness = max(1, int(round(1 + df * 1.2)))
-                        _draw_neon_edges(canvas, [poly], glow, thickness)
-
-        # -- Faint horizon / runway glow line (ambient neon) --
+        # ── Phase C: Faint horizon / runway glow line (atmospherics) ───
         y_hz = int(cam.cy_pix + 2)
         cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
                  lineType=cv2.LINE_AA)
 
         return canvas
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _draw_floor_bg(self, canvas: np.ndarray) -> None:
+        """Fill a (possibly translucent) trapezoid covering the full runway."""
+        cam = self.cam
+        bgr = _hex_to_bgr(self.floor_bg_color, default=(140, 26, 90))
+
+        if cam.n_lanes >= 2:
+            outer_left  = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step   = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left  = outer_left  - half_step
+        x_right = outer_right + half_step
+
+        corners_w = [
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_NEAR),
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_NEAR),
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR),
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_FAR),
+        ]
+        proj = [cam.project(*c) for c in corners_w]
+        if any(p is None for p in proj):
+            return
+        poly = np.array(
+            [(int(round(p[0])), int(round(p[1]))) for p in proj],
+            dtype=np.int32,
+        )
+        opacity = self.floor_bg_opacity
+        if opacity >= 1.0:
+            cv2.fillConvexPoly(canvas, poly, bgr, lineType=cv2.LINE_AA)
+        elif opacity > 0.0:
+            overlay = canvas.copy()
+            cv2.fillConvexPoly(overlay, poly, bgr, lineType=cv2.LINE_AA)
+            cv2.addWeighted(overlay, opacity, canvas, 1.0 - opacity, 0, canvas)
+
+    def _draw_chevron_strip(self, canvas: np.ndarray, frame: int) -> None:
+        """Draw a single column of >>>-arrows down the centre of the runway."""
+        cam = self.cam
+
+        if self.chevron_blink and (frame // 15) % 2 == 1:
+            return
+
+        bgr = _hex_to_bgr(self.chevron_color, default=(0, 215, 255))
+
+        spacing = (cam.Z_FAR - cam.Z_NEAR) / max(1, self.chevron_count)
+        z_slots = [cam.Z_NEAR + i * spacing for i in range(self.chevron_count)]
+        scroll  = ((frame * 0.30) % spacing) if self.chevron_scroll else 0.0
+
+        if cam.n_lanes >= 2:
+            spread = abs(cam.lane_world_x(cam.n_lanes - 1) - cam.lane_world_x(0))
+        else:
+            spread = 1.9
+        half_w    = spread * self.chevron_width_frac * 0.5
+        arrow_len = 1.2
+
+        polys: list[tuple[float, "np.ndarray", float]] = []
+        for z_c in z_slots:
+            wz = z_c - scroll
+            if wz <= cam.Z_NEAR + 0.05:
+                continue
+            z_tip  = wz - arrow_len * 0.5
+            z_base = wz + arrow_len * 0.5
+            z_mid  = wz
+            # Clamp the near-end vertices so they never project outside
+            # (below) the floor-background trapezoid boundary at Z_NEAR.
+            _z_floor = cam.Z_NEAR + 0.05
+            z_tip_c       = max(_z_floor, z_tip)
+            z_tip_inner_c = max(_z_floor, z_tip + 0.45)
+            # 8-vertex notched chevron (outer ring CCW then inner ring CW)
+            corners_w = [
+                (-half_w,        cam.FLOOR_WORLD_Y, z_base),
+                (-half_w * 0.55, cam.FLOOR_WORLD_Y, z_mid),
+                (0.0,            cam.FLOOR_WORLD_Y, z_tip_c),
+                (+half_w * 0.55, cam.FLOOR_WORLD_Y, z_mid),
+                (+half_w,        cam.FLOOR_WORLD_Y, z_base),
+                (+half_w * 0.65, cam.FLOOR_WORLD_Y, z_base + 0.05),
+                (0.0,            cam.FLOOR_WORLD_Y, z_tip_inner_c),
+                (-half_w * 0.65, cam.FLOOR_WORLD_Y, z_base + 0.05),
+            ]
+            proj = [cam.project(*c) for c in corners_w]
+            if any(p is None for p in proj):
+                continue
+            depth_factor = max(0.15, min(1.0, 5.0 / wz))
+            pts = np.array(
+                [(int(round(p[0])), int(round(p[1]))) for p in proj],
+                dtype=np.int32,
+            )
+            polys.append((wz, pts, depth_factor))
+
+        polys.sort(key=lambda t: -t[0])   # far first
+
+        for _, pts, df in polys:
+            fill = tuple(int(c * (0.35 + 0.65 * df)) for c in bgr)
+            cv2.fillPoly(canvas, [pts], fill, lineType=cv2.LINE_AA)
+            rim = tuple(int(min(255, c * (0.55 + 0.85 * df))) for c in bgr)
+            cv2.polylines(canvas, [pts], True, rim, 1, lineType=cv2.LINE_AA)
+
+    def _draw_floor_tiles_legacy(self, canvas: np.ndarray, frame: int) -> None:
+        """Original floor-tile rendering (lane_tiles or 2-column). Pixel-identical."""
+        cam = self.cam
+
+        # -- Blink: hide tiles on odd half-seconds --------------------
+        if self.floor_panel_blink and (frame // 15) % 2 == 1:
+            return
+
+        # -- Floor panels (receding rows of grey tiles) ----------------
+        # `lane_tiles` mode: one tile column per lane (dance mode, 4
+        # lanes under the 4 viewport panels).  Legacy mode: two columns
+        # flanking center (punch mode).
+        tile_len  = 1.6                        # length along z
+        if self.lane_tiles and cam.n_lanes >= 2:
+            x_centers = tuple(cam.lane_world_x(i)
+                              for i in range(cam.n_lanes))
+            # Tile half-width = 80% of lane spacing so adjacent rows
+            # almost touch but keep a visible neon seam between them.
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+            tile_w = max(0.25, step * 0.80)
+        else:
+            x_centers = (-0.95, +0.95)
+            tile_w    = 0.55
+        z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
+        scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
+
+        # Resolve the glow color: custom hex or neutral grey default.
+        if self.floor_panel_color:
+            try:
+                hx = self.floor_panel_color.lstrip("#")
+                r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+                floor_glow_color = np.array([b, g, r], dtype=np.float32)
+            except Exception:
+                floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
+        else:
+            # Neutral grey neon for the floor panels (same hue as the tile
+            # fill, just brighter) – keeps the ground reading as ground while
+            # the punch cubes own the saturated green/red accent colors.
+            floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
+
+        floor_polys = []
+        for lane_i, xc in enumerate(x_centers):
+            for z_c in z_slots:
+                wz = z_c - scroll
+                if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
+                    continue
+                corners = [
+                    (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                    (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                    (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                    (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                ]
+                proj = [cam.project(*c) for c in corners]
+                if any(p is None for p in proj):
+                    continue
+                depth_factor = max(0.08, min(1.0, 5.0 / wz))
+                poly = np.array([(int(p[0]), int(p[1])) for p in proj],
+                                dtype=np.int32)
+                floor_polys.append((wz, poly, depth_factor, lane_i))
+
+        floor_polys.sort(key=lambda t: -t[0])  # far first
+
+        # Pass 1: fill each tile — image-warp or flat color.
+        if self._tile_img is not None:
+            # Perspective-warp the source image onto each tile poly.
+            ih, iw = self._tile_img.shape[:2]
+            src_pts = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]],
+                               dtype=np.float32)
+            for _, poly, df, _ in floor_polys:
+                dst_pts = poly.astype(np.float32)
+                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                warped = cv2.warpPerspective(
+                    self._tile_img, M, (canvas.shape[1], canvas.shape[0])
+                )
+                # Blend warped image into canvas only inside tile poly.
+                mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(mask, [poly], 255)
+                alpha = min(1.0, 0.25 + 0.75 * df) * self.floor_panel_opacity
+                canvas[mask > 0] = cv2.addWeighted(
+                    canvas, 1.0 - alpha, warped, alpha, 0
+                )[mask > 0]
+        else:
+            for _, poly, df, _ in floor_polys:
+                if self.floor_panel_color:
+                    # Tint with custom color, scale by depth.
+                    fill = tuple(int(c * df * 0.4) for c in
+                                 (int(floor_glow_color[0]),
+                                  int(floor_glow_color[1]),
+                                  int(floor_glow_color[2])))
+                else:
+                    base = int(45 * df)
+                    fill = (base, base + 2, base + 2)
+                if self.floor_panel_opacity >= 1.0:
+                    cv2.fillPoly(canvas, [poly], fill, lineType=cv2.LINE_AA)
+                elif self.floor_panel_opacity > 0.0:
+                    overlay = canvas.copy()
+                    cv2.fillPoly(overlay, [poly], fill, lineType=cv2.LINE_AA)
+                    cv2.addWeighted(
+                        overlay,
+                        self.floor_panel_opacity,
+                        canvas,
+                        1.0 - self.floor_panel_opacity,
+                        0,
+                        canvas,
+                    )
+
+        # Pass 2: rim outline.
+        if self.lane_tiles:
+            for _, poly, df, _ in floor_polys:
+                c = int((60 + 60 * df) * self.floor_panel_opacity)
+                cv2.polylines(canvas, [poly], True, (c, c, c), 1,
+                              lineType=cv2.LINE_AA)
+        else:
+            for _, poly, df, _ in floor_polys:
+                glow = floor_glow_color * (0.40 + 0.60 * df) * self.floor_panel_opacity
+                thickness = max(1, int(round(1 + df * 1.2)))
+                _draw_neon_edges(canvas, [poly], glow, thickness)
 
     def draw_hit_zone(self, canvas: np.ndarray) -> np.ndarray:
         cam = self.cam
@@ -1167,6 +1320,24 @@ def _round_poly(pts: np.ndarray, radius: float, steps: int = 6) -> np.ndarray:
             mt = 1.0 - t
             out.append(mt * mt * A + 2.0 * mt * t * curr + t * t * B)
     return np.asarray(out, dtype=np.float32)
+
+
+def _hex_to_bgr(hex_str: str,
+                default: tuple[int, int, int] = (255, 0, 255)
+                ) -> tuple[int, int, int]:
+    """Parse a '#RRGGBB' hex string and return (B, G, R) for OpenCV.
+
+    Returns *default* (magenta) on any parse failure so callers never crash
+    on bad user input.
+    """
+    try:
+        s = (hex_str or "").lstrip('#')
+        if len(s) != 6:
+            return default
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+        return (b, g, r)
+    except (ValueError, AttributeError):
+        return default
 
 
 def _draw_neon_edges(canvas: np.ndarray,
@@ -2989,12 +3160,16 @@ class SideRailRenderer:
         image_path: str | None = None,
         pulse: str = "beat",
         pulse_intensity: float = 0.6,
+        chevron_depth: float = 1.0,
+        chevron_density: int = 6,
     ):
         self._cam    = cam
         self._shape  = shape.lower()
         self._height = max(0.03, float(height))
         self._pulse  = pulse.lower()
         self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
+        self._chev_depth   = float(max(0.1, chevron_depth))
+        self._chev_density = int(max(2, min(20, chevron_density)))
 
         # Color
         try:
@@ -3177,37 +3352,94 @@ class SideRailRenderer:
                 cv2.fillPoly(canvas, [quad], bgr_d)
             prev = curr
 
-    # ── chevron: animated arrows on inner face ────────────────────────────
+    # ── chevron: glowing open-V neon lines on inner face (>>> style) ─────
     def _draw_chevrons(self, canvas, wx_i, wx_o, bgr_t, bgr_d,
                        color, frame_idx):
-        zs   = self._z_slices
-        step = zs[1] - zs[0]
-        scroll = (frame_idx * step * 0.4) % (step * 3)
+        """Draw wall chevrons as glowing open-V neon outlines (no fill).
+
+        Each chevron is a simple 3-point open polyline:
+            (top, z_base) → (mid, z_tip) → (bot, z_base)
+        rendered with a Gaussian-blurred halo + bright core, identical in
+        look to the >>> neon arrows in the reference image.
+        """
+        cam    = self._cam
         bot, top = self._bot_y, self._top_y
-        mid_y = (bot + top) * 0.5
-        sign  = 1.0 if wx_i > 0 else -1.0
+        mid_y  = (bot + top) * 0.5
+        half_h = (bot - top) * 0.5          # positive (bot > top in world Y)
 
-        # Draw box base (tube-like inner strip) as background
-        self._draw_tube(canvas, wx_i, wx_o, bgr_d, bgr_d, color)
+        n_slots   = self._chev_density
+        spacing   = (cam.Z_FAR - cam.Z_NEAR) / n_slots
+        scroll    = (frame_idx * 0.30) % spacing
+        _z_safe   = cam.Z_NEAR + 0.05
 
-        # Draw chevron arrows on the inner face
-        for i in range(0, len(zs) - 3, 3):
-            z_c = zs[i] + scroll
-            if z_c >= zs[-1]:
+        # Base arrow_len for 120° opening at the near reference depth,
+        # then scaled by the user-facing chevron_depth multiplier.
+        _wz_ref   = cam.Z_NEAR + spacing
+        _fy_fx    = (cam.fy / cam.fx) if cam.fx > 0 else 1.0
+        _wx_safe  = max(0.1, abs(wx_i))
+        arrow_len = _fy_fx * half_h * _wz_ref / (_wx_safe * math.sqrt(3))
+        arrow_len = max(spacing * 0.06, min(spacing * 0.40, arrow_len))
+        arrow_len *= self._chev_depth   # user depth multiplier (>1 = more pointed)
+
+        polys: list[tuple[float, np.ndarray, float]] = []
+        for i in range(n_slots + 1):
+            wz = cam.Z_NEAR + i * spacing - scroll
+            if wz <= _z_safe:
                 continue
-            half = step * 1.1
-            corners = [
-                (wx_i, top,   z_c + half),
-                (wx_i, bot,   z_c + half),
-                (wx_i, mid_y, z_c - half * 0.5),
+            z_tip  = max(_z_safe, wz - arrow_len * 0.5)
+            z_base = wz + arrow_len * 0.5
+
+            # Open V: 3 world points on the inner face (X = wx_i)
+            corners_w = [
+                (wx_i, top,   z_base),   # top-far  (open end)
+                (wx_i, mid_y, z_tip),    # center tip (near end)
+                (wx_i, bot,   z_base),   # bot-far  (open end)
             ]
-            pts = [self._cam.project(x, y, z) for x, y, z in corners]
-            if any(p is None for p in pts):
+            proj = [cam.project(x, y, z) for x, y, z in corners_w]
+            if any(p is None for p in proj):
                 continue
-            poly = np.array([[int(p[0]), int(p[1])] for p in pts],
-                             dtype=np.int32)
-            cv2.fillPoly(canvas, [poly], bgr_t)
-            _draw_neon_edges(canvas, [poly], color, 1)
+            depth_factor = max(0.15, min(1.0, 5.0 / wz))
+            pts = np.array(
+                [(int(round(p[0])), int(round(p[1]))) for p in proj],
+                dtype=np.int32,
+            )
+            polys.append((wz, pts, depth_factor))
+
+        polys.sort(key=lambda t: -t[0])   # far first → near last (on top)
+
+        H_cv, W_cv = canvas.shape[:2]
+        for _, pts, df in polys:
+            # Scale brightness by depth
+            scaled = np.clip(color * (0.35 + 0.65 * df), 0, 255).astype(np.float32)
+            glow_col = tuple(int(min(255.0, c * 1.2 + 20)) for c in scaled)
+            core_col = tuple(int(min(255.0, c * 0.55 + 130)) for c in scaled)
+            core_thick = max(2, int(round(1.5 + df * 2.5)))
+            wide = max(5, core_thick * 4)
+
+            # Bounding box for the blurred halo (crop to avoid full-frame blur)
+            xs, ys = pts[:, 0], pts[:, 1]
+            pad = wide + 8
+            x0 = max(0, int(xs.min()) - pad)
+            y0 = max(0, int(ys.min()) - pad)
+            x1 = min(W_cv, int(xs.max()) + pad + 1)
+            y1 = min(H_cv, int(ys.max()) + pad + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            crop = canvas[y0:y1, x0:x1]
+            shifted = pts - np.array([x0, y0], dtype=pts.dtype)
+
+            # Halo: blurred wide polyline blended via screen-mode (max)
+            overlay = np.zeros_like(crop)
+            cv2.polylines(overlay, [shifted], False, glow_col,
+                          wide, lineType=cv2.LINE_AA)
+            k = (wide * 2) | 1
+            overlay = cv2.GaussianBlur(overlay, (k, k), 0)
+            np.maximum(crop, overlay, out=crop)
+
+            # Bright core: thin crisp line drawn directly on canvas
+            cv2.polylines(canvas, [pts], False, core_col,
+                          core_thick, lineType=cv2.LINE_AA)
 
 
 class ParticleSystem:
@@ -4824,8 +5056,17 @@ class RhythmVisualizer:
         tunnel    = TunnelRenderer(cam, show_floor_panels=self.SHOW_FLOOR_PANELS,
                                    lane_tiles=True,
                                    floor_panel_color=getattr(self, "FLOOR_PANEL_COLOR", None),
+                                   floor_panel_opacity=float(getattr(self, "FLOOR_PANEL_OPACITY", 1.0)),
                                    floor_panel_blink=getattr(self, "FLOOR_PANEL_BLINK", False),
-                                   floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None))
+                                   floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None),
+                                   floor_layout=getattr(self, "FLOOR_LAYOUT", "auto"),
+                                   floor_bg_color=getattr(self, "FLOOR_BG_COLOR", None),
+                                   floor_bg_opacity=float(getattr(self, "FLOOR_BG_OPACITY", 1.0)),
+                                   chevron_color=getattr(self, "CHEVRON_COLOR", "#FFD700"),
+                                   chevron_scroll=bool(getattr(self, "CHEVRON_SCROLL", True)),
+                                   chevron_blink=bool(getattr(self, "CHEVRON_BLINK", False)),
+                                   chevron_width_frac=float(getattr(self, "CHEVRON_WIDTH_FRAC", 0.45)),
+                                   chevron_count=int(getattr(self, "CHEVRON_COUNT", 6)))
         side_rail: SideRailRenderer | None = None
         if self.SHOW_SIDE_RAILS:
             side_rail = SideRailRenderer(
@@ -4837,6 +5078,8 @@ class RhythmVisualizer:
                 image_path=self.RAIL_IMAGE,
                 pulse=self.RAIL_PULSE,
                 pulse_intensity=self.RAIL_PULSE_INTENSITY,
+                chevron_depth=getattr(self, "RAIL_CHEVRON_DEPTH", 1.0),
+                chevron_density=getattr(self, "RAIL_CHEVRON_DENSITY", 6),
             )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
@@ -5683,10 +5926,33 @@ def parse_arguments():
                          'Default 1.'))
     p.add_argument('--floor_panel_color', type=str, default=None, metavar='#RRGGBB',
                    help='Custom hex color for floor tile neon (e.g. #4af0c8). Default grey.')
+    p.add_argument('--floor_panel_opacity', type=float, default=1.0, metavar='0..1',
+                   help='Opacity of floor panel tiles (0=transparent, 1=solid). Default 1.0.')
     p.add_argument('--floor_panel_blink', type=int, default=0, metavar='0|1',
                    help='Flash floor tiles on/off each half-second. Default 0.')
     p.add_argument('--floor_panel_image', type=str, default=None, metavar='PATH',
                    help='Image file to perspective-warp onto floor tiles instead of flat fill.')
+    # ── Floor layout + background ───────────────────────────────────────
+    p.add_argument('--floor_layout', type=str, default='auto',
+                   choices=['auto', 'chevron_strip'],
+                   help='Floor tile layout. auto = mode-dependent (legacy/lane tiles). '
+                        'chevron_strip = single >>>-arrow strip down the centre. Default auto.')
+    p.add_argument('--floor_bg_color', type=str, default=None, metavar='#RRGGBB',
+                   help='Solid background color for the runway trapezoid (drawn under '
+                        'tiles/chevron). None = transparent / canvas black (default).')
+    p.add_argument('--floor_bg_opacity', type=float, default=1.0, metavar='0..1',
+                   help='Opacity of the floor background trapezoid (0=transparent, 1=solid). Default 1.0.')
+    # ── Chevron (used only when --floor_layout chevron_strip) ──────────
+    p.add_argument('--chevron_color', type=str, default='#FFD700', metavar='#RRGGBB',
+                   help='Chevron arrow fill color. Default #FFD700 (gold).')
+    p.add_argument('--chevron_scroll', type=int, default=1, metavar='0|1',
+                   help='Scroll chevrons toward camera continuously. Default 1.')
+    p.add_argument('--chevron_blink', type=int, default=0, metavar='0|1',
+                   help='Blink chevrons on/off every 15 frames (~0.5 s). Default 0.')
+    p.add_argument('--chevron_width_frac', type=float, default=0.45,
+                   help='Chevron strip width as fraction of lane spread (0.1..1.0). Default 0.45.')
+    p.add_argument('--chevron_count', type=int, default=6,
+                   help='Number of chevrons visible simultaneously (3..12). Default 6.')
     p.add_argument('--stickman', type=int, default=1, metavar='0|1',
                    help=('Show the left-column stickman fighter. 0 = hide '
                          '(useful when compositing a standalone stickman '
@@ -5743,6 +6009,11 @@ def parse_arguments():
                    help='Audio-reactive pulse mode for rails. Default beat.')
     p.add_argument('--rail_pulse_intensity', type=float, default=0.6, metavar='0..1',
                    help='Pulse intensity 0=static, 1=full blink. Default 0.6.')
+    p.add_argument('--rail_chevron_depth', type=float, default=1.0, metavar='MULT',
+                   help='Chevron pointedness multiplier (shape=chevron only). '
+                        '1.0 = 120° opening angle; >1 = more pointed; <1 = flatter. Default 1.0.')
+    p.add_argument('--rail_chevron_density', type=int, default=6, metavar='N',
+                   help='Number of chevrons visible on each side wall (2-20). Default 6.')
     p.add_argument('--travel',  type=int, default=-1,
                    help=('Frames for target to fly from spawn to hit. '
                          'Default = -1 (auto: matches one L↔R beat cycle so '
@@ -6022,8 +6293,17 @@ if __name__ == '__main__':
     viz.MESH_WIREFRAME    = args.mesh_wireframe
     viz.SHOW_FLOOR_PANELS  = bool(args.floor_panels)
     viz.FLOOR_PANEL_COLOR  = args.floor_panel_color or None
+    viz.FLOOR_PANEL_OPACITY = float(args.floor_panel_opacity)
     viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
     viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
+    viz.FLOOR_LAYOUT         = args.floor_layout
+    viz.FLOOR_BG_COLOR       = args.floor_bg_color or None
+    viz.FLOOR_BG_OPACITY     = float(args.floor_bg_opacity)
+    viz.CHEVRON_COLOR        = args.chevron_color
+    viz.CHEVRON_SCROLL       = bool(int(args.chevron_scroll))
+    viz.CHEVRON_BLINK        = bool(int(args.chevron_blink))
+    viz.CHEVRON_WIDTH_FRAC   = float(args.chevron_width_frac)
+    viz.CHEVRON_COUNT        = int(args.chevron_count)
     viz.FAR_SPREAD_FRAC        = args.far_spread_frac        # None or float
     viz.WALL_FLOOR_GAP_FRAC    = args.wall_floor_gap_frac   # None or float
     viz.FLOOR_HIT_FRAC         = args.floor_hit_frac        # None or float
@@ -6037,6 +6317,8 @@ if __name__ == '__main__':
     viz.RAIL_IMAGE             = args.rail_image or None
     viz.RAIL_PULSE             = str(args.rail_pulse)
     viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
+    viz.RAIL_CHEVRON_DEPTH     = float(args.rail_chevron_depth)
+    viz.RAIL_CHEVRON_DENSITY   = int(args.rail_chevron_density)
     viz.SHOW_STICKMAN      = bool(args.stickman)
     viz.STICK_X0          = int(args.stick_x0)
     viz.STICK_Y0          = int(args.stick_y0)

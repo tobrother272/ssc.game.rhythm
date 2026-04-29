@@ -184,8 +184,17 @@ class LiveFrameRenderer:
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: bool = True,
         floor_panel_color: Optional[str] = None,
+        floor_panel_opacity: float = 1.0,
         floor_panel_blink: bool = False,
         floor_panel_image: Optional[str] = None,
+        floor_layout: str = "auto",
+        floor_bg_color: Optional[str] = None,
+        floor_bg_opacity: float = 1.0,
+        chevron_color: str = "#FFD700",
+        chevron_scroll: bool = True,
+        chevron_blink: bool = False,
+        chevron_width_frac: float = 0.45,
+        chevron_count: int = 6,
         show_side_rails: bool = False,
         rail_color: str = "#FF60FF",
         rail_shape: str = "chunky",
@@ -194,6 +203,8 @@ class LiveFrameRenderer:
         rail_image: Optional[str] = None,
         rail_pulse: str = "beat",
         rail_pulse_intensity: float = 0.6,
+        rail_chevron_depth: float = 1.0,
+        rail_chevron_density: int = 6,
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -222,8 +233,17 @@ class LiveFrameRenderer:
         self._stickman_box = stickman_box
         self._show_floor_panels = bool(show_floor_panels)
         self._floor_panel_color = floor_panel_color or None
+        self._floor_panel_opacity = float(floor_panel_opacity)
         self._floor_panel_blink = bool(floor_panel_blink)
         self._floor_panel_image = floor_panel_image or None
+        self._floor_layout = str(floor_layout)
+        self._floor_bg_color = floor_bg_color or None
+        self._floor_bg_opacity = float(floor_bg_opacity)
+        self._chevron_color = str(chevron_color)
+        self._chevron_scroll = bool(chevron_scroll)
+        self._chevron_blink = bool(chevron_blink)
+        self._chevron_width_frac = float(chevron_width_frac)
+        self._chevron_count = int(chevron_count)
         self._show_side_rails = bool(show_side_rails)
         self._rail_color = str(rail_color)
         self._rail_shape = str(rail_shape)
@@ -232,6 +252,8 @@ class LiveFrameRenderer:
         self._rail_image = rail_image or None
         self._rail_pulse = str(rail_pulse)
         self._rail_pulse_intensity = float(rail_pulse_intensity)
+        self._rail_chevron_depth   = float(rail_chevron_depth)
+        self._rail_chevron_density = int(rail_chevron_density)
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -388,8 +410,17 @@ class LiveFrameRenderer:
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
         floor_panel_color: Optional[str] = None,
+        floor_panel_opacity: Optional[float] = None,
         floor_panel_blink: Optional[bool] = None,
         floor_panel_image: Optional[str] = None,
+        floor_layout: Optional[str] = None,
+        floor_bg_color: Optional[str] = None,
+        floor_bg_opacity: Optional[float] = None,
+        chevron_color: Optional[str] = None,
+        chevron_scroll: Optional[bool] = None,
+        chevron_blink: Optional[bool] = None,
+        chevron_width_frac: Optional[float] = None,
+        chevron_count: Optional[int] = None,
         show_side_rails: Optional[bool] = None,
         rail_color: Optional[str] = None,
         rail_shape: Optional[str] = None,
@@ -398,6 +429,8 @@ class LiveFrameRenderer:
         rail_image: Optional[str] = None,
         rail_pulse: Optional[str] = None,
         rail_pulse_intensity: Optional[float] = None,
+        rail_chevron_depth: Optional[float] = None,
+        rail_chevron_density: Optional[int] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -432,10 +465,28 @@ class LiveFrameRenderer:
             self._show_floor_panels = bool(show_floor_panels)
         if floor_panel_color is not None:
             self._floor_panel_color = floor_panel_color or None
+        if floor_panel_opacity is not None:
+            self._floor_panel_opacity = float(floor_panel_opacity)
         if floor_panel_blink is not None:
             self._floor_panel_blink = bool(floor_panel_blink)
         if floor_panel_image is not None:
             self._floor_panel_image = floor_panel_image or None
+        if floor_layout is not None:
+            self._floor_layout = str(floor_layout)
+        if floor_bg_color is not None:
+            self._floor_bg_color = floor_bg_color or None
+        if floor_bg_opacity is not None:
+            self._floor_bg_opacity = float(floor_bg_opacity)
+        if chevron_color is not None:
+            self._chevron_color = str(chevron_color)
+        if chevron_scroll is not None:
+            self._chevron_scroll = bool(chevron_scroll)
+        if chevron_blink is not None:
+            self._chevron_blink = bool(chevron_blink)
+        if chevron_width_frac is not None:
+            self._chevron_width_frac = float(chevron_width_frac)
+        if chevron_count is not None:
+            self._chevron_count = int(chevron_count)
         if show_side_rails is not None:
             self._show_side_rails = bool(show_side_rails)
         if rail_color is not None:
@@ -452,6 +503,10 @@ class LiveFrameRenderer:
             self._rail_pulse = str(rail_pulse)
         if rail_pulse_intensity is not None:
             self._rail_pulse_intensity = float(rail_pulse_intensity)
+        if rail_chevron_depth is not None:
+            self._rail_chevron_depth = float(rail_chevron_depth)
+        if rail_chevron_density is not None:
+            self._rail_chevron_density = int(rail_chevron_density)
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -650,8 +705,17 @@ class LiveFrameRenderer:
             show_floor_panels=self._show_floor_panels,
             lane_tiles=True,
             floor_panel_color=self._floor_panel_color,
+            floor_panel_opacity=self._floor_panel_opacity,
             floor_panel_blink=self._floor_panel_blink,
             floor_panel_image=self._floor_panel_image,
+            floor_layout=self._floor_layout,
+                                   floor_bg_color=self._floor_bg_color,
+                                   floor_bg_opacity=self._floor_bg_opacity,
+            chevron_color=self._chevron_color,
+            chevron_scroll=self._chevron_scroll,
+            chevron_blink=self._chevron_blink,
+            chevron_width_frac=self._chevron_width_frac,
+            chevron_count=self._chevron_count,
         )
         if self._show_side_rails:
             self._side_rail: Optional[SideRailRenderer] = SideRailRenderer(
@@ -663,6 +727,8 @@ class LiveFrameRenderer:
                 image_path=self._rail_image,
                 pulse=self._rail_pulse,
                 pulse_intensity=self._rail_pulse_intensity,
+                chevron_depth=self._rail_chevron_depth,
+                chevron_density=self._rail_chevron_density,
             )
         else:
             self._side_rail = None

@@ -18,12 +18,14 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -100,26 +102,99 @@ class _FloorPanelSection(QGroupBox):
     Shown/hidden by the parent form based on the "Floor panels" toggle.
     Emits ``changed`` when any of its controls changes so the parent can
     persist the values immediately.
+
+    Controls (top → bottom):
+        Layout combobox  (auto / chevron_strip)
+        BG color picker + Clear button
+        Tile color picker
+        Blink checkbox
+        Tile image chooser
+        ── Chevron sub-group (enabled only when layout='chevron_strip') ──
+        Chevron color picker
+        Chevron blink checkbox
+        Chevron scroll checkbox
+        Chevron width fraction spinbox
+        Chevron count spinbox
     """
 
     changed = Signal()
 
-    def __init__(self, color: str | None, blink: bool, image: str | None,
-                 parent: Optional[QWidget] = None) -> None:
+    _LAYOUTS = [
+        ("Auto (mode default)", "auto"),
+        ("Chevron strip (>>>)", "chevron_strip"),
+    ]
+
+    def __init__(
+        self,
+        color: str | None,
+        blink: bool,
+        image: str | None,
+        floor_panel_opacity: float = 1.0,
+        floor_layout: str = "auto",
+        floor_bg_color: str | None = None,
+        floor_bg_opacity: float = 1.0,
+        chevron_color: str = "#FFD700",
+        chevron_scroll: bool = True,
+        chevron_blink: bool = False,
+        chevron_width_frac: float = 0.45,
+        chevron_count: int = 6,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__("Floor Panel Options", parent)
         form = QFormLayout(self)
+        self._form = form
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        # ---- Color picker ----
-        # Wrap button in an HBoxLayout so it left-aligns and doesn't stretch
-        # across the full field width (a bare QPushButton in a form row
-        # stretches by default and gets clipped when the panel is narrow).
+        # ---- Layout combobox ----
+        self._layout_cb = QComboBox()
+        for label, val in self._LAYOUTS:
+            self._layout_cb.addItem(label, val)
+        lidx = next((i for i, (_, v) in enumerate(self._LAYOUTS)
+                     if v == floor_layout), 0)
+        self._layout_cb.setCurrentIndex(lidx)
+        _no_scroll(self._layout_cb)
+        self._layout_cb.currentIndexChanged.connect(self._on_layout_changed)
+        form.addRow("Layout", self._layout_cb)
+
+        # ---- BG color picker + Clear ----
+        bg_row = QWidget()
+        bg_layout = QHBoxLayout(bg_row)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(4)
+        self._bg_color: str | None = floor_bg_color or None
+        self._bg_btn = QPushButton()
+        self._bg_btn.setMinimumWidth(90)
+        self._bg_btn.setMaximumWidth(160)
+        self._bg_btn.setToolTip("Background color for the whole runway trapezoid")
+        self._refresh_bg_btn()
+        self._bg_btn.clicked.connect(self._pick_bg_color)
+        self._bg_clear_btn = QPushButton("✕")
+        self._bg_clear_btn.setFixedWidth(26)
+        self._bg_clear_btn.setToolTip("Remove background color (transparent)")
+        self._bg_clear_btn.clicked.connect(self._clear_bg_color)
+        bg_layout.addWidget(self._bg_btn)
+        bg_layout.addWidget(self._bg_clear_btn)
+        bg_layout.addStretch()
+        form.addRow("BG color", bg_row)
+
+        # ---- BG opacity (numeric input, no slider) ----
+        self._bg_opacity_sp = QDoubleSpinBox()
+        self._bg_opacity_sp.setRange(0.0, 1.0)
+        self._bg_opacity_sp.setSingleStep(0.05)
+        self._bg_opacity_sp.setDecimals(2)
+        self._bg_opacity_sp.setValue(float(floor_bg_opacity))
+        self._bg_opacity_sp.setToolTip("Background opacity: 0 = invisible, 1 = fully opaque")
+        _no_scroll(self._bg_opacity_sp)
+        self._bg_opacity_sp.valueChanged.connect(self.changed)
+        form.addRow("BG opacity", self._bg_opacity_sp)
+
+        # ---- Tile color picker + opacity on same row ----
         color_row = QWidget()
         color_layout = QHBoxLayout(color_row)
         color_layout.setContentsMargins(0, 0, 0, 0)
-        color_layout.setSpacing(0)
+        color_layout.setSpacing(6)
         self._color_btn = QPushButton()
         self._color_btn.setMinimumWidth(90)
         self._color_btn.setMaximumWidth(160)
@@ -128,8 +203,20 @@ class _FloorPanelSection(QGroupBox):
         self._refresh_color_btn()
         self._color_btn.clicked.connect(self._pick_color)
         color_layout.addWidget(self._color_btn)
-        color_layout.addStretch()
+        self._tile_opacity_lbl = QLabel("Opacity")
+        self._tile_opacity_sp = QDoubleSpinBox()
+        self._tile_opacity_sp.setRange(0.0, 1.0)
+        self._tile_opacity_sp.setSingleStep(0.05)
+        self._tile_opacity_sp.setDecimals(2)
+        self._tile_opacity_sp.setValue(float(floor_panel_opacity))
+        self._tile_opacity_sp.setToolTip("Tile opacity: 0 = invisible, 1 = fully opaque")
+        self._tile_opacity_sp.setFixedWidth(72)
+        _no_scroll(self._tile_opacity_sp)
+        self._tile_opacity_sp.valueChanged.connect(self.changed)
+        color_layout.addWidget(self._tile_opacity_lbl)
+        color_layout.addWidget(self._tile_opacity_sp)
         form.addRow("Tile color", color_row)
+        self._tile_color_row = color_row
 
         # ---- Blink checkbox ----
         blink_row = QWidget()
@@ -163,6 +250,129 @@ class _FloorPanelSection(QGroupBox):
         img_layout.addWidget(img_browse)
         form.addRow("Tile image", self._img_row)
 
+        # ── Chevron sub-group separator ────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(sep)
+        self._chevron_header = QLabel("<b>Chevron options</b>")
+        form.addRow(self._chevron_header)
+
+        # ---- Chevron color picker ----
+        chev_color_row = QWidget()
+        chcl = QHBoxLayout(chev_color_row)
+        chcl.setContentsMargins(0, 0, 0, 0)
+        self._chev_color: str = chevron_color or "#FFD700"
+        self._chev_color_btn = QPushButton()
+        self._chev_color_btn.setMinimumWidth(90)
+        self._chev_color_btn.setMaximumWidth(160)
+        self._chev_color_btn.setToolTip("Arrow fill color")
+        self._refresh_chev_color_btn()
+        self._chev_color_btn.clicked.connect(self._pick_chev_color)
+        chcl.addWidget(self._chev_color_btn)
+        chcl.addStretch()
+        self._chev_color_label = form.addRow("Color", chev_color_row)
+
+        # ---- Chevron scroll checkbox ----
+        cs_row = QWidget()
+        csl = QHBoxLayout(cs_row)
+        csl.setContentsMargins(0, 0, 0, 0)
+        self._chev_scroll_cb = QCheckBox()
+        self._chev_scroll_cb.setChecked(bool(chevron_scroll))
+        self._chev_scroll_cb.setToolTip("Scroll arrows toward the camera continuously")
+        self._chev_scroll_cb.stateChanged.connect(self.changed)
+        csl.addWidget(self._chev_scroll_cb)
+        csl.addStretch()
+        form.addRow("Scroll", cs_row)
+
+        # ---- Chevron blink checkbox ----
+        cb_row = QWidget()
+        cbl = QHBoxLayout(cb_row)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        self._chev_blink_cb = QCheckBox()
+        self._chev_blink_cb.setChecked(bool(chevron_blink))
+        self._chev_blink_cb.setToolTip("Blink chevrons on/off every ~0.5 s")
+        self._chev_blink_cb.stateChanged.connect(self.changed)
+        cbl.addWidget(self._chev_blink_cb)
+        cbl.addStretch()
+        form.addRow("Blink", cb_row)
+
+        # ---- Chevron width fraction ----
+        self._chev_width_sp = QDoubleSpinBox()
+        self._chev_width_sp.setRange(0.10, 1.0)
+        self._chev_width_sp.setSingleStep(0.05)
+        self._chev_width_sp.setDecimals(2)
+        self._chev_width_sp.setValue(float(chevron_width_frac))
+        self._chev_width_sp.setToolTip("Strip width as fraction of lane spread (0.1 – 1.0)")
+        _no_scroll(self._chev_width_sp)
+        self._chev_width_sp.valueChanged.connect(self.changed)
+        form.addRow("Width frac", self._chev_width_sp)
+
+        # ---- Chevron count ----
+        self._chev_count_sp = QSpinBox()
+        self._chev_count_sp.setRange(3, 12)
+        self._chev_count_sp.setValue(int(chevron_count))
+        self._chev_count_sp.setToolTip("Number of arrows visible simultaneously (3 – 12)")
+        _no_scroll(self._chev_count_sp)
+        self._chev_count_sp.valueChanged.connect(self.changed)
+        form.addRow("Count", self._chev_count_sp)
+
+        # Keep references to all chevron widgets for enable/disable
+        self._chevron_widgets = [
+            chev_color_row, self._chev_color_btn,
+            cs_row, self._chev_scroll_cb,
+            cb_row, self._chev_blink_cb,
+            self._chev_width_sp, self._chev_count_sp,
+            sep, self._chevron_header,
+        ]
+        self._update_chevron_visibility()
+
+    # ------------------------------------------------------------------
+    def _on_layout_changed(self) -> None:
+        self._update_chevron_visibility()
+        self.changed.emit()
+
+    def _update_chevron_visibility(self) -> None:
+        enabled = (self._layout_cb.currentData() == "chevron_strip")
+        for w in self._chevron_widgets:
+            w.setEnabled(enabled)
+        # In chevron layout, tile color/opacity are irrelevant (legacy tiles only).
+        try:
+            self._form.setRowVisible(self._tile_color_row, not enabled)
+        except Exception:
+            self._tile_color_row.setVisible(not enabled)
+
+    # ------------------------------------------------------------------
+    def _refresh_bg_btn(self) -> None:
+        if self._bg_color:
+            self._bg_btn.setText(self._bg_color)
+            self._bg_btn.setStyleSheet(
+                f"background-color:{self._bg_color}; color: #fff;"
+                f" border:1px solid #888; border-radius:3px;"
+            )
+        else:
+            self._bg_btn.setText("None")
+            self._bg_btn.setStyleSheet("")
+
+    def _pick_bg_color(self) -> None:
+        initial = QColor(self._bg_color) if self._bg_color else QColor(90, 26, 140)
+        dlg = QColorDialog(initial, self)
+        # Native dialog on some Windows setups occasionally reports stale/invalid
+        # selected color; force Qt dialog for deterministic behavior.
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setWindowTitle("Runway background color")
+        if dlg.exec():
+            color = dlg.selectedColor()
+            if color.isValid():
+                self._bg_color = color.name(QColor.NameFormat.HexRgb)
+                self._refresh_bg_btn()
+                self.changed.emit()
+
+    def _clear_bg_color(self) -> None:
+        self._bg_color = None
+        self._refresh_bg_btn()
+        self.changed.emit()
+
     # ------------------------------------------------------------------
     def _refresh_color_btn(self) -> None:
         if self._color:
@@ -195,6 +405,22 @@ class _FloorPanelSection(QGroupBox):
             self.changed.emit()
 
     # ------------------------------------------------------------------
+    def _refresh_chev_color_btn(self) -> None:
+        self._chev_color_btn.setText(self._chev_color)
+        self._chev_color_btn.setStyleSheet(
+            f"background-color:{self._chev_color}; color: #000;"
+            f" border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick_chev_color(self) -> None:
+        initial = QColor(self._chev_color)
+        color = QColorDialog.getColor(initial, self, "Chevron arrow color")
+        if color.isValid():
+            self._chev_color = color.name()
+            self._refresh_chev_color_btn()
+            self.changed.emit()
+
+    # ------------------------------------------------------------------
     def get_color(self) -> str | None:
         return self._color or None
 
@@ -204,6 +430,33 @@ class _FloorPanelSection(QGroupBox):
     def get_image(self) -> str | None:
         t = self._img_edit.text().strip()
         return t or None
+
+    def get_floor_layout(self) -> str:
+        return self._layout_cb.currentData() or "auto"
+
+    def get_floor_bg_color(self) -> str | None:
+        return self._bg_color or None
+
+    def get_floor_bg_opacity(self) -> float:
+        return self._bg_opacity_sp.value()
+
+    def get_floor_panel_opacity(self) -> float:
+        return self._tile_opacity_sp.value()
+
+    def get_chevron_color(self) -> str:
+        return self._chev_color
+
+    def get_chevron_scroll(self) -> bool:
+        return self._chev_scroll_cb.isChecked()
+
+    def get_chevron_blink(self) -> bool:
+        return self._chev_blink_cb.isChecked()
+
+    def get_chevron_width_frac(self) -> float:
+        return self._chev_width_sp.value()
+
+    def get_chevron_count(self) -> int:
+        return self._chev_count_sp.value()
 
 
 class _SideRailSection(QGroupBox):
@@ -230,6 +483,8 @@ class _SideRailSection(QGroupBox):
         image: str | None,
         pulse: str,
         pulse_intensity: float,
+        chevron_depth: float = 1.0,
+        chevron_density: int = 6,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Side Rail Options", parent)
@@ -325,6 +580,86 @@ class _SideRailSection(QGroupBox):
         self._intensity_sp.valueChanged.connect(self.changed)
         form.addRow("Intensity", self._intensity_sp)
 
+        # ── Chevron-only sub-group ─────────────────────────────────────
+        self._chev_sep = QFrame()
+        self._chev_sep.setFrameShape(QFrame.Shape.HLine)
+        self._chev_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._chev_sep)
+        self._chev_header = QLabel("<b>Chevron options</b>")
+        form.addRow(self._chev_header)
+
+        # ---- Depth (pointedness) — slider 0.2 … 5.0 step 0.1 ----
+        depth_row = QWidget()
+        dl = QHBoxLayout(depth_row)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(6)
+        self._chev_depth_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chev_depth_sl.setRange(2, 50)   # ×10 of real value
+        self._chev_depth_sl.setSingleStep(1)
+        self._chev_depth_sl.setPageStep(5)
+        self._chev_depth_sl.setValue(max(2, min(50, round(float(chevron_depth) * 10))))
+        self._chev_depth_sl.setToolTip(
+            "Chevron pointedness multiplier.\n"
+            "1.0 = 120° opening angle.  >1 = sharper.  <1 = flatter."
+        )
+        self._chev_depth_lbl = QLabel(f"{float(chevron_depth):.1f}×")
+        self._chev_depth_lbl.setMinimumWidth(36)
+        self._chev_depth_sl.valueChanged.connect(self._on_chev_depth_changed)
+        dl.addWidget(self._chev_depth_sl, stretch=1)
+        dl.addWidget(self._chev_depth_lbl)
+        form.addRow("Depth", depth_row)
+
+        # ---- Density (count) — slider 6 … 20 ----
+        density_row = QWidget()
+        dsl = QHBoxLayout(density_row)
+        dsl.setContentsMargins(0, 0, 0, 0)
+        dsl.setSpacing(6)
+        self._chev_density_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chev_density_sl.setRange(6, 20)
+        self._chev_density_sl.setSingleStep(1)
+        self._chev_density_sl.setValue(max(6, min(20, int(chevron_density))))
+        self._chev_density_sl.setToolTip("Number of chevrons visible on each wall (6 – 20)")
+        self._chev_density_lbl = QLabel(str(self._chev_density_sl.value()))
+        self._chev_density_lbl.setMinimumWidth(26)
+        self._chev_density_sl.valueChanged.connect(self._on_chev_density_changed)
+        dsl.addWidget(self._chev_density_sl, stretch=1)
+        dsl.addWidget(self._chev_density_lbl)
+        form.addRow("Density", density_row)
+
+        self._chev_widgets = [
+            self._chev_sep, self._chev_header,
+            depth_row, density_row,
+        ]
+        # Wire shape change to show/hide chevron sub-group
+        self._shape_cb.currentIndexChanged.connect(self._on_shape_changed)
+        self._update_chev_visibility()
+
+        # 2-second debounce for continuous slider input — label updates
+        # instantly but `changed` is emitted only after the user stops
+        # dragging for ≥2 s to avoid rebuilding the scene on every tick.
+        self._slider_debounce = QTimer(self)
+        self._slider_debounce.setSingleShot(True)
+        self._slider_debounce.setInterval(2000)
+        self._slider_debounce.timeout.connect(self.changed)
+
+    # ------------------------------------------------------------------
+    def _on_shape_changed(self) -> None:
+        self._update_chev_visibility()
+        self.changed.emit()
+
+    def _on_chev_depth_changed(self, raw: int) -> None:
+        self._chev_depth_lbl.setText(f"{raw / 10:.1f}×")
+        self._slider_debounce.start()   # restart 2-s window
+
+    def _on_chev_density_changed(self, val: int) -> None:
+        self._chev_density_lbl.setText(str(val))
+        self._slider_debounce.start()   # restart 2-s window
+
+    def _update_chev_visibility(self) -> None:
+        is_chev = (self._shape_cb.currentData() == "chevron")
+        for w in self._chev_widgets:
+            w.setVisible(is_chev)
+
     # ------------------------------------------------------------------
     def _refresh_color_btn(self) -> None:
         self._color_btn.setText(self._color)
@@ -372,6 +707,12 @@ class _SideRailSection(QGroupBox):
 
     def get_pulse_intensity(self) -> float:
         return self._intensity_sp.value()
+
+    def get_chevron_depth(self) -> float:
+        return self._chev_depth_sl.value() / 10.0
+
+    def get_chevron_density(self) -> int:
+        return self._chev_density_sl.value()
 
 
 def format_sec(value: float) -> str:
@@ -883,6 +1224,15 @@ class SegmentConfigPanel(QWidget):
                     color=rs.get("floor_panel_color") or None,
                     blink=bool(rs.get("floor_panel_blink", False)),
                     image=rs.get("floor_panel_image") or None,
+                    floor_panel_opacity=float(rs.get("floor_panel_opacity", 1.0) or 1.0),
+                    floor_layout=str(rs.get("floor_layout", "auto")),
+                    floor_bg_color=rs.get("floor_bg_color") or None,
+                    floor_bg_opacity=float(rs.get("floor_bg_opacity", 1.0) or 1.0),
+                    chevron_color=str(rs.get("chevron_color", "#FFD700")),
+                    chevron_scroll=bool(rs.get("chevron_scroll", True)),
+                    chevron_blink=bool(rs.get("chevron_blink", False)),
+                    chevron_width_frac=float(rs.get("chevron_width_frac", 0.45) or 0.45),
+                    chevron_count=int(rs.get("chevron_count", 6) or 6),
                     parent=self,
                 )
                 section.setVisible(bool(value))
@@ -906,6 +1256,8 @@ class SegmentConfigPanel(QWidget):
                     image=rs.get("rail_image") or None,
                     pulse=rs.get("rail_pulse", "beat"),
                     pulse_intensity=float(rs.get("rail_pulse_intensity", 0.6)),
+                    chevron_depth=float(rs.get("rail_chevron_depth", 1.0) or 1.0),
+                    chevron_density=int(rs.get("rail_chevron_density", 6) or 6),
                     parent=self,
                 )
                 sr_section.setVisible(bool(value))
@@ -1090,10 +1442,7 @@ class SegmentConfigPanel(QWidget):
             segment.render_settings[key] = self._collect_setting_widget_value(key, widget)
         # Also persist floor panel sub-section values (if section exists).
         if self._floor_panel_section is not None:
-            sec = self._floor_panel_section
-            segment.render_settings["floor_panel_color"] = sec.get_color()
-            segment.render_settings["floor_panel_blink"] = sec.get_blink()
-            segment.render_settings["floor_panel_image"] = sec.get_image()
+            self._write_floor_panel_to_rs(segment, self._floor_panel_section)
         if self._side_rail_section is not None:
             self._write_side_rail_to_rs(segment, self._side_rail_section)
         validated = build_settings(segment.mode, segment.render_settings)
@@ -1105,11 +1454,25 @@ class SegmentConfigPanel(QWidget):
         segment = self._segment
         if segment is None or self._floor_panel_section is None:
             return
-        sec = self._floor_panel_section
+        self._write_floor_panel_to_rs(segment, self._floor_panel_section)
+        self.segment_changed.emit(segment.id)
+
+    @staticmethod
+    def _write_floor_panel_to_rs(
+        segment: "Segment", sec: "_FloorPanelSection"
+    ) -> None:
         segment.render_settings["floor_panel_color"] = sec.get_color()
+        segment.render_settings["floor_panel_opacity"] = sec.get_floor_panel_opacity()
         segment.render_settings["floor_panel_blink"] = sec.get_blink()
         segment.render_settings["floor_panel_image"] = sec.get_image()
-        self.segment_changed.emit(segment.id)
+        segment.render_settings["floor_layout"]      = sec.get_floor_layout()
+        segment.render_settings["floor_bg_color"]    = sec.get_floor_bg_color()
+        segment.render_settings["floor_bg_opacity"]  = sec.get_floor_bg_opacity()
+        segment.render_settings["chevron_color"]     = sec.get_chevron_color()
+        segment.render_settings["chevron_scroll"]    = sec.get_chevron_scroll()
+        segment.render_settings["chevron_blink"]     = sec.get_chevron_blink()
+        segment.render_settings["chevron_width_frac"] = sec.get_chevron_width_frac()
+        segment.render_settings["chevron_count"]     = sec.get_chevron_count()
 
     @staticmethod
     def _write_side_rail_to_rs(segment: "Segment", sec: "_SideRailSection") -> None:
@@ -1118,8 +1481,10 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["rail_height"]          = sec.get_height()
         segment.render_settings["rail_offset_x"]        = sec.get_offset_x()
         segment.render_settings["rail_image"]           = sec.get_image()
-        segment.render_settings["rail_pulse"]           = sec.get_pulse()
-        segment.render_settings["rail_pulse_intensity"] = sec.get_pulse_intensity()
+        segment.render_settings["rail_pulse"]            = sec.get_pulse()
+        segment.render_settings["rail_pulse_intensity"]  = sec.get_pulse_intensity()
+        segment.render_settings["rail_chevron_depth"]    = sec.get_chevron_depth()
+        segment.render_settings["rail_chevron_density"]  = sec.get_chevron_density()
 
     def _commit_side_rail_section(self) -> None:
         """Called when any side rail sub-section control changes."""

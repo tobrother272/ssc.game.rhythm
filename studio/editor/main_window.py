@@ -1769,8 +1769,17 @@ class MainWindow(QMainWindow):
             "show_stickman": bool(_get("stickman", True)),
             "show_floor_panels": bool(_get("floor_panels", True)),
             "floor_panel_color": _get("floor_panel_color", None) or "",
+            "floor_panel_opacity": float(_get("floor_panel_opacity", 1.0) or 1.0),
             "floor_panel_blink": bool(_get("floor_panel_blink", False)),
             "floor_panel_image": _get("floor_panel_image", None) or "",
+            "floor_layout":          str(_get("floor_layout", "auto")),
+            "floor_bg_color":        _get("floor_bg_color", None) or "",
+            "floor_bg_opacity":      float(_get("floor_bg_opacity", 1.0) or 1.0),
+            "chevron_color":         str(_get("chevron_color", "#FFD700")),
+            "chevron_scroll":        bool(_get("chevron_scroll", True)),
+            "chevron_blink":         bool(_get("chevron_blink", False)),
+            "chevron_width_frac":    float(_get("chevron_width_frac", 0.45) or 0.45),
+            "chevron_count":         int(_get("chevron_count", 6) or 6),
             "show_side_rails":       bool(_get("side_rails", False)),
             "rail_color":            str(_get("rail_color", "#FF60FF")),
             "rail_shape":            str(_get("rail_shape", "chunky")),
@@ -1779,6 +1788,8 @@ class MainWindow(QMainWindow):
             "rail_image":            _get("rail_image", None) or "",
             "rail_pulse":            str(_get("rail_pulse", "beat")),
             "rail_pulse_intensity":  float(_get("rail_pulse_intensity", 0.6)),
+            "rail_chevron_depth":    float(_get("rail_chevron_depth", 1.0) or 1.0),
+            "rail_chevron_density":  int(_get("rail_chevron_density", 6) or 6),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -1942,8 +1953,17 @@ class MainWindow(QMainWindow):
             # Use "" (not None) so update_mode's "if x is not None" guard
             # fires even when the user has cleared the value — "" or None → None.
             floor_panel_color = rs.get("floor_panel_color") or ""
+            floor_panel_opacity = float(rs.get("floor_panel_opacity", 1.0) or 1.0)
             floor_panel_blink = bool(rs.get("floor_panel_blink", False))
             floor_panel_image = rs.get("floor_panel_image") or ""
+            floor_layout      = str(rs.get("floor_layout", "auto"))
+            floor_bg_color    = rs.get("floor_bg_color") or ""
+            floor_bg_opacity  = float(rs.get("floor_bg_opacity", 1.0) or 1.0)
+            chevron_color     = str(rs.get("chevron_color", "#FFD700"))
+            chevron_scroll    = bool(rs.get("chevron_scroll", True))
+            chevron_blink     = bool(rs.get("chevron_blink", False))
+            chevron_width_frac = float(rs.get("chevron_width_frac", 0.45) or 0.45)
+            chevron_count     = int(rs.get("chevron_count", 6) or 6)
             show_side_rails      = bool(rs.get("side_rails", False))
             rail_color           = str(rs.get("rail_color", "#FF60FF"))
             rail_shape           = str(rs.get("rail_shape", "chunky"))
@@ -1952,6 +1972,8 @@ class MainWindow(QMainWindow):
             rail_image           = rs.get("rail_image") or ""
             rail_pulse           = str(rs.get("rail_pulse", "beat"))
             rail_pulse_intensity = float(rs.get("rail_pulse_intensity", 0.6) or 0.6)
+            rail_chevron_depth   = float(rs.get("rail_chevron_depth", 1.0) or 1.0)
+            rail_chevron_density = int(rs.get("rail_chevron_density", 6) or 6)
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -1970,8 +1992,17 @@ class MainWindow(QMainWindow):
                     stickman_box=stickman_box,
                     show_floor_panels=show_floor_panels,
                     floor_panel_color=floor_panel_color,
+                    floor_panel_opacity=floor_panel_opacity,
                     floor_panel_blink=floor_panel_blink,
                     floor_panel_image=floor_panel_image,
+                    floor_layout=floor_layout,
+                    floor_bg_color=floor_bg_color,
+                    floor_bg_opacity=floor_bg_opacity,
+                    chevron_color=chevron_color,
+                    chevron_scroll=chevron_scroll,
+                    chevron_blink=chevron_blink,
+                    chevron_width_frac=chevron_width_frac,
+                    chevron_count=chevron_count,
                     show_side_rails=show_side_rails,
                     rail_color=rail_color,
                     rail_shape=rail_shape,
@@ -1980,6 +2011,8 @@ class MainWindow(QMainWindow):
                     rail_image=rail_image,
                     rail_pulse=rail_pulse,
                     rail_pulse_intensity=rail_pulse_intensity,
+                    rail_chevron_depth=rail_chevron_depth,
+                    rail_chevron_density=rail_chevron_density,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

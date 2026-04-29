@@ -80,8 +80,22 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     bloom: bool = True
     floor_panels: bool = True
     floor_panel_color: Optional[str] = None    # hex e.g. "#4af0c8"; None = default grey
+    floor_panel_opacity: float = 1.0           # 0.0 (transparent) … 1.0 (solid)
     floor_panel_blink: bool = False            # tiles flash on every beat
     floor_panel_image: Optional[str] = None   # image file overlaid on tiles; None = draw shapes
+    # Floor layout override ('auto' = mode-dependent legacy behaviour;
+    # 'chevron_strip' = single centre column of >>>-arrow shapes).
+    floor_layout: str = "auto"
+    # Solid background color for the runway trapezoid (drawn UNDER tiles/chevron).
+    # None = transparent (canvas black / skybox shows through).
+    floor_bg_color: Optional[str] = None          # hex e.g. "#5A1A8C"
+    floor_bg_opacity: float = 1.0                 # 0.0 (transparent) … 1.0 (solid)
+    # Chevron-specific — only active when floor_layout='chevron_strip'.
+    chevron_color: str = "#FFD700"                 # arrow fill color (gold default)
+    chevron_scroll: bool = True                    # scroll toward camera continuously
+    chevron_blink: bool = False                    # flash on/off every 15 frames (~0.5s)
+    chevron_width_frac: float = 0.45               # strip width as fraction of lane spread
+    chevron_count: int = 6                         # number of arrows visible simultaneously
     stickman: bool = True
     # Camera perspective overrides (None = use per-mode default)
     floor_hit_frac: Optional[float] = None    # where floor meets near-camera edge (0.7-0.95)
@@ -89,6 +103,8 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     floor_spread_frac: Optional[float] = None # near-end runway width fraction (0.3-0.85)
     far_spread_frac: Optional[float] = None   # far-end (horizon) spread, independent of near
     wall_floor_gap_frac: Optional[float] = None  # vertical gap between near wall bottom and floor (0-0.30)
+    rail_chevron_depth: float = 1.0    # pointedness multiplier (1.0 = 120° opening angle)
+    rail_chevron_density: int = 6      # number of chevrons per wall (2-20)
 
 
 class PunchSettings(BaseRenderSettings):
