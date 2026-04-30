@@ -1752,6 +1752,10 @@ class PreviewPanel(QWidget):
         rail_pulse_intensity: Optional[float] = None,
         rail_chevron_depth: Optional[float] = None,
         rail_chevron_density: Optional[int] = None,
+        rail_pillar_count: Optional[int] = None,
+        rail_pillar_radius: Optional[float] = None,
+        rail_chase_mode: Optional[str] = None,
+        rail_chase_speed_frames: Optional[int] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -1784,6 +1788,10 @@ class PreviewPanel(QWidget):
             rail_pulse_intensity=rail_pulse_intensity,
             rail_chevron_depth=rail_chevron_depth,
             rail_chevron_density=rail_chevron_density,
+            rail_pillar_count=rail_pillar_count,
+            rail_pillar_radius=rail_pillar_radius,
+            rail_chase_mode=rail_chase_mode,
+            rail_chase_speed_frames=rail_chase_speed_frames,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)

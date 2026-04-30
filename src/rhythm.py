@@ -3162,6 +3162,10 @@ class SideRailRenderer:
         pulse_intensity: float = 0.6,
         chevron_depth: float = 1.0,
         chevron_density: int = 6,
+        pillar_count: int = 16,
+        pillar_radius: float = 1.0,
+        chase_mode: str = "time",
+        chase_speed_frames: int = 4,
     ):
         self._cam    = cam
         self._shape  = shape.lower()
@@ -3170,6 +3174,14 @@ class SideRailRenderer:
         self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
         self._chev_depth   = float(max(0.1, chevron_depth))
         self._chev_density = int(max(2, min(20, chevron_density)))
+        self._pillar_count = max(4, min(32, int(pillar_count)))
+        self._pillar_radius = float(max(0.2, min(2.0, pillar_radius)))
+        self._chase_mode = str(chase_mode).lower()
+        if self._chase_mode not in ("time", "beat"):
+            self._chase_mode = "time"
+        self._chase_speed_frames = max(1, int(chase_speed_frames))
+        self._chase_step = 0
+        self._chase_frame_counter = 0
 
         # Color
         try:
@@ -3237,6 +3249,12 @@ class SideRailRenderer:
 
         # Z grid
         self._z_slices = np.linspace(cam.Z_NEAR, cam.Z_FAR, 32)
+        self._pillar_zs = np.linspace(cam.Z_FAR, cam.Z_NEAR, self._pillar_count)
+        spacing = (
+            abs(self._pillar_zs[1] - self._pillar_zs[0])
+            if self._pillar_count > 1 else 1.0
+        )
+        self._pillar_half_z = spacing * 0.20
 
     # ------------------------------------------------------------------
     def _effective_color(self, bass_val: float, hit: bool) -> np.ndarray:
@@ -3247,6 +3265,17 @@ class SideRailRenderer:
         return np.clip(
             self._base_bgr + flash * (255 - self._base_bgr), 0, 255
         ).astype(np.float32)
+
+    def _advance_chase(self, hit: bool) -> None:
+        """Advance pillar highlight index according to chase mode."""
+        if self._chase_mode == "beat":
+            if hit:
+                self._chase_step = (self._chase_step + 1) % self._pillar_count
+            return
+        self._chase_frame_counter += 1
+        if self._chase_frame_counter >= self._chase_speed_frames:
+            self._chase_frame_counter = 0
+            self._chase_step = (self._chase_step + 1) % self._pillar_count
 
     # ------------------------------------------------------------------
     def draw(
@@ -3265,11 +3294,16 @@ class SideRailRenderer:
         dim2   = np.clip(color * 0.45, 0, 255).astype(np.float32)
         bgr_d2 = (int(dim2[0]), int(dim2[1]), int(dim2[2]))
 
+        if self._shape == "pillar":
+            self._advance_chase(hit)
+
         for wx_i, wx_o in (
             (self._ri_r, self._ro_r),   # right rail
             (self._ri_l, self._ro_l),   # left rail
         ):
-            if self._shape == "tube":
+            if self._shape == "pillar":
+                self._draw_pillar(canvas, wx_i, wx_o, color)
+            elif self._shape == "tube":
                 self._draw_tube(canvas, wx_i, wx_o, bgr_t, bgr_d, color)
             elif self._shape == "chevron":
                 self._draw_chevrons(canvas, wx_i, wx_o, bgr_t, bgr_d,
@@ -3468,6 +3502,79 @@ class SideRailRenderer:
             # Bright core: thin crisp line drawn directly on canvas
             cv2.polylines(canvas, [pts], False, core_col,
                           core_thick, lineType=cv2.LINE_AA)
+
+    def _draw_pillar(self, canvas: np.ndarray, wx_i: float, wx_o: float,
+                     color: np.ndarray) -> np.ndarray:
+        """Draw cylindrical-looking pillar row with one running highlight head."""
+        cam = self._cam
+        bot, top = self._bot_y, self._top_y
+        head_idx = self._chase_step
+        dim_color = np.clip(color * 0.25, 0, 255).astype(np.float32)
+
+        # Cylinder approximation: high-sided round prism around the Y axis.
+        # Keep radius slightly inside the rail box bounds.
+        x_c = (wx_i + wx_o) * 0.5
+        radius_x = max(0.01, abs(wx_o - wx_i) * 0.46)
+        radius_z = max(0.01, self._pillar_half_z * 0.96)
+        radius_x *= self._pillar_radius
+        radius_z *= self._pillar_radius
+        n_sides = 20
+        thetas = np.linspace(0.0, 2.0 * math.pi, n_sides + 1)
+
+        for i, z_c in enumerate(self._pillar_zs):
+            is_head = (i == head_idx)
+            face_color = color if is_head else dim_color
+
+            # Side facets
+            for s in range(n_sides):
+                t0 = float(thetas[s])
+                t1 = float(thetas[s + 1])
+                x0 = x_c + radius_x * math.cos(t0)
+                z0 = z_c + radius_z * math.sin(t0)
+                x1 = x_c + radius_x * math.cos(t1)
+                z1 = z_c + radius_z * math.sin(t1)
+
+                # Simple cylindrical shading: facets facing camera (-Z) are brighter.
+                tm = 0.5 * (t0 + t1)
+                facing = max(0.0, -math.sin(tm))
+                shade = 0.55 + 0.45 * facing
+                facet_color = np.clip(face_color * shade, 0, 255).astype(np.float32)
+                bgr_facet = (
+                    int(facet_color[0]),
+                    int(facet_color[1]),
+                    int(facet_color[2]),
+                )
+
+                self._fill_face(
+                    canvas,
+                    [(x0, top, z0), (x1, top, z1), (x1, bot, z1), (x0, bot, z0)],
+                    bgr_facet,
+                    color,
+                    glow=is_head and facing > 0.85,
+                )
+
+            # Top cap (helps the pillar read as a cylinder, not a flat strip).
+            top_pts = []
+            for s in range(n_sides):
+                tt = float(thetas[s])
+                p = cam.project(
+                    x_c + radius_x * math.cos(tt),
+                    top,
+                    z_c + radius_z * math.sin(tt),
+                )
+                if p is None:
+                    top_pts = []
+                    break
+                top_pts.append((int(p[0]), int(p[1])))
+            if len(top_pts) >= 3:
+                top_poly = np.array(top_pts, dtype=np.int32)
+                top_color = np.clip(face_color * 0.62, 0, 255).astype(np.float32)
+                bgr_top = (int(top_color[0]), int(top_color[1]), int(top_color[2]))
+                cv2.fillConvexPoly(canvas, top_poly, bgr_top)
+                if is_head:
+                    _draw_neon_edges(canvas, [top_poly], face_color, 1)
+
+        return canvas
 
 
 class ParticleSystem:
@@ -4724,6 +4831,10 @@ class RhythmVisualizer:
         self.RAIL_IMAGE:           str | None = None
         self.RAIL_PULSE:           str   = 'beat'
         self.RAIL_PULSE_INTENSITY: float = 0.6
+        self.RAIL_PILLAR_COUNT:    int = 16
+        self.RAIL_PILLAR_RADIUS:   float = 1.0
+        self.RAIL_CHASE_MODE:      str = "time"
+        self.RAIL_CHASE_SPEED_FRAMES: int = 4
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -5108,6 +5219,10 @@ class RhythmVisualizer:
                 pulse_intensity=self.RAIL_PULSE_INTENSITY,
                 chevron_depth=getattr(self, "RAIL_CHEVRON_DEPTH", 1.0),
                 chevron_density=getattr(self, "RAIL_CHEVRON_DENSITY", 6),
+                pillar_count=getattr(self, "RAIL_PILLAR_COUNT", 16),
+                pillar_radius=getattr(self, "RAIL_PILLAR_RADIUS", 1.0),
+                chase_mode=getattr(self, "RAIL_CHASE_MODE", "time"),
+                chase_speed_frames=getattr(self, "RAIL_CHASE_SPEED_FRAMES", 4),
             )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
@@ -6024,8 +6139,8 @@ def parse_arguments():
     p.add_argument('--rail_color', type=str, default='#FF60FF',
                    help='Hex color for side-rail neon (e.g. "#FF60FF"). Default magenta.')
     p.add_argument('--rail_shape', type=str, default='chunky',
-                   choices=['chunky', 'tube', 'chevron'],
-                   help='Rail style: chunky=fence blocks, tube=strip, chevron=arrows.')
+                  choices=['chunky', 'tube', 'chevron', 'pillar'],
+                  help='Rail style: chunky=fence blocks, tube=strip, chevron=arrows, pillar=LED-chase columns.')
     p.add_argument('--rail_height', type=float, default=0.14,
                    help='Box height (world units). Default 0.14.')
     p.add_argument('--rail_offset_x', type=float, default=0.08,
@@ -6037,6 +6152,15 @@ def parse_arguments():
                    help='Audio-reactive pulse mode for rails. Default beat.')
     p.add_argument('--rail_pulse_intensity', type=float, default=0.6, metavar='0..1',
                    help='Pulse intensity 0=static, 1=full blink. Default 0.6.')
+    p.add_argument('--rail_pillar_count', type=int, default=16, metavar='N',
+                   help='Number of pillars in pillar shape (4..32). Default 16.')
+    p.add_argument('--rail_pillar_radius', type=float, default=1.0, metavar='MULT',
+                   help='Pillar circumference scale (0.2..2.0). <1 smaller pillars, >1 thicker.')
+    p.add_argument('--rail_chase_mode', type=str, default='time',
+                   choices=['time', 'beat'],
+                   help='Chase advance trigger: time=constant interval (frames), beat=on each beat hit. Default time.')
+    p.add_argument('--rail_chase_speed_frames', type=int, default=4, metavar='N',
+                   help='Frames between chase advances (only for chase_mode=time). Default 4.')
     p.add_argument('--rail_chevron_depth', type=float, default=1.0, metavar='MULT',
                    help='Chevron pointedness multiplier (shape=chevron only). '
                         '1.0 = 120° opening angle; >1 = more pointed; <1 = flatter. Default 1.0.')
@@ -6345,6 +6469,10 @@ if __name__ == '__main__':
     viz.RAIL_IMAGE             = args.rail_image or None
     viz.RAIL_PULSE             = str(args.rail_pulse)
     viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
+    viz.RAIL_PILLAR_COUNT      = int(args.rail_pillar_count)
+    viz.RAIL_PILLAR_RADIUS     = float(args.rail_pillar_radius)
+    viz.RAIL_CHASE_MODE        = str(args.rail_chase_mode)
+    viz.RAIL_CHASE_SPEED_FRAMES = int(args.rail_chase_speed_frames)
     viz.RAIL_CHEVRON_DEPTH     = float(args.rail_chevron_depth)
     viz.RAIL_CHEVRON_DENSITY   = int(args.rail_chevron_density)
     viz.SHOW_STICKMAN      = bool(args.stickman)

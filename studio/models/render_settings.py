@@ -21,6 +21,7 @@ class RailShape(str, Enum):
     CHUNKY  = "chunky"    # fence blocks (default)
     TUBE    = "tube"      # continuous extruded strip
     CHEVRON = "chevron"   # >>> inward-pointing arrows
+    PILLAR  = "pillar"    # row of 3-D columns with running LED highlight
 
 
 class RailPulse(str, Enum):
@@ -42,6 +43,10 @@ class SideRailMixin(BaseModel):
     rail_image: Optional[str] = None
     rail_pulse: RailPulse = RailPulse.BEAT
     rail_pulse_intensity: float = 0.6
+    rail_pillar_count: int = Field(default=16, ge=4, le=32)
+    rail_pillar_radius: float = Field(default=1.0, ge=0.2, le=2.0)
+    rail_chase_mode: Literal["time", "beat"] = "time"
+    rail_chase_speed_frames: int = Field(default=4, ge=1, le=60)
 
 
 class RenderMode(str, Enum):

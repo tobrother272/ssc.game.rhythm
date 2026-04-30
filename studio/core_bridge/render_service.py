@@ -564,6 +564,8 @@ class RenderService(QObject):
         "max_per_lane",
         "chevron_count",
         "rail_chevron_density",
+        "rail_pillar_count",
+        "rail_chase_speed_frames",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -594,6 +596,10 @@ class RenderService(QObject):
         "rail_image",
         "rail_pulse",
         "rail_pulse_intensity",
+        "rail_pillar_count",
+        "rail_chase_mode",
+        "rail_pillar_radius",
+        "rail_chase_speed_frames",
         "floor_hit_frac",
         "horizon_frac",
         "floor_spread_frac",

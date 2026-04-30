@@ -469,7 +469,8 @@ class _SideRailSection(QGroupBox):
 
     _SHAPES = [("Chunky (fence blocks)", "chunky"),
                ("Tube (strip)", "tube"),
-               ("Chevron (arrows)", "chevron")]
+               ("Chevron (arrows)", "chevron"),
+               ("Pillar (LED chase)", "pillar")]
     _PULSES = [("None (static)", "none"),
                ("Beat (flash on hit)", "beat"),
                ("RMS (breathe with bass)", "rms")]
@@ -485,6 +486,10 @@ class _SideRailSection(QGroupBox):
         pulse_intensity: float,
         chevron_depth: float = 1.0,
         chevron_density: int = 6,
+        pillar_count: int = 16,
+        pillar_radius: float = 1.0,
+        chase_mode: str = "time",
+        chase_speed_frames: int = 4,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Side Rail Options", parent)
@@ -630,9 +635,64 @@ class _SideRailSection(QGroupBox):
             self._chev_sep, self._chev_header,
             depth_row, density_row,
         ]
+
+        # ── Pillar-only sub-group ──────────────────────────────────────
+        self._pillar_sep = QFrame()
+        self._pillar_sep.setFrameShape(QFrame.Shape.HLine)
+        self._pillar_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._pillar_sep)
+        self._pillar_header = QLabel("<b>Pillar options</b>")
+        form.addRow(self._pillar_header)
+
+        self._pillar_count_sp = QSpinBox()
+        self._pillar_count_sp.setRange(4, 32)
+        self._pillar_count_sp.setValue(int(pillar_count))
+        self._pillar_count_sp.setToolTip("Number of pillars (4..32). More = denser LED row.")
+        _no_scroll(self._pillar_count_sp)
+        self._pillar_count_sp.valueChanged.connect(self.changed)
+        form.addRow("Count", self._pillar_count_sp)
+
+        self._pillar_radius_sp = QDoubleSpinBox()
+        self._pillar_radius_sp.setRange(0.2, 2.0)
+        self._pillar_radius_sp.setSingleStep(0.05)
+        self._pillar_radius_sp.setDecimals(2)
+        self._pillar_radius_sp.setValue(float(pillar_radius))
+        self._pillar_radius_sp.setToolTip(
+            "Pillar circumference scale. <1 = thinner columns, >1 = thicker."
+        )
+        _no_scroll(self._pillar_radius_sp)
+        self._pillar_radius_sp.valueChanged.connect(self.changed)
+        form.addRow("Radius", self._pillar_radius_sp)
+
+        self._chase_mode_cb = QComboBox()
+        self._chase_mode_cb.addItems(["time", "beat"])
+        self._chase_mode_cb.setCurrentText(str(chase_mode))
+        self._chase_mode_cb.setToolTip(
+            "time = constant frame interval; beat = advance on each beat hit"
+        )
+        _no_scroll(self._chase_mode_cb)
+        self._chase_mode_cb.currentTextChanged.connect(self.changed)
+        form.addRow("Chase mode", self._chase_mode_cb)
+
+        self._chase_speed_sp = QSpinBox()
+        self._chase_speed_sp.setRange(1, 60)
+        self._chase_speed_sp.setValue(int(chase_speed_frames))
+        self._chase_speed_sp.setToolTip(
+            "Frames per chase advance (only for time mode). 4 ≈ 133ms @30fps."
+        )
+        _no_scroll(self._chase_speed_sp)
+        self._chase_speed_sp.valueChanged.connect(self.changed)
+        form.addRow("Chase speed", self._chase_speed_sp)
+
+        self._pillar_widgets = [
+            self._pillar_sep, self._pillar_header,
+            self._pillar_count_sp, self._pillar_radius_sp,
+            self._chase_mode_cb, self._chase_speed_sp,
+        ]
         # Wire shape change to show/hide chevron sub-group
         self._shape_cb.currentIndexChanged.connect(self._on_shape_changed)
         self._update_chev_visibility()
+        self._update_pillar_visibility()
 
         # 2-second debounce for continuous slider input — label updates
         # instantly but `changed` is emitted only after the user stops
@@ -645,6 +705,7 @@ class _SideRailSection(QGroupBox):
     # ------------------------------------------------------------------
     def _on_shape_changed(self) -> None:
         self._update_chev_visibility()
+        self._update_pillar_visibility()
         self.changed.emit()
 
     def _on_chev_depth_changed(self, raw: int) -> None:
@@ -659,6 +720,11 @@ class _SideRailSection(QGroupBox):
         is_chev = (self._shape_cb.currentData() == "chevron")
         for w in self._chev_widgets:
             w.setVisible(is_chev)
+
+    def _update_pillar_visibility(self) -> None:
+        is_pillar = (self._shape_cb.currentData() == "pillar")
+        for w in self._pillar_widgets:
+            w.setVisible(is_pillar)
 
     # ------------------------------------------------------------------
     def _refresh_color_btn(self) -> None:
@@ -713,6 +779,18 @@ class _SideRailSection(QGroupBox):
 
     def get_chevron_density(self) -> int:
         return self._chev_density_sl.value()
+
+    def get_pillar_count(self) -> int:
+        return self._pillar_count_sp.value()
+
+    def get_pillar_radius(self) -> float:
+        return self._pillar_radius_sp.value()
+
+    def get_chase_mode(self) -> str:
+        return self._chase_mode_cb.currentText()
+
+    def get_chase_speed_frames(self) -> int:
+        return self._chase_speed_sp.value()
 
 
 def format_sec(value: float) -> str:
@@ -1258,6 +1336,10 @@ class SegmentConfigPanel(QWidget):
                     pulse_intensity=float(rs.get("rail_pulse_intensity", 0.6)),
                     chevron_depth=float(rs.get("rail_chevron_depth", 1.0) or 1.0),
                     chevron_density=int(rs.get("rail_chevron_density", 6) or 6),
+                    pillar_count=int(rs.get("rail_pillar_count", 16) or 16),
+                    pillar_radius=float(rs.get("rail_pillar_radius", 1.0) or 1.0),
+                    chase_mode=str(rs.get("rail_chase_mode", "time") or "time"),
+                    chase_speed_frames=int(rs.get("rail_chase_speed_frames", 4) or 4),
                     parent=self,
                 )
                 sr_section.setVisible(bool(value))
@@ -1485,6 +1567,10 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["rail_pulse_intensity"]  = sec.get_pulse_intensity()
         segment.render_settings["rail_chevron_depth"]    = sec.get_chevron_depth()
         segment.render_settings["rail_chevron_density"]  = sec.get_chevron_density()
+        segment.render_settings["rail_pillar_count"]     = sec.get_pillar_count()
+        segment.render_settings["rail_pillar_radius"]    = sec.get_pillar_radius()
+        segment.render_settings["rail_chase_mode"]       = sec.get_chase_mode()
+        segment.render_settings["rail_chase_speed_frames"] = sec.get_chase_speed_frames()
 
     def _commit_side_rail_section(self) -> None:
         """Called when any side rail sub-section control changes."""

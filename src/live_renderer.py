@@ -205,6 +205,10 @@ class LiveFrameRenderer:
         rail_pulse_intensity: float = 0.6,
         rail_chevron_depth: float = 1.0,
         rail_chevron_density: int = 6,
+        rail_pillar_count: int = 16,
+        rail_pillar_radius: float = 1.0,
+        rail_chase_mode: str = "time",
+        rail_chase_speed_frames: int = 4,
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -254,6 +258,10 @@ class LiveFrameRenderer:
         self._rail_pulse_intensity = float(rail_pulse_intensity)
         self._rail_chevron_depth   = float(rail_chevron_depth)
         self._rail_chevron_density = int(rail_chevron_density)
+        self._rail_pillar_count = int(rail_pillar_count)
+        self._rail_pillar_radius = float(rail_pillar_radius)
+        self._rail_chase_mode = str(rail_chase_mode)
+        self._rail_chase_speed_frames = int(rail_chase_speed_frames)
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -285,6 +293,7 @@ class LiveFrameRenderer:
         # sentinel.  ``render_at`` will fast-forward to the requested
         # frame index from there.
         self._cur_fi: int = -1
+        self._hit_this_frame: bool = False
 
     # ------------------------------------------------------------------
     # public API
@@ -344,6 +353,7 @@ class LiveFrameRenderer:
             # reverse (which isn't supported anyway).
             self._build_scene()
             self._cur_fi = -1
+            self._hit_this_frame = False
         # Fast-forward state without drawing — particles + game advance
         # exactly the same way they would under the encoder loop, but we
         # skip the canvas compose for everything except the final frame.
@@ -354,6 +364,7 @@ class LiveFrameRenderer:
         while self._cur_fi < target_fi:
             self._cur_fi += 1
             hits = self._game.update(self._cur_fi)
+            self._hit_this_frame = len(hits) > 0
             self._apply_hits(hits, self._cur_fi)
             # Particles need to keep ticking even on skipped frames so a
             # forward-scrub through a hit lands with the same particle
@@ -401,6 +412,7 @@ class LiveFrameRenderer:
         # schedule.
         self._refresh_stickman_events()
         self._cur_fi = -1
+        self._hit_this_frame = False
 
     def update_mode(
         self,
@@ -431,6 +443,10 @@ class LiveFrameRenderer:
         rail_pulse_intensity: Optional[float] = None,
         rail_chevron_depth: Optional[float] = None,
         rail_chevron_density: Optional[int] = None,
+        rail_pillar_count: Optional[int] = None,
+        rail_pillar_radius: Optional[float] = None,
+        rail_chase_mode: Optional[str] = None,
+        rail_chase_speed_frames: Optional[int] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -507,6 +523,14 @@ class LiveFrameRenderer:
             self._rail_chevron_depth = float(rail_chevron_depth)
         if rail_chevron_density is not None:
             self._rail_chevron_density = int(rail_chevron_density)
+        if rail_pillar_count is not None:
+            self._rail_pillar_count = int(rail_pillar_count)
+        if rail_pillar_radius is not None:
+            self._rail_pillar_radius = float(rail_pillar_radius)
+        if rail_chase_mode is not None:
+            self._rail_chase_mode = str(rail_chase_mode)
+        if rail_chase_speed_frames is not None:
+            self._rail_chase_speed_frames = int(rail_chase_speed_frames)
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -729,6 +753,10 @@ class LiveFrameRenderer:
                 pulse_intensity=self._rail_pulse_intensity,
                 chevron_depth=self._rail_chevron_depth,
                 chevron_density=self._rail_chevron_density,
+                pillar_count=self._rail_pillar_count,
+                pillar_radius=self._rail_pillar_radius,
+                chase_mode=self._rail_chase_mode,
+                chase_speed_frames=self._rail_chase_speed_frames,
             )
         else:
             self._side_rail = None
@@ -996,7 +1024,7 @@ class LiveFrameRenderer:
         # 1b. side rails
         if self._side_rail is not None:
             _bass = float(self._audio.bass_arr[fi]) if fi < len(self._audio.bass_arr) else 0.0
-            self._side_rail.draw(canvas, fi, bass_val=_bass, hit=False)
+            self._side_rail.draw(canvas, fi, bass_val=_bass, hit=self._hit_this_frame)
         # 2. targets (back to front so close cubes occlude far ones)
         for tg in self._game.alive_sorted(fi):
             canvas = tg.draw(canvas, self._cam, fi)
