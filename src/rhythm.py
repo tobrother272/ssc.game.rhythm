@@ -3143,7 +3143,7 @@ class SideRailRenderer:
     pulse       : 'none' | 'beat' | 'rms'
     """
 
-    _tex_cache: dict[str, np.ndarray] = {}
+    _tex_cache: dict[object, np.ndarray] = {}
 
     # Box proportions relative to height
     _BOX_LIFT_FRAC  = 0.50   # gap below box = height * this  (Y clearance)
@@ -3179,14 +3179,28 @@ class SideRailRenderer:
         except Exception:
             self._base_bgr = np.array([255, 96, 255], dtype=np.float32)
 
-        # Texture (optional, applied to inner face)
+        # Texture (optional, applied to inner face).
+        # Downscale oversized inputs because rail faces are small on-screen;
+        # high-res sources only add warp cost with negligible visual gain.
         self._tex: np.ndarray | None = None
         if image_path:
-            if image_path not in SideRailRenderer._tex_cache:
+            cache_key = (image_path, "v2")
+            if cache_key not in SideRailRenderer._tex_cache:
                 img = cv2.imread(image_path, cv2.IMREAD_COLOR)
                 if img is not None:
-                    SideRailRenderer._tex_cache[image_path] = img
-            self._tex = SideRailRenderer._tex_cache.get(image_path)
+                    MAX_TEX_EDGE = 256
+                    h, w = img.shape[:2]
+                    longest = max(h, w)
+                    if longest > MAX_TEX_EDGE:
+                        scale = MAX_TEX_EDGE / float(longest)
+                        new_w = max(1, int(round(w * scale)))
+                        new_h = max(1, int(round(h * scale)))
+                        img = cv2.resize(
+                            img, (new_w, new_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    SideRailRenderer._tex_cache[cache_key] = img
+            self._tex = SideRailRenderer._tex_cache.get(cache_key)
 
         # Outer edge of the outermost floor tile
         # (mirrors TunnelRenderer: tile_w = max(0.25, step*0.80))
@@ -3278,17 +3292,31 @@ class SideRailRenderer:
         if poly is None:
             return
         if self._tex is not None:
+            H, W = canvas.shape[:2]
+            # Bbox of poly clipped to canvas bounds
+            x0, y0 = poly.min(axis=0)
+            x1, y1 = poly.max(axis=0) + 1
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(W, int(x1)), min(H, int(y1))
+            if x1 <= x0 or y1 <= y0:
+                return
+            bw, bh = x1 - x0, y1 - y0
+            # Translate poly into bbox-local coords
+            poly_local = poly - np.array([x0, y0], dtype=np.int32)
+            # Warp output to bbox size only (NOT full canvas)
             th, tw = self._tex.shape[:2]
-            src = np.float32([[0,0],[tw,0],[tw,th],[0,th]])
-            M = cv2.getPerspectiveTransform(src, np.float32(poly))
-            warped = cv2.warpPerspective(
-                self._tex, M, (canvas.shape[1], canvas.shape[0]))
-            mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
-            cv2.fillPoly(mask, [poly], 255)
-            canvas[mask > 0] = warped[mask > 0]
+            src = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]])
+            M = cv2.getPerspectiveTransform(src, poly_local.astype(np.float32))
+            warped = cv2.warpPerspective(self._tex, M, (bw, bh))
+            # Mask in bbox-local space
+            mask = np.zeros((bh, bw), dtype=np.uint8)
+            cv2.fillPoly(mask, [poly_local], 255)
+            # Composite into canvas ROI (no full-canvas scan)
+            roi = canvas[y0:y1, x0:x1]
+            roi[mask > 0] = warped[mask > 0]
         else:
             cv2.fillPoly(canvas, [poly], bgr)
-        if glow:
+        if glow and self._tex is None:
             col_arr = np.array([bgr[0], bgr[1], bgr[2]], dtype=np.float32)
             _draw_neon_edges(canvas, [poly], col_arr, 1)
 
