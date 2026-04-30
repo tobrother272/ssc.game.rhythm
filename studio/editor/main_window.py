@@ -167,6 +167,12 @@ class MainWindow(QMainWindow):
         # would cause Windows file-lock failures, so we keep them
         # serialised through this guard.
         self._inflight_trim_segments: set[str] = set()
+        # Per-segment signature of the last trim request we issued.  Tuples of
+        # ``(audio_path, round(start_sec, 3), round(end_sec, 3))`` — re-trim
+        # only when this signature actually changes so render-settings edits
+        # (toggling side rails, picking a colour, …) never overwrite a trim
+        # file that the live-preview QMediaPlayer is currently reading.
+        self._last_trim_signature: dict[str, tuple] = {}
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
         # ── Export dialog (kept alive while open so user can monitor progress)
@@ -471,6 +477,30 @@ class MainWindow(QMainWindow):
         if getattr(self, "_preview_mode_active", False):
             self._stop_preview_mode()
         self.project = project
+        # Reset trim cache when swapping projects so signatures from the
+        # previous project don't suppress legitimate trims in the new one.
+        self._last_trim_signature.clear()
+        self._inflight_trim_segments.clear()
+        # Pre-populate cache for segments that already have a trim on disk
+        # so a no-op form edit right after open doesn't re-trim.
+        for seg in project.segments:
+            if (
+                seg.audio_path
+                and seg.trimmed_audio_path
+                and Path(seg.trimmed_audio_path).exists()
+                and seg.duration_sec > 0
+            ):
+                start = self._audio_offset(seg)
+                end = start + (
+                    seg.audio_duration_sec
+                    if seg.audio_duration_sec > 0
+                    else seg.duration_sec
+                )
+                self._last_trim_signature[seg.id] = (
+                    str(seg.audio_path),
+                    round(float(start), 3),
+                    round(float(end), 3),
+                )
         self.media_panel.set_project(project)
         self.timeline_panel.set_project(project)
         self.timeline_panel.clear_beat_events()
@@ -856,6 +886,42 @@ class MainWindow(QMainWindow):
             if segment.audio_duration_sec > 0
             else segment.duration_sec
         )
+        # Skip when the audio window for this segment hasn't changed since
+        # the last successful trim AND the trimmed file still exists on
+        # disk.  Render-settings edits (side rails, colours, …) emit
+        # ``segment_changed`` but do not affect the audio window — re-running
+        # ffmpeg here would race with the QMediaPlayer that is reading the
+        # same trim file during live preview and could leave a corrupted
+        # file on disk (or silently skip on Windows because of the file
+        # lock).  Cache invalidates automatically when start/end/source
+        # changes, so a real audio-window edit still re-trims.
+        sig = (
+            str(segment.audio_path),
+            round(float(audio_start), 3),
+            round(float(audio_end), 3),
+        )
+        cached_sig = self._last_trim_signature.get(segment.id)
+        trim_exists = bool(
+            segment.trimmed_audio_path
+            and Path(segment.trimmed_audio_path).exists()
+        )
+        if cached_sig == sig and trim_exists and segment.id not in self._inflight_trim_segments:
+            return
+        # Real audio-window change while live preview is reading the trim
+        # file — drop preview first so QMediaPlayer releases the file
+        # handle (Windows) before ffmpeg overwrites it.  The user can
+        # re-toggle Preview once the new trim lands.
+        if (
+            self._preview_mode_active
+            and self._preview_active_segment_id == segment.id
+        ):
+            self._stop_preview_mode()
+            self.statusBar().showMessage(
+                "Preview stopped — segment audio window changed; "
+                "click Preview again once retrim finishes.",
+                4000,
+            )
+        self._last_trim_signature[segment.id] = sig
         self._inflight_trim_segments.add(segment.id)
         self.audio_trim_service.trim(
             segment_id=segment.id,
@@ -896,6 +962,9 @@ class MainWindow(QMainWindow):
 
     def _on_trim_failed(self, segment_id: str, message: str) -> None:
         self._inflight_trim_segments.discard(segment_id)
+        # Drop the cached signature so the next form change retries the
+        # trim instead of silently skipping with stale params.
+        self._last_trim_signature.pop(segment_id, None)
         self.statusBar().showMessage(f"Audio trim failed: {message}", 5000)
         print(f"[AudioTrim] segment={segment_id} error={message}", flush=True)
         # Drop any deferred Auto-Gen request — without a valid trim we
@@ -1445,6 +1514,8 @@ class MainWindow(QMainWindow):
         if current is not None and current.id == segment_id:
             self.segment_panel.set_segment(None)
         self.timeline_panel.clear_beat_events(segment_id)
+        self._last_trim_signature.pop(segment_id, None)
+        self._inflight_trim_segments.discard(segment_id)
         self.project.segments = [
             s for s in self.project.segments if s.id != segment_id
         ]

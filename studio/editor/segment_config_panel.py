@@ -1078,7 +1078,16 @@ class SegmentConfigPanel(QWidget):
         self.form_layout.addRow("Name", self.name_input)
 
         self.audio_combo = QComboBox()
-        self.audio_combo.currentIndexChanged.connect(self._commit_general)
+        # Audio source is bound to the segment at creation/split/join/duplicate
+        # time only.  Config edits MUST NEVER mutate ``segment.audio_path`` —
+        # otherwise toggling unrelated render settings during preview races
+        # with the trim service and corrupts the per-segment trim file.
+        # The combo is therefore display-only here.
+        self.audio_combo.setEnabled(False)
+        self.audio_combo.setToolTip(
+            "Audio source is set when the segment is created, split, joined, "
+            "or duplicated. To change the source, recreate the segment."
+        )
         _no_scroll(self.audio_combo)
         self.form_layout.addRow("Audio source", self.audio_combo)
 
@@ -1634,8 +1643,11 @@ class SegmentConfigPanel(QWidget):
         segment = self._segment
         if segment is None:
             return
+        # NOTE: ``segment.audio_path`` is intentionally NOT written here.
+        # The audio source is bound to the segment by the create / split /
+        # join / duplicate operations only; config edits must never change
+        # which file the segment plays.
         segment.name = self.name_input.text().strip() or "Segment"
-        segment.audio_path = str(self.audio_combo.currentData() or "")
         start = float(self.start_spin.value())
         end = float(self.end_spin.value())
         segment.start_time_sec = min(start, end)
@@ -1644,7 +1656,6 @@ class SegmentConfigPanel(QWidget):
             0.0, min(5.0, float(self.min_spacing_spin.value()))
         )
         self._load_segment_fields(segment)
-        # Audio source may have just changed → re-evaluate preview/render gating.
         self._set_empty_state(False)
         self.segment_changed.emit(segment.id)
 
