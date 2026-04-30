@@ -42,6 +42,7 @@ class SideRailMixin(BaseModel):
     rail_height: float = 0.14     # box height (world units)
     rail_offset_x: float = 0.08  # X gap from outer tile edge to box inner face
     rail_image: Optional[str] = None
+    rail_texture_non_loop: bool = False
     rail_pulse: RailPulse = RailPulse.BEAT
     rail_pulse_intensity: float = 0.6
     rail_pillar_count: int = Field(default=16, ge=4, le=32)
@@ -95,6 +96,10 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     floor_panel_opacity: float = 1.0           # 0.0 (transparent) … 1.0 (solid)
     floor_panel_blink: bool = False            # tiles flash on every beat
     floor_panel_image: Optional[str] = None   # image file overlaid on tiles; None = draw shapes
+    # When True AND ``floor_panel_image`` is set, the image is stretched to fill
+    # the entire floor trapezoid as a single static graphic — chevrons, tiles,
+    # blink, BG color and opacity are all skipped.  Ignored when no image.
+    floor_full_static_image: bool = False
     # Floor layout override ('auto' = mode-dependent legacy behaviour;
     # 'chevron_strip' = single centre column of >>>-arrow shapes).
     floor_layout: str = "auto"

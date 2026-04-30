@@ -568,6 +568,7 @@ class TunnelRenderer:
                  floor_panel_opacity: float = 1.0,
                  floor_panel_blink: bool = False,
                  floor_panel_image: str | None = None,
+                 floor_full_static_image: bool = False,
                  floor_layout: str = 'auto',
                  floor_bg_color: str | None = None,
                  floor_bg_opacity: float = 1.0,
@@ -589,6 +590,10 @@ class TunnelRenderer:
         from a fixed half-second period so the preview matches the render).
         `floor_panel_image`: optional image path; when set the image is
         perspective-warped onto each tile instead of the flat grey fill.
+        `floor_full_static_image`: when True AND `floor_panel_image` is set,
+        the image is stretched (perspective-warped) onto the FULL floor
+        trapezoid as one static graphic — chevrons, tiles, BG color, blink
+        and opacity are all bypassed.  Has no effect when no image is loaded.
         `floor_layout`: 'auto' (legacy lane_tiles / 2-column) or
         'chevron_strip' (single centre column of >>>-arrow shapes).
         `floor_bg_color`: hex "#RRGGBB" solid trapezoid drawn UNDER tiles;
@@ -609,6 +614,7 @@ class TunnelRenderer:
         self.chevron_blink = bool(chevron_blink)
         self.chevron_width_frac = float(max(0.1, min(2.0, chevron_width_frac)))
         self.chevron_count = int(max(3, min(12, chevron_count)))
+        self.floor_full_static_image = bool(floor_full_static_image)
         # Pre-load the tile image (BGR) so we don't re-read on every frame.
         self._tile_img: "np.ndarray | None" = None
         if floor_panel_image:
@@ -631,6 +637,16 @@ class TunnelRenderer:
           3. Horizon glow line (atmospherics).
         """
         cam = self.cam
+
+        # ── Phase 0: Full static image short-circuit ───────────────────
+        # When enabled with an image loaded, render JUST the image stretched
+        # onto the whole floor trapezoid and skip every other floor effect.
+        if self.floor_full_static_image and self._tile_img is not None:
+            self._draw_floor_full_static(canvas)
+            y_hz = int(cam.cy_pix + 2)
+            cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
+                     lineType=cv2.LINE_AA)
+            return canvas
 
         # ── Phase A: Floor BG trapezoid (solid color under tiles) ──────
         if self.floor_bg_color:
@@ -686,6 +702,51 @@ class TunnelRenderer:
             overlay = canvas.copy()
             cv2.fillConvexPoly(overlay, poly, bgr, lineType=cv2.LINE_AA)
             cv2.addWeighted(overlay, opacity, canvas, 1.0 - opacity, 0, canvas)
+
+    def _draw_floor_full_static(self, canvas: np.ndarray) -> None:
+        """Stretch ``self._tile_img`` to the full runway trapezoid (one shot)."""
+        cam = self.cam
+        if self._tile_img is None:
+            return
+
+        if cam.n_lanes >= 2:
+            outer_left  = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step   = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left  = outer_left  - half_step
+        x_right = outer_right + half_step
+
+        corners_w = [
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_NEAR),   # near-left
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_NEAR),   # near-right
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR),    # far-right
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_FAR),    # far-left
+        ]
+        proj = [cam.project(*c) for c in corners_w]
+        if any(p is None for p in proj):
+            return
+        dst_pts = np.array(
+            [(float(p[0]), float(p[1])) for p in proj],
+            dtype=np.float32,
+        )
+
+        ih, iw = self._tile_img.shape[:2]
+        # Source corners ordered to match dst: TL, TR, BR, BL.
+        # Image y=0 is "top" / far end of the floor; y=ih is "bottom" / near.
+        src_pts = np.array(
+            [[0,   ih], [iw, ih], [iw, 0], [0,  0]],
+            dtype=np.float32,
+        )
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(
+            self._tile_img, M, (canvas.shape[1], canvas.shape[0])
+        )
+        poly_int = dst_pts.astype(np.int32)
+        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, poly_int, 255)
+        canvas[mask > 0] = warped[mask > 0]
 
     def _draw_chevron_strip(self, canvas: np.ndarray, frame: int) -> None:
         """Draw a single column of >>>-arrows down the centre of the runway."""
@@ -3158,6 +3219,7 @@ class SideRailRenderer:
         height: float = 0.14,
         offset_x: float = 0.08,
         image_path: str | None = None,
+        texture_non_loop: bool = False,
         pulse: str = "beat",
         pulse_intensity: float = 0.6,
         chevron_depth: float = 1.0,
@@ -3177,6 +3239,7 @@ class SideRailRenderer:
         self._shape  = shape.lower()
         if self._shape in {"pillar", "dot"}:
             image_path = None
+        self._texture_non_loop = bool(texture_non_loop)
         self._height = max(0.03, float(height))
         self._pulse  = pulse.lower()
         self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
@@ -3415,36 +3478,32 @@ class SideRailRenderer:
     def _draw_tube(self, canvas, wx_i, wx_o, bgr_t, bgr_d, color):
         zs = self._z_slices
         bot, top = self._bot_y, self._top_y
-        # Inner face: continuous quad strip
-        prev: list | None = None
-        for z in zs:
-            pb = self._cam.project(wx_i, bot, z)
-            pt = self._cam.project(wx_i, top, z)
-            if pb is None or pt is None:
-                prev = None
-                continue
-            curr = [(int(pb[0]), int(pb[1])), (int(pt[0]), int(pt[1]))]
-            if prev is not None:
-                quad = np.array(
-                    [prev[0], prev[1], curr[1], curr[0]], dtype=np.int32)
-                cv2.fillPoly(canvas, [quad], bgr_t)
-                c = np.array([bgr_t[0], bgr_t[1], bgr_t[2]], dtype=np.float32)
-                _draw_neon_edges(canvas, [quad], c, 1)
-            prev = curr
-        # Top face
-        prev = None
-        for z in zs:
-            pi_ = self._cam.project(wx_i, top, z)
-            po_ = self._cam.project(wx_o, top, z)
-            if pi_ is None or po_ is None:
-                prev = None
-                continue
-            curr = [(int(pi_[0]), int(pi_[1])), (int(po_[0]), int(po_[1]))]
-            if prev is not None:
-                quad = np.array(
-                    [prev[0], prev[1], curr[1], curr[0]], dtype=np.int32)
-                cv2.fillPoly(canvas, [quad], bgr_d)
-            prev = curr
+        # Optional non-loop mode: map the texture ONCE across the full rail
+        # length, instead of re-warping per segment (which visually tiles).
+        if self._texture_non_loop and self._tex is not None:
+            z0 = self._cam.Z_NEAR + 0.05
+            z1 = self._cam.Z_FAR
+            self._fill_face(canvas, [
+                (wx_i, bot, z0), (wx_i, top, z0),
+                (wx_i, top, z1), (wx_i, bot, z1),
+            ], bgr_t, color, glow=True)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
+            return
+        for i in range(len(zs) - 1):
+            z0, z1 = zs[i], zs[i + 1]
+            # Inner face: continuous strip facing runway.
+            self._fill_face(canvas, [
+                (wx_i, bot, z0), (wx_i, top, z0),
+                (wx_i, top, z1), (wx_i, bot, z1),
+            ], bgr_t, color, glow=True)
+            # Top face: depth cue, slightly dimmer.
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
 
     # ── chevron: glowing open-V neon lines on inner face (>>> style) ─────
     def _draw_chevrons(self, canvas, wx_i, wx_o, bgr_t, bgr_d,
@@ -5303,6 +5362,7 @@ class RhythmVisualizer:
                                    floor_panel_opacity=float(getattr(self, "FLOOR_PANEL_OPACITY", 1.0)),
                                    floor_panel_blink=getattr(self, "FLOOR_PANEL_BLINK", False),
                                    floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None),
+                                   floor_full_static_image=bool(getattr(self, "FLOOR_FULL_STATIC_IMAGE", False)),
                                    floor_layout=getattr(self, "FLOOR_LAYOUT", "auto"),
                                    floor_bg_color=getattr(self, "FLOOR_BG_COLOR", None),
                                    floor_bg_opacity=float(getattr(self, "FLOOR_BG_OPACITY", 1.0)),
@@ -5320,6 +5380,7 @@ class RhythmVisualizer:
                 height=self.RAIL_HEIGHT,
                 offset_x=self.RAIL_OFFSET_X,
                 image_path=self.RAIL_IMAGE,
+                texture_non_loop=bool(getattr(self, "RAIL_TEXTURE_NON_LOOP", False)),
                 pulse=self.RAIL_PULSE,
                 pulse_intensity=self.RAIL_PULSE_INTENSITY,
                 chevron_depth=getattr(self, "RAIL_CHEVRON_DEPTH", 1.0),
@@ -6186,6 +6247,11 @@ def parse_arguments():
                    help='Flash floor tiles on/off each half-second. Default 0.')
     p.add_argument('--floor_panel_image', type=str, default=None, metavar='PATH',
                    help='Image file to perspective-warp onto floor tiles instead of flat fill.')
+    p.add_argument('--floor_full_static_image', type=int, default=0, metavar='0|1',
+                   help='When 1 AND --floor_panel_image is set, stretch the image '
+                        'to the entire floor trapezoid as a single static graphic. '
+                        'All other floor effects (chevron, tiles, BG color, blink, '
+                        'opacity) are bypassed. Default 0.')
     # ── Floor layout + background ───────────────────────────────────────
     p.add_argument('--floor_layout', type=str, default='auto',
                    choices=['auto', 'chevron_strip'],
@@ -6258,6 +6324,8 @@ def parse_arguments():
                    help='Gap from outer lane tile edge to fence face (world units). Default 0.03.')
     p.add_argument('--rail_image', type=str, default=None,
                    help='Optional PNG/JPG to texture rail blocks. None = solid color.')
+    p.add_argument('--rail_texture_non_loop', type=int, default=0, metavar='0|1',
+                   help='Tube+texture only: 1 = map texture once across full rail length (no tiling). Default 0.')
     p.add_argument('--rail_pulse', type=str, default='beat',
                    choices=['none', 'beat', 'rms'],
                    help='Audio-reactive pulse mode for rails. Default beat.')
@@ -6572,6 +6640,7 @@ if __name__ == '__main__':
     viz.FLOOR_PANEL_OPACITY = float(args.floor_panel_opacity)
     viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
     viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
+    viz.FLOOR_FULL_STATIC_IMAGE = bool(int(args.floor_full_static_image))
     viz.FLOOR_LAYOUT         = args.floor_layout
     viz.FLOOR_BG_COLOR       = args.floor_bg_color or None
     viz.FLOOR_BG_OPACITY     = float(args.floor_bg_opacity)
@@ -6591,6 +6660,7 @@ if __name__ == '__main__':
     viz.RAIL_HEIGHT            = float(args.rail_height)
     viz.RAIL_OFFSET_X          = float(args.rail_offset_x)
     viz.RAIL_IMAGE             = args.rail_image or None
+    viz.RAIL_TEXTURE_NON_LOOP  = bool(int(args.rail_texture_non_loop))
     viz.RAIL_PULSE             = str(args.rail_pulse)
     viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
     viz.RAIL_PILLAR_COUNT      = int(args.rail_pillar_count)

@@ -70,7 +70,6 @@ class StickmanBoxOverlay(QWidget):
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
@@ -265,7 +264,6 @@ class FloorWallOverlay(QWidget):
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
@@ -1734,6 +1732,7 @@ class PreviewPanel(QWidget):
         floor_panel_opacity: Optional[float] = None,
         floor_panel_blink: Optional[bool] = None,
         floor_panel_image: Optional[str] = None,
+        floor_full_static_image: Optional[bool] = None,
         floor_layout: Optional[str] = None,
         floor_bg_color: Optional[str] = None,
         floor_bg_opacity: Optional[float] = None,
@@ -1748,6 +1747,7 @@ class PreviewPanel(QWidget):
         rail_height: Optional[float] = None,
         rail_offset_x: Optional[float] = None,
         rail_image: Optional[str] = None,
+        rail_texture_non_loop: Optional[bool] = None,
         rail_pulse: Optional[str] = None,
         rail_pulse_intensity: Optional[float] = None,
         rail_chevron_depth: Optional[float] = None,
@@ -1776,6 +1776,7 @@ class PreviewPanel(QWidget):
             floor_panel_opacity=floor_panel_opacity,
             floor_panel_blink=floor_panel_blink,
             floor_panel_image=floor_panel_image,
+            floor_full_static_image=floor_full_static_image,
             floor_layout=floor_layout,
             floor_bg_color=floor_bg_color,
             floor_bg_opacity=floor_bg_opacity,
@@ -1790,6 +1791,7 @@ class PreviewPanel(QWidget):
             rail_height=rail_height,
             rail_offset_x=rail_offset_x,
             rail_image=rail_image,
+            rail_texture_non_loop=rail_texture_non_loop,
             rail_pulse=rail_pulse,
             rail_pulse_intensity=rail_pulse_intensity,
             rail_chevron_depth=rail_chevron_depth,

@@ -187,6 +187,7 @@ class LiveFrameRenderer:
         floor_panel_opacity: float = 1.0,
         floor_panel_blink: bool = False,
         floor_panel_image: Optional[str] = None,
+        floor_full_static_image: bool = False,
         floor_layout: str = "auto",
         floor_bg_color: Optional[str] = None,
         floor_bg_opacity: float = 1.0,
@@ -201,6 +202,7 @@ class LiveFrameRenderer:
         rail_height: float = 0.14,
         rail_offset_x: float = 0.08,
         rail_image: Optional[str] = None,
+        rail_texture_non_loop: bool = False,
         rail_pulse: str = "beat",
         rail_pulse_intensity: float = 0.6,
         rail_chevron_depth: float = 1.0,
@@ -246,6 +248,7 @@ class LiveFrameRenderer:
         self._floor_panel_opacity = float(floor_panel_opacity)
         self._floor_panel_blink = bool(floor_panel_blink)
         self._floor_panel_image = floor_panel_image or None
+        self._floor_full_static_image = bool(floor_full_static_image)
         self._floor_layout = str(floor_layout)
         self._floor_bg_color = floor_bg_color or None
         self._floor_bg_opacity = float(floor_bg_opacity)
@@ -260,6 +263,7 @@ class LiveFrameRenderer:
         self._rail_height = float(rail_height)
         self._rail_offset_x = float(rail_offset_x)
         self._rail_image = rail_image or None
+        self._rail_texture_non_loop = bool(rail_texture_non_loop)
         self._rail_pulse = str(rail_pulse)
         self._rail_pulse_intensity = float(rail_pulse_intensity)
         self._rail_chevron_depth   = float(rail_chevron_depth)
@@ -437,6 +441,7 @@ class LiveFrameRenderer:
         floor_panel_opacity: Optional[float] = None,
         floor_panel_blink: Optional[bool] = None,
         floor_panel_image: Optional[str] = None,
+        floor_full_static_image: Optional[bool] = None,
         floor_layout: Optional[str] = None,
         floor_bg_color: Optional[str] = None,
         floor_bg_opacity: Optional[float] = None,
@@ -451,6 +456,7 @@ class LiveFrameRenderer:
         rail_height: Optional[float] = None,
         rail_offset_x: Optional[float] = None,
         rail_image: Optional[str] = None,
+        rail_texture_non_loop: Optional[bool] = None,
         rail_pulse: Optional[str] = None,
         rail_pulse_intensity: Optional[float] = None,
         rail_chevron_depth: Optional[float] = None,
@@ -505,6 +511,8 @@ class LiveFrameRenderer:
             self._floor_panel_blink = bool(floor_panel_blink)
         if floor_panel_image is not None:
             self._floor_panel_image = floor_panel_image or None
+        if floor_full_static_image is not None:
+            self._floor_full_static_image = bool(floor_full_static_image)
         if floor_layout is not None:
             self._floor_layout = str(floor_layout)
         if floor_bg_color is not None:
@@ -533,6 +541,8 @@ class LiveFrameRenderer:
             self._rail_offset_x = float(rail_offset_x)
         if rail_image is not None:
             self._rail_image = rail_image or None
+        if rail_texture_non_loop is not None:
+            self._rail_texture_non_loop = bool(rail_texture_non_loop)
         if rail_pulse is not None:
             self._rail_pulse = str(rail_pulse)
         if rail_pulse_intensity is not None:
@@ -762,6 +772,7 @@ class LiveFrameRenderer:
             floor_panel_opacity=self._floor_panel_opacity,
             floor_panel_blink=self._floor_panel_blink,
             floor_panel_image=self._floor_panel_image,
+            floor_full_static_image=self._floor_full_static_image,
             floor_layout=self._floor_layout,
                                    floor_bg_color=self._floor_bg_color,
                                    floor_bg_opacity=self._floor_bg_opacity,
@@ -779,6 +790,7 @@ class LiveFrameRenderer:
                 height=self._rail_height,
                 offset_x=self._rail_offset_x,
                 image_path=self._rail_image,
+                texture_non_loop=self._rail_texture_non_loop,
                 pulse=self._rail_pulse,
                 pulse_intensity=self._rail_pulse_intensity,
                 chevron_depth=self._rail_chevron_depth,

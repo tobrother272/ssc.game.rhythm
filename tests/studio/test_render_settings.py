@@ -103,3 +103,18 @@ def test_dot_anim_mode_invalid() -> None:
     except ValidationError:
         pass
 
+
+def test_tube_texture_non_loop_round_trip() -> None:
+    s = build_settings(
+        "punch",
+        {
+            "side_rails": True,
+            "rail_shape": "tube",
+            "rail_image": "C:/tmp/rail.png",
+            "rail_texture_non_loop": True,
+        },
+    )
+    d = s.model_dump(mode="json")
+    assert d["rail_shape"] == "tube"
+    assert d["rail_texture_non_loop"] is True
+

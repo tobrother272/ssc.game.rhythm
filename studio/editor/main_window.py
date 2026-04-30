@@ -1933,6 +1933,7 @@ class MainWindow(QMainWindow):
             "floor_panel_opacity": float(_get("floor_panel_opacity", 1.0) or 1.0),
             "floor_panel_blink": bool(_get("floor_panel_blink", False)),
             "floor_panel_image": _get("floor_panel_image", None) or "",
+            "floor_full_static_image": bool(_get("floor_full_static_image", False)),
             "floor_layout":          str(_get("floor_layout", "auto")),
             "floor_bg_color":        _get("floor_bg_color", None) or "",
             "floor_bg_opacity":      float(_get("floor_bg_opacity", 1.0) or 1.0),
@@ -1947,6 +1948,7 @@ class MainWindow(QMainWindow):
             "rail_height":           float(_get("rail_height", 0.14)),
             "rail_offset_x":         float(_get("rail_offset_x", 0.08)),
             "rail_image":            _get("rail_image", None) or "",
+            "rail_texture_non_loop": bool(_get("rail_texture_non_loop", False)),
             "rail_pulse":            str(_get("rail_pulse", "beat")),
             "rail_pulse_intensity":  float(_get("rail_pulse_intensity", 0.6)),
             "rail_chevron_depth":    float(_get("rail_chevron_depth", 1.0) or 1.0),
@@ -2127,6 +2129,7 @@ class MainWindow(QMainWindow):
             floor_panel_opacity = float(rs.get("floor_panel_opacity", 1.0) or 1.0)
             floor_panel_blink = bool(rs.get("floor_panel_blink", False))
             floor_panel_image = rs.get("floor_panel_image") or ""
+            floor_full_static_image = bool(rs.get("floor_full_static_image", False))
             floor_layout      = str(rs.get("floor_layout", "auto"))
             floor_bg_color    = rs.get("floor_bg_color") or ""
             floor_bg_opacity  = float(rs.get("floor_bg_opacity", 1.0) or 1.0)
@@ -2141,6 +2144,7 @@ class MainWindow(QMainWindow):
             rail_height          = float(rs.get("rail_height", 0.14) or 0.14)
             rail_offset_x        = float(rs.get("rail_offset_x", 0.08) or 0.08)
             rail_image           = rs.get("rail_image") or ""
+            rail_texture_non_loop = bool(rs.get("rail_texture_non_loop", False))
             rail_pulse           = str(rs.get("rail_pulse", "beat"))
             rail_pulse_intensity = float(rs.get("rail_pulse_intensity", 0.6) or 0.6)
             rail_chevron_depth   = float(rs.get("rail_chevron_depth", 1.0) or 1.0)
@@ -2176,6 +2180,7 @@ class MainWindow(QMainWindow):
                     floor_panel_opacity=floor_panel_opacity,
                     floor_panel_blink=floor_panel_blink,
                     floor_panel_image=floor_panel_image,
+                    floor_full_static_image=floor_full_static_image,
                     floor_layout=floor_layout,
                     floor_bg_color=floor_bg_color,
                     floor_bg_opacity=floor_bg_opacity,
@@ -2190,6 +2195,7 @@ class MainWindow(QMainWindow):
                     rail_height=rail_height,
                     rail_offset_x=rail_offset_x,
                     rail_image=rail_image,
+                    rail_texture_non_loop=rail_texture_non_loop,
                     rail_pulse=rail_pulse,
                     rail_pulse_intensity=rail_pulse_intensity,
                     rail_chevron_depth=rail_chevron_depth,

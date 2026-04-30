@@ -138,6 +138,7 @@ class _FloorPanelSection(QGroupBox):
         chevron_blink: bool = False,
         chevron_width_frac: float = 0.45,
         chevron_count: int = 6,
+        full_static_image: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Floor Panel Options", parent)
@@ -241,7 +242,7 @@ class _FloorPanelSection(QGroupBox):
             "Image to warp onto floor tiles instead of flat fill.\n"
             "Leave blank to use the default shape fill."
         )
-        self._img_edit.editingFinished.connect(self.changed)
+        self._img_edit.editingFinished.connect(self._on_img_edit_changed)
         img_browse = QPushButton("…")
         img_browse.setFixedWidth(28)
         img_browse.setToolTip("Browse for an image file")
@@ -249,6 +250,23 @@ class _FloorPanelSection(QGroupBox):
         img_layout.addWidget(self._img_edit)
         img_layout.addWidget(img_browse)
         form.addRow("Tile image", self._img_row)
+
+        # ── Full static image checkbox (visible only with image set) ───
+        full_row = QWidget()
+        full_layout = QHBoxLayout(full_row)
+        full_layout.setContentsMargins(0, 0, 0, 0)
+        self._full_static_cb = QCheckBox()
+        self._full_static_cb.setChecked(bool(full_static_image))
+        self._full_static_cb.setToolTip(
+            "Stretch the tile image across the WHOLE floor as a single static\n"
+            "graphic. All other floor effects (chevron, tiles, BG color, blink,\n"
+            "opacity) are bypassed. Visible only when a tile image is selected."
+        )
+        self._full_static_cb.stateChanged.connect(self._on_full_static_changed)
+        full_layout.addWidget(self._full_static_cb)
+        full_layout.addStretch()
+        form.addRow("Full static image", full_row)
+        self._full_static_row = full_row
 
         # ── Chevron sub-group separator ────────────────────────────────
         sep = QFrame()
@@ -325,7 +343,17 @@ class _FloorPanelSection(QGroupBox):
             self._chev_width_sp, self._chev_count_sp,
             sep, self._chevron_header,
         ]
+        # Rows that disappear when "Full static image" is enabled.
+        # (Layout / BG / tiles / blink / chevron all become irrelevant — the
+        # whole floor becomes a single stretched image.)
+        self._effect_rows = [
+            self._layout_cb, bg_row, self._bg_opacity_sp,
+            color_row, blink_row, sep, self._chevron_header,
+            chev_color_row, cs_row, cb_row,
+            self._chev_width_sp, self._chev_count_sp,
+        ]
         self._update_chevron_visibility()
+        self._update_full_static_visibility()
 
     # ------------------------------------------------------------------
     def _on_layout_changed(self) -> None:
@@ -336,11 +364,11 @@ class _FloorPanelSection(QGroupBox):
         enabled = (self._layout_cb.currentData() == "chevron_strip")
         for w in self._chevron_widgets:
             w.setEnabled(enabled)
+        # In auto layout, chevron controls are not needed -> hide the whole block.
+        for w in self._chevron_widgets:
+            self._set_floor_row_visible(w, enabled)
         # In chevron layout, tile color/opacity are irrelevant (legacy tiles only).
-        try:
-            self._form.setRowVisible(self._tile_color_row, not enabled)
-        except Exception:
-            self._tile_color_row.setVisible(not enabled)
+        self._set_floor_row_visible(self._tile_color_row, not enabled)
 
     # ------------------------------------------------------------------
     def _refresh_bg_btn(self) -> None:
@@ -402,7 +430,51 @@ class _FloorPanelSection(QGroupBox):
         )
         if path:
             self._img_edit.setText(path)
+            self._update_full_static_visibility()
             self.changed.emit()
+
+    def _on_img_edit_changed(self) -> None:
+        self._update_full_static_visibility()
+        self.changed.emit()
+
+    def _on_full_static_changed(self) -> None:
+        self._apply_full_static_state()
+        self.changed.emit()
+
+    def _has_image(self) -> bool:
+        return bool(self._img_edit.text().strip())
+
+    def _update_full_static_visibility(self) -> None:
+        """Show the 'Full static image' row only when a tile image is set."""
+        has_img = self._has_image()
+        self._set_floor_row_visible(self._full_static_row, has_img)
+        # If the image was just cleared, also clear the checkbox state so the
+        # value persisted to render_settings reflects what's currently usable.
+        if not has_img and self._full_static_cb.isChecked():
+            self._full_static_cb.blockSignals(True)
+            self._full_static_cb.setChecked(False)
+            self._full_static_cb.blockSignals(False)
+        self._apply_full_static_state()
+
+    def _apply_full_static_state(self) -> None:
+        """Hide the rest of the floor effect rows when full-static is on."""
+        full = (self._full_static_cb.isChecked() and self._has_image())
+        for w in self._effect_rows:
+            self._set_floor_row_visible(w, not full)
+        # Image row stays visible regardless (user must see/edit the path).
+        # When full-static is OFF, restore the layout-driven chevron visibility.
+        if not full:
+            self._update_chevron_visibility()
+
+    def _set_floor_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """Safely toggle a floor row without Qt invalid-widget warnings."""
+        try:
+            if self._form.indexOf(widget) >= 0:
+                self._form.setRowVisible(widget, visible)
+            else:
+                widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
 
     # ------------------------------------------------------------------
     def _refresh_chev_color_btn(self) -> None:
@@ -458,6 +530,9 @@ class _FloorPanelSection(QGroupBox):
     def get_chevron_count(self) -> int:
         return self._chev_count_sp.value()
 
+    def get_full_static_image(self) -> bool:
+        return bool(self._full_static_cb.isChecked()) and self._has_image()
+
 
 class _SideRailSection(QGroupBox):
     """Config sub-section for side-rail settings.
@@ -485,6 +560,7 @@ class _SideRailSection(QGroupBox):
         image: str | None,
         pulse: str,
         pulse_intensity: float,
+        texture_non_loop: bool = False,
         chevron_depth: float = 1.0,
         chevron_density: int = 6,
         pillar_count: int = 16,
@@ -560,7 +636,7 @@ class _SideRailSection(QGroupBox):
             "Optional PNG/JPG to texture the rail blocks.\n"
             "Leave blank to use the solid neon color."
         )
-        self._img_edit.editingFinished.connect(self.changed)
+        self._img_edit.editingFinished.connect(self._on_texture_edited)
         img_browse = QPushButton("…")
         img_browse.setFixedWidth(28)
         img_browse.clicked.connect(self._browse_image)
@@ -572,6 +648,22 @@ class _SideRailSection(QGroupBox):
         ir.addWidget(img_browse)
         form.addRow("Texture", img_row)
         self._texture_row = img_row
+
+        # Tube-only texture option
+        non_loop_row = QWidget()
+        nl = QHBoxLayout(non_loop_row)
+        nl.setContentsMargins(0, 0, 0, 0)
+        self._texture_non_loop_cb = QCheckBox()
+        self._texture_non_loop_cb.setChecked(bool(texture_non_loop))
+        self._texture_non_loop_cb.setToolTip(
+            "Tube mode only. ON = map texture once over full rail length;\n"
+            "OFF = tile/loop texture per segment."
+        )
+        self._texture_non_loop_cb.stateChanged.connect(self.changed)
+        nl.addWidget(self._texture_non_loop_cb)
+        nl.addStretch()
+        form.addRow("Non-loop", non_loop_row)
+        self._texture_non_loop_row = non_loop_row
 
         # ---- Pulse mode ----
         self._pulse_cb = QComboBox()
@@ -764,6 +856,7 @@ class _SideRailSection(QGroupBox):
         self._update_pillar_visibility()
         self._update_dot_visibility()
         self._update_texture_visibility()
+        self._update_texture_tube_options_visibility()
 
         # 2-second debounce for continuous slider input — label updates
         # instantly but `changed` is emitted only after the user stops
@@ -779,6 +872,7 @@ class _SideRailSection(QGroupBox):
         self._update_pillar_visibility()
         self._update_dot_visibility()
         self._update_texture_visibility()
+        self._update_texture_tube_options_visibility()
         self.changed.emit()
 
     def _on_chev_depth_changed(self, raw: int) -> None:
@@ -792,25 +886,40 @@ class _SideRailSection(QGroupBox):
     def _update_chev_visibility(self) -> None:
         is_chev = (self._shape_cb.currentData() == "chevron")
         for w in self._chev_widgets:
-            w.setVisible(is_chev)
+            self._set_side_row_visible(w, is_chev)
 
     def _update_pillar_visibility(self) -> None:
         is_pillar = (self._shape_cb.currentData() == "pillar")
         for w in self._pillar_widgets:
-            w.setVisible(is_pillar)
+            self._set_side_row_visible(w, is_pillar)
 
     def _update_dot_visibility(self) -> None:
         is_dot = (self._shape_cb.currentData() == "dot")
         for w in self._dot_widgets:
-            w.setVisible(is_dot)
+            self._set_side_row_visible(w, is_dot)
+
+    def _set_side_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """Hide/show a full form row (label + field) when possible."""
+        # During panel rebuilds, stale signals can hit widgets that are no
+        # longer attached to this form. Guard to avoid Qt warning:
+        # "QFormLayout::setRowVisible: Invalid widget".
+        try:
+            if self._form.indexOf(widget) >= 0:
+                self._form.setRowVisible(widget, visible)
+            else:
+                widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
 
     def _update_texture_visibility(self) -> None:
         shape = self._shape_cb.currentData()
-        show_texture = shape not in ("pillar", "dot")
-        try:
-            self._form.setRowVisible(self._texture_row, show_texture)
-        except Exception:
-            self._texture_row.setVisible(show_texture)
+        show_texture = shape not in ("chevron", "pillar", "dot")
+        self._set_side_row_visible(self._texture_row, show_texture)
+
+    def _update_texture_tube_options_visibility(self) -> None:
+        is_tube = (self._shape_cb.currentData() == "tube")
+        has_tex = bool(self._img_edit.text().strip())
+        self._set_side_row_visible(self._texture_non_loop_row, is_tube and has_tex)
 
     @staticmethod
     def _refresh_dot_color_btn(btn: QPushButton, hex_color: str) -> None:
@@ -843,7 +952,12 @@ class _SideRailSection(QGroupBox):
         )
         if path:
             self._img_edit.setText(path)
+            self._update_texture_tube_options_visibility()
             self.changed.emit()
+
+    def _on_texture_edited(self) -> None:
+        self._update_texture_tube_options_visibility()
+        self.changed.emit()
 
     def _pick_dot_color_near(self) -> None:
         self._pick_dot_color_for("near")
@@ -883,6 +997,13 @@ class _SideRailSection(QGroupBox):
     def get_image(self) -> str | None:
         t = self._img_edit.text().strip()
         return t or None
+
+    def get_texture_non_loop(self) -> bool:
+        return (
+            bool(self._texture_non_loop_cb.isChecked())
+            and (self.get_shape() == "tube")
+            and bool(self.get_image())
+        )
 
     def get_pulse(self) -> str:
         return self._pulse_cb.currentData() or "beat"
@@ -1454,6 +1575,7 @@ class SegmentConfigPanel(QWidget):
                     chevron_blink=bool(rs.get("chevron_blink", False)),
                     chevron_width_frac=float(rs.get("chevron_width_frac", 0.45) or 0.45),
                     chevron_count=int(rs.get("chevron_count", 6) or 6),
+                    full_static_image=bool(rs.get("floor_full_static_image", False)),
                     parent=self,
                 )
                 section.setVisible(bool(value))
@@ -1475,6 +1597,7 @@ class SegmentConfigPanel(QWidget):
                     height=float(rs.get("rail_height", 0.14)),
                     offset_x=float(rs.get("rail_offset_x", 0.08)),
                     image=rs.get("rail_image") or None,
+                    texture_non_loop=bool(rs.get("rail_texture_non_loop", False)),
                     pulse=rs.get("rail_pulse", "beat"),
                     pulse_intensity=float(rs.get("rail_pulse_intensity", 0.6)),
                     chevron_depth=float(rs.get("rail_chevron_depth", 1.0) or 1.0),
@@ -1698,6 +1821,7 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["floor_panel_opacity"] = sec.get_floor_panel_opacity()
         segment.render_settings["floor_panel_blink"] = sec.get_blink()
         segment.render_settings["floor_panel_image"] = sec.get_image()
+        segment.render_settings["floor_full_static_image"] = sec.get_full_static_image()
         segment.render_settings["floor_layout"]      = sec.get_floor_layout()
         segment.render_settings["floor_bg_color"]    = sec.get_floor_bg_color()
         segment.render_settings["floor_bg_opacity"]  = sec.get_floor_bg_opacity()
@@ -1714,6 +1838,7 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["rail_height"]          = sec.get_height()
         segment.render_settings["rail_offset_x"]        = sec.get_offset_x()
         segment.render_settings["rail_image"]           = sec.get_image()
+        segment.render_settings["rail_texture_non_loop"] = sec.get_texture_non_loop()
         segment.render_settings["rail_pulse"]            = sec.get_pulse()
         segment.render_settings["rail_pulse_intensity"]  = sec.get_pulse_intensity()
         segment.render_settings["rail_chevron_depth"]    = sec.get_chevron_depth()

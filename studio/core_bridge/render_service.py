@@ -647,6 +647,7 @@ class RenderService(QObject):
         "floor_panel_opacity",
         "floor_panel_blink",
         "floor_panel_image",
+        "floor_full_static_image",
         "stickman",
         "line_zigzag",
         "side_rails",
@@ -655,6 +656,7 @@ class RenderService(QObject):
         "rail_height",
         "rail_offset_x",
         "rail_image",
+        "rail_texture_non_loop",
         "rail_pulse",
         "rail_pulse_intensity",
         "rail_pillar_count",
@@ -692,6 +694,7 @@ class RenderService(QObject):
     def _settings_to_args(cls, settings: dict) -> list[str]:
         args: list[str] = []
         rail_shape = str(settings.get("rail_shape", "") or "").lower()
+        rail_image = str(settings.get("rail_image", "") or "").strip()
         for key, value in settings.items():
             if key in cls._SKIP_KEYS:
                 continue
@@ -700,6 +703,10 @@ class RenderService(QObject):
             # Dot/Pillar rails do not use texture path: avoid passing stale
             # --rail_image from previous shapes to keep command clean.
             if key == "rail_image" and rail_shape in {"pillar", "dot"}:
+                continue
+            if key == "rail_texture_non_loop" and rail_shape != "tube":
+                continue
+            if key == "rail_texture_non_loop" and not rail_image:
                 continue
             # Skip Optional fields explicitly set to None — the CLI flag
             # is omitted so rhythm.py falls back to its own default (e.g.
