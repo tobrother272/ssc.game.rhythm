@@ -607,7 +607,7 @@ class TunnelRenderer:
         self.chevron_color = str(chevron_color)
         self.chevron_scroll = bool(chevron_scroll)
         self.chevron_blink = bool(chevron_blink)
-        self.chevron_width_frac = float(max(0.1, min(1.0, chevron_width_frac)))
+        self.chevron_width_frac = float(max(0.1, min(2.0, chevron_width_frac)))
         self.chevron_count = int(max(3, min(12, chevron_count)))
         # Pre-load the tile image (BGR) so we don't re-read on every frame.
         self._tile_img: "np.ndarray | None" = None
@@ -3175,6 +3175,8 @@ class SideRailRenderer:
     ):
         self._cam    = cam
         self._shape  = shape.lower()
+        if self._shape in {"pillar", "dot"}:
+            image_path = None
         self._height = max(0.03, float(height))
         self._pulse  = pulse.lower()
         self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))

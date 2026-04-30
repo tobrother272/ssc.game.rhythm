@@ -106,7 +106,7 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     chevron_color: str = "#FFD700"                 # arrow fill color (gold default)
     chevron_scroll: bool = True                    # scroll toward camera continuously
     chevron_blink: bool = False                    # flash on/off every 15 frames (~0.5s)
-    chevron_width_frac: float = 0.45               # strip width as fraction of lane spread
+    chevron_width_frac: float = Field(default=0.45, ge=0.1, le=2.0)  # strip width as fraction of lane spread
     chevron_count: int = 6                         # number of arrows visible simultaneously
     stickman: bool = True
     # Camera perspective overrides (None = use per-mode default)

@@ -299,11 +299,11 @@ class _FloorPanelSection(QGroupBox):
 
         # ---- Chevron width fraction ----
         self._chev_width_sp = QDoubleSpinBox()
-        self._chev_width_sp.setRange(0.10, 1.0)
+        self._chev_width_sp.setRange(0.10, 2.0)
         self._chev_width_sp.setSingleStep(0.05)
         self._chev_width_sp.setDecimals(2)
         self._chev_width_sp.setValue(float(chevron_width_frac))
-        self._chev_width_sp.setToolTip("Strip width as fraction of lane spread (0.1 – 1.0)")
+        self._chev_width_sp.setToolTip("Strip width as fraction of lane spread (0.1 – 2.0)")
         _no_scroll(self._chev_width_sp)
         self._chev_width_sp.valueChanged.connect(self.changed)
         form.addRow("Width frac", self._chev_width_sp)

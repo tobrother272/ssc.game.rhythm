@@ -8,14 +8,16 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from PySide6.QtCore import QSettings, QThread, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSettings, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStatusBar,
@@ -256,6 +258,86 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.outer_splitter)
         self.setCentralWidget(container)
+        self._init_timeline_render_overlay()
+
+    def _init_timeline_render_overlay(self) -> None:
+        """Create a blocking overlay shown on top of the timeline while rendering."""
+        self._timeline_render_overlay = QFrame(self.timeline_panel)
+        self._timeline_render_overlay.setObjectName("timelineRenderOverlay")
+        self._timeline_render_overlay.setStyleSheet(
+            "#timelineRenderOverlay {"
+            " background-color: rgba(8, 8, 12, 190);"
+            " border: 1px solid rgba(255, 255, 255, 45);"
+            " border-radius: 6px;"
+            "}"
+        )
+        box = QVBoxLayout(self._timeline_render_overlay)
+        box.setContentsMargins(24, 16, 24, 16)
+        box.setSpacing(8)
+        box.addStretch(1)
+
+        self._timeline_render_title = QLabel("Rendering…")
+        self._timeline_render_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._timeline_render_title.setStyleSheet(
+            "color: #F4F6FF; font-size: 16px; font-weight: 700;"
+        )
+        box.addWidget(self._timeline_render_title)
+
+        self._timeline_render_message = QLabel("Please wait until current segment finishes.")
+        self._timeline_render_message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._timeline_render_message.setStyleSheet(
+            "color: #D6DBF5; font-size: 12px;"
+        )
+        box.addWidget(self._timeline_render_message)
+
+        self._timeline_render_progress = QProgressBar()
+        self._timeline_render_progress.setRange(0, 100)
+        self._timeline_render_progress.setValue(0)
+        self._timeline_render_progress.setFormat("%p%")
+        self._timeline_render_progress.setTextVisible(True)
+        self._timeline_render_progress.setFixedHeight(18)
+        box.addWidget(self._timeline_render_progress)
+        box.addStretch(2)
+
+        self._timeline_render_overlay.hide()
+        self.timeline_panel.installEventFilter(self)
+        self._resize_timeline_render_overlay()
+
+    def _resize_timeline_render_overlay(self) -> None:
+        if not hasattr(self, "_timeline_render_overlay"):
+            return
+        margin = 10
+        rect = self.timeline_panel.rect().adjusted(margin, margin, -margin, -margin)
+        self._timeline_render_overlay.setGeometry(rect)
+
+    def _set_timeline_render_overlay(
+        self,
+        *,
+        visible: bool,
+        title: str = "Rendering…",
+        message: str = "Please wait until current segment finishes.",
+        progress: Optional[int] = None,
+    ) -> None:
+        if not hasattr(self, "_timeline_render_overlay"):
+            return
+        self._timeline_render_title.setText(title)
+        self._timeline_render_message.setText(message)
+        if progress is not None:
+            self._timeline_render_progress.setValue(max(0, min(100, int(progress))))
+        if visible:
+            self._resize_timeline_render_overlay()
+            self._timeline_render_overlay.raise_()
+            self._timeline_render_overlay.show()
+        else:
+            self._timeline_render_overlay.hide()
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self.timeline_panel and event.type() in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+        }:
+            self._resize_timeline_render_overlay()
+        return super().eventFilter(watched, event)
 
     def _build_menu(self) -> None:
         menu = self.menuBar()
@@ -276,8 +358,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Exit", self.close)
 
         render_menu = menu.addMenu("Render")
-        render_menu.addAction("Render Selected Segment", self._render_selected_segment)
-        render_menu.addAction("Render All", self._render_all_segments)
+        self._act_render_selected = render_menu.addAction(
+            "Render Selected Segment", self._render_selected_segment
+        )
+        self._act_render_all = render_menu.addAction(
+            "Render All", self._render_all_segments
+        )
 
         menu.addMenu("Edit")
 
@@ -294,8 +380,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction("Save", self._on_save_project)
         toolbar.addAction("Save As", self._on_save_as_project)
         toolbar.addSeparator()
-        toolbar.addAction("Render Selected", self._render_selected_segment)
-        toolbar.addAction("Render All", self._render_all_segments)
+        self._tb_act_render_selected = toolbar.addAction(
+            "Render Selected", self._render_selected_segment
+        )
+        self._tb_act_render_all = toolbar.addAction(
+            "Render All", self._render_all_segments
+        )
 
         # Right-side spacer + Export accent button
         spacer = QWidget()
@@ -2097,6 +2187,12 @@ class MainWindow(QMainWindow):
             label="Rendering",
             subtitle=f"{segment.name} — preparing…",
         )
+        self._set_timeline_render_overlay(
+            visible=True,
+            title=f"Rendering: {segment.name}",
+            message="Timeline is locked until current segment render finishes.",
+            progress=0,
+        )
         self.statusBar().showMessage(
             f"Rendering '{segment.name}' ({segment.start_time_sec:.1f}s"
             f"–{segment.end_time_sec:.1f}s)…", 3000
@@ -2104,6 +2200,7 @@ class MainWindow(QMainWindow):
         self._update_status()
         self.timeline_panel.refresh()
         self.segment_panel.set_segment(segment)
+        self._refresh_render_controls()
 
     def _on_render_progress(self, segment_id: str, progress: int) -> None:
         segment = self.project.get_segment(segment_id)
@@ -2119,10 +2216,17 @@ class MainWindow(QMainWindow):
             label="Rendering",
             subtitle=segment.name,
         )
+        self._set_timeline_render_overlay(
+            visible=True,
+            title=f"Rendering: {segment.name}",
+            message=f"Please wait… {progress}%",
+            progress=progress,
+        )
         # Lightweight status-label-only refresh — never rebuilds form widgets,
         # so any spinbox the user might be editing during a long render is
         # preserved.  No-op when the user has selected a different segment.
         self.segment_panel.refresh_status_only(segment)
+        self._refresh_render_controls()
         self._update_status()
 
     def _on_render_finished(self, segment_id: str, output_path: str) -> None:
@@ -2136,6 +2240,7 @@ class MainWindow(QMainWindow):
         segment.last_rendered_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
         self.preview_panel.hide_render_overlay()
+        self._set_timeline_render_overlay(visible=False)
 
         # The rendered file's local time 0 corresponds to project time
         # ``segment.start_time_sec`` — pass it so the timeline's red
@@ -2159,6 +2264,7 @@ class MainWindow(QMainWindow):
 
         self.segment_panel.set_segment(segment)
         self.timeline_panel.refresh()
+        self._refresh_render_controls()
         self._update_status()
 
     def _auto_save_after_render(self, segment_name: str) -> None:
@@ -2194,12 +2300,40 @@ class MainWindow(QMainWindow):
         segment.last_render_error = message
         segment.last_render_progress = 0
         self.preview_panel.hide_render_overlay()
+        self._set_timeline_render_overlay(visible=False)
         self.statusBar().showMessage(f"Render failed: {segment.name}", 5000)
         self.segment_panel.set_segment(segment)
         self._sync_preview_button_state()
+        self._refresh_render_controls()
         self._update_status()
 
+    def _refresh_render_controls(self) -> None:
+        """Disable render actions/buttons while queue is active."""
+        busy = any(
+            seg.render_status in {RenderStatus.QUEUED, RenderStatus.RENDERING}
+            for seg in self.project.segments
+        )
+        enabled = not busy
+        for act_name in (
+            "_act_render_selected",
+            "_act_render_all",
+            "_tb_act_render_selected",
+            "_tb_act_render_all",
+        ):
+            act = getattr(self, act_name, None)
+            if act is not None:
+                act.setEnabled(enabled)
+
+        current = self.segment_panel.current_segment
+        can_render_current = (
+            enabled and current is not None and bool(current.audio_path)
+        )
+        self.segment_panel.render_button.setEnabled(can_render_current)
+        if enabled:
+            self._set_timeline_render_overlay(visible=False)
+
     def _update_status(self) -> None:
+        self._refresh_render_controls()
         queue_count = sum(
             1
             for segment in self.project.segments

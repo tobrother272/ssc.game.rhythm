@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from math import floor
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ from PySide6.QtCore import QObject, Signal
 
 from studio.models import Segment, build_settings
 from src.bundle_paths import get_rhythm_command as _get_rhythm_command
+from src.bundle_paths import find_ffprobe as _find_ffprobe
 
 
 @dataclass
@@ -310,6 +312,22 @@ class RenderService(QObject):
                             flush=True,
                         )
 
+            # ----------------------------------------------------------------
+            # Duration guard: audio file used for render MUST match segment
+            # duration when rounded to whole seconds. Abort render on mismatch.
+            # ----------------------------------------------------------------
+            if job.duration_sec is not None and job.duration_sec > 0:
+                audio_dur_sec = self._probe_audio_duration_sec(audio_path)
+                expected_sec = int(floor(float(job.duration_sec) + 0.5))
+                actual_sec = int(floor(float(audio_dur_sec) + 0.5))
+                if actual_sec != expected_sec:
+                    raise RuntimeError(
+                        "Render aborted: audio duration does not match segment "
+                        f"duration (rounded seconds). "
+                        f"audio={actual_sec}s (raw={audio_dur_sec:.3f}s), "
+                        f"segment={expected_sec}s (raw={float(job.duration_sec):.3f}s)."
+                    )
+
             # --- Build subprocess command -----------------------------------
             # src.rhythm expects:
             #   -i / --input   <audio/video file>   (required)
@@ -379,7 +397,8 @@ class RenderService(QObject):
                         float(t) for t in job.beat_times if float(t) >= 0.0
                     ]
                 if valid:
-                    times_csv = ",".join(f"{float(t):.6f}" for t in valid)
+                    # Keep beat_times compact and human-readable in logged CMD.
+                    times_csv = ",".join(f"{float(t):.2f}" for t in valid)
                     command.extend([
                         "--beat_source", "array",
                         "--beat_times", times_csv,
@@ -548,6 +567,45 @@ class RenderService(QObject):
             if temp_audio:
                 Path(temp_audio).unlink(missing_ok=True)
 
+    @staticmethod
+    def _probe_audio_duration_sec(audio_path: str) -> float:
+        """Return media duration (seconds) using ffprobe."""
+        ffprobe = _find_ffprobe()
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            audio_path,
+        ]
+        _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=_creation_flags,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Cannot verify audio duration via ffprobe (rc={result.returncode}): "
+                f"{result.stdout[-400:]}"
+            )
+        out = (result.stdout or "").strip()
+        try:
+            dur = float(out)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Cannot parse audio duration from ffprobe output: {out!r}"
+            ) from exc
+        if dur <= 0:
+            raise RuntimeError(
+                f"Invalid audio duration from ffprobe: {dur:.6f}s"
+            )
+        return dur
+
     # Matches "Progress: 30%" prints from src.rhythm.RhythmVisualizer
     # .process_video (emitted at every 10% boundary).
     _PROGRESS_RE = re.compile(r"Progress:\s*(\d{1,3})\s*%")
@@ -633,15 +691,22 @@ class RenderService(QObject):
     @classmethod
     def _settings_to_args(cls, settings: dict) -> list[str]:
         args: list[str] = []
+        rail_shape = str(settings.get("rail_shape", "") or "").lower()
         for key, value in settings.items():
             if key in cls._SKIP_KEYS:
                 continue
             if key not in cls._ALLOWED_KEYS:
                 continue
+            # Dot/Pillar rails do not use texture path: avoid passing stale
+            # --rail_image from previous shapes to keep command clean.
+            if key == "rail_image" and rail_shape in {"pillar", "dot"}:
+                continue
             # Skip Optional fields explicitly set to None — the CLI flag
             # is omitted so rhythm.py falls back to its own default (e.g.
             # line_zigzag=None means "Off", i.e. no zigzag pattern).
             if value is None:
+                continue
+            if key == "rail_image" and not str(value).strip():
                 continue
             cli_key = f"--{key}"
 
