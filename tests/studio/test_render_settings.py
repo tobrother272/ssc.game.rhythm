@@ -118,3 +118,38 @@ def test_tube_texture_non_loop_round_trip() -> None:
     assert d["rail_shape"] == "tube"
     assert d["rail_texture_non_loop"] is True
 
+
+def test_relax_extensions_round_trip() -> None:
+    raw = {
+        "relax_interval": 0.25,
+        "relax_travel_sec": 3.5,
+        "relax_texture_low": "C:/tmp/low.png",
+        "relax_texture_high": "C:/tmp/high.png",
+        "relax_texture_middle": "C:/tmp/mid.png",
+        "relax_hole_mask_path": "C:/tmp/mask.png",
+        "relax_kind_ratio_middle": 0.6,
+        "relax_countdown_enabled": False,
+        "relax_countdown_color": "#FF0000",
+        "relax_countdown_max_sec": 4.2,
+    }
+    s = build_settings("relax", raw)
+    d = s.model_dump(mode="json")
+    assert d["relax_travel_sec"] == 3.5
+    assert d["relax_texture_middle"] == "C:/tmp/mid.png"
+    assert d["relax_kind_ratio_middle"] == 0.6
+    assert d["relax_countdown_enabled"] is False
+    assert d["relax_countdown_color"] == "#FF0000"
+    assert d["relax_countdown_max_sec"] == 4.2
+
+
+def test_relax_defaults_backward_compatible() -> None:
+    s = build_settings("relax", {"relax_interval": 0.1})
+    d = s.model_dump(mode="json")
+    assert d["relax_interval"] == 0.1
+    assert d["relax_travel_sec"] == 3.0
+    assert d["relax_kind_ratio_middle"] == 0.33
+    assert d["relax_show_low"] is True
+    assert d["relax_show_high"] is True
+    assert d["relax_show_middle"] is True
+    assert d["relax_countdown_enabled"] is True
+

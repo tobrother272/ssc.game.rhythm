@@ -158,6 +158,18 @@ class RelaxSettings(BaseRenderSettings):
     """Render settings for relax mode."""
 
     relax_interval: float = 0.0
+    relax_travel_sec: float = Field(default=3.0, ge=0.5, le=10.0)
+    relax_texture_low: Optional[str] = None
+    relax_texture_high: Optional[str] = None
+    relax_texture_middle: Optional[str] = None
+    relax_kind_ratio_middle: float = Field(default=0.33, ge=0.0, le=1.0)
+    relax_show_low: bool = True
+    relax_show_high: bool = True
+    relax_show_middle: bool = True
+    relax_countdown_enabled: bool = True
+    relax_countdown_color: str = "#FFFFFF"
+    relax_countdown_max_sec: float = 5.0
+    relax_hole_mask_path: Optional[str] = None
 
 
 class ComboSettings(PunchSettings, DanceSettings, LineSettings, RelaxSettings):

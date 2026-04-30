@@ -87,6 +87,7 @@ import rhythm as _rhy  # noqa: E402  (sys.path setup must precede import)
 from rhythm import (  # noqa: E402
     BASS_RANGE,
     CLR_BG,
+    CountdownHUD,
     ComboHUD,
     DanceTarget,
     GameManager,
@@ -217,6 +218,19 @@ class LiveFrameRenderer:
         rail_dot_anim_mode: str = "audio",
         rail_dot_color_near: str = "#FF60FF",
         rail_dot_color_far: str = "#00FFFF",
+        relax_interval: float = 0.0,
+        relax_travel_sec: float = 0.0,
+        relax_texture_low: Optional[str] = None,
+        relax_texture_high: Optional[str] = None,
+        relax_texture_middle: Optional[str] = None,
+        relax_hole_mask_path: Optional[str] = None,
+        relax_kind_ratio_middle: float = 0.33,
+        relax_show_low: bool = True,
+        relax_show_high: bool = True,
+        relax_show_middle: bool = True,
+        relax_countdown_enabled: bool = True,
+        relax_countdown_color: str = "#FFFFFF",
+        relax_countdown_max_sec: float = 5.0,
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -278,6 +292,19 @@ class LiveFrameRenderer:
         self._rail_dot_anim_mode = str(rail_dot_anim_mode)
         self._rail_dot_color_near = str(rail_dot_color_near)
         self._rail_dot_color_far = str(rail_dot_color_far)
+        self._relax_interval = max(0.0, float(relax_interval))
+        self._relax_travel_sec = max(0.0, float(relax_travel_sec))
+        self._relax_texture_low = relax_texture_low or None
+        self._relax_texture_high = relax_texture_high or None
+        self._relax_texture_middle = relax_texture_middle or None
+        self._relax_hole_mask_path = relax_hole_mask_path or None
+        self._relax_kind_ratio_middle = float(relax_kind_ratio_middle)
+        self._relax_show_low = bool(relax_show_low)
+        self._relax_show_high = bool(relax_show_high)
+        self._relax_show_middle = bool(relax_show_middle)
+        self._relax_countdown_enabled = bool(relax_countdown_enabled)
+        self._relax_countdown_color = str(relax_countdown_color)
+        self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -471,6 +498,19 @@ class LiveFrameRenderer:
         rail_dot_anim_mode: Optional[str] = None,
         rail_dot_color_near: Optional[str] = None,
         rail_dot_color_far: Optional[str] = None,
+        relax_interval: Optional[float] = None,
+        relax_travel_sec: Optional[float] = None,
+        relax_texture_low: Optional[str] = None,
+        relax_texture_high: Optional[str] = None,
+        relax_texture_middle: Optional[str] = None,
+        relax_hole_mask_path: Optional[str] = None,
+        relax_kind_ratio_middle: Optional[float] = None,
+        relax_show_low: Optional[bool] = None,
+        relax_show_high: Optional[bool] = None,
+        relax_show_middle: Optional[bool] = None,
+        relax_countdown_enabled: Optional[bool] = None,
+        relax_countdown_color: Optional[str] = None,
+        relax_countdown_max_sec: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -571,6 +611,32 @@ class LiveFrameRenderer:
             self._rail_dot_color_near = str(rail_dot_color_near)
         if rail_dot_color_far is not None:
             self._rail_dot_color_far = str(rail_dot_color_far)
+        if relax_interval is not None:
+            self._relax_interval = max(0.0, float(relax_interval))
+        if relax_travel_sec is not None:
+            self._relax_travel_sec = max(0.0, float(relax_travel_sec))
+        if relax_texture_low is not None:
+            self._relax_texture_low = relax_texture_low or None
+        if relax_texture_high is not None:
+            self._relax_texture_high = relax_texture_high or None
+        if relax_texture_middle is not None:
+            self._relax_texture_middle = relax_texture_middle or None
+        if relax_hole_mask_path is not None:
+            self._relax_hole_mask_path = relax_hole_mask_path or None
+        if relax_kind_ratio_middle is not None:
+            self._relax_kind_ratio_middle = float(relax_kind_ratio_middle)
+        if relax_show_low is not None:
+            self._relax_show_low = bool(relax_show_low)
+        if relax_show_high is not None:
+            self._relax_show_high = bool(relax_show_high)
+        if relax_show_middle is not None:
+            self._relax_show_middle = bool(relax_show_middle)
+        if relax_countdown_enabled is not None:
+            self._relax_countdown_enabled = bool(relax_countdown_enabled)
+        if relax_countdown_color is not None:
+            self._relax_countdown_color = str(relax_countdown_color)
+        if relax_countdown_max_sec is not None:
+            self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -831,6 +897,13 @@ class LiveFrameRenderer:
         else:
             self._stick = None
         self._combo = ComboHUD(self._cam)
+        self._countdown_hud = None
+        if self._relax_countdown_enabled:
+            self._countdown_hud = CountdownHUD(
+                self._cam,
+                color=self._relax_countdown_color,
+                max_show_sec=self._relax_countdown_max_sec,
+            )
         self._viewport = ViewportFrame(
             self._cam,
             neon_color=self._panel_neon_color,
@@ -858,6 +931,8 @@ class LiveFrameRenderer:
                                        * relax_slow_mult)))
         else:
             travel = max(8, abs(_rhy.TARGET_TRAVEL_FRAMES))
+        if solo_relax and self._relax_travel_sec > 0.0:
+            travel = max(8, int(round(self._relax_travel_sec * float(self._fps))))
         self._travel = travel
         # Per-lane visual spacing guard — same formula as process_video.
         if len(self._beat_frames) >= 2:
@@ -874,6 +949,21 @@ class LiveFrameRenderer:
         # with all the cubes / walls / line-chains / dance tiles that
         # the per-frame compose will then animate frame-by-frame.
         self._game = GameManager(self._cam, travel=travel)
+        self._game.RELAX_KIND_RATIO_MIDDLE = float(
+            np.clip(self._relax_kind_ratio_middle, 0.0, 1.0)
+        )
+        self._game.RELAX_TEXTURE_LOW = self._relax_texture_low
+        self._game.RELAX_TEXTURE_HIGH = self._relax_texture_high
+        self._game.RELAX_TEXTURE_MIDDLE = self._relax_texture_middle
+        self._game.RELAX_HOLE_MASK_PATH = self._relax_hole_mask_path
+        enabled_kinds: list[str] = []
+        if self._relax_show_low:
+            enabled_kinds.append("low")
+        if self._relax_show_high:
+            enabled_kinds.append("high")
+        if self._relax_show_middle:
+            enabled_kinds.append("middle")
+        self._game.RELAX_ENABLED_KINDS = tuple(enabled_kinds or ["low", "high", "middle"])
         self._game.pre_schedule(
             self._beat_frames,
             self._audio.bass_arr,
@@ -922,6 +1012,8 @@ class LiveFrameRenderer:
                 kind = "W"
                 lean_scale = 1.0
             elif isinstance(tg, RelaxTarget):
+                if tg.kind == "middle":
+                    continue
                 kind = "JP" if tg.kind == "low" else "SQ"
                 lean_scale = 1.0
                 t_hit = tg.dodge_frame / self._fps
@@ -1101,4 +1193,6 @@ class LiveFrameRenderer:
         if self._stick is not None:
             self._stick.draw(canvas, fi)
         self._combo.draw(canvas, fi)
+        if self._countdown_hud is not None and "relax" in self._modes_seq:
+            self._countdown_hud.draw(canvas, self._game.targets, fi, float(self._fps))
         return canvas

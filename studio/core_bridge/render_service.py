@@ -684,6 +684,19 @@ class RenderService(QObject):
         "chevron_count",
         "rail_chevron_depth",
         "rail_chevron_density",
+        "relax_interval",
+        "relax_travel_sec",
+        "relax_texture_low",
+        "relax_texture_high",
+        "relax_texture_middle",
+        "relax_hole_mask_path",
+        "relax_kind_ratio_middle",
+        "relax_show_low",
+        "relax_show_high",
+        "relax_show_middle",
+        "relax_countdown_enabled",
+        "relax_countdown_color",
+        "relax_countdown_max_sec",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
@@ -714,6 +727,13 @@ class RenderService(QObject):
             if value is None:
                 continue
             if key == "rail_image" and not str(value).strip():
+                continue
+            if key in {
+                "relax_texture_low",
+                "relax_texture_high",
+                "relax_texture_middle",
+                "relax_hole_mask_path",
+            } and not str(value).strip():
                 continue
             cli_key = f"--{key}"
 

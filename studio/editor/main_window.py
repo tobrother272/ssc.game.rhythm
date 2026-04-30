@@ -2068,6 +2068,19 @@ class MainWindow(QMainWindow):
             "rail_dot_anim_mode":    str(_get("rail_dot_anim_mode", "audio") or "audio"),
             "rail_dot_color_near":   str(_get("rail_dot_color_near", "#FF60FF") or "#FF60FF"),
             "rail_dot_color_far":    str(_get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
+            "relax_interval":       float(_get("relax_interval", 0.0) or 0.0),
+            "relax_travel_sec":     float(_get("relax_travel_sec", 3.0) or 3.0),
+            "relax_texture_low":    _get("relax_texture_low", None) or "",
+            "relax_texture_high":   _get("relax_texture_high", None) or "",
+            "relax_texture_middle": _get("relax_texture_middle", None) or "",
+            "relax_hole_mask_path": _get("relax_hole_mask_path", None) or "",
+            "relax_kind_ratio_middle": float(_get("relax_kind_ratio_middle", 0.33) or 0.33),
+            "relax_show_low": bool(_get("relax_show_low", True)),
+            "relax_show_high": bool(_get("relax_show_high", True)),
+            "relax_show_middle": bool(_get("relax_show_middle", True)),
+            "relax_countdown_enabled": bool(_get("relax_countdown_enabled", True)),
+            "relax_countdown_color": str(_get("relax_countdown_color", "#FFFFFF") or "#FFFFFF"),
+            "relax_countdown_max_sec": float(_get("relax_countdown_max_sec", 5.0) or 5.0),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -2264,6 +2277,19 @@ class MainWindow(QMainWindow):
             rail_dot_anim_mode = str(rs.get("rail_dot_anim_mode", "audio") or "audio")
             rail_dot_color_near = str(rs.get("rail_dot_color_near", "#FF60FF") or "#FF60FF")
             rail_dot_color_far = str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF")
+            relax_interval = float(rs.get("relax_interval", 0.0) or 0.0)
+            relax_travel_sec = float(rs.get("relax_travel_sec", 3.0) or 3.0)
+            relax_texture_low = rs.get("relax_texture_low") or ""
+            relax_texture_high = rs.get("relax_texture_high") or ""
+            relax_texture_middle = rs.get("relax_texture_middle") or ""
+            relax_hole_mask_path = rs.get("relax_hole_mask_path") or ""
+            relax_kind_ratio_middle = float(rs.get("relax_kind_ratio_middle", 0.33) or 0.33)
+            relax_show_low = bool(rs.get("relax_show_low", True))
+            relax_show_high = bool(rs.get("relax_show_high", True))
+            relax_show_middle = bool(rs.get("relax_show_middle", True))
+            relax_countdown_enabled = bool(rs.get("relax_countdown_enabled", True))
+            relax_countdown_color = str(rs.get("relax_countdown_color", "#FFFFFF") or "#FFFFFF")
+            relax_countdown_max_sec = float(rs.get("relax_countdown_max_sec", 5.0) or 5.0)
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -2315,6 +2341,19 @@ class MainWindow(QMainWindow):
                     rail_dot_anim_mode=rail_dot_anim_mode,
                     rail_dot_color_near=rail_dot_color_near,
                     rail_dot_color_far=rail_dot_color_far,
+                    relax_interval=relax_interval,
+                    relax_travel_sec=relax_travel_sec,
+                    relax_texture_low=relax_texture_low,
+                    relax_texture_high=relax_texture_high,
+                    relax_texture_middle=relax_texture_middle,
+                    relax_hole_mask_path=relax_hole_mask_path,
+                    relax_kind_ratio_middle=relax_kind_ratio_middle,
+                    relax_show_low=relax_show_low,
+                    relax_show_high=relax_show_high,
+                    relax_show_middle=relax_show_middle,
+                    relax_countdown_enabled=relax_countdown_enabled,
+                    relax_countdown_color=relax_countdown_color,
+                    relax_countdown_max_sec=relax_countdown_max_sec,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

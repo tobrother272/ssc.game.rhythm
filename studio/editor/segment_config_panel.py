@@ -1512,6 +1512,21 @@ class SegmentConfigPanel(QWidget):
     _MODE_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
         "combo": ("mode_list",),
         "line":  ("line_zigzag",),
+        "relax": (
+            "relax_interval",
+            "relax_travel_sec",
+            "relax_texture_low",
+            "relax_texture_high",
+            "relax_texture_middle",
+            "relax_hole_mask_path",
+            "relax_kind_ratio_middle",
+            "relax_show_low",
+            "relax_show_high",
+            "relax_show_middle",
+            "relax_countdown_enabled",
+            "relax_countdown_color",
+            "relax_countdown_max_sec",
+        ),
     }
 
     _FIELD_LABELS = {
@@ -1525,6 +1540,19 @@ class SegmentConfigPanel(QWidget):
         "stickman":    "Stickman",
         "mode_list":   "Sub-modes",
         "line_zigzag": "Zigzag",
+        "relax_interval": "Relax interval",
+        "relax_travel_sec": "Relax travel (sec)",
+        "relax_texture_low": "Relax texture low",
+        "relax_texture_high": "Relax texture high",
+        "relax_texture_middle": "Relax texture middle",
+        "relax_hole_mask_path": "Relax hole mask",
+        "relax_kind_ratio_middle": "Middle ratio",
+        "relax_show_low": "Show low",
+        "relax_show_high": "Show high",
+        "relax_show_middle": "Show middle",
+        "relax_countdown_enabled": "Countdown",
+        "relax_countdown_color": "Countdown color",
+        "relax_countdown_max_sec": "Countdown max sec",
     }
 
     def _rebuild_dynamic_settings(self) -> None:
@@ -1542,6 +1570,13 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings = persist_defaults
 
         mode_extras = self._MODE_EXTRA_FIELDS.get(segment.mode, ())
+        if segment.mode == "combo":
+            mode_list = model.model_dump(mode="json").get("mode_list") or []
+            if "relax" in mode_list:
+                mode_extras = (
+                    mode_extras
+                    + self._MODE_EXTRA_FIELDS.get("relax", ())
+                )
         rs = segment.render_settings or {}
         for key in self._VISIBLE_FIELDS + mode_extras:
             # Prefer the full dump so Optional fields with value=None still
@@ -1656,9 +1691,23 @@ class SegmentConfigPanel(QWidget):
             "so blocks drift slowly.  A large value here (e.g. 2.0) adds\n"
             "2s on top of that ~15s cycle → only 1–2 blocks per minute.\n"
             "Recommended: 0.0 (beat-driven) or 0.3–0.5s for a slight gap."),
+        "relax_travel_sec": (0.5, 10.0, 0.1, 2, "Relax block travel seconds (solo relax)."),
+        "relax_kind_ratio_middle": (0.0, 1.0, 0.01, 2, "Middle block spawn ratio (0..1)."),
+        "relax_countdown_max_sec": (0.0, 20.0, 0.1, 2, "Countdown visible window (seconds)."),
     }
 
     def _build_widget_for_value(self, key: str, value):
+        if key in {
+            "relax_texture_low",
+            "relax_texture_high",
+            "relax_texture_middle",
+            "relax_hole_mask_path",
+        }:
+            line = QLineEdit("" if value is None else str(value))
+            line.setPlaceholderText("Optional file path")
+            line.editingFinished.connect(self._commit_settings)
+            return line
+
         if isinstance(value, bool):
             widget = QCheckBox()
             widget.setChecked(value)

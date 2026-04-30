@@ -197,6 +197,8 @@ def _relax_camera_dy(targets, cur_frame: int, height: int) -> int:
     for t in targets:
         if not isinstance(t, RelaxTarget):
             continue
+        if t.kind == 'middle':
+            continue
         dodge_f  = t.dodge_frame
         hold_end = t.dodge_end_frame    # end of the sustained pose
         start_f  = dodge_f - W
@@ -643,7 +645,7 @@ class TunnelRenderer:
         # onto the whole floor trapezoid and skip every other floor effect.
         if self.floor_full_static_image and self._tile_img is not None:
             self._draw_floor_full_static(canvas)
-            y_hz = int(cam.cy_pix + 2)
+            y_hz = self._runway_horizon_y()
             cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
                      lineType=cv2.LINE_AA)
             return canvas
@@ -660,13 +662,30 @@ class TunnelRenderer:
                 self._draw_floor_tiles_legacy(canvas, frame)
 
         # ── Phase C: Faint horizon / runway glow line (atmospherics) ───
-        y_hz = int(cam.cy_pix + 2)
+        y_hz = self._runway_horizon_y()
         cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
                  lineType=cv2.LINE_AA)
 
         return canvas
 
     # ── helpers ──────────────────────────────────────────────────────────
+
+    def _runway_horizon_y(self) -> int:
+        """Y of the runway far edge; keeps glow line aligned to floor."""
+        cam = self.cam
+        if cam.n_lanes >= 2:
+            outer_left = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left = outer_left - half_step
+        x_right = outer_right + half_step
+        p_l = cam.project(x_left, cam.FLOOR_WORLD_Y, cam.Z_FAR)
+        p_r = cam.project(x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR)
+        if p_l is None or p_r is None:
+            return int(cam.cy_pix + 2)
+        return int(round((float(p_l[1]) + float(p_r[1])) * 0.5))
 
     def _draw_floor_bg(self, canvas: np.ndarray) -> None:
         """Fill a (possibly translucent) trapezoid covering the full runway."""
@@ -2631,6 +2650,8 @@ class RelaxTarget(Target):
     """
 
     HIT_DEPTH = 0.0
+    _tex_cache: dict[str, np.ndarray] = {}
+    _hole_mask_cache: dict[str, np.ndarray] = {}
 
     # Visual tuning ────────────────────────────────────────────────────
     LOW_HEIGHT_FRAC  = 0.07   # fraction of tunnel height (hit-plane)
@@ -2644,6 +2665,9 @@ class RelaxTarget(Target):
     # the horizon.
     HIGH_HORIZON_OFFSET_FRAC = 0.26   # bar centre above horizon @ z=0
     HIGH_HEIGHT_FRAC         = 0.35   # bar height           @ z=0
+    MIDDLE_HORIZON_OFFSET_FRAC = 0.20
+    HOLE_DEFAULT_WIDTH_FRAC = 0.18
+    HOLE_DEFAULT_HEIGHT_FRAC = 0.55
 
     # Motion profile (two-phase piecewise) ────────────────────────────
     # The block's spawn→hit travel is split into TWO distinct phases
@@ -2709,6 +2733,7 @@ class RelaxTarget(Target):
     DODGE_OFFSET_LOW  = +0.01   # fire just after z=0 — block is right at
                                 # the hit-zone edge before the jump starts
     DODGE_OFFSET_HIGH = +0.064
+    DODGE_OFFSET_MIDDLE = +0.0
     DODGE_HOLD_FRAC   = 0.04   # hold briefly then snap back to RELAX_STAND
 
     # Dodge timing ─────────────────────────────────────────────────────
@@ -2727,8 +2752,12 @@ class RelaxTarget(Target):
         # because the slab always spans the whole width, but Target's
         # base __init__ needs *something*, so we pass centre.
         super().__init__(spawn_frame, hit_frame, lane=0, is_left=False)
-        self.kind = 'high' if kind == 'high' else 'low'
+        if kind not in ('low', 'high', 'middle'):
+            kind = 'low'
+        self.kind = kind
         self.color = CLR_WALL_PINK
+        self.texture_path: str | None = None
+        self.hole_mask_path: str | None = None
 
     # ---------------- lifecycle ----------------
     #
@@ -2766,6 +2795,45 @@ class RelaxTarget(Target):
             return 1.0
         travel_f = max(1, self.hit_frame - self.spawn_frame)
         p_lin = (cur_frame - self.spawn_frame) / travel_f
+
+        # ── MIDDLE blocks: visual-linear approach ────────────────────────
+        # Middle is a wall to dodge through — it should grow on screen
+        # at a roughly CONSTANT rate so the player can read its
+        # approach.  Using inverse-Z (1/wz linear in time) makes the
+        # block's screen-space size scale linearly: at p_lin=0.5 it's
+        # already roughly half-size, at p_lin=1 it's at the hit plane.
+        # Pass-by carries the same inverse velocity so it leaves the
+        # viewport without lingering.
+        if self.kind == 'middle':
+            # Two-phase z_norm linear motion (per user spec):
+            #   • Phase 1 (drift):  t ∈ [0, 2/3], z: 1.0 → 0.2
+            #     covers 80 % of the z-distance in the first 2/3 of travel.
+            #     Block enters at the FAR horizon (start of floor) and
+            #     drifts forward — slow visual change because perspective
+            #     compresses the far field.
+            #   • Phase 2 (approach): t ∈ [2/3, 1], z: 0.2 → 0
+            #     covers the last 20 % of z in 1/3 of time — visually
+            #     this is the "rush to camera" because the same z-step
+            #     near the camera produces a much larger screen-scale
+            #     change.
+            # Velocities are CONTINUOUS in z (linear pieces), so the
+            # block moves smoothly without "jumping".
+            T_M = 2.0 / 3.0
+            D_M = 0.8                              # phase-1 z-distance fraction
+            z_split = 1.0 - D_M                    # = 0.2 — z at hand-off
+            if p_lin <= T_M:
+                z = 1.0 - D_M * (p_lin / T_M)
+            elif p_lin <= 1.0:
+                z = z_split * (1.0 - (p_lin - T_M) / (1.0 - T_M))
+            else:
+                # Pass-by: continue at the phase-2 z-velocity.  At z<-0.1
+                # cam.project() returns None (behind camera) so the wall
+                # disappears almost immediately after p=1.
+                v2 = z_split / max(1e-6, 1.0 - T_M)
+                z = -v2 * (p_lin - 1.0)
+            return max(-1.2, z)
+
+        # ── LOW / HIGH: two-phase "70% chậm + 30% vút" ──────────────────
         D = self.PHASE_SPLIT_D
         T = self._phase_split_t()
         z_split = 1.0 - D                  # z at the Phase 1 → 2 hand-off
@@ -2797,8 +2865,12 @@ class RelaxTarget(Target):
         until the bar is visibly passing above.
         """
         travel_f = max(1, self.hit_frame - self.spawn_frame)
-        offset_frac = (self.DODGE_OFFSET_LOW if self.kind == 'low'
-                       else self.DODGE_OFFSET_HIGH)
+        if self.kind == 'low':
+            offset_frac = self.DODGE_OFFSET_LOW
+        elif self.kind == 'high':
+            offset_frac = self.DODGE_OFFSET_HIGH
+        else:
+            offset_frac = self.DODGE_OFFSET_MIDDLE
         return self.hit_frame + int(round(travel_f * offset_frac))
 
     @property
@@ -2912,6 +2984,8 @@ class RelaxTarget(Target):
              cur_frame: int):
         if self.state != 'flying':
             return canvas
+        if self.kind == 'middle':
+            return self._draw_middle(canvas, cam, cur_frame)
         z = self.depth(cur_frame)
 
         # Front face
@@ -2935,6 +3009,177 @@ class RelaxTarget(Target):
                                x_l, x_r, y_t, y_b,
                                x_lb, x_rb, y_tb, y_bb)
 
+    @classmethod
+    def _load_texture(cls, path: str | None) -> np.ndarray | None:
+        if not path:
+            return None
+        key = str(path)
+        if key not in cls._tex_cache:
+            img = cv2.imread(key, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                if max(h, w) > 512:
+                    sc = 512.0 / float(max(h, w))
+                    img = cv2.resize(
+                        img,
+                        (max(1, int(round(w * sc))), max(1, int(round(h * sc)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                cls._tex_cache[key] = img
+            else:
+                cls._tex_cache[key] = None
+        return cls._tex_cache.get(key)
+
+    @classmethod
+    def _load_hole_mask(cls, path: str | None) -> np.ndarray | None:
+        if not path:
+            return None
+        key = str(path)
+        if key not in cls._hole_mask_cache:
+            img = cv2.imread(key, cv2.IMREAD_UNCHANGED)
+            if img is not None and len(img.shape) == 3 and img.shape[2] == 4:
+                cls._hole_mask_cache[key] = img
+            else:
+                cls._hole_mask_cache[key] = None
+        return cls._hole_mask_cache.get(key)
+
+    def _draw_textured_quad(self, canvas: np.ndarray, poly: np.ndarray, tex: np.ndarray) -> bool:
+        H, W = canvas.shape[:2]
+        x0, y0 = poly.min(axis=0)
+        x1, y1 = poly.max(axis=0) + 1
+        x0, y0 = max(0, int(x0)), max(0, int(y0))
+        x1, y1 = min(W, int(x1)), min(H, int(y1))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        bw, bh = x1 - x0, y1 - y0
+        poly_local = poly.astype(np.int32) - np.array([x0, y0], dtype=np.int32)
+        th, tw = tex.shape[:2]
+        src_pts = np.float32([[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]])
+        dst_pts = poly_local.astype(np.float32)
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(tex, M, (bw, bh))
+        mask = np.zeros((bh, bw), dtype=np.uint8)
+        cv2.fillPoly(mask, [poly_local], 255)
+        roi = canvas[y0:y1, x0:x1]
+        roi[mask > 0] = warped[mask > 0]
+        return True
+
+    def _draw_middle(self, canvas: np.ndarray, cam: "PerspectiveCamera", cur_frame: int):
+        z = self.depth(cur_frame)
+        if z < -1.0:
+            return canvas
+        base_canvas = canvas.copy()
+        H, _W = canvas.shape[:2]
+
+        # CRITICAL: low/high use 2D-legacy converge ((1-z)^1) while the floor
+        # renderer projects WORLD coords with cam.project() (true 1/z).  At
+        # z>0 the legacy formula tapers slower → the slab ends up wider than
+        # the floor at the same depth.  For `middle` we MUST match the floor
+        # exactly, so we project the same world points that _draw_floor_bg
+        # projects.
+        if cam.n_lanes >= 2:
+            outer_left = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        xw_left = outer_left - half_step
+        xw_right = outer_right + half_step
+        wz = cam.z_from_norm(max(0.0, min(1.0, z)))
+        p_l = cam.project(xw_left, cam.FLOOR_WORLD_Y, wz)
+        p_r = cam.project(xw_right, cam.FLOOR_WORLD_Y, wz)
+        if p_l is None or p_r is None:
+            return canvas
+        x_l = int(round(p_l[0]))
+        x_r = int(round(p_r[0]))
+        y_bot_f = float(p_l[1])  # exact floor y at this depth
+        if x_l > x_r:
+            x_l, x_r = x_r, x_l
+
+        # Height in WORLD space, projected with the same 1/z perspective as
+        # width and floor.  Calibrated so at z_norm=0 (hit zone) the screen
+        # height equals 3× HIGH_HEIGHT_FRAC × cam.H (= 3× a high block at z=0).
+        # This gives true perspective scaling: as the block approaches,
+        # height grows at the SAME rate as width — feels like the block is
+        # moving toward the camera, not growing taller in place.
+        world_dh = 3.9 * self.HIGH_HEIGHT_FRAC * cam.H * cam.Z_NEAR / cam.fy
+        p_top = cam.project(xw_left, cam.FLOOR_WORLD_Y - world_dh, wz)
+        if p_top is None:
+            return canvas
+        y_bot = int(round(y_bot_f))
+        y_top = int(round(float(p_top[1])))
+        y_top = max(0, min(H - 1, y_top))
+        y_bot = max(0, min(H - 1, y_bot))
+        if y_bot <= y_top:
+            return canvas
+        wall_poly = np.array(
+            [(x_l, y_top), (x_r, y_top), (x_r, y_bot), (x_l, y_bot)],
+            dtype=np.int32,
+        )
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            self._draw_textured_quad(canvas, wall_poly, tex)
+        else:
+            cv2.fillConvexPoly(canvas, wall_poly, CLR_WALL_PINK)
+            stripe_col = (15, 5, 25)
+            for i in range(1, 24):
+                x = int(x_l + (x_r - x_l) * i / 24.0)
+                cv2.line(canvas, (x, y_top), (x, y_bot), stripe_col, 1, cv2.LINE_AA)
+        # Middle block now renders as a solid obstacle by default.
+        # Only apply cutout when user explicitly provides a mask path.
+        if self.hole_mask_path:
+            self._punch_hole(canvas, wall_poly, base_canvas)
+
+        # Fade-out across the last 1/10 of travel time.  Alpha goes
+        # 1.0 → 0.0 as p_lin moves through [9/10, 1].  We blend the block
+        # back toward `base_canvas`; non-block pixels are identical in
+        # both buffers so they pass through unchanged.
+        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        p_lin = (cur_frame - self.spawn_frame) / travel_f
+        FADE_START = 0.9
+        if p_lin > FADE_START:
+            if p_lin >= 1.0:
+                canvas[:] = base_canvas
+            else:
+                alpha = 1.0 - (p_lin - FADE_START) / (1.0 - FADE_START)
+                alpha = max(0.0, min(1.0, alpha))
+                cv2.addWeighted(canvas, alpha, base_canvas, 1.0 - alpha, 0, canvas)
+        return canvas
+
+    def _punch_hole(self, canvas: np.ndarray, wall_poly: np.ndarray,
+                    base_canvas: np.ndarray) -> None:
+        H, W = canvas.shape[:2]
+        cx = W // 2
+        cy = int((int(wall_poly[0][1]) + int(wall_poly[2][1])) * 0.5)
+        mask = self._load_hole_mask(self.hole_mask_path)
+        if mask is not None:
+            wall_h = max(1, int(wall_poly[2][1] - wall_poly[0][1]))
+            target_h = max(1, int(wall_h * 0.7))
+            mh, mw = mask.shape[:2]
+            target_w = max(1, int(target_h * mw / max(1, mh)))
+            resized = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            x0 = cx - target_w // 2
+            y0 = cy - target_h // 2
+            x1 = x0 + target_w
+            y1 = y0 + target_h
+            sx0 = max(0, -x0)
+            sy0 = max(0, -y0)
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+            x1 = min(W, x1)
+            y1 = min(H, y1)
+            if x1 > x0 and y1 > y0:
+                crop = resized[sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)]
+                alpha = crop[:, :, 3].astype(np.float32) / 255.0
+                hole = 1.0 - alpha
+                roi = canvas[y0:y1, x0:x1].astype(np.float32)
+                base_roi = base_canvas[y0:y1, x0:x1].astype(np.float32)
+                out = roi * (1.0 - hole[..., None]) + base_roi * hole[..., None]
+                canvas[y0:y1, x0:x1] = out.astype(np.uint8)
+                return
+        # No fallback rectangular cutout: if mask is absent/invalid,
+        # keep the block fully filled.
+
     # -- per-kind rendering -------------------------------------------------
     def _draw_low(self, canvas, cam, z,
                   x_l, x_r, y_t, y_b,
@@ -2952,6 +3197,12 @@ class RelaxTarget(Target):
         tonal step between top and front faces plus a soft rim
         highlight tracing the rounded top edge.
         """
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            front_poly = np.array([(x_l, y_t), (x_r, y_t), (x_r, y_b), (x_l, y_b)], np.int32)
+            self._draw_textured_quad(canvas, front_poly, tex)
+            return canvas
+
         front_col    = CLR_WALL_PINK         # bright magenta
         top_col      = (140, 25, 190)        # warm pink for top face
         top_edge_col = (15, 5, 25)           # near-black: used for BOTH
@@ -3028,6 +3279,12 @@ class RelaxTarget(Target):
         design language to the ground slab (user: "thiết kế lại vật
         cản treo", obstacle-visual-style rule).
         """
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            front_poly = np.array([(x_l, y_t), (x_r, y_t), (x_r, y_b), (x_l, y_b)], np.int32)
+            self._draw_textured_quad(canvas, front_poly, tex)
+            return canvas
+
         front_col    = CLR_WALL_PINK          # bright magenta
         bot_col      = (140, 25, 190)         # warm purple — bottom face
         top_col      = (70, 25, 95)           # dark plum — hidden top face
@@ -4163,6 +4420,46 @@ class ComboHUD:
         return 'walk'
 
 
+class CountdownHUD:
+    """Top-right countdown for next relax obstacle."""
+
+    def __init__(self, cam: PerspectiveCamera, color: str = "#FFFFFF",
+                 max_show_sec: float = 5.0) -> None:
+        self.cam = cam
+        self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
+        self._max_show_sec = float(max_show_sec)
+        self._font = cv2.FONT_HERSHEY_SIMPLEX
+        self._scale = max(0.8, cam.H / 540.0)
+        self._thickness = max(1, int(round(self._scale * 1.5)))
+
+    def draw(self, canvas: np.ndarray, targets: list, cur_frame: int, fps: float) -> None:
+        next_t = None
+        for t in targets:
+            if not isinstance(t, RelaxTarget):
+                continue
+            if t.hit_exec_f >= 0 or t.hit_frame <= cur_frame:
+                continue
+            if next_t is None or t.hit_frame < next_t.hit_frame:
+                next_t = t
+        if next_t is None:
+            return
+        time_left = (next_t.hit_frame - cur_frame) / max(1.0, float(fps))
+        if time_left < 0.0 or time_left > self._max_show_sec:
+            return
+        text = str(max(0, int(np.ceil(time_left))))
+        (tw, th), _ = cv2.getTextSize(
+            text, self._font, self._scale, self._thickness
+        )
+        H, W = canvas.shape[:2]
+        margin = max(8, int(round(20 * self._scale)))
+        x = max(0, W - tw - margin)
+        y = min(H - 1, th + margin)
+        cv2.putText(canvas, text, (x, y), self._font, self._scale,
+                    (0, 0, 0), self._thickness + 2, cv2.LINE_AA)
+        cv2.putText(canvas, text, (x, y), self._font, self._scale,
+                    self._color_bgr, self._thickness, cv2.LINE_AA)
+
+
 # ── GameManager ──────────────────────────────────────────────────────────────
 class GameManager:
     """Schedules targets on audio onsets, auto-hits when they reach hit zone.
@@ -4408,10 +4705,35 @@ class GameManager:
                 # and HIGH (floating bar → duck).  `relax_kind` lets the
                 # caller override to force one or the other (e.g. for
                 # testing).
-                if relax_kind not in ('low', 'high'):
-                    relax_kind = ('high' if self.rng.random() < 0.5
-                                  else 'low')
-                return RelaxTarget(spawn_f, bf, kind=relax_kind)
+                enabled_kinds = list(getattr(
+                    self, "RELAX_ENABLED_KINDS", ("low", "high", "middle")
+                ))
+                enabled_kinds = [k for k in enabled_kinds if k in ("low", "high", "middle")]
+                if not enabled_kinds:
+                    enabled_kinds = ["low", "high", "middle"]
+                if relax_kind not in enabled_kinds:
+                    if len(enabled_kinds) == 1:
+                        relax_kind = enabled_kinds[0]
+                    elif "middle" in enabled_kinds:
+                        ratio_mid = float(getattr(self, "RELAX_KIND_RATIO_MIDDLE", 0.33))
+                        ratio_mid = max(0.0, min(1.0, ratio_mid))
+                        other = [k for k in enabled_kinds if k != "middle"]
+                        if not other:
+                            relax_kind = "middle"
+                        else:
+                            r = self.rng.random()
+                            if r < ratio_mid:
+                                relax_kind = "middle"
+                            else:
+                                relax_kind = str(self.rng.choice(other))
+                    else:
+                        relax_kind = str(self.rng.choice(enabled_kinds))
+                target = RelaxTarget(spawn_f, bf, kind=relax_kind)
+                tex_attr = f"RELAX_TEXTURE_{str(relax_kind).upper()}"
+                target.texture_path = getattr(self, tex_attr, None)
+                if relax_kind == 'middle':
+                    target.hole_mask_path = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+                return target
             return PunchTarget(spawn_f, bf, lane, is_left)
 
         def _target_cls_for(m: str):
@@ -4976,6 +5298,18 @@ class RhythmVisualizer:
         #                 audio beats so inter-mode alternation stays
         #                 coherent.
         self.RELAX_INTERVAL:    float = 0.0
+        self.RELAX_TRAVEL_SEC:  float = 0.0
+        self.RELAX_TEXTURE_LOW: str | None = None
+        self.RELAX_TEXTURE_HIGH: str | None = None
+        self.RELAX_TEXTURE_MIDDLE: str | None = None
+        self.RELAX_HOLE_MASK_PATH: str | None = None
+        self.RELAX_KIND_RATIO_MIDDLE: float = 0.33
+        self.RELAX_SHOW_LOW: bool = True
+        self.RELAX_SHOW_HIGH: bool = True
+        self.RELAX_SHOW_MIDDLE: bool = True
+        self.RELAX_COUNTDOWN_ENABLED: bool = True
+        self.RELAX_COUNTDOWN_COLOR: str = "#FFFFFF"
+        self.RELAX_COUNTDOWN_MAX_SEC: float = 5.0
         # ── Camera perspective overrides ────────────────────────────────
         self.FLOOR_HIT_FRAC:    float | None = None
         self.HORIZON_FRAC:      float | None = None
@@ -5437,6 +5771,13 @@ class RhythmVisualizer:
         else:
             stick = None
         combo     = ComboHUD(cam)
+        countdown_hud = None
+        if bool(getattr(self, "RELAX_COUNTDOWN_ENABLED", True)):
+            countdown_hud = CountdownHUD(
+                cam,
+                color=str(getattr(self, "RELAX_COUNTDOWN_COLOR", "#FFFFFF")),
+                max_show_sec=float(getattr(self, "RELAX_COUNTDOWN_MAX_SEC", 5.0)),
+            )
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
                                   mode=mode)
         # ── auto-adjust TRAVEL so blocks flow smoothly ──────────────
@@ -5491,6 +5832,10 @@ class RhythmVisualizer:
             travel = max(8, int(round(self.TRAVEL_FRAMES * _relax_slow_mult)))
             print(f"[travel:manual] user travel={self.TRAVEL_FRAMES}f "
                   f"× relax_slow {_relax_slow_mult:.1f} = {travel}f")
+        if solo_relax and float(getattr(self, "RELAX_TRAVEL_SEC", 0.0)) > 0.0:
+            travel = max(8, int(round(float(self.RELAX_TRAVEL_SEC) * float(self.FPS))))
+            print(f"[relax-travel] override travel={self.RELAX_TRAVEL_SEC:.2f}s "
+                  f"({travel}f)")
 
         game = GameManager(cam, travel=travel)
 
@@ -5603,6 +5948,21 @@ class RhythmVisualizer:
                       f"cleanly from the horizon instead of popping "
                       f"in mid-flight.")
 
+        game.RELAX_KIND_RATIO_MIDDLE = float(
+            max(0.0, min(1.0, getattr(self, "RELAX_KIND_RATIO_MIDDLE", 0.33)))
+        )
+        game.RELAX_TEXTURE_LOW = getattr(self, "RELAX_TEXTURE_LOW", None)
+        game.RELAX_TEXTURE_HIGH = getattr(self, "RELAX_TEXTURE_HIGH", None)
+        game.RELAX_TEXTURE_MIDDLE = getattr(self, "RELAX_TEXTURE_MIDDLE", None)
+        game.RELAX_HOLE_MASK_PATH = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+        enabled_kinds: list[str] = []
+        if bool(getattr(self, "RELAX_SHOW_LOW", True)):
+            enabled_kinds.append("low")
+        if bool(getattr(self, "RELAX_SHOW_HIGH", True)):
+            enabled_kinds.append("high")
+        if bool(getattr(self, "RELAX_SHOW_MIDDLE", True)):
+            enabled_kinds.append("middle")
+        game.RELAX_ENABLED_KINDS = tuple(enabled_kinds or ["low", "high", "middle"])
         game.pre_schedule(beat_frames, bass_arr,
                           min_gap_frames=self.BEAT_MIN_GAP,
                           min_lane_gap=min_lane_gap,
@@ -5658,6 +6018,8 @@ class RhythmVisualizer:
                 # rhythm between blocks instead of chaining SQ/JP
                 # waypoints end-to-end (which the user observed as
                 # "never returning to initial position").
+                if tg.kind == 'middle':
+                    continue
                 kind = 'JP' if tg.kind == 'low' else 'SQ'
                 lean_scale = 1.0
                 t_hit = tg.dodge_frame / self.FPS
@@ -6066,6 +6428,8 @@ class RhythmVisualizer:
             if stick is not None:
                 stick.draw(canvas, fi)
             combo.draw(canvas, fi)
+            if countdown_hud is not None and 'relax' in modes_seq:
+                countdown_hud.draw(canvas, game.targets, fi, float(self.FPS))
 
             if self.LINE_DEBUG and line_dbg_events:
                 # Top timeline: visualize where each line block event lands.
@@ -6555,6 +6919,32 @@ def parse_arguments():
                          'mode alternation stays coherent.  Typical '
                          'values: 0.5–2.0 for calm, breathing '
                          'gameplay.'))
+    p.add_argument('--relax_travel_sec', type=float, default=0.0,
+                   help=('Relax block travel time in seconds. '
+                         '>0 overrides auto travel only for solo relax.'))
+    p.add_argument('--relax_texture_low', type=str, default=None, metavar='PATH',
+                   help='Texture image for LOW relax block front face.')
+    p.add_argument('--relax_texture_high', type=str, default=None, metavar='PATH',
+                   help='Texture image for HIGH relax block front face.')
+    p.add_argument('--relax_texture_middle', type=str, default=None, metavar='PATH',
+                   help='Texture image for MIDDLE relax block face.')
+    p.add_argument('--relax_hole_mask_path', type=str, default=None, metavar='PATH',
+                   help='PNG alpha mask for MIDDLE hole (alpha=0 = hole).')
+    p.add_argument('--relax_kind_ratio_middle', type=float, default=0.33,
+                   help='Spawn ratio for middle relax block kind (0..1).')
+    p.add_argument('--relax_show_low', type=int, default=1, metavar='0|1',
+                   help='Enable low relax blocks.')
+    p.add_argument('--relax_show_high', type=int, default=1, metavar='0|1',
+                   help='Enable high relax blocks.')
+    p.add_argument('--relax_show_middle', type=int, default=1, metavar='0|1',
+                   help='Enable middle relax blocks.')
+    p.add_argument('--relax_countdown_enabled', type=int, default=1, metavar='0|1',
+                   help='Show relax countdown HUD in top-right.')
+    p.add_argument('--relax_countdown_color', type=str, default='#FFFFFF',
+                   metavar='#RRGGBB',
+                   help='Relax countdown text color.')
+    p.add_argument('--relax_countdown_max_sec', type=float, default=5.0,
+                   help='Only show countdown if next hit <= this many seconds.')
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -6703,6 +7093,20 @@ if __name__ == '__main__':
     viz.LINE_DEBUG       = bool(args.line_debug)
     viz.LINE_ZIGZAG      = str(args.line_zigzag).lower().strip() or 'vertical'
     viz.RELAX_INTERVAL   = max(0.0, float(args.relax_interval))
+    viz.RELAX_TRAVEL_SEC = max(0.0, float(args.relax_travel_sec))
+    viz.RELAX_TEXTURE_LOW = args.relax_texture_low or None
+    viz.RELAX_TEXTURE_HIGH = args.relax_texture_high or None
+    viz.RELAX_TEXTURE_MIDDLE = args.relax_texture_middle or None
+    viz.RELAX_HOLE_MASK_PATH = args.relax_hole_mask_path or None
+    viz.RELAX_KIND_RATIO_MIDDLE = max(
+        0.0, min(1.0, float(args.relax_kind_ratio_middle))
+    )
+    viz.RELAX_SHOW_LOW = bool(int(args.relax_show_low))
+    viz.RELAX_SHOW_HIGH = bool(int(args.relax_show_high))
+    viz.RELAX_SHOW_MIDDLE = bool(int(args.relax_show_middle))
+    viz.RELAX_COUNTDOWN_ENABLED = bool(int(args.relax_countdown_enabled))
+    viz.RELAX_COUNTDOWN_COLOR = str(args.relax_countdown_color)
+    viz.RELAX_COUNTDOWN_MAX_SEC = max(0.0, float(args.relax_countdown_max_sec))
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:
