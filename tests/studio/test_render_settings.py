@@ -164,3 +164,20 @@ def test_relax_defaults_backward_compatible() -> None:
     assert d["relax_countdown_x"] == 0.88
     assert d["relax_countdown_h"] == 0.16
 
+
+def test_background_fields_round_trip() -> None:
+    s = build_settings(
+        "punch",
+        {
+            "background_type": "video",
+            "background_color": "#112233",
+            "background_image": "C:/tmp/bg.png",
+            "background_video": "C:/tmp/bg.mp4",
+        },
+    )
+    d = s.model_dump(mode="json")
+    assert d["background_type"] == "video"
+    assert d["background_color"] == "#112233"
+    assert d["background_image"] == "C:/tmp/bg.png"
+    assert d["background_video"] == "C:/tmp/bg.mp4"
+

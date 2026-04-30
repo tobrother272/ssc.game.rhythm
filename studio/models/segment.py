@@ -42,6 +42,9 @@ class Segment:
     # survives across project moves.  Persisted in the .htproj file so
     # the segment knows where to find its render after re-opening.
     video_path: Optional[str] = None
+    # True when this segment is created from a dropped source video.
+    # Playback uses ``video_path`` directly and segment tuning is locked.
+    is_video_segment: bool = False
     render_status: RenderStatus = RenderStatus.IDLE
     last_rendered_at: Optional[str] = None
     last_render_error: Optional[str] = None

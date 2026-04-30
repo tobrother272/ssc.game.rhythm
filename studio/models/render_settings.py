@@ -107,6 +107,10 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     # None = transparent (canvas black / skybox shows through).
     floor_bg_color: Optional[str] = None          # hex e.g. "#5A1A8C"
     floor_bg_opacity: float = 1.0                 # 0.0 (transparent) … 1.0 (solid)
+    background_type: Literal["solid", "image", "video"] = "solid"
+    background_color: str = "#000000"
+    background_image: Optional[str] = None
+    background_video: Optional[str] = None
     # Chevron-specific — only active when floor_layout='chevron_strip'.
     chevron_color: str = "#FFD700"                 # arrow fill color (gold default)
     chevron_scroll: bool = True                    # scroll toward camera continuously

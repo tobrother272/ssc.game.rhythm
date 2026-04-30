@@ -1370,6 +1370,7 @@ class MainWindow(QMainWindow):
             )
         start_time = round(start_time * 10) / 10.0
 
+        is_video = (media.kind.value == "video")
         segment = Segment(
             name=f"Segment {len(self.project.segments) + 1}",
             start_time_sec=start_time,
@@ -1379,6 +1380,8 @@ class MainWindow(QMainWindow):
             audio_duration_sec=duration,
             mode="punch",
             render_settings=build_settings("punch", {}).model_dump(mode="json", exclude_none=True),
+            video_path=media.source_path if is_video else None,
+            is_video_segment=is_video,
         )
         self.project.segments.append(segment)
         self.timeline_panel.refresh()
@@ -1387,9 +1390,10 @@ class MainWindow(QMainWindow):
         # Extract waveform now that an audio media has been dropped onto timeline.
         if segment.audio_path:
             self._request_waveform_for(segment.audio_path)
-        # Trim the audio clip for this segment so the WAV is ready before
-        # the user hits Render / Preview.
-        self._request_audio_trim(segment)
+        # Trim the audio clip for audio-backed segments so the WAV is
+        # ready before the user hits Render / Preview.
+        if not segment.is_video_segment:
+            self._request_audio_trim(segment)
         self._on_project_changed()
 
     def _on_segment_selected(self, segment: Segment | None) -> None:
@@ -1781,6 +1785,13 @@ class MainWindow(QMainWindow):
         segment = self.project.get_segment(segment_id)
         if segment is None:
             return
+        if bool(getattr(segment, "is_video_segment", False)):
+            self.statusBar().showMessage(
+                "This segment is source-video playback only (live preview disabled).",
+                3500,
+            )
+            self.segment_panel.set_preview_active(False)
+            return
         if not segment.audio_path:
             self.statusBar().showMessage("Segment has no audio source", 3000)
             self.segment_panel.set_preview_active(False)
@@ -2051,6 +2062,10 @@ class MainWindow(QMainWindow):
             "floor_layout":          str(_get("floor_layout", "auto")),
             "floor_bg_color":        _get("floor_bg_color", None) or "",
             "floor_bg_opacity":      float(_get("floor_bg_opacity", 1.0) or 1.0),
+            "background_type":       str(_get("background_type", "solid") or "solid"),
+            "background_color":      str(_get("background_color", "#000000") or "#000000"),
+            "background_image":      _get("background_image", None) or "",
+            "background_video":      _get("background_video", None) or "",
             "chevron_color":         str(_get("chevron_color", "#FFD700")),
             "chevron_scroll":        bool(_get("chevron_scroll", True)),
             "chevron_blink":         bool(_get("chevron_blink", False)),
@@ -2265,6 +2280,10 @@ class MainWindow(QMainWindow):
             floor_layout      = str(rs.get("floor_layout", "auto"))
             floor_bg_color    = rs.get("floor_bg_color") or ""
             floor_bg_opacity  = float(rs.get("floor_bg_opacity", 1.0) or 1.0)
+            background_type   = str(rs.get("background_type", "solid") or "solid")
+            background_color  = str(rs.get("background_color", "#000000") or "#000000")
+            background_image  = rs.get("background_image") or ""
+            background_video  = rs.get("background_video") or ""
             chevron_color     = str(rs.get("chevron_color", "#FFD700"))
             chevron_scroll    = bool(rs.get("chevron_scroll", True))
             chevron_blink     = bool(rs.get("chevron_blink", False))
@@ -2334,6 +2353,10 @@ class MainWindow(QMainWindow):
                     floor_layout=floor_layout,
                     floor_bg_color=floor_bg_color,
                     floor_bg_opacity=floor_bg_opacity,
+                    background_type=background_type,
+                    background_color=background_color,
+                    background_image=background_image,
+                    background_video=background_video,
                     chevron_color=chevron_color,
                     chevron_scroll=chevron_scroll,
                     chevron_blink=chevron_blink,
@@ -2406,6 +2429,11 @@ class MainWindow(QMainWindow):
         self._enqueue_segment(segment)
 
     def _enqueue_segment(self, segment: Segment) -> None:
+        if bool(getattr(segment, "is_video_segment", False)):
+            self.statusBar().showMessage(
+                "Source-video segments cannot be rendered.", 3500
+            )
+            return
         if not segment.audio_path:
             self.statusBar().showMessage("Segment has no audio source", 3000)
             return

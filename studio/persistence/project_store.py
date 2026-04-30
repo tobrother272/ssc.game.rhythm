@@ -152,6 +152,7 @@ class ProjectStore:
             render_settings=payload.get("render_settings", {}),
             trimmed_audio_path=self._to_absolute(payload.get("trimmed_audio_path"), project_dir),
             video_path=self._to_absolute(new_video_path, project_dir),
+            is_video_segment=bool(payload.get("is_video_segment", False)),
             render_status=RenderStatus(payload.get("render_status", RenderStatus.IDLE.value)),
             last_rendered_at=payload.get("last_rendered_at"),
             last_render_error=payload.get("last_render_error"),

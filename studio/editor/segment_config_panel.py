@@ -1199,6 +1199,38 @@ class SegmentConfigPanel(QWidget):
         self._refresh_audio_options()
         self._load_segment_fields(segment)
         self._rebuild_dynamic_settings()
+        self._apply_video_segment_lock_state(segment)
+
+    @staticmethod
+    def _is_video_segment_locked(segment: Segment | None) -> bool:
+        return bool(segment is not None and getattr(segment, "is_video_segment", False))
+
+    def _apply_video_segment_lock_state(self, segment: Segment) -> None:
+        """Lock inspector controls for source-video playback segments."""
+        locked = self._is_video_segment_locked(segment)
+        self.start_spin.setEnabled(not locked)
+        self.end_spin.setEnabled(not locked)
+        self.min_spacing_spin.setEnabled(not locked)
+        self.mode_combo.setEnabled(not locked)
+        self.dynamic_root.setEnabled(not locked)
+        self.reset_button.setEnabled(not locked)
+        self.preview_button.setChecked(False)
+        self.preview_button.setEnabled(False if locked else bool(segment.audio_path))
+        self.render_button.setEnabled(False if locked else bool(segment.audio_path))
+        if locked:
+            msg = (
+                "Source-video segment: duration/video are fixed from dropped media "
+                "and effect settings are locked."
+            )
+            self.status_label.setText("Status: source-video segment (locked)")
+            self.status_label.setStyleSheet("color:#a78bfa;")
+            self.status_label.setToolTip(msg)
+            self.preview_button.setToolTip(
+                "This segment previews directly from its source video."
+            )
+            self.render_button.setToolTip(
+                "Source-video segments are playback-only and do not render."
+            )
 
     def refresh_status_only(self, segment: Segment) -> None:
         """Update only the status label/header without rebuilding the form.
@@ -1443,8 +1475,9 @@ class SegmentConfigPanel(QWidget):
             and self._segment is not None
             and bool(self._segment.audio_path)
         )
-        self.preview_button.setEnabled(has_audio)
-        self.render_button.setEnabled(has_audio)
+        is_video_locked = self._is_video_segment_locked(self._segment)
+        self.preview_button.setEnabled(has_audio and not is_video_locked)
+        self.render_button.setEnabled(has_audio and not is_video_locked)
         self._refresh_open_folder_state()
         if empty:
             self.preview_button.setToolTip(
@@ -1456,12 +1489,20 @@ class SegmentConfigPanel(QWidget):
             self.header_label.setText("Select a segment in the timeline to configure")
             self.status_label.setText("")
         elif not has_audio:
-            self.preview_button.setToolTip(
-                "Assign an audio source to this segment to enable preview"
-            )
-            self.render_button.setToolTip(
-                "Assign an audio source to this segment to enable render"
-            )
+            if is_video_locked:
+                self.preview_button.setToolTip(
+                    "This segment previews directly from its source video."
+                )
+                self.render_button.setToolTip(
+                    "Source-video segments are playback-only and do not render."
+                )
+            else:
+                self.preview_button.setToolTip(
+                    "Assign an audio source to this segment to enable preview"
+                )
+                self.render_button.setToolTip(
+                    "Assign an audio source to this segment to enable render"
+                )
         else:
             self.preview_button.setToolTip(
                 "Render and play this segment with current settings"
@@ -1609,6 +1650,10 @@ class SegmentConfigPanel(QWidget):
         "density",
         "speed",
         "max_per_lane",
+        "background_type",
+        "background_color",
+        "background_image",
+        "background_video",
         "floor_panels",
         "side_rails",
         "stickman",
@@ -1645,6 +1690,10 @@ class SegmentConfigPanel(QWidget):
         "density":     "Density",
         "speed":       "Speed",
         "max_per_lane":"Max / lane",
+        "background_type": "Background",
+        "background_color": "Background color",
+        "background_image": "Background image",
+        "background_video": "Background video",
         "floor_panels":"Floor panels",
         "side_rails":  "Side rails",
         "stickman":    "Stickman",
@@ -1769,6 +1818,7 @@ class SegmentConfigPanel(QWidget):
                         s.setVisible(state == Qt.CheckState.Checked.value
                                      or state == 2)
                 )
+        self._update_background_visibility()
 
     # Per-key UI hints (range, step, decimals, tooltip).
     # Keys not listed fall back to generic wide-range spinboxes.
@@ -1809,6 +1859,37 @@ class SegmentConfigPanel(QWidget):
     }
 
     def _build_widget_for_value(self, key: str, value):
+        if key == "background_type":
+            combo = QComboBox()
+            combo.addItem("Solid color", "solid")
+            combo.addItem("Image", "image")
+            combo.addItem("Video", "video")
+            combo.setCurrentIndex(max(0, combo.findData(str(value or "solid"))))
+            combo.currentIndexChanged.connect(self._on_background_type_changed)
+            return _no_scroll(combo)
+        if key == "background_color":
+            widget = _ColorPickerWidget(
+                None if value is None else str(value),
+                title="Background color",
+                default_color="#000000",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
+        if key in {"background_image", "background_video"}:
+            filt = ("Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)"
+                    if key == "background_video"
+                    else "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)")
+            title = "Select background video" if key == "background_video" else "Select background image"
+            widget = _PathBrowseWidget(
+                "" if value is None else str(value),
+                title=title,
+                file_filter=filt,
+                placeholder="Optional file path",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
         if key == "relax_countdown_color":
             widget = _ColorPickerWidget(
                 None if value is None else str(value),
@@ -1922,6 +2003,34 @@ class SegmentConfigPanel(QWidget):
             return line
         return None
 
+    def _set_dynamic_row_visible(self, widget: QWidget, visible: bool) -> None:
+        try:
+            lbl = self.dynamic_layout.labelForField(widget)
+            if lbl is not None:
+                lbl.setVisible(visible)
+            widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
+
+    def _update_background_visibility(self) -> None:
+        bg_type_widget = self._setting_widgets.get("background_type")
+        if not isinstance(bg_type_widget, QComboBox):
+            return
+        bg_type = str(bg_type_widget.currentData() or "solid")
+        w_color = self._setting_widgets.get("background_color")
+        w_image = self._setting_widgets.get("background_image")
+        w_video = self._setting_widgets.get("background_video")
+        if isinstance(w_color, QWidget):
+            self._set_dynamic_row_visible(w_color, bg_type == "solid")
+        if isinstance(w_image, QWidget):
+            self._set_dynamic_row_visible(w_image, bg_type == "image")
+        if isinstance(w_video, QWidget):
+            self._set_dynamic_row_visible(w_video, bg_type == "video")
+
+    def _on_background_type_changed(self, *_args) -> None:
+        self._update_background_visibility()
+        self._commit_settings()
+
     def _collect_setting_widget_value(self, key: str, widget: QWidget):
         if isinstance(widget, _ModeListWidget):
             return widget.get_value()
@@ -1949,6 +2058,8 @@ class SegmentConfigPanel(QWidget):
         segment = self._segment
         if segment is None:
             return
+        if self._is_video_segment_locked(segment):
+            return
         # NOTE: ``segment.audio_path`` is intentionally NOT written here.
         # The audio source is bound to the segment by the create / split /
         # join / duplicate operations only; config edits must never change
@@ -1969,6 +2080,8 @@ class SegmentConfigPanel(QWidget):
         segment = self._segment
         if segment is None:
             return
+        if self._is_video_segment_locked(segment):
+            return
         segment.mode = str(self.mode_combo.currentData())
         self._rebuild_dynamic_settings()
         self.segment_changed.emit(segment.id)
@@ -1976,6 +2089,8 @@ class SegmentConfigPanel(QWidget):
     def _commit_settings(self) -> None:
         segment = self._segment
         if segment is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         for key, widget in self._setting_widgets.items():
             segment.render_settings[key] = self._collect_setting_widget_value(key, widget)
@@ -1992,6 +2107,8 @@ class SegmentConfigPanel(QWidget):
         """Called when any floor panel sub-section control changes."""
         segment = self._segment
         if segment is None or self._floor_panel_section is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         self._write_floor_panel_to_rs(segment, self._floor_panel_section)
         self.segment_changed.emit(segment.id)
@@ -2041,6 +2158,8 @@ class SegmentConfigPanel(QWidget):
         """Called when any side rail sub-section control changes."""
         segment = self._segment
         if segment is None or self._side_rail_section is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         self._write_side_rail_to_rs(segment, self._side_rail_section)
         self.segment_changed.emit(segment.id)
@@ -2117,7 +2236,9 @@ class SegmentConfigPanel(QWidget):
             if not self.preview_button.isChecked():
                 self.preview_button.setText("▶  Preview")
                 self.preview_button.setEnabled(
-                    self._segment is not None and bool(getattr(self._segment, "audio_path", None))
+                    self._segment is not None
+                    and bool(getattr(self._segment, "audio_path", None))
+                    and not self._is_video_segment_locked(self._segment)
                 )
                 self.preview_button.setToolTip(self._preview_default_tooltip)
 
@@ -2158,6 +2279,8 @@ class SegmentConfigPanel(QWidget):
         """
         segment = self._segment
         if segment is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         segment.render_settings = build_settings(segment.mode, {}).model_dump(
             mode="json", exclude_none=True

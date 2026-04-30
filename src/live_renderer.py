@@ -100,6 +100,7 @@ from rhythm import (  # noqa: E402
     PunchTarget,
     RelaxTarget,
     SideRailRenderer,
+    SegmentBackgroundLayer,
     StickmanHUD,
     Target,
     TunnelRenderer,
@@ -192,6 +193,10 @@ class LiveFrameRenderer:
         floor_layout: str = "auto",
         floor_bg_color: Optional[str] = None,
         floor_bg_opacity: float = 1.0,
+        background_type: str = "solid",
+        background_color: str = "#000000",
+        background_image: Optional[str] = None,
+        background_video: Optional[str] = None,
         chevron_color: str = "#FFD700",
         chevron_scroll: bool = True,
         chevron_blink: bool = False,
@@ -271,6 +276,10 @@ class LiveFrameRenderer:
         self._floor_layout = str(floor_layout)
         self._floor_bg_color = floor_bg_color or None
         self._floor_bg_opacity = float(floor_bg_opacity)
+        self._background_type = str(background_type or "solid")
+        self._background_color = str(background_color or "#000000")
+        self._background_image = background_image or None
+        self._background_video = background_video or None
         self._chevron_color = str(chevron_color)
         self._chevron_scroll = bool(chevron_scroll)
         self._chevron_blink = bool(chevron_blink)
@@ -482,6 +491,10 @@ class LiveFrameRenderer:
         floor_layout: Optional[str] = None,
         floor_bg_color: Optional[str] = None,
         floor_bg_opacity: Optional[float] = None,
+        background_type: Optional[str] = None,
+        background_color: Optional[str] = None,
+        background_image: Optional[str] = None,
+        background_video: Optional[str] = None,
         chevron_color: Optional[str] = None,
         chevron_scroll: Optional[bool] = None,
         chevron_blink: Optional[bool] = None,
@@ -574,6 +587,14 @@ class LiveFrameRenderer:
             self._floor_bg_color = floor_bg_color or None
         if floor_bg_opacity is not None:
             self._floor_bg_opacity = float(floor_bg_opacity)
+        if background_type is not None:
+            self._background_type = str(background_type or "solid")
+        if background_color is not None:
+            self._background_color = str(background_color or "#000000")
+        if background_image is not None:
+            self._background_image = background_image or None
+        if background_video is not None:
+            self._background_video = background_video or None
         if chevron_color is not None:
             self._chevron_color = str(chevron_color)
         if chevron_scroll is not None:
@@ -745,6 +766,9 @@ class LiveFrameRenderer:
         self._viewport = None  # type: ignore[assignment]
         self._combo = None  # type: ignore[assignment]
         self._stick = None  # type: ignore[assignment]
+        if getattr(self, "_background_layer", None) is not None:
+            self._background_layer.close()
+        self._background_layer = None
 
     # ------------------------------------------------------------------
     # construction helpers
@@ -840,6 +864,9 @@ class LiveFrameRenderer:
         if not modes_seq:
             modes_seq = ["punch"]
         self._modes_seq = modes_seq
+        if getattr(self, "_background_layer", None) is not None:
+            self._background_layer.close()
+            self._background_layer = None
         combo_mode = len(modes_seq) >= 2
         self._combo_mode = combo_mode
         # Scene-dressing primary mode picks lane count + floor spread.
@@ -864,6 +891,15 @@ class LiveFrameRenderer:
         if self._wall_floor_gap_frac is not None:
             cam_kwargs["wall_floor_gap_frac"] = self._wall_floor_gap_frac
         self._cam = PerspectiveCamera(self._width, self._height, **cam_kwargs)
+        self._background_layer = SegmentBackgroundLayer(
+            self._width,
+            self._height,
+            bg_type=self._background_type,
+            color=self._background_color,
+            image_path=self._background_image,
+            video_path=self._background_video,
+            fps=float(self._fps),
+        )
         # Tunnel + decorative HUDs.  ``show_floor_panels`` is sourced
         # from the segment's render setting (default True) and is
         # hot-toggleable through :meth:`update_mode` so the user can
@@ -1188,6 +1224,8 @@ class LiveFrameRenderer:
 
     def _blank_frame(self) -> np.ndarray:
         """Return a flat ``CLR_BG`` frame.  Used when audio is empty."""
+        if getattr(self, "_background_layer", None) is not None:
+            return self._background_layer.frame(0)
         return np.full((self._height, self._width, 3),
                        CLR_BG, dtype=np.uint8)
 
@@ -1207,8 +1245,11 @@ class LiveFrameRenderer:
         # Hits emitted from the most recent ``update`` are stored on
         # the GameManager's ``_pending_hits``; we re-resolve them here
         # so particle bursts spawn at the right pixel position.
-        canvas = np.full((self._height, self._width, 3),
-                         CLR_BG, dtype=np.uint8)
+        if getattr(self, "_background_layer", None) is not None:
+            canvas = self._background_layer.frame(fi)
+        else:
+            canvas = np.full((self._height, self._width, 3),
+                             CLR_BG, dtype=np.uint8)
         # 1. tunnel walls + floor grid
         canvas = self._tunnel.draw(canvas, fi)
         # 1b. side rails

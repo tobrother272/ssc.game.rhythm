@@ -677,6 +677,10 @@ class RenderService(QObject):
         "floor_layout",
         "floor_bg_color",
         "floor_bg_opacity",
+        "background_type",
+        "background_color",
+        "background_image",
+        "background_video",
         "chevron_color",
         "chevron_scroll",
         "chevron_blink",
@@ -739,6 +743,8 @@ class RenderService(QObject):
                 "relax_texture_middle",
                 "relax_hole_mask_path",
             } and not str(value).strip():
+                continue
+            if key in {"background_image", "background_video"} and not str(value).strip():
                 continue
             cli_key = f"--{key}"
 

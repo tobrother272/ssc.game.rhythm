@@ -560,6 +560,88 @@ class PerspectiveCamera:
         return self.cy_v - t * (self.cy_v - top)
 
 
+# ── SegmentBackgroundLayer ───────────────────────────────────────────────────
+class SegmentBackgroundLayer:
+    """Background fill layer drawn under all segment elements."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        bg_type: str = "solid",
+        color: str = "#000000",
+        image_path: str | None = None,
+        video_path: str | None = None,
+        fps: float = 30.0,
+    ) -> None:
+        self._w = int(width)
+        self._h = int(height)
+        self._fps = max(1e-6, float(fps))
+        t = str(bg_type or "solid").strip().lower()
+        self._type = t if t in {"solid", "image", "video"} else "solid"
+        self._solid_bgr = _hex_to_bgr(color, default=CLR_BG)
+        self._image: np.ndarray | None = None
+        self._cap: cv2.VideoCapture | None = None
+        self._video_fps = self._fps
+        self._video_frames = 0
+        self._last_src_idx = -1
+        self._last_frame: np.ndarray | None = None
+
+        if self._type == "image" and image_path:
+            try:
+                img = cv2.imread(str(image_path))
+                if img is not None:
+                    self._image = cv2.resize(
+                        img, (self._w, self._h), interpolation=cv2.INTER_AREA
+                    )
+            except Exception:
+                self._image = None
+        elif self._type == "video" and video_path:
+            try:
+                cap = cv2.VideoCapture(str(video_path))
+                if cap is not None and cap.isOpened():
+                    self._cap = cap
+                    vf = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if vf > 1e-3:
+                        self._video_fps = vf
+                    self._video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                else:
+                    if cap is not None:
+                        cap.release()
+            except Exception:
+                self._cap = None
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _solid_frame(self) -> np.ndarray:
+        return np.full((self._h, self._w, 3), self._solid_bgr, dtype=np.uint8)
+
+    def frame(self, frame_idx: int) -> np.ndarray:
+        if self._type == "image" and self._image is not None:
+            return self._image.copy()
+        if self._type == "video" and self._cap is not None:
+            src_idx = int(round((float(frame_idx) / self._fps) * self._video_fps))
+            if self._video_frames > 0:
+                src_idx = max(0, min(self._video_frames - 1, src_idx))
+            if src_idx != self._last_src_idx:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(src_idx))
+                ok, frm = self._cap.read()
+                if ok and frm is not None:
+                    if frm.shape[1] != self._w or frm.shape[0] != self._h:
+                        frm = cv2.resize(
+                            frm, (self._w, self._h), interpolation=cv2.INTER_LINEAR
+                        )
+                    self._last_frame = frm
+                    self._last_src_idx = src_idx
+            if self._last_frame is not None:
+                return self._last_frame.copy()
+        return self._solid_frame()
+
+
 # ── TunnelRenderer ────────────────────────────────────────────────────────────
 class TunnelRenderer:
     """Draws the receding 3D tunnel: floor grid + side walls with neon strips."""
@@ -5304,6 +5386,11 @@ class RhythmVisualizer:
         # -- scene toggles --
         self.SHOW_FLOOR_PANELS: bool = True   # receding grey tile rows
         self.SHOW_STICKMAN:     bool = True   # left-column punching fighter
+        # -- segment background (drawn behind all scene elements) --
+        self.BACKGROUND_TYPE:   str = "solid"     # solid | image | video
+        self.BACKGROUND_COLOR:  str = "#000000"
+        self.BACKGROUND_IMAGE:  str | None = None
+        self.BACKGROUND_VIDEO:  str | None = None
         # -- stickman draw-box override (top-left corner + size, in PIXELS).
         #    Any value < 0 means "use the StickmanHUD default for that
         #    component" (left-column HUD: x=W*1%, y=H*9%, w=W*13.5%,
@@ -5817,6 +5904,15 @@ class RhythmVisualizer:
                 dot_color_near=getattr(self, "RAIL_DOT_COLOR_NEAR", "#FF60FF"),
                 dot_color_far=getattr(self, "RAIL_DOT_COLOR_FAR", "#00FFFF"),
             )
+        bg_layer = SegmentBackgroundLayer(
+            self.WIDTH,
+            self.HEIGHT,
+            bg_type=str(getattr(self, "BACKGROUND_TYPE", "solid")),
+            color=str(getattr(self, "BACKGROUND_COLOR", "#000000")),
+            image_path=getattr(self, "BACKGROUND_IMAGE", None),
+            video_path=getattr(self, "BACKGROUND_VIDEO", None),
+            fps=float(self.FPS),
+        )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
         # mode's action library.  Solo 'line' uses its own 'line' action
@@ -6402,7 +6498,7 @@ class RhythmVisualizer:
             hits = game.update(fi)
 
             # ── canvas build ────────────────────────────────────────
-            canvas = np.full((self.HEIGHT, self.WIDTH, 3), CLR_BG, dtype=np.uint8)
+            canvas = bg_layer.frame(fi)
 
             # 1. tunnel walls + floor grid
             canvas = tunnel.draw(canvas, fi)
@@ -6580,6 +6676,7 @@ class RhythmVisualizer:
               f"avg {total_frames/(t_done-t_render):.1f} FPS")
 
         # ── finalise encoder ─────────────────────────────────────────
+        bg_layer.close()
         if _vwriter is not None:
             _vwriter.release()
         if _vproc is not None:
@@ -6696,6 +6793,15 @@ def parse_arguments():
                         'tiles/chevron). None = transparent / canvas black (default).')
     p.add_argument('--floor_bg_opacity', type=float, default=1.0, metavar='0..1',
                    help='Opacity of the floor background trapezoid (0=transparent, 1=solid). Default 1.0.')
+    p.add_argument('--background_type', type=str, default='solid',
+                   choices=['solid', 'image', 'video'],
+                   help='Segment background type: solid color, image, or video.')
+    p.add_argument('--background_color', type=str, default='#000000', metavar='#RRGGBB',
+                   help='Background color when --background_type solid.')
+    p.add_argument('--background_image', type=str, default=None, metavar='PATH',
+                   help='Background image path when --background_type image.')
+    p.add_argument('--background_video', type=str, default=None, metavar='PATH',
+                   help='Background video path when --background_type video.')
     # ── Chevron (used only when --floor_layout chevron_strip) ──────────
     p.add_argument('--chevron_color', type=str, default='#FFD700', metavar='#RRGGBB',
                    help='Chevron arrow fill color. Default #FFD700 (gold).')
@@ -7116,6 +7222,10 @@ if __name__ == '__main__':
     viz.FLOOR_LAYOUT         = args.floor_layout
     viz.FLOOR_BG_COLOR       = args.floor_bg_color or None
     viz.FLOOR_BG_OPACITY     = float(args.floor_bg_opacity)
+    viz.BACKGROUND_TYPE      = str(args.background_type or "solid")
+    viz.BACKGROUND_COLOR     = str(args.background_color or "#000000")
+    viz.BACKGROUND_IMAGE     = args.background_image or None
+    viz.BACKGROUND_VIDEO     = args.background_video or None
     viz.CHEVRON_COLOR        = args.chevron_color
     viz.CHEVRON_SCROLL       = bool(int(args.chevron_scroll))
     viz.CHEVRON_BLINK        = bool(int(args.chevron_blink))
