@@ -566,6 +566,9 @@ class RenderService(QObject):
         "rail_chevron_density",
         "rail_pillar_count",
         "rail_chase_speed_frames",
+        "rail_dot_count",
+        "rail_dot_lines",
+        "rail_dot_size_px",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -600,6 +603,12 @@ class RenderService(QObject):
         "rail_chase_mode",
         "rail_pillar_radius",
         "rail_chase_speed_frames",
+        "rail_dot_count",
+        "rail_dot_lines",
+        "rail_dot_size_px",
+        "rail_dot_anim_mode",
+        "rail_dot_color_near",
+        "rail_dot_color_far",
         "floor_hit_frac",
         "horizon_frac",
         "floor_spread_frac",

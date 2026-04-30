@@ -209,6 +209,12 @@ class LiveFrameRenderer:
         rail_pillar_radius: float = 1.0,
         rail_chase_mode: str = "time",
         rail_chase_speed_frames: int = 4,
+        rail_dot_count: int = 24,
+        rail_dot_lines: int = 1,
+        rail_dot_size_px: int = 6,
+        rail_dot_anim_mode: str = "audio",
+        rail_dot_color_near: str = "#FF60FF",
+        rail_dot_color_far: str = "#00FFFF",
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -262,6 +268,12 @@ class LiveFrameRenderer:
         self._rail_pillar_radius = float(rail_pillar_radius)
         self._rail_chase_mode = str(rail_chase_mode)
         self._rail_chase_speed_frames = int(rail_chase_speed_frames)
+        self._rail_dot_count = int(rail_dot_count)
+        self._rail_dot_lines = int(rail_dot_lines)
+        self._rail_dot_size_px = int(rail_dot_size_px)
+        self._rail_dot_anim_mode = str(rail_dot_anim_mode)
+        self._rail_dot_color_near = str(rail_dot_color_near)
+        self._rail_dot_color_far = str(rail_dot_color_far)
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -447,6 +459,12 @@ class LiveFrameRenderer:
         rail_pillar_radius: Optional[float] = None,
         rail_chase_mode: Optional[str] = None,
         rail_chase_speed_frames: Optional[int] = None,
+        rail_dot_count: Optional[int] = None,
+        rail_dot_lines: Optional[int] = None,
+        rail_dot_size_px: Optional[int] = None,
+        rail_dot_anim_mode: Optional[str] = None,
+        rail_dot_color_near: Optional[str] = None,
+        rail_dot_color_far: Optional[str] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -531,6 +549,18 @@ class LiveFrameRenderer:
             self._rail_chase_mode = str(rail_chase_mode)
         if rail_chase_speed_frames is not None:
             self._rail_chase_speed_frames = int(rail_chase_speed_frames)
+        if rail_dot_count is not None:
+            self._rail_dot_count = int(rail_dot_count)
+        if rail_dot_lines is not None:
+            self._rail_dot_lines = int(rail_dot_lines)
+        if rail_dot_size_px is not None:
+            self._rail_dot_size_px = int(rail_dot_size_px)
+        if rail_dot_anim_mode is not None:
+            self._rail_dot_anim_mode = str(rail_dot_anim_mode)
+        if rail_dot_color_near is not None:
+            self._rail_dot_color_near = str(rail_dot_color_near)
+        if rail_dot_color_far is not None:
+            self._rail_dot_color_far = str(rail_dot_color_far)
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -757,6 +787,12 @@ class LiveFrameRenderer:
                 pillar_radius=self._rail_pillar_radius,
                 chase_mode=self._rail_chase_mode,
                 chase_speed_frames=self._rail_chase_speed_frames,
+                dot_count=self._rail_dot_count,
+                dot_lines=self._rail_dot_lines,
+                dot_size_px=self._rail_dot_size_px,
+                dot_anim_mode=self._rail_dot_anim_mode,
+                dot_color_near=self._rail_dot_color_near,
+                dot_color_far=self._rail_dot_color_far,
             )
         else:
             self._side_rail = None

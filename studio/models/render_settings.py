@@ -22,6 +22,7 @@ class RailShape(str, Enum):
     TUBE    = "tube"      # continuous extruded strip
     CHEVRON = "chevron"   # >>> inward-pointing arrows
     PILLAR  = "pillar"    # row of 3-D columns with running LED highlight
+    DOT     = "dot"       # row of glowing dots with anim + gradient
 
 
 class RailPulse(str, Enum):
@@ -47,6 +48,12 @@ class SideRailMixin(BaseModel):
     rail_pillar_radius: float = Field(default=1.0, ge=0.2, le=2.0)
     rail_chase_mode: Literal["time", "beat"] = "time"
     rail_chase_speed_frames: int = Field(default=4, ge=1, le=60)
+    rail_dot_count: int = Field(default=24, ge=8, le=64)
+    rail_dot_lines: int = Field(default=1, ge=1, le=8)
+    rail_dot_size_px: int = Field(default=6, ge=2, le=20)
+    rail_dot_anim_mode: Literal["audio", "twinkle", "wave"] = "audio"
+    rail_dot_color_near: str = "#FF60FF"
+    rail_dot_color_far: str = "#00FFFF"
 
 
 class RenderMode(str, Enum):

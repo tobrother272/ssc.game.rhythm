@@ -1756,6 +1756,12 @@ class PreviewPanel(QWidget):
         rail_pillar_radius: Optional[float] = None,
         rail_chase_mode: Optional[str] = None,
         rail_chase_speed_frames: Optional[int] = None,
+        rail_dot_count: Optional[int] = None,
+        rail_dot_lines: Optional[int] = None,
+        rail_dot_size_px: Optional[int] = None,
+        rail_dot_anim_mode: Optional[str] = None,
+        rail_dot_color_near: Optional[str] = None,
+        rail_dot_color_far: Optional[str] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -1792,6 +1798,12 @@ class PreviewPanel(QWidget):
             rail_pillar_radius=rail_pillar_radius,
             rail_chase_mode=rail_chase_mode,
             rail_chase_speed_frames=rail_chase_speed_frames,
+            rail_dot_count=rail_dot_count,
+            rail_dot_lines=rail_dot_lines,
+            rail_dot_size_px=rail_dot_size_px,
+            rail_dot_anim_mode=rail_dot_anim_mode,
+            rail_dot_color_near=rail_dot_color_near,
+            rail_dot_color_far=rail_dot_color_far,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)

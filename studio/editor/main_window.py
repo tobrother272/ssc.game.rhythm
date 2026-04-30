@@ -1794,6 +1794,12 @@ class MainWindow(QMainWindow):
             "rail_pillar_radius":    float(_get("rail_pillar_radius", 1.0) or 1.0),
             "rail_chase_mode":       str(_get("rail_chase_mode", "time") or "time"),
             "rail_chase_speed_frames": int(_get("rail_chase_speed_frames", 4) or 4),
+            "rail_dot_count":        int(_get("rail_dot_count", 24) or 24),
+            "rail_dot_lines":        int(_get("rail_dot_lines", 1) or 1),
+            "rail_dot_size_px":      int(_get("rail_dot_size_px", 6) or 6),
+            "rail_dot_anim_mode":    str(_get("rail_dot_anim_mode", "audio") or "audio"),
+            "rail_dot_color_near":   str(_get("rail_dot_color_near", "#FF60FF") or "#FF60FF"),
+            "rail_dot_color_far":    str(_get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -1982,6 +1988,12 @@ class MainWindow(QMainWindow):
             rail_pillar_radius = float(rs.get("rail_pillar_radius", 1.0) or 1.0)
             rail_chase_mode = str(rs.get("rail_chase_mode", "time") or "time")
             rail_chase_speed_frames = int(rs.get("rail_chase_speed_frames", 4) or 4)
+            rail_dot_count = int(rs.get("rail_dot_count", 24) or 24)
+            rail_dot_lines = int(rs.get("rail_dot_lines", 1) or 1)
+            rail_dot_size_px = int(rs.get("rail_dot_size_px", 6) or 6)
+            rail_dot_anim_mode = str(rs.get("rail_dot_anim_mode", "audio") or "audio")
+            rail_dot_color_near = str(rs.get("rail_dot_color_near", "#FF60FF") or "#FF60FF")
+            rail_dot_color_far = str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF")
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -2025,6 +2037,12 @@ class MainWindow(QMainWindow):
                     rail_pillar_radius=rail_pillar_radius,
                     rail_chase_mode=rail_chase_mode,
                     rail_chase_speed_frames=rail_chase_speed_frames,
+                    rail_dot_count=rail_dot_count,
+                    rail_dot_lines=rail_dot_lines,
+                    rail_dot_size_px=rail_dot_size_px,
+                    rail_dot_anim_mode=rail_dot_anim_mode,
+                    rail_dot_color_near=rail_dot_color_near,
+                    rail_dot_color_far=rail_dot_color_far,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

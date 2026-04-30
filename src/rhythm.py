@@ -3166,6 +3166,12 @@ class SideRailRenderer:
         pillar_radius: float = 1.0,
         chase_mode: str = "time",
         chase_speed_frames: int = 4,
+        dot_count: int = 24,
+        dot_lines: int = 1,
+        dot_size_px: int = 6,
+        dot_anim_mode: str = "audio",
+        dot_color_near: str = "#FF60FF",
+        dot_color_far: str = "#00FFFF",
     ):
         self._cam    = cam
         self._shape  = shape.lower()
@@ -3182,6 +3188,20 @@ class SideRailRenderer:
         self._chase_speed_frames = max(1, int(chase_speed_frames))
         self._chase_step = 0
         self._chase_frame_counter = 0
+        self._dot_count = max(8, min(64, int(dot_count)))
+        self._dot_lines = max(1, min(8, int(dot_lines)))
+        self._dot_size_px = max(2, min(20, int(dot_size_px)))
+        self._dot_anim_mode = str(dot_anim_mode).lower()
+        if self._dot_anim_mode not in ("audio", "twinkle", "wave"):
+            self._dot_anim_mode = "audio"
+        self._dot_near_bgr = np.array(
+            _hex_to_bgr(dot_color_near, default=(255, 96, 255)),
+            dtype=np.float32,
+        )
+        self._dot_far_bgr = np.array(
+            _hex_to_bgr(dot_color_far, default=(255, 255, 0)),
+            dtype=np.float32,
+        )
 
         # Color
         try:
@@ -3255,6 +3275,14 @@ class SideRailRenderer:
             if self._pillar_count > 1 else 1.0
         )
         self._pillar_half_z = spacing * 0.20
+        self._dot_zs = np.linspace(cam.Z_NEAR, cam.Z_FAR, self._dot_count)
+        if self._dot_count > 1:
+            ts = np.linspace(0.0, 1.0, self._dot_count)[:, None]
+        else:
+            ts = np.array([[0.0]])
+        self._dot_base_colors = (
+            self._dot_near_bgr[None, :] * (1 - ts) + self._dot_far_bgr[None, :] * ts
+        )
 
     # ------------------------------------------------------------------
     def _effective_color(self, bass_val: float, hit: bool) -> np.ndarray:
@@ -3301,7 +3329,9 @@ class SideRailRenderer:
             (self._ri_r, self._ro_r),   # right rail
             (self._ri_l, self._ro_l),   # left rail
         ):
-            if self._shape == "pillar":
+            if self._shape == "dot":
+                self._draw_dots(canvas, wx_i, wx_o, color, frame_idx, bass_val)
+            elif self._shape == "pillar":
                 self._draw_pillar(canvas, wx_i, wx_o, color)
             elif self._shape == "tube":
                 self._draw_tube(canvas, wx_i, wx_o, bgr_t, bgr_d, color)
@@ -3573,6 +3603,74 @@ class SideRailRenderer:
                 cv2.fillConvexPoly(canvas, top_poly, bgr_top)
                 if is_head:
                     _draw_neon_edges(canvas, [top_poly], face_color, 1)
+
+        return canvas
+
+    def _draw_dots(
+        self,
+        canvas: np.ndarray,
+        wx_i: float,
+        wx_o: float,
+        color: np.ndarray,
+        frame_idx: int,
+        bass_val: float,
+    ) -> np.ndarray:
+        """Draw glowing 2D dots projected on the rail inner edge."""
+        cam = self._cam
+        bot, top = self._bot_y, self._top_y
+
+        n = self._dot_count
+        base_size = self._dot_size_px
+        anim = self._dot_anim_mode
+
+        if anim == "audio":
+            mod_per_dot = np.full(n, 0.4 + 0.6 * float(bass_val), dtype=np.float32)
+        elif anim == "twinkle":
+            period = 30
+            phases = ((frame_idx + np.arange(n) * 7) % period) / float(period)
+            mod_per_dot = (
+                0.3 + 0.7 * (0.5 + 0.5 * np.sin(phases * 2 * np.pi))
+            ).astype(np.float32)
+        elif anim == "wave":
+            wave_phase = (np.arange(n) / max(1, n - 1) + frame_idx * 0.05) * 2 * np.pi
+            mod_per_dot = (
+                0.4 + 0.6 * (0.5 + 0.5 * np.sin(wave_phase))
+            ).astype(np.float32)
+        else:
+            mod_per_dot = np.ones(n, dtype=np.float32)
+
+        pulse_norm = max(1e-3, float(np.linalg.norm(self._base_bgr)))
+        pulse_factor = float(np.linalg.norm(color) / pulse_norm)
+
+        if self._dot_lines <= 1:
+            y_fracs = [0.5]
+        else:
+            # Split lines vertically on the wall (top -> bottom), not across rail width.
+            y_fracs = [j / (self._dot_lines - 1) for j in range(self._dot_lines)]
+
+        for i, wz in enumerate(self._dot_zs):
+            bgr_val = self._dot_base_colors[i] * mod_per_dot[i] * pulse_factor
+            bgr_val = np.clip(bgr_val, 0, 255)
+            col_tuple = (int(bgr_val[0]), int(bgr_val[1]), int(bgr_val[2]))
+            depth_factor = max(0.15, min(1.0, 5.0 / max(0.1, float(wz))))
+            radius = max(2, int(round(base_size * depth_factor)))
+            halo_col = tuple(int(c * 0.5) for c in col_tuple)
+
+            for frac in y_fracs:
+                wy = float(top + (bot - top) * frac)
+                proj = cam.project(float(wx_i), wy, float(wz))
+                if proj is None:
+                    continue
+                cx, cy = int(proj[0]), int(proj[1])
+                cv2.circle(canvas, (cx, cy), radius, col_tuple, -1, lineType=cv2.LINE_AA)
+                cv2.circle(
+                    canvas,
+                    (cx, cy),
+                    int(radius * 1.6),
+                    halo_col,
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
 
         return canvas
 
@@ -4835,6 +4933,11 @@ class RhythmVisualizer:
         self.RAIL_PILLAR_RADIUS:   float = 1.0
         self.RAIL_CHASE_MODE:      str = "time"
         self.RAIL_CHASE_SPEED_FRAMES: int = 4
+        self.RAIL_DOT_COUNT:       int = 24
+        self.RAIL_DOT_SIZE_PX:     int = 6
+        self.RAIL_DOT_ANIM_MODE:   str = "audio"
+        self.RAIL_DOT_COLOR_NEAR:  str = "#FF60FF"
+        self.RAIL_DOT_COLOR_FAR:   str = "#00FFFF"
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -5223,6 +5326,12 @@ class RhythmVisualizer:
                 pillar_radius=getattr(self, "RAIL_PILLAR_RADIUS", 1.0),
                 chase_mode=getattr(self, "RAIL_CHASE_MODE", "time"),
                 chase_speed_frames=getattr(self, "RAIL_CHASE_SPEED_FRAMES", 4),
+                dot_count=getattr(self, "RAIL_DOT_COUNT", 24),
+                dot_lines=getattr(self, "RAIL_DOT_LINES", 1),
+                dot_size_px=getattr(self, "RAIL_DOT_SIZE_PX", 6),
+                dot_anim_mode=getattr(self, "RAIL_DOT_ANIM_MODE", "audio"),
+                dot_color_near=getattr(self, "RAIL_DOT_COLOR_NEAR", "#FF60FF"),
+                dot_color_far=getattr(self, "RAIL_DOT_COLOR_FAR", "#00FFFF"),
             )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
@@ -6139,8 +6248,8 @@ def parse_arguments():
     p.add_argument('--rail_color', type=str, default='#FF60FF',
                    help='Hex color for side-rail neon (e.g. "#FF60FF"). Default magenta.')
     p.add_argument('--rail_shape', type=str, default='chunky',
-                  choices=['chunky', 'tube', 'chevron', 'pillar'],
-                  help='Rail style: chunky=fence blocks, tube=strip, chevron=arrows, pillar=LED-chase columns.')
+                  choices=['chunky', 'tube', 'chevron', 'pillar', 'dot'],
+                  help='Rail style: chunky=fence, tube=strip, chevron=arrows, pillar=LED-chase, dot=glowing dots.')
     p.add_argument('--rail_height', type=float, default=0.14,
                    help='Box height (world units). Default 0.14.')
     p.add_argument('--rail_offset_x', type=float, default=0.08,
@@ -6161,6 +6270,19 @@ def parse_arguments():
                    help='Chase advance trigger: time=constant interval (frames), beat=on each beat hit. Default time.')
     p.add_argument('--rail_chase_speed_frames', type=int, default=4, metavar='N',
                    help='Frames between chase advances (only for chase_mode=time). Default 4.')
+    p.add_argument('--rail_dot_count', type=int, default=24, metavar='N',
+                   help='Number of dots per rail (8..64). Default 24.')
+    p.add_argument('--rail_dot_lines', type=int, default=1, metavar='N',
+                   help='Number of vertical dot lines on each wall (top..bottom, 1..8). Default 1.')
+    p.add_argument('--rail_dot_size_px', type=int, default=6, metavar='PX',
+                   help='Base dot radius in pixels at Z_NEAR (2..20). Default 6.')
+    p.add_argument('--rail_dot_anim_mode', type=str, default='audio',
+                   choices=['audio', 'twinkle', 'wave'],
+                   help='Dot animation: audio=brightness from bass, twinkle=random fade, wave=sin wave. Default audio.')
+    p.add_argument('--rail_dot_color_near', type=str, default='#FF60FF', metavar='#RRGGBB',
+                   help='Color of dots closest to camera. Default magenta.')
+    p.add_argument('--rail_dot_color_far', type=str, default='#00FFFF', metavar='#RRGGBB',
+                   help='Color of dots at vanishing point. Default cyan.')
     p.add_argument('--rail_chevron_depth', type=float, default=1.0, metavar='MULT',
                    help='Chevron pointedness multiplier (shape=chevron only). '
                         '1.0 = 120° opening angle; >1 = more pointed; <1 = flatter. Default 1.0.')
@@ -6473,6 +6595,12 @@ if __name__ == '__main__':
     viz.RAIL_PILLAR_RADIUS     = float(args.rail_pillar_radius)
     viz.RAIL_CHASE_MODE        = str(args.rail_chase_mode)
     viz.RAIL_CHASE_SPEED_FRAMES = int(args.rail_chase_speed_frames)
+    viz.RAIL_DOT_COUNT         = int(args.rail_dot_count)
+    viz.RAIL_DOT_LINES         = int(args.rail_dot_lines)
+    viz.RAIL_DOT_SIZE_PX       = int(args.rail_dot_size_px)
+    viz.RAIL_DOT_ANIM_MODE     = str(args.rail_dot_anim_mode)
+    viz.RAIL_DOT_COLOR_NEAR    = str(args.rail_dot_color_near)
+    viz.RAIL_DOT_COLOR_FAR     = str(args.rail_dot_color_far)
     viz.RAIL_CHEVRON_DEPTH     = float(args.rail_chevron_depth)
     viz.RAIL_CHEVRON_DENSITY   = int(args.rail_chevron_density)
     viz.SHOW_STICKMAN      = bool(args.stickman)

@@ -470,7 +470,8 @@ class _SideRailSection(QGroupBox):
     _SHAPES = [("Chunky (fence blocks)", "chunky"),
                ("Tube (strip)", "tube"),
                ("Chevron (arrows)", "chevron"),
-               ("Pillar (LED chase)", "pillar")]
+               ("Pillar (LED chase)", "pillar"),
+               ("Dot (glowing dots)", "dot")]
     _PULSES = [("None (static)", "none"),
                ("Beat (flash on hit)", "beat"),
                ("RMS (breathe with bass)", "rms")]
@@ -490,10 +491,17 @@ class _SideRailSection(QGroupBox):
         pillar_radius: float = 1.0,
         chase_mode: str = "time",
         chase_speed_frames: int = 4,
+        dot_count: int = 24,
+        dot_lines: int = 1,
+        dot_size_px: int = 6,
+        dot_anim_mode: str = "audio",
+        dot_color_near: str = "#FF60FF",
+        dot_color_far: str = "#00FFFF",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Side Rail Options", parent)
         form = QFormLayout(self)
+        self._form = form
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
@@ -563,6 +571,7 @@ class _SideRailSection(QGroupBox):
         ir.addWidget(self._img_edit)
         ir.addWidget(img_browse)
         form.addRow("Texture", img_row)
+        self._texture_row = img_row
 
         # ---- Pulse mode ----
         self._pulse_cb = QComboBox()
@@ -689,10 +698,72 @@ class _SideRailSection(QGroupBox):
             self._pillar_count_sp, self._pillar_radius_sp,
             self._chase_mode_cb, self._chase_speed_sp,
         ]
+
+        # ── Dot-only sub-group ─────────────────────────────────────────
+        self._dot_sep = QFrame()
+        self._dot_sep.setFrameShape(QFrame.Shape.HLine)
+        self._dot_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._dot_sep)
+        self._dot_header = QLabel("<b>Dot options</b>")
+        form.addRow(self._dot_header)
+
+        self._dot_count_sp = QSpinBox()
+        self._dot_count_sp.setRange(8, 64)
+        self._dot_count_sp.setValue(int(dot_count))
+        self._dot_count_sp.setToolTip("Number of dots per rail (8..64)")
+        _no_scroll(self._dot_count_sp)
+        self._dot_count_sp.valueChanged.connect(self.changed)
+        form.addRow("Count", self._dot_count_sp)
+
+        self._dot_lines_sp = QSpinBox()
+        self._dot_lines_sp.setRange(1, 8)
+        self._dot_lines_sp.setValue(int(dot_lines))
+        self._dot_lines_sp.setToolTip("Number of vertical dot lines on wall (top -> bottom) (1..8)")
+        _no_scroll(self._dot_lines_sp)
+        self._dot_lines_sp.valueChanged.connect(self.changed)
+        form.addRow("Lines (vertical)", self._dot_lines_sp)
+
+        self._dot_size_sp = QSpinBox()
+        self._dot_size_sp.setRange(2, 20)
+        self._dot_size_sp.setValue(int(dot_size_px))
+        self._dot_size_sp.setToolTip("Base dot radius in pixels at Z_NEAR")
+        _no_scroll(self._dot_size_sp)
+        self._dot_size_sp.valueChanged.connect(self.changed)
+        form.addRow("Size (px)", self._dot_size_sp)
+
+        self._dot_anim_cb = QComboBox()
+        self._dot_anim_cb.addItems(["audio", "twinkle", "wave"])
+        self._dot_anim_cb.setCurrentText(str(dot_anim_mode))
+        self._dot_anim_cb.setToolTip(
+            "audio = brightness from bass; twinkle = random fade; wave = sin wave"
+        )
+        _no_scroll(self._dot_anim_cb)
+        self._dot_anim_cb.currentTextChanged.connect(self.changed)
+        form.addRow("Anim mode", self._dot_anim_cb)
+
+        self._dot_color_near = str(dot_color_near or "#FF60FF")
+        self._dot_near_btn = QPushButton(self._dot_color_near)
+        self._refresh_dot_color_btn(self._dot_near_btn, self._dot_color_near)
+        self._dot_near_btn.clicked.connect(self._pick_dot_color_near)
+        form.addRow("Near color", self._dot_near_btn)
+
+        self._dot_color_far = str(dot_color_far or "#00FFFF")
+        self._dot_far_btn = QPushButton(self._dot_color_far)
+        self._refresh_dot_color_btn(self._dot_far_btn, self._dot_color_far)
+        self._dot_far_btn.clicked.connect(self._pick_dot_color_far)
+        form.addRow("Far color", self._dot_far_btn)
+
+        self._dot_widgets = [
+            self._dot_sep, self._dot_header,
+            self._dot_count_sp, self._dot_lines_sp, self._dot_size_sp, self._dot_anim_cb,
+            self._dot_near_btn, self._dot_far_btn,
+        ]
         # Wire shape change to show/hide chevron sub-group
         self._shape_cb.currentIndexChanged.connect(self._on_shape_changed)
         self._update_chev_visibility()
         self._update_pillar_visibility()
+        self._update_dot_visibility()
+        self._update_texture_visibility()
 
         # 2-second debounce for continuous slider input — label updates
         # instantly but `changed` is emitted only after the user stops
@@ -706,6 +777,8 @@ class _SideRailSection(QGroupBox):
     def _on_shape_changed(self) -> None:
         self._update_chev_visibility()
         self._update_pillar_visibility()
+        self._update_dot_visibility()
+        self._update_texture_visibility()
         self.changed.emit()
 
     def _on_chev_depth_changed(self, raw: int) -> None:
@@ -725,6 +798,27 @@ class _SideRailSection(QGroupBox):
         is_pillar = (self._shape_cb.currentData() == "pillar")
         for w in self._pillar_widgets:
             w.setVisible(is_pillar)
+
+    def _update_dot_visibility(self) -> None:
+        is_dot = (self._shape_cb.currentData() == "dot")
+        for w in self._dot_widgets:
+            w.setVisible(is_dot)
+
+    def _update_texture_visibility(self) -> None:
+        shape = self._shape_cb.currentData()
+        show_texture = shape not in ("pillar", "dot")
+        try:
+            self._form.setRowVisible(self._texture_row, show_texture)
+        except Exception:
+            self._texture_row.setVisible(show_texture)
+
+    @staticmethod
+    def _refresh_dot_color_btn(btn: QPushButton, hex_color: str) -> None:
+        btn.setText(hex_color)
+        btn.setStyleSheet(
+            f"background-color:{hex_color}; color:#fff;"
+            " border:1px solid #888; border-radius:3px;"
+        )
 
     # ------------------------------------------------------------------
     def _refresh_color_btn(self) -> None:
@@ -750,6 +844,28 @@ class _SideRailSection(QGroupBox):
         if path:
             self._img_edit.setText(path)
             self.changed.emit()
+
+    def _pick_dot_color_near(self) -> None:
+        self._pick_dot_color_for("near")
+
+    def _pick_dot_color_far(self) -> None:
+        self._pick_dot_color_for("far")
+
+    def _pick_dot_color_for(self, side: str) -> None:
+        current = self._dot_color_near if side == "near" else self._dot_color_far
+        dlg = QColorDialog(QColor(current), self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            col = dlg.selectedColor()
+            if col.isValid():
+                hex_str = col.name(QColor.NameFormat.HexRgb).upper()
+                if side == "near":
+                    self._dot_color_near = hex_str
+                    self._refresh_dot_color_btn(self._dot_near_btn, hex_str)
+                else:
+                    self._dot_color_far = hex_str
+                    self._refresh_dot_color_btn(self._dot_far_btn, hex_str)
+                self.changed.emit()
 
     # ------------------------------------------------------------------
     def get_color(self) -> str:
@@ -791,6 +907,24 @@ class _SideRailSection(QGroupBox):
 
     def get_chase_speed_frames(self) -> int:
         return self._chase_speed_sp.value()
+
+    def get_dot_count(self) -> int:
+        return self._dot_count_sp.value()
+
+    def get_dot_lines(self) -> int:
+        return self._dot_lines_sp.value()
+
+    def get_dot_size_px(self) -> int:
+        return self._dot_size_sp.value()
+
+    def get_dot_anim_mode(self) -> str:
+        return self._dot_anim_cb.currentText()
+
+    def get_dot_color_near(self) -> str:
+        return self._dot_color_near
+
+    def get_dot_color_far(self) -> str:
+        return self._dot_color_far
 
 
 def format_sec(value: float) -> str:
@@ -1340,6 +1474,12 @@ class SegmentConfigPanel(QWidget):
                     pillar_radius=float(rs.get("rail_pillar_radius", 1.0) or 1.0),
                     chase_mode=str(rs.get("rail_chase_mode", "time") or "time"),
                     chase_speed_frames=int(rs.get("rail_chase_speed_frames", 4) or 4),
+                    dot_count=int(rs.get("rail_dot_count", 24) or 24),
+                    dot_lines=int(rs.get("rail_dot_lines", 1) or 1),
+                    dot_size_px=int(rs.get("rail_dot_size_px", 6) or 6),
+                    dot_anim_mode=str(rs.get("rail_dot_anim_mode", "audio") or "audio"),
+                    dot_color_near=str(rs.get("rail_dot_color_near", "#FF60FF") or "#FF60FF"),
+                    dot_color_far=str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
                     parent=self,
                 )
                 sr_section.setVisible(bool(value))
@@ -1571,6 +1711,12 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings["rail_pillar_radius"]    = sec.get_pillar_radius()
         segment.render_settings["rail_chase_mode"]       = sec.get_chase_mode()
         segment.render_settings["rail_chase_speed_frames"] = sec.get_chase_speed_frames()
+        segment.render_settings["rail_dot_count"]        = sec.get_dot_count()
+        segment.render_settings["rail_dot_lines"]        = sec.get_dot_lines()
+        segment.render_settings["rail_dot_size_px"]      = sec.get_dot_size_px()
+        segment.render_settings["rail_dot_anim_mode"]    = sec.get_dot_anim_mode()
+        segment.render_settings["rail_dot_color_near"]   = sec.get_dot_color_near()
+        segment.render_settings["rail_dot_color_far"]    = sec.get_dot_color_far()
 
     def _commit_side_rail_section(self) -> None:
         """Called when any side rail sub-section control changes."""

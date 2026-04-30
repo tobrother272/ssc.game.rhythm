@@ -62,3 +62,44 @@ def test_pillar_count_clamped() -> None:
     except ValidationError:
         pass
 
+
+def test_dot_shape_defaults() -> None:
+    s = build_settings("punch", {})
+    assert s.rail_dot_count == 24
+    assert s.rail_dot_lines == 1
+    assert s.rail_dot_size_px == 6
+    assert s.rail_dot_anim_mode == "audio"
+    assert s.rail_dot_color_near == "#FF60FF"
+    assert s.rail_dot_color_far == "#00FFFF"
+
+
+def test_dot_shape_round_trip() -> None:
+    raw = {
+        "side_rails": True,
+        "rail_shape": "dot",
+        "rail_dot_count": 32,
+        "rail_dot_lines": 3,
+        "rail_dot_size_px": 8,
+        "rail_dot_anim_mode": "twinkle",
+        "rail_dot_color_near": "#FFFFFF",
+        "rail_dot_color_far": "#0080FF",
+    }
+    s = build_settings("dance", raw)
+    d = s.model_dump(mode="json")
+    assert d["rail_shape"] == "dot"
+    assert d["rail_dot_count"] == 32
+    assert d["rail_dot_lines"] == 3
+    assert d["rail_dot_anim_mode"] == "twinkle"
+    assert d["rail_dot_color_near"] == "#FFFFFF"
+    assert d["rail_dot_color_far"] == "#0080FF"
+
+
+def test_dot_anim_mode_invalid() -> None:
+    from pydantic import ValidationError
+
+    try:
+        build_settings("punch", {"rail_dot_anim_mode": "sparkle"})
+        assert False, "should reject invalid anim mode"
+    except ValidationError:
+        pass
+
