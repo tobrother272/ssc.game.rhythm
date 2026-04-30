@@ -12,6 +12,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -507,6 +508,15 @@ class PreviewPanel(QWidget):
     # so its ``_preview_mode_active`` flag stays in sync with the
     # panel's actual state.
     live_preview_stopped = Signal()
+    # Emitted when full-preview auto-advance picks a next segment.
+    # Empty id ("") means we reached end-of-timeline.
+    segment_auto_advanced = Signal(str)
+    # Emitted whenever the full-preview checkbox toggles.
+    full_preview_mode_changed = Signal(bool)
+    # Emitted when full-preview seek crosses into another segment while live
+    # preview is active. MainWindow should rebuild renderer using that segment's
+    # config, then seek to the requested project time.
+    segment_seek_requested = Signal(str, float)  # segment_id, project_time_sec
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -542,7 +552,22 @@ class PreviewPanel(QWidget):
         self._live_active: bool = False
         self._live_renderer: Optional["LiveFrameRenderer"] = None
         self._live_buffer_rgb: object = None  # holds QImage backing array alive
+        # Full-preview mode: when True, EndOfMedia auto-advances to the next
+        # timeline segment instead of stopping at the current segment end.
+        self._full_preview_mode: bool = False
+        # Cached timeline order pushed by MainWindow.
+        self._project_segments: list[Segment] = []
+        # Last observed playback state (used to decide auto-resume on advance).
+        self._was_playing: bool = False
+        # While user drags the seek slider in full-preview mode, we defer the
+        # expensive cross-segment source-switch to slider release.
+        self._full_seek_dragging: bool = False
+        self._pending_full_seek_ms: int = -1
         self._build_ui()
+        if hasattr(self, "_full_preview_cb"):
+            self._full_preview_cb.blockSignals(True)
+            self._full_preview_cb.setChecked(False)
+            self._full_preview_cb.blockSignals(False)
 
     def set_source_media(self, media: MediaItem | None) -> None:
         """Set selected media source and load it for preview."""
@@ -551,6 +576,150 @@ class PreviewPanel(QWidget):
         self._playhead_offset_sec = 0.0
         if self.source_combo.currentData() == "media":
             self._load_active_source()
+
+    def set_project_segments(self, segments: list[Segment]) -> None:
+        """Set sorted segment cache used by full-preview auto-advance."""
+        self._project_segments = sorted(
+            list(segments or []), key=lambda s: float(s.start_time_sec or 0.0)
+        )
+        self._refresh_seek_ui(self.player.position(), self.player.duration())
+
+    def is_full_preview_mode(self) -> bool:
+        return bool(self._full_preview_mode)
+
+    def _on_full_preview_toggled(self, checked: bool) -> None:
+        self._full_preview_mode = bool(checked)
+        self._refresh_seek_ui(self.player.position(), self.player.duration())
+        self.full_preview_mode_changed.emit(self._full_preview_mode)
+
+    def _timeline_total_duration_ms(self) -> int:
+        """Total project duration from cached segments (ms)."""
+        if not self._project_segments:
+            return 0
+        end_sec = max(float(getattr(s, "end_time_sec", 0.0) or 0.0) for s in self._project_segments)
+        return max(0, int(round(end_sec * 1000.0)))
+
+    def _refresh_time_label(self, position_ms: int, media_duration_ms: int) -> None:
+        """Refresh time label for segment-mode or full-project mode."""
+        if self._full_preview_mode and self._selected_segment is not None and self._project_segments:
+            current_project_ms = int(
+                round((self._playhead_offset_sec + max(0, position_ms) / 1000.0) * 1000.0)
+            )
+            total_project_ms = self._timeline_total_duration_ms()
+            if total_project_ms > 0:
+                self.time_label.setText(
+                    f"{format_ms(current_project_ms)} / {format_ms(total_project_ms)}"
+                )
+                return
+        self.time_label.setText(
+            f"{format_ms(max(0, position_ms))} / {format_ms(max(0, media_duration_ms))}"
+        )
+
+    def _project_ms_from_local_ms(self, local_ms: int) -> int:
+        return int(
+            round((self._playhead_offset_sec + max(0, local_ms) / 1000.0) * 1000.0)
+        )
+
+    def _refresh_seek_ui(self, position_ms: int, media_duration_ms: int) -> None:
+        """Refresh both seek range/value and time label for current mode."""
+        self._refresh_time_label(position_ms, media_duration_ms)
+        if self._full_preview_mode and self._project_segments:
+            total_ms = self._timeline_total_duration_ms()
+            proj_ms = self._project_ms_from_local_ms(position_ms)
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setRange(0, max(0, total_ms))
+            self.seek_slider.setValue(max(0, min(total_ms, proj_ms)))
+            self.seek_slider.blockSignals(False)
+            return
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setRange(0, max(0, media_duration_ms))
+        self.seek_slider.setValue(max(0, position_ms))
+        self.seek_slider.blockSignals(False)
+
+    def _segment_for_project_time(self, t_sec: float) -> Optional[Segment]:
+        if not self._project_segments:
+            return None
+        t = float(max(0.0, t_sec))
+        # Primary: segment containing t.
+        for seg in self._project_segments:
+            s = float(seg.start_time_sec or 0.0)
+            e = float(seg.end_time_sec or s)
+            if s <= t < e:
+                return seg
+        # If inside a gap, pick next segment; if beyond end, clamp to last.
+        for seg in self._project_segments:
+            if float(seg.start_time_sec or 0.0) >= t:
+                return seg
+        return self._project_segments[-1]
+
+    def _seek_project_time_sec(self, t_sec: float, *, resume_play: bool = False) -> None:
+        """Seek by project time; switches source segment if needed."""
+        target = self._segment_for_project_time(t_sec)
+        if target is None:
+            return
+        if (
+            self._full_preview_mode
+            and self._live_active
+            and self._selected_segment is not None
+            and self._selected_segment.id != target.id
+        ):
+            # Do NOT swap source in-place here: live renderer config would still
+            # belong to the old segment. Delegate to MainWindow to rebuild with
+            # the target segment's settings.
+            self.segment_seek_requested.emit(target.id, float(max(0.0, t_sec)))
+            self.playhead_changed.emit(float(max(0.0, t_sec)))
+            return
+        local_sec = max(0.0, float(t_sec) - float(target.start_time_sec or 0.0))
+        local_ms = int(round(local_sec * 1000.0))
+        was_playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        ) or bool(resume_play)
+
+        if self._selected_segment is None or self._selected_segment.id != target.id:
+            self.set_source_segment(target)
+
+        if self._media_ready:
+            self.player.setPosition(local_ms)
+            if was_playing:
+                self.player.play()
+        else:
+            self._pending_seek_ms = local_ms
+            if was_playing:
+                self._pending_play = True
+                self._set_play_button_state(playing=True)
+
+        self.playhead_changed.emit(float(max(0.0, t_sec)))
+
+    def _on_seek_slider_moved(self, value: int) -> None:
+        if not (self._full_preview_mode and self._project_segments):
+            self.player.setPosition(int(value))
+            return
+        self._full_seek_dragging = True
+        self._pending_full_seek_ms = int(value)
+        total_ms = self._timeline_total_duration_ms()
+        self.time_label.setText(
+            f"{format_ms(max(0, value))} / {format_ms(max(0, total_ms))}"
+        )
+
+    def _on_seek_slider_pressed(self) -> None:
+        """Any seek interaction forces playback into paused state."""
+        self._pending_play = False
+        self.player.pause()
+        if self._full_preview_mode and self._project_segments:
+            self._full_seek_dragging = True
+            self._pending_full_seek_ms = int(self.seek_slider.value())
+
+    def _on_seek_slider_released(self) -> None:
+        if not (self._full_preview_mode and self._project_segments):
+            return
+        self._full_seek_dragging = False
+        target_ms = (
+            self._pending_full_seek_ms
+            if self._pending_full_seek_ms >= 0
+            else int(self.seek_slider.value())
+        )
+        self._pending_full_seek_ms = -1
+        self._seek_project_time_sec(float(target_ms) / 1000.0, resume_play=False)
 
     # ------------------------------------------------------------------
     # Stickman overlay
@@ -785,10 +954,13 @@ class PreviewPanel(QWidget):
            content, not at the start of the full source file.
         4. Nothing → clear.
         """
+        was_live_preview = self.is_live_preview_active()
+        keep_live = was_live_preview and self._full_preview_mode
         self._selected_segment = segment
 
         if segment is None:
-            self.clear()
+            if not keep_live:
+                self.clear()
             return
 
         rendered_ready = bool(
@@ -798,7 +970,10 @@ class PreviewPanel(QWidget):
         if rendered_ready:
             self._set_source_combo_silently("segment")
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
-            self._load_path(segment.video_path)  # type: ignore[arg-type]
+            self._load_path(
+                segment.video_path,  # type: ignore[arg-type]
+                keep_live_preview=keep_live,
+            )
             self._refresh_stickman_button_state()
             return
 
@@ -810,7 +985,7 @@ class PreviewPanel(QWidget):
         if trimmed and Path(trimmed).exists():
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
-            self._load_path(trimmed)
+            self._load_path(trimmed, keep_live_preview=keep_live)
             self._refresh_stickman_button_state()
             return
 
@@ -821,7 +996,7 @@ class PreviewPanel(QWidget):
             # once the trim completes via _on_trim_ready → set_source_segment.
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = 0.0
-            self._load_path(segment.audio_path)
+            self._load_path(segment.audio_path, keep_live_preview=keep_live)
             self._refresh_stickman_button_state()
             return
 
@@ -1083,7 +1258,9 @@ class PreviewPanel(QWidget):
         self.stop_button.clicked.connect(self._on_stop_clicked)
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
-        self.seek_slider.sliderMoved.connect(self.player.setPosition)
+        self.seek_slider.sliderPressed.connect(self._on_seek_slider_pressed)
+        self.seek_slider.sliderMoved.connect(self._on_seek_slider_moved)
+        self.seek_slider.sliderReleased.connect(self._on_seek_slider_released)
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet(
             "color:#c0c0c0;font-family:Consolas,Menlo,monospace;"
@@ -1117,6 +1294,13 @@ class PreviewPanel(QWidget):
         )
         self.floor_wall_button.toggled.connect(self._on_floor_wall_edit_toggled)
         self.floor_wall_button.setEnabled(False)
+        self._full_preview_cb = QCheckBox("Preview full")
+        self._full_preview_cb.setToolTip(
+            "Auto-play next segment when current reaches end.\n"
+            "When selecting another segment on timeline, keep preview mode on."
+        )
+        self._full_preview_cb.setChecked(self._full_preview_mode)
+        self._full_preview_cb.toggled.connect(self._on_full_preview_toggled)
 
         self.play_button.setEnabled(False)
 
@@ -1140,6 +1324,7 @@ class PreviewPanel(QWidget):
         control_row.addWidget(vol_label)
         control_row.addWidget(self.volume_slider)
         control_row.addWidget(self.fps_combo)
+        control_row.addWidget(self._full_preview_cb)
         control_row.addWidget(self.stickman_button)
         control_row.addWidget(self.floor_wall_button)
         control_row.addWidget(self.full_button)
@@ -1170,14 +1355,20 @@ class PreviewPanel(QWidget):
         self.clear()
         self.empty_label.setText("Main timeline preview is TODO in skeleton")
 
-    def _load_path(self, raw_path: str, *, force_reload: bool = False) -> None:
+    def _load_path(
+        self,
+        raw_path: str,
+        *,
+        force_reload: bool = False,
+        keep_live_preview: bool = False,
+    ) -> None:
         # When live-preview is active, ANY call to load a different
         # video/audio source is a deliberate choice by the caller
         # (user picked another segment, switched the source-combo,
         # auto-loaded a freshly-rendered file…) that supersedes live
         # mode.  Tear it down first so the renderer + frame timer
         # release cleanly before we start a new probe.
-        if self._live_active:
+        if self._live_active and not keep_live_preview:
             self.stop_live_preview()
         # ``raw_path`` is always a local filesystem path now that live
         # preview is in-process and HLS streaming has been removed.
@@ -1235,7 +1426,12 @@ class PreviewPanel(QWidget):
         self.play_button.setEnabled(False)
         self._set_play_button_state(playing=False)
         self._current_url = url
-        self._show_loading()
+        if self._live_active and keep_live_preview:
+            # Keep live page visible while swapping audio source in-place.
+            self.stage_stack.setCurrentIndex(self._live_page_index)
+            self._loading_timer.stop()
+        else:
+            self._show_loading()
         self.player.setSource(url)
         self._load_watchdog.start()
 
@@ -1287,22 +1483,18 @@ class PreviewPanel(QWidget):
         self.player.setPosition(0)
 
     def _on_position_changed(self, value: int) -> None:
-        self.seek_slider.blockSignals(True)
-        self.seek_slider.setValue(value)
-        self.seek_slider.blockSignals(False)
-        self.time_label.setText(
-            f"{format_ms(value)} / {format_ms(self.player.duration())}"
-        )
+        if self._full_preview_mode and self._full_seek_dragging:
+            # Keep user's dragged thumb position untouched while dragging.
+            self._refresh_time_label(self.player.position(), self.player.duration())
+        else:
+            self._refresh_seek_ui(value, self.player.duration())
         # Translate media-local time → project timeline time so the timeline
         # red playhead tracks correctly even when we're playing a rendered
         # segment video that starts mid-project (offset = segment.start).
         self.playhead_changed.emit(value / 1000.0 + self._playhead_offset_sec)
 
     def _on_duration_changed(self, value: int) -> None:
-        self.seek_slider.setRange(0, max(0, value))
-        self.time_label.setText(
-            f"{format_ms(self.player.position())} / {format_ms(value)}"
-        )
+        self._refresh_seek_ui(self.player.position(), value)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         MS = QMediaPlayer.MediaStatus
@@ -1322,6 +1514,8 @@ class PreviewPanel(QWidget):
                 # Stop the loading-dots animation; the live page is
                 # already current and we don't want it switched away.
                 self._loading_timer.stop()
+                if self.stage_stack.currentIndex() == 1:
+                    self.stage_stack.setCurrentIndex(self._live_page_index)
             self.play_button.setEnabled(True)
             if self._pending_seek_ms >= 0:
                 self.player.setPosition(self._pending_seek_ms)
@@ -1332,6 +1526,13 @@ class PreviewPanel(QWidget):
             return
 
         if status == MS.EndOfMedia:
+            # Full-preview mode: advance only on genuine end-position events.
+            if self._full_preview_mode:
+                dur = int(self.player.duration())
+                pos = int(self.player.position())
+                at_end = (dur <= 0) or (pos >= max(0, dur - 120))
+                if at_end and self._auto_advance_to_next_segment():
+                    return
             # File finished - keep button enabled so user can replay.
             self._load_watchdog.stop()
             self._media_ready = True
@@ -1380,6 +1581,7 @@ class PreviewPanel(QWidget):
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         """Keep play/pause button label in sync with the actual player state."""
         is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._was_playing = bool(is_playing)
         self._set_play_button_state(playing=is_playing)
         # Ensure button stays enabled whenever we have a usable source.
         if self._media_ready or is_playing:
@@ -1392,6 +1594,46 @@ class PreviewPanel(QWidget):
         # ``TypeError: int() argument must be ... not 'PlaybackState'``
         # on direct ``int(...)`` conversion).
         self.playback_state_changed.emit(int(state.value))
+
+    def _is_segment_playable(self, segment: Segment | None) -> bool:
+        if segment is None:
+            return False
+        if segment.video_path and Path(segment.video_path).exists():
+            return True
+        p = segment.trimmed_audio_path or segment.audio_path
+        return bool(p) and Path(str(p)).exists()
+
+    def _auto_advance_to_next_segment(self) -> bool:
+        """Advance to next playable segment; returns True if advanced."""
+        current = self._selected_segment
+        if current is None or not self._project_segments:
+            return False
+        cur_idx = next(
+            (i for i, s in enumerate(self._project_segments) if s.id == current.id),
+            -1,
+        )
+        if cur_idx < 0:
+            return False
+
+        next_idx = cur_idx + 1
+        while next_idx < len(self._project_segments):
+            cand = self._project_segments[next_idx]
+            if self._is_segment_playable(cand):
+                next_seg = cand
+                self.segment_auto_advanced.emit(next_seg.id)
+                self.set_source_segment(next_seg)
+                # EndOfMedia-triggered advance should continue playing.
+                if self._media_ready:
+                    self.player.play()
+                else:
+                    self._pending_play = True
+                    self._set_play_button_state(playing=True)
+                return True
+            next_idx += 1
+
+        # End reached (or no later playable segment).
+        self.segment_auto_advanced.emit("")
+        return False
 
     @property
     def preview_fps(self) -> int:
@@ -1561,6 +1803,9 @@ class PreviewPanel(QWidget):
         If the media source is still loading, the seek is queued and applied
         automatically once the player signals it is ready.
         """
+        if self._full_preview_mode and self._project_segments:
+            self._seek_project_time_sec(float(time_sec), resume_play=False)
+            return
         local_sec = max(0.0, time_sec - self._playhead_offset_sec)
         ms = int(local_sec * 1000)
         if self._media_ready:
@@ -1583,6 +1828,7 @@ class PreviewPanel(QWidget):
         *,
         start_local_sec: float = 0.0,
         project_offset_sec: float = 0.0,
+        auto_play: bool = True,
     ) -> None:
         """Switch the panel into live-render mode.
 
@@ -1635,9 +1881,9 @@ class PreviewPanel(QWidget):
         self._media_ready = False
         self._load_retries = 0
         self._pending_seek_ms = max(0, int(start_local_sec * 1000))
-        self._pending_play = True
+        self._pending_play = bool(auto_play)
         self.play_button.setEnabled(False)
-        self._set_play_button_state(playing=True)
+        self._set_play_button_state(playing=bool(auto_play))
         self.player.setSource(audio_url)
         self._load_watchdog.start()
 

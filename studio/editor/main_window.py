@@ -450,6 +450,14 @@ class MainWindow(QMainWindow):
         self.preview_panel.floor_wall_committed.connect(
             self._on_floor_wall_committed
         )
+        self.preview_panel.segment_auto_advanced.connect(
+            self._on_preview_segment_auto_advanced,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.preview_panel.segment_seek_requested.connect(
+            self._on_preview_segment_seek_requested,
+            Qt.ConnectionType.QueuedConnection,
+        )
         # The panel may auto-stop live-preview when its source is
         # forcibly replaced (e.g. user clicked another segment) — keep
         # our toggle flags + segment-panel button in sync via this
@@ -516,6 +524,7 @@ class MainWindow(QMainWindow):
                 )
         self.segment_panel.set_project(project)
         self.segment_panel.set_segment(None)
+        self.preview_panel.set_project_segments(project.segments)
         self._current_waveform_path = None
         # Restore waveform from the first audio MediaItem with cached data.
         # Prefer RMS (matches game render); fall back to nothing — old peak
@@ -757,8 +766,67 @@ class MainWindow(QMainWindow):
 
     def _on_project_changed(self) -> None:
         self.project.updated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        self.preview_panel.set_project_segments(self.project.segments)
         self.timeline_panel.refresh()
         self._update_status()
+
+    def _on_preview_segment_auto_advanced(self, next_segment_id: str) -> None:
+        """Handle panel auto-advance feedback (selection/playhead/status)."""
+        if not next_segment_id:
+            self.statusBar().showMessage("End of timeline", 2000)
+            return
+        seg = self.project.get_segment(next_segment_id)
+        if seg is None:
+            self.statusBar().showMessage("End of timeline", 2000)
+            return
+
+        self.segment_panel.set_segment(seg)
+        if seg.audio_path:
+            self._request_waveform_for(seg.audio_path)
+        elif not seg.audio_path:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
+        start = float(seg.start_time_sec or 0.0)
+        self.timeline_panel.set_playhead(start)
+
+        ordered = self.project.sorted_segments()
+        idx = next((i for i, s in enumerate(ordered) if s.id == seg.id), -1)
+        if idx >= 0:
+            self.statusBar().showMessage(
+                f"Playing segment {idx + 1}/{len(ordered)}: {seg.name}",
+                2000,
+            )
+        else:
+            self.statusBar().showMessage(f"Playing: {seg.name}", 2000)
+
+        # Keep live-preview mode running across segment boundaries.
+        if self._preview_mode_active and self._preview_active_segment_id != seg.id:
+            self._on_preview_segment_requested(seg.id)
+
+    def _on_preview_segment_seek_requested(
+        self,
+        segment_id: str,
+        project_time_sec: float,
+    ) -> None:
+        """Cross-segment seek in full-preview mode while live-preview is active."""
+        seg = self.project.get_segment(segment_id)
+        if seg is None:
+            return
+        self.segment_panel.set_segment(seg)
+        if seg.audio_path:
+            self._request_waveform_for(seg.audio_path)
+        elif not seg.audio_path:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
+        t = max(0.0, float(project_time_sec))
+        self.timeline_panel.set_playhead(t)
+        # Rebuild preview against the segment at seek target; keep paused
+        # (user must press Play again after seek).
+        self._on_preview_segment_requested(
+            seg.id,
+            start_project_sec=t,
+            auto_play=False,
+        )
 
     def _request_waveform_for(self, audio_path: Optional[str]) -> None:
         """Show waveform for ``audio_path`` (cached MediaItem RMS when available).
@@ -1316,6 +1384,8 @@ class MainWindow(QMainWindow):
         self._on_project_changed()
 
     def _on_segment_selected(self, segment: Segment | None) -> None:
+        full_mode = self.preview_panel.is_full_preview_mode()
+        was_live = self._preview_mode_active
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
         # Load waveform for this segment’s audio, or show empty for a segment
@@ -1331,6 +1401,8 @@ class MainWindow(QMainWindow):
             start = segment.start_time_sec
             self.timeline_panel.set_playhead(start)
             self.preview_panel.seek_to_seconds(start)
+            if full_mode and was_live and segment.id != self._preview_active_segment_id:
+                self._on_preview_segment_requested(segment.id)
 
     def _on_segment_changed_by_timeline(self, _segment_id: str) -> None:
         current = self.segment_panel.current_segment
@@ -1654,7 +1726,13 @@ class MainWindow(QMainWindow):
     def _on_export_dialog_closed(self) -> None:
         self._export_dialog = None  # type: ignore[assignment]
 
-    def _on_preview_segment_requested(self, segment_id: str) -> None:
+    def _on_preview_segment_requested(
+        self,
+        segment_id: str,
+        *,
+        start_project_sec: Optional[float] = None,
+        auto_play: bool = True,
+    ) -> None:
         """Toggle live preview mode for the segment.
 
         OFF → ON  : build an in-process :class:`LiveFrameRenderer` for
@@ -1683,6 +1761,9 @@ class MainWindow(QMainWindow):
 
         if self._preview_mode_active:
             already = (self._preview_active_segment_id == segment_id)
+            if already and start_project_sec is not None:
+                self.preview_panel.seek_to_seconds(float(start_project_sec))
+                return
             self._stop_preview_mode()
             if already:
                 return
@@ -1696,7 +1777,11 @@ class MainWindow(QMainWindow):
             self.segment_panel.set_preview_active(False)
             return
 
-        self._start_live_preview(segment)
+        self._start_live_preview(
+            segment,
+            start_project_sec=start_project_sec,
+            auto_play=auto_play,
+        )
 
     def _stop_preview_mode(self) -> None:
         """Tear down the in-process live preview + reset toggle state.
@@ -1758,7 +1843,13 @@ class MainWindow(QMainWindow):
         self.segment_panel.set_preview_active(False)
         self._update_status()
 
-    def _start_live_preview(self, segment: Segment) -> None:
+    def _start_live_preview(
+        self,
+        segment: Segment,
+        *,
+        start_project_sec: Optional[float] = None,
+        auto_play: bool = True,
+    ) -> None:
         """Kick off background construction of a LiveFrameRenderer.
 
         ``LiveFrameRenderer.__init__`` runs ``librosa.load`` + FFT +
@@ -1819,8 +1910,14 @@ class MainWindow(QMainWindow):
         worker = _RendererWorker(
             audio_path, beat_times, mode_str, kwargs, parent=self
         )
+        seg_start = float(segment.start_time_sec or 0.0)
+        if start_project_sec is None:
+            start_local_sec = 0.0
+        else:
+            start_local_sec = max(0.0, float(start_project_sec) - seg_start)
         worker.ready.connect(
-            lambda renderer, seg=segment, ap=audio_path: self._on_renderer_ready(renderer, seg, ap)
+            lambda renderer, seg=segment, ap=audio_path, sl=start_local_sec, apy=auto_play:
+            self._on_renderer_ready(renderer, seg, ap, sl, apy)
         )
         worker.failed.connect(self._on_renderer_failed)
         worker.finished.connect(worker.deleteLater)
@@ -1843,7 +1940,14 @@ class MainWindow(QMainWindow):
             self._preview_worker_segment_id = None
             self.segment_panel.set_preview_loading(False)
 
-    def _on_renderer_ready(self, renderer: object, segment: Segment, audio_path: str) -> None:
+    def _on_renderer_ready(
+        self,
+        renderer: object,
+        segment: Segment,
+        audio_path: str,
+        start_local_sec: float = 0.0,
+        auto_play: bool = True,
+    ) -> None:
         """Called on the UI thread when the background worker finishes."""
         self._preview_worker = None
         self._preview_worker_segment_id = None
@@ -1863,8 +1967,9 @@ class MainWindow(QMainWindow):
             self.preview_panel.start_live_preview(
                 renderer,
                 audio_path,
-                start_local_sec=0.0,
+                start_local_sec=max(0.0, float(start_local_sec)),
                 project_offset_sec=seg_start,
+                auto_play=bool(auto_play),
             )
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(
