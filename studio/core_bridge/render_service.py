@@ -686,6 +686,7 @@ class RenderService(QObject):
         "rail_chevron_density",
         "relax_interval",
         "relax_travel_sec",
+        "relax_wait_sec",
         "relax_texture_low",
         "relax_texture_high",
         "relax_texture_middle",
@@ -697,6 +698,10 @@ class RenderService(QObject):
         "relax_countdown_enabled",
         "relax_countdown_color",
         "relax_countdown_max_sec",
+        "relax_countdown_x",
+        "relax_countdown_y",
+        "relax_countdown_w",
+        "relax_countdown_h",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any

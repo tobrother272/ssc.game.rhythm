@@ -123,6 +123,7 @@ def test_relax_extensions_round_trip() -> None:
     raw = {
         "relax_interval": 0.25,
         "relax_travel_sec": 3.5,
+        "relax_wait_sec": 1.2,
         "relax_texture_low": "C:/tmp/low.png",
         "relax_texture_high": "C:/tmp/high.png",
         "relax_texture_middle": "C:/tmp/mid.png",
@@ -131,15 +132,22 @@ def test_relax_extensions_round_trip() -> None:
         "relax_countdown_enabled": False,
         "relax_countdown_color": "#FF0000",
         "relax_countdown_max_sec": 4.2,
+        "relax_countdown_x": 0.72,
+        "relax_countdown_y": 0.08,
+        "relax_countdown_w": 0.14,
+        "relax_countdown_h": 0.20,
     }
     s = build_settings("relax", raw)
     d = s.model_dump(mode="json")
     assert d["relax_travel_sec"] == 3.5
+    assert d["relax_wait_sec"] == 1.2
     assert d["relax_texture_middle"] == "C:/tmp/mid.png"
     assert d["relax_kind_ratio_middle"] == 0.6
     assert d["relax_countdown_enabled"] is False
     assert d["relax_countdown_color"] == "#FF0000"
     assert d["relax_countdown_max_sec"] == 4.2
+    assert d["relax_countdown_x"] == 0.72
+    assert d["relax_countdown_h"] == 0.20
 
 
 def test_relax_defaults_backward_compatible() -> None:
@@ -147,9 +155,12 @@ def test_relax_defaults_backward_compatible() -> None:
     d = s.model_dump(mode="json")
     assert d["relax_interval"] == 0.1
     assert d["relax_travel_sec"] == 3.0
+    assert d["relax_wait_sec"] == 0.0
     assert d["relax_kind_ratio_middle"] == 0.33
     assert d["relax_show_low"] is True
     assert d["relax_show_high"] is True
     assert d["relax_show_middle"] is True
     assert d["relax_countdown_enabled"] is True
+    assert d["relax_countdown_x"] == 0.88
+    assert d["relax_countdown_h"] == 0.16
 

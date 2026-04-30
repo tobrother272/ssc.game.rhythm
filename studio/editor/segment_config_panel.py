@@ -96,6 +96,115 @@ class _ModeListWidget(QWidget):
         return selected or ["punch"]
 
 
+class _PathBrowseWidget(QWidget):
+    """Line-edit file path with a browse button."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        value: Optional[str],
+        *,
+        title: str,
+        file_filter: str,
+        placeholder: str = "Optional file path",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._file_filter = file_filter
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._edit = QLineEdit("" if value is None else str(value))
+        self._edit.setPlaceholderText(placeholder)
+        self._edit.editingFinished.connect(self.changed)
+        browse = QPushButton("…")
+        browse.setFixedWidth(28)
+        browse.setToolTip("Browse for a file")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self._edit)
+        row.addWidget(browse)
+
+    def _browse(self) -> None:
+        current = self._edit.text().strip()
+        start_dir = ""
+        if current:
+            p = Path(current)
+            start_dir = str(p.parent if p.parent.exists() else p)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self._title,
+            start_dir,
+            self._file_filter,
+        )
+        if path:
+            self._edit.setText(path)
+            self.changed.emit()
+
+    def get_value(self) -> Optional[str]:
+        text = self._edit.text().strip()
+        return text or None
+
+
+class _ColorPickerWidget(QWidget):
+    """Simple color picker button that stores a #RRGGBB value."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        value: Optional[str],
+        *,
+        title: str,
+        default_color: str = "#FFFFFF",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._default_color = default_color
+        self._color = str(value or default_color)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._btn = QPushButton()
+        self._btn.setMinimumWidth(100)
+        self._btn.setMaximumWidth(170)
+        self._btn.clicked.connect(self._pick)
+        row.addWidget(self._btn)
+        row.addStretch()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        c = QColor(self._color)
+        if not c.isValid():
+            self._color = self._default_color
+            c = QColor(self._color)
+        self._btn.setText(self._color.upper())
+        text_col = "#000000" if c.lightness() > 140 else "#FFFFFF"
+        self._btn.setStyleSheet(
+            f"background-color:{self._color}; color:{text_col};"
+            " border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick(self) -> None:
+        initial = QColor(self._color)
+        dlg = QColorDialog(initial, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setWindowTitle(self._title)
+        if dlg.exec():
+            color = dlg.selectedColor()
+            if color.isValid():
+                self._color = color.name(QColor.NameFormat.HexRgb)
+                self._refresh()
+                self.changed.emit()
+
+    def get_value(self) -> str:
+        return str(self._color or self._default_color)
+
+
 class _FloorPanelSection(QGroupBox):
     """Collapsible config sub-section for floor panel customisation.
 
@@ -1515,6 +1624,7 @@ class SegmentConfigPanel(QWidget):
         "relax": (
             "relax_interval",
             "relax_travel_sec",
+            "relax_wait_sec",
             "relax_texture_low",
             "relax_texture_high",
             "relax_texture_middle",
@@ -1542,6 +1652,7 @@ class SegmentConfigPanel(QWidget):
         "line_zigzag": "Zigzag",
         "relax_interval": "Relax interval",
         "relax_travel_sec": "Relax travel (sec)",
+        "relax_wait_sec": "Relax wait (sec)",
         "relax_texture_low": "Relax texture low",
         "relax_texture_high": "Relax texture high",
         "relax_texture_middle": "Relax texture middle",
@@ -1692,17 +1803,36 @@ class SegmentConfigPanel(QWidget):
             "2s on top of that ~15s cycle → only 1–2 blocks per minute.\n"
             "Recommended: 0.0 (beat-driven) or 0.3–0.5s for a slight gap."),
         "relax_travel_sec": (0.5, 10.0, 0.1, 2, "Relax block travel seconds (solo relax)."),
+        "relax_wait_sec": (0.0, 10.0, 0.1, 2, "Hold time before relax block starts moving."),
         "relax_kind_ratio_middle": (0.0, 1.0, 0.01, 2, "Middle block spawn ratio (0..1)."),
         "relax_countdown_max_sec": (0.0, 20.0, 0.1, 2, "Countdown visible window (seconds)."),
     }
 
     def _build_widget_for_value(self, key: str, value):
+        if key == "relax_countdown_color":
+            widget = _ColorPickerWidget(
+                None if value is None else str(value),
+                title="Relax countdown color",
+                default_color="#FFFFFF",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
         if key in {
             "relax_texture_low",
             "relax_texture_high",
             "relax_texture_middle",
-            "relax_hole_mask_path",
         }:
+            widget = _PathBrowseWidget(
+                "" if value is None else str(value),
+                title="Select relax texture image",
+                file_filter="Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+                placeholder="Optional file path",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
+        if key == "relax_hole_mask_path":
             line = QLineEdit("" if value is None else str(value))
             line.setPlaceholderText("Optional file path")
             line.editingFinished.connect(self._commit_settings)
@@ -1794,6 +1924,10 @@ class SegmentConfigPanel(QWidget):
 
     def _collect_setting_widget_value(self, key: str, widget: QWidget):
         if isinstance(widget, _ModeListWidget):
+            return widget.get_value()
+        if isinstance(widget, _ColorPickerWidget):
+            return widget.get_value()
+        if isinstance(widget, _PathBrowseWidget):
             return widget.get_value()
         if isinstance(widget, QCheckBox):
             return widget.isChecked()

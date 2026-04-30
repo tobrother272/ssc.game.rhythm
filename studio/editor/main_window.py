@@ -1249,6 +1249,10 @@ class MainWindow(QMainWindow):
         near_spread: float,
         far_spread: float,
         wall_floor_gap_frac: float = 0.0,
+        relax_countdown_x: float = 0.88,
+        relax_countdown_y: float = 0.04,
+        relax_countdown_w: float = 0.10,
+        relax_countdown_h: float = 0.16,
     ) -> None:
         """Persist floor/wall drag result into the active segment's render_settings."""
         seg_id = self._preview_active_segment_id
@@ -1262,12 +1266,17 @@ class MainWindow(QMainWindow):
         seg.render_settings["floor_spread_frac"]    = round(near_spread,         4)
         seg.render_settings["far_spread_frac"]      = round(far_spread,          4)
         seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
+        seg.render_settings["relax_countdown_x"]    = round(relax_countdown_x,   4)
+        seg.render_settings["relax_countdown_y"]    = round(relax_countdown_y,   4)
+        seg.render_settings["relax_countdown_w"]    = round(relax_countdown_w,   4)
+        seg.render_settings["relax_countdown_h"]    = round(relax_countdown_h,   4)
         self._on_project_changed()
         self.statusBar().showMessage(
             f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
             f"horizon:{horizon_frac*100:.1f}%  "
             f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%  "
-            f"gap:{wall_floor_gap_frac*100:.1f}%",
+            f"gap:{wall_floor_gap_frac*100:.1f}%  "
+            f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%",
             2500,
         )
 
@@ -2070,6 +2079,7 @@ class MainWindow(QMainWindow):
             "rail_dot_color_far":    str(_get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
             "relax_interval":       float(_get("relax_interval", 0.0) or 0.0),
             "relax_travel_sec":     float(_get("relax_travel_sec", 3.0) or 3.0),
+            "relax_wait_sec":       float(_get("relax_wait_sec", 0.0) or 0.0),
             "relax_texture_low":    _get("relax_texture_low", None) or "",
             "relax_texture_high":   _get("relax_texture_high", None) or "",
             "relax_texture_middle": _get("relax_texture_middle", None) or "",
@@ -2081,6 +2091,10 @@ class MainWindow(QMainWindow):
             "relax_countdown_enabled": bool(_get("relax_countdown_enabled", True)),
             "relax_countdown_color": str(_get("relax_countdown_color", "#FFFFFF") or "#FFFFFF"),
             "relax_countdown_max_sec": float(_get("relax_countdown_max_sec", 5.0) or 5.0),
+            "relax_countdown_x": float(_get("relax_countdown_x", 0.88) or 0.88),
+            "relax_countdown_y": float(_get("relax_countdown_y", 0.04) or 0.04),
+            "relax_countdown_w": float(_get("relax_countdown_w", 0.10) or 0.10),
+            "relax_countdown_h": float(_get("relax_countdown_h", 0.16) or 0.16),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -2279,6 +2293,7 @@ class MainWindow(QMainWindow):
             rail_dot_color_far = str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF")
             relax_interval = float(rs.get("relax_interval", 0.0) or 0.0)
             relax_travel_sec = float(rs.get("relax_travel_sec", 3.0) or 3.0)
+            relax_wait_sec = float(rs.get("relax_wait_sec", 0.0) or 0.0)
             relax_texture_low = rs.get("relax_texture_low") or ""
             relax_texture_high = rs.get("relax_texture_high") or ""
             relax_texture_middle = rs.get("relax_texture_middle") or ""
@@ -2290,6 +2305,10 @@ class MainWindow(QMainWindow):
             relax_countdown_enabled = bool(rs.get("relax_countdown_enabled", True))
             relax_countdown_color = str(rs.get("relax_countdown_color", "#FFFFFF") or "#FFFFFF")
             relax_countdown_max_sec = float(rs.get("relax_countdown_max_sec", 5.0) or 5.0)
+            relax_countdown_x = float(rs.get("relax_countdown_x", 0.88) or 0.88)
+            relax_countdown_y = float(rs.get("relax_countdown_y", 0.04) or 0.04)
+            relax_countdown_w = float(rs.get("relax_countdown_w", 0.10) or 0.10)
+            relax_countdown_h = float(rs.get("relax_countdown_h", 0.16) or 0.16)
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -2343,6 +2362,7 @@ class MainWindow(QMainWindow):
                     rail_dot_color_far=rail_dot_color_far,
                     relax_interval=relax_interval,
                     relax_travel_sec=relax_travel_sec,
+                    relax_wait_sec=relax_wait_sec,
                     relax_texture_low=relax_texture_low,
                     relax_texture_high=relax_texture_high,
                     relax_texture_middle=relax_texture_middle,
@@ -2354,6 +2374,10 @@ class MainWindow(QMainWindow):
                     relax_countdown_enabled=relax_countdown_enabled,
                     relax_countdown_color=relax_countdown_color,
                     relax_countdown_max_sec=relax_countdown_max_sec,
+                    relax_countdown_x=relax_countdown_x,
+                    relax_countdown_y=relax_countdown_y,
+                    relax_countdown_w=relax_countdown_w,
+                    relax_countdown_h=relax_countdown_h,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

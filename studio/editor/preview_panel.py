@@ -248,9 +248,11 @@ class FloorWallOverlay(QWidget):
     Moving near does NOT move far, and vice versa.
     """
 
-    # 5 floats: hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac
-    changing  = Signal(float, float, float, float, float)
-    committed = Signal(float, float, float, float, float)
+    # 9 floats:
+    # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
+    # countdown_x, countdown_y, countdown_w, countdown_h
+    changing  = Signal(float, float, float, float, float, float, float, float, float)
+    committed = Signal(float, float, float, float, float, float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
@@ -274,8 +276,18 @@ class FloorWallOverlay(QWidget):
         self._near_spread:         float = 0.65   # controls floor_spread_frac
         self._far_spread:          float = 0.65   # controls far_spread_frac (independent)
         self._wall_floor_gap_frac: float = 0.0    # near-wall Y lifted above floor line
+        self._countdown_enabled: bool = False
+        self._cd_x: float = 0.88
+        self._cd_y: float = 0.04
+        self._cd_w: float = 0.10
+        self._cd_h: float = 0.16
 
-        self._drag: str | None = None  # 'hit'|'horizon'|'wall_near'|'wall_far'|'gap_side'
+        self._drag: str | None = None  # + 'cd_move'|'cd_tl'|'cd_tr'|'cd_bl'|'cd_br'
+        self._drag_anchor: QPoint = QPoint()
+        self._drag_cd_x0 = 0.0
+        self._drag_cd_y0 = 0.0
+        self._drag_cd_w0 = 0.0
+        self._drag_cd_h0 = 0.0
 
     # ── public API ──────────────────────────────────────────────────────
     def set_fractions(
@@ -285,18 +297,29 @@ class FloorWallOverlay(QWidget):
         near_spread: float,
         far_spread: float,
         wall_floor_gap_frac: float = 0.0,
+        countdown_enabled: bool = False,
+        countdown_x: float = 0.88,
+        countdown_y: float = 0.04,
+        countdown_w: float = 0.10,
+        countdown_h: float = 0.16,
     ) -> None:
         self._hit_frac             = max(0.70, min(0.95, float(hit_frac)))
         self._horizon_frac         = max(0.20, min(0.60, float(horizon_frac)))
         self._near_spread          = max(0.20, min(3.00, float(near_spread)))
         self._far_spread           = max(0.05, min(3.00, float(far_spread)))
         self._wall_floor_gap_frac  = max(0.00, min(0.30, float(wall_floor_gap_frac)))
+        self._countdown_enabled = bool(countdown_enabled)
+        self._cd_x = max(0.0, min(0.98, float(countdown_x)))
+        self._cd_y = max(0.0, min(0.98, float(countdown_y)))
+        self._cd_w = max(0.02, min(1.0 - self._cd_x, float(countdown_w)))
+        self._cd_h = max(0.02, min(1.0 - self._cd_y, float(countdown_h)))
         self.update()
 
-    def get_fractions(self) -> tuple[float, float, float, float, float]:
+    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float]:
         return (self._hit_frac, self._horizon_frac,
                 self._near_spread, self._far_spread,
-                self._wall_floor_gap_frac)
+                self._wall_floor_gap_frac,
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h)
 
     # ── geometry helpers ────────────────────────────────────────────────
     def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
@@ -328,8 +351,32 @@ class FloorWallOverlay(QWidget):
     def _gap_lx(self) -> int: return self._GAP_MARGIN
     def _gap_rx(self) -> int: return self.width() - self._GAP_MARGIN
 
+    def _countdown_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._cd_x * w),
+            int(self._cd_y * h),
+            max(1, int(self._cd_w * w)),
+            max(1, int(self._cd_h * h)),
+        )
+
     def _handle_at(self, pos: QPoint) -> str | None:
         r = self._HANDLE_R + 7
+        if self._countdown_enabled:
+            cd = self._countdown_rect_px()
+            hs = 14
+            corners = {
+                "cd_tl": QRect(cd.left() - hs // 2, cd.top() - hs // 2, hs, hs),
+                "cd_tr": QRect(cd.right() - hs // 2, cd.top() - hs // 2, hs, hs),
+                "cd_bl": QRect(cd.left() - hs // 2, cd.bottom() - hs // 2, hs, hs),
+                "cd_br": QRect(cd.right() - hs // 2, cd.bottom() - hs // 2, hs, hs),
+            }
+            for kind, rr in corners.items():
+                if rr.contains(pos):
+                    return kind
+            if cd.contains(pos):
+                return "cd_move"
         # Gap handles on the wall diagonal lines — checked before near handles
         gy = self._gap_y()
         if abs(pos.y() - gy) <= r and (
@@ -358,6 +405,12 @@ class FloorWallOverlay(QWidget):
         self._drag = self._handle_at(ev.pos())
         if self._drag in ("wall_near", "wall_far"):
             self.grabMouse()
+        if self._drag and self._drag.startswith("cd_"):
+            self._drag_anchor = ev.pos()
+            self._drag_cd_x0 = self._cd_x
+            self._drag_cd_y0 = self._cd_y
+            self._drag_cd_w0 = self._cd_w
+            self._drag_cd_h0 = self._cd_h
 
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag in ("wall_near", "wall_far"):
@@ -367,6 +420,7 @@ class FloorWallOverlay(QWidget):
             self.committed.emit(
                 self._hit_frac, self._horizon_frac, self._near_spread,
                 self._far_spread, self._wall_floor_gap_frac,
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h,
             )
 
     def mouseMoveEvent(self, ev) -> None:
@@ -376,6 +430,12 @@ class FloorWallOverlay(QWidget):
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
             elif hover == "wall_near":
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif hover in ("cd_tl", "cd_br"):
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif hover in ("cd_tr", "cd_bl"):
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif hover == "cd_move":
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif self._drag is None:
@@ -402,10 +462,39 @@ class FloorWallOverlay(QWidget):
             # Horizontal drag — grabMouse() keeps events firing outside widget
             rx = float(ev.pos().x())
             self._far_spread = max(0.05, min(3.00, (rx / w - 0.5) * 2 / self._FAR_DISP))
+        elif self._drag and self._drag.startswith("cd_"):
+            dx = (ev.pos().x() - self._drag_anchor.x()) / float(max(1, w))
+            dy = (ev.pos().y() - self._drag_anchor.y()) / float(max(1, h))
+            x, y, ww, hh = self._drag_cd_x0, self._drag_cd_y0, self._drag_cd_w0, self._drag_cd_h0
+            minf = 0.02
+            if self._drag == "cd_move":
+                x = max(0.0, min(1.0 - ww, x + dx))
+                y = max(0.0, min(1.0 - hh, y + dy))
+            elif self._drag == "cd_tl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                ww = ww - (nx - x)
+                hh = hh - (ny - y)
+                x, y = nx, ny
+            elif self._drag == "cd_tr":
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                nw = max(minf, min(1.0 - x, ww + dx))
+                hh = hh - (ny - y)
+                y, ww = ny, nw
+            elif self._drag == "cd_bl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                nh = max(minf, min(1.0 - y, hh + dy))
+                ww = ww - (nx - x)
+                x, hh = nx, nh
+            elif self._drag == "cd_br":
+                ww = max(minf, min(1.0 - x, ww + dx))
+                hh = max(minf, min(1.0 - y, hh + dy))
+            self._cd_x, self._cd_y, self._cd_w, self._cd_h = x, y, ww, hh
         self.update()
         self.changing.emit(
             self._hit_frac, self._horizon_frac, self._near_spread,
             self._far_spread, self._wall_floor_gap_frac,
+            self._cd_x, self._cd_y, self._cd_w, self._cd_h,
         )
 
     # ── paint ────────────────────────────────────────────────────────────
@@ -472,6 +561,24 @@ class FloorWallOverlay(QWidget):
         p.setPen(QPen(self._GAP_CLR))
         p.drawText(self._gap_rx() + rg + 4, gy + 5, "Gap")
 
+        if self._countdown_enabled:
+            cd = self._countdown_rect_px()
+            p.setBrush(QBrush(QColor(255, 80, 220, 36)))
+            p.setPen(QPen(QColor(255, 120, 235), 2.0, Qt.PenStyle.DashLine))
+            p.drawRect(cd)
+            hs = 7
+            p.setBrush(QBrush(QColor(255, 120, 235)))
+            p.setPen(QPen(QColor(255, 255, 255), 1.2))
+            for cx, cy in (
+                (cd.left(), cd.top()),
+                (cd.right(), cd.top()),
+                (cd.left(), cd.bottom()),
+                (cd.right(), cd.bottom()),
+            ):
+                p.drawRect(cx - hs, cy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 120, 235)))
+            p.drawText(cd.left() + 6, max(14, cd.top() - 6), "Countdown")
+
 
 def format_ms(ms: int) -> str:
     """Format milliseconds to mm:ss string."""
@@ -496,10 +603,12 @@ class PreviewPanel(QWidget):
     # (0..1) of the rendered video frame.  MainWindow listens, writes
     # to ``segment.stickman_location``, and triggers a project save.
     stickman_location_changed = Signal(str, dict)
-    # Emitted on mouse-release when the user finishes dragging a floor/wall
-    # handle.  Carries (hit, horizon, near_spread, far_spread, wall_floor_gap_frac).
+    # Emitted on mouse-release when the user finishes dragging floor/wall
+    # handles or the relax countdown box.
     # MainWindow saves these into segment.render_settings and requests a preview update.
-    floor_wall_committed = Signal(float, float, float, float, float)
+    floor_wall_committed = Signal(
+        float, float, float, float, float, float, float, float, float
+    )
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
     # auto-stopped because a different source was loaded (user
@@ -899,7 +1008,21 @@ class PreviewPanel(QWidget):
             near_sp    = float(rs.get("floor_spread_frac")    or 0.65)
             far_sp     = float(rs.get("far_spread_frac")      or near_sp)
             gap        = float(rs.get("wall_floor_gap_frac")  or 0.0)
-            self.floor_wall_overlay.set_fractions(hit, hz, near_sp, far_sp, gap)
+            has_relax = False
+            if seg is not None:
+                if str(seg.mode) == "relax":
+                    has_relax = True
+                elif str(seg.mode) == "combo":
+                    modes = rs.get("mode_list") or []
+                    has_relax = "relax" in [str(m) for m in modes]
+            cdx = float(rs.get("relax_countdown_x", 0.88) or 0.88)
+            cdy = float(rs.get("relax_countdown_y", 0.04) or 0.04)
+            cdw = float(rs.get("relax_countdown_w", 0.10) or 0.10)
+            cdh = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            self.floor_wall_overlay.set_fractions(
+                hit, hz, near_sp, far_sp, gap,
+                has_relax, cdx, cdy, cdw, cdh,
+            )
             self._sync_floor_wall_overlay_pos()
             self.floor_wall_overlay.show()
             self._floor_wall_pos_timer.start()
@@ -908,7 +1031,9 @@ class PreviewPanel(QWidget):
             self.floor_wall_overlay.hide()
 
     def _on_floor_wall_changing(
-        self, hit: float, hz: float, near_sp: float, far_sp: float, gap: float
+        self,
+        hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
+        cdx: float, cdy: float, cdw: float, cdh: float,
     ) -> None:
         """Live-update the renderer while the user drags a handle."""
         if not self._live_active or self._live_renderer is None:
@@ -920,10 +1045,13 @@ class PreviewPanel(QWidget):
             far_spread_frac=far_sp,
             wall_floor_gap_frac=gap,
         )
+        self._live_renderer.update_countdown_box(x=cdx, y=cdy, w=cdw, h=cdh)
         self._render_live_frame(self.player.position() / 1000.0)
 
     def _on_floor_wall_committed(
-        self, hit: float, hz: float, near_sp: float, far_sp: float, gap: float
+        self,
+        hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
+        cdx: float, cdy: float, cdw: float, cdh: float,
     ) -> None:
         """Persist the final drag result and notify MainWindow."""
         seg = self._selected_segment
@@ -933,7 +1061,11 @@ class PreviewPanel(QWidget):
             seg.render_settings["floor_spread_frac"]    = round(near_sp, 4)
             seg.render_settings["far_spread_frac"]      = round(far_sp,  4)
             seg.render_settings["wall_floor_gap_frac"]  = round(gap,     4)
-        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp, gap)
+            seg.render_settings["relax_countdown_x"]    = round(cdx,     4)
+            seg.render_settings["relax_countdown_y"]    = round(cdy,     4)
+            seg.render_settings["relax_countdown_w"]    = round(cdw,     4)
+            seg.render_settings["relax_countdown_h"]    = round(cdh,     4)
+        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh)
 
     def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
         """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""
@@ -2010,6 +2142,7 @@ class PreviewPanel(QWidget):
         rail_dot_color_far: Optional[str] = None,
         relax_interval: Optional[float] = None,
         relax_travel_sec: Optional[float] = None,
+        relax_wait_sec: Optional[float] = None,
         relax_texture_low: Optional[str] = None,
         relax_texture_high: Optional[str] = None,
         relax_texture_middle: Optional[str] = None,
@@ -2021,6 +2154,10 @@ class PreviewPanel(QWidget):
         relax_countdown_enabled: Optional[bool] = None,
         relax_countdown_color: Optional[str] = None,
         relax_countdown_max_sec: Optional[float] = None,
+        relax_countdown_x: Optional[float] = None,
+        relax_countdown_y: Optional[float] = None,
+        relax_countdown_w: Optional[float] = None,
+        relax_countdown_h: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -2067,6 +2204,7 @@ class PreviewPanel(QWidget):
             rail_dot_color_far=rail_dot_color_far,
             relax_interval=relax_interval,
             relax_travel_sec=relax_travel_sec,
+            relax_wait_sec=relax_wait_sec,
             relax_texture_low=relax_texture_low,
             relax_texture_high=relax_texture_high,
             relax_texture_middle=relax_texture_middle,
@@ -2078,6 +2216,10 @@ class PreviewPanel(QWidget):
             relax_countdown_enabled=relax_countdown_enabled,
             relax_countdown_color=relax_countdown_color,
             relax_countdown_max_sec=relax_countdown_max_sec,
+            relax_countdown_x=relax_countdown_x,
+            relax_countdown_y=relax_countdown_y,
+            relax_countdown_w=relax_countdown_w,
+            relax_countdown_h=relax_countdown_h,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)

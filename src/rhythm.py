@@ -2747,7 +2747,8 @@ class RelaxTarget(Target):
     # how the phase split is tuned.
 
     def __init__(self, spawn_frame: int, hit_frame: int,
-                 kind: str = 'low'):
+                 kind: str = 'low',
+                 wait_frames: int = 0):
         # Centre lane + is_left=False: lane index is irrelevant here
         # because the slab always spans the whole width, but Target's
         # base __init__ needs *something*, so we pass centre.
@@ -2758,6 +2759,7 @@ class RelaxTarget(Target):
         self.color = CLR_WALL_PINK
         self.texture_path: str | None = None
         self.hole_mask_path: str | None = None
+        self.wait_frames = max(0, int(wait_frames))
 
     # ---------------- lifecycle ----------------
     #
@@ -2790,11 +2792,19 @@ class RelaxTarget(Target):
         D = cls.PHASE_SPLIT_D
         return D / (D + (1.0 - D) / cls.PHASE_SPEED_RATIO)
 
+    @property
+    def move_start_frame(self) -> int:
+        return self.spawn_frame + self.wait_frames
+
     def depth(self, cur_frame: int) -> float:
-        if cur_frame <= self.spawn_frame:
+        move_start = self.move_start_frame
+        # Hold at the far horizon while waiting.
+        if cur_frame <= move_start:
             return 1.0
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
-        p_lin = (cur_frame - self.spawn_frame) / travel_f
+        # Movement duration stays unchanged (configured travel), so it is
+        # measured from move_start -> hit_frame.
+        travel_f = max(1, self.hit_frame - move_start)
+        p_lin = (cur_frame - move_start) / travel_f
 
         # ── MIDDLE blocks: visual-linear approach ────────────────────────
         # Middle is a wall to dodge through — it should grow on screen
@@ -2864,7 +2874,7 @@ class RelaxTarget(Target):
         where a jump must precede the slab but a duck is delayed
         until the bar is visibly passing above.
         """
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
         if self.kind == 'low':
             offset_frac = self.DODGE_OFFSET_LOW
         elif self.kind == 'high':
@@ -2882,7 +2892,7 @@ class RelaxTarget(Target):
         before the next beat's dodge_frame (on a typical 2 s cadence
         at travel=180 this leaves ≈0.5 s of recovery room).
         """
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
         return self.dodge_frame + int(round(travel_f * self.DODGE_HOLD_FRAC))
 
     def check_hit(self, cur_frame: int) -> bool:
@@ -2904,7 +2914,7 @@ class RelaxTarget(Target):
         # frame analytically from the Phase-2 world-velocity:
         #     v2 = z_split / (1 - T)
         #     Δframes = travel_f · 1.2 / v2
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
         T = self._phase_split_t()
         z_split = 1.0 - self.PHASE_SPLIT_D
         v2 = z_split / max(1e-6, 1.0 - T)
@@ -4421,43 +4431,106 @@ class ComboHUD:
 
 
 class CountdownHUD:
-    """Top-right countdown for next relax obstacle."""
+    """Top-right countdown bound to the currently visible relax obstacle."""
 
     def __init__(self, cam: PerspectiveCamera, color: str = "#FFFFFF",
-                 max_show_sec: float = 5.0) -> None:
+                 max_show_sec: float = 5.0,
+                 box: tuple[float, float, float, float] | None = None) -> None:
         self.cam = cam
         self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
         self._max_show_sec = float(max_show_sec)
-        self._font = cv2.FONT_HERSHEY_SIMPLEX
-        self._scale = max(0.8, cam.H / 540.0)
-        self._thickness = max(1, int(round(self._scale * 1.5)))
+        self._font = cv2.FONT_HERSHEY_DUPLEX
+        if box is None:
+            box = (0.88, 0.04, 0.10, 0.16)  # top-right default
+        self.set_box(*box)
+
+    def set_box(self, x: float, y: float, w: float, h: float) -> None:
+        x = max(0.0, min(0.98, float(x)))
+        y = max(0.0, min(0.98, float(y)))
+        w = max(0.02, min(1.0 - x, float(w)))
+        h = max(0.02, min(1.0 - y, float(h)))
+        self._box_x = x
+        self._box_y = y
+        self._box_w = w
+        self._box_h = h
 
     def draw(self, canvas: np.ndarray, targets: list, cur_frame: int, fps: float) -> None:
-        next_t = None
+        active_t = None
         for t in targets:
             if not isinstance(t, RelaxTarget):
                 continue
-            if t.hit_exec_f >= 0 or t.hit_frame <= cur_frame:
+            # Countdown is per-block life cycle: show only while this
+            # block is actually in-flight on screen (spawned and not yet
+            # removed). Do not show pre-spawn future targets.
+            if t.spawn_frame > cur_frame:
                 continue
-            if next_t is None or t.hit_frame < next_t.hit_frame:
-                next_t = t
-        if next_t is None:
+            if t.is_dead(cur_frame):
+                continue
+            if active_t is None or t.hit_frame < active_t.hit_frame:
+                active_t = t
+        if active_t is None:
             return
-        time_left = (next_t.hit_frame - cur_frame) / max(1.0, float(fps))
-        if time_left < 0.0 or time_left > self._max_show_sec:
+
+        # Countdown now represents the per-block WAIT window before
+        # movement starts.
+        move_start = int(active_t.move_start_frame)
+        if cur_frame >= move_start:
+            return
+        time_left = (move_start - cur_frame) / max(1.0, float(fps))
+        if time_left < 0.0:
             return
         text = str(max(0, int(np.ceil(time_left))))
-        (tw, th), _ = cv2.getTextSize(
-            text, self._font, self._scale, self._thickness
-        )
         H, W = canvas.shape[:2]
-        margin = max(8, int(round(20 * self._scale)))
-        x = max(0, W - tw - margin)
-        y = min(H - 1, th + margin)
-        cv2.putText(canvas, text, (x, y), self._font, self._scale,
-                    (0, 0, 0), self._thickness + 2, cv2.LINE_AA)
-        cv2.putText(canvas, text, (x, y), self._font, self._scale,
-                    self._color_bgr, self._thickness, cv2.LINE_AA)
+        bx = int(round(self._box_x * W))
+        by = int(round(self._box_y * H))
+        bw = max(1, int(round(self._box_w * W)))
+        bh = max(1, int(round(self._box_h * H)))
+        bx = max(0, min(W - 1, bx))
+        by = max(0, min(H - 1, by))
+        bw = min(bw, W - bx)
+        bh = min(bh, H - by)
+        if bw <= 1 or bh <= 1:
+            return
+
+        # Fit font size tightly to the user box (very small padding).
+        # Compute scale from glyph bounds at scale=1 so large boxes
+        # produce large digits (not tiny centered text).
+        t_ref = max(1, int(round(2.0)))
+        (tw_ref, th_ref), _ = cv2.getTextSize(text, self._font, 1.0, t_ref)
+        target_w = max(1, int(bw * 0.995))
+        target_h = max(1, int(bh * 0.995))
+        scale_w = target_w / max(1.0, float(tw_ref))
+        scale_h = target_h / max(1.0, float(th_ref))
+        font_scale = max(0.20, min(scale_w, scale_h))
+        thickness = max(1, int(round(font_scale * 2.0)))
+        (tw, th), _ = cv2.getTextSize(text, self._font, font_scale, thickness)
+        # Thickness quantization can push text slightly over bounds.
+        while (tw > target_w or th > target_h) and font_scale > 0.12:
+            font_scale *= 0.97
+            thickness = max(1, int(round(font_scale * 2.0)))
+            (tw, th), _ = cv2.getTextSize(text, self._font, font_scale, thickness)
+        x = bx + (bw - tw) // 2
+        y = by + (bh + th) // 2
+
+        # Neon glow passes (blurred) using the user-selected color.
+        glow = np.zeros_like(canvas)
+        for thick, alpha in ((thickness + 10, 0.10),
+                             (thickness + 6, 0.18),
+                             (thickness + 3, 0.28)):
+            layer = np.zeros_like(canvas)
+            cv2.putText(
+                layer, text, (x, y), self._font, font_scale,
+                self._color_bgr, thick, cv2.LINE_AA
+            )
+            glow = cv2.addWeighted(glow, 1.0, layer, alpha, 0.0)
+        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=4.0, sigmaY=4.0)
+        canvas[:] = cv2.addWeighted(canvas, 1.0, glow, 0.95, 0.0)
+
+        # Crisp neon outline + fixed white fill.
+        cv2.putText(canvas, text, (x, y), self._font, font_scale,
+                    self._color_bgr, thickness + 2, cv2.LINE_AA)
+        cv2.putText(canvas, text, (x, y), self._font, font_scale,
+                    (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 # ── GameManager ──────────────────────────────────────────────────────────────
@@ -4682,6 +4755,8 @@ class GameManager:
                       f"base_hold={line_hold_frames}f")
                 beat_frames = chain_starts
 
+        relax_wait_f = max(0, int(getattr(self, "RELAX_WAIT_FRAMES", 0)))
+
         def _spawn_target(m: str, spawn_f: int, bf: int, lane: int,
                           is_left: bool,
                           line_block_hits: list[int] | None = None,
@@ -4728,7 +4803,9 @@ class GameManager:
                                 relax_kind = str(self.rng.choice(other))
                     else:
                         relax_kind = str(self.rng.choice(enabled_kinds))
-                target = RelaxTarget(spawn_f, bf, kind=relax_kind)
+                target = RelaxTarget(
+                    spawn_f, bf, kind=relax_kind, wait_frames=relax_wait_f
+                )
                 tex_attr = f"RELAX_TEXTURE_{str(relax_kind).upper()}"
                 target.texture_path = getattr(self, tex_attr, None)
                 if relax_kind == 'middle':
@@ -4934,7 +5011,12 @@ class GameManager:
                 if beat_source != 'array' and bf < relax_busy_until:
                     skipped_stacked += 1
                     continue
-                t = _spawn_target('relax', spawn_f, bf, 0, False)
+                # Relax semantics: beat-frame is the APPEAR time at horizon.
+                # Target then waits `relax_wait_f`, and only after that starts
+                # moving for `travel` frames until hit.
+                relax_spawn_f = int(bf)
+                relax_hit_f = int(bf) + relax_wait_f + self.travel
+                t = _spawn_target('relax', relax_spawn_f, relax_hit_f, 0, False)
                 self.targets.append(t)
                 # Stream obstacles continuously: while one slab is
                 # front-and-centre, the NEXT should already be gliding
@@ -5299,6 +5381,7 @@ class RhythmVisualizer:
         #                 coherent.
         self.RELAX_INTERVAL:    float = 0.0
         self.RELAX_TRAVEL_SEC:  float = 0.0
+        self.RELAX_WAIT_SEC:    float = 0.0
         self.RELAX_TEXTURE_LOW: str | None = None
         self.RELAX_TEXTURE_HIGH: str | None = None
         self.RELAX_TEXTURE_MIDDLE: str | None = None
@@ -5310,6 +5393,10 @@ class RhythmVisualizer:
         self.RELAX_COUNTDOWN_ENABLED: bool = True
         self.RELAX_COUNTDOWN_COLOR: str = "#FFFFFF"
         self.RELAX_COUNTDOWN_MAX_SEC: float = 5.0
+        self.RELAX_COUNTDOWN_X: float = 0.88
+        self.RELAX_COUNTDOWN_Y: float = 0.04
+        self.RELAX_COUNTDOWN_W: float = 0.10
+        self.RELAX_COUNTDOWN_H: float = 0.16
         # ── Camera perspective overrides ────────────────────────────────
         self.FLOOR_HIT_FRAC:    float | None = None
         self.HORIZON_FRAC:      float | None = None
@@ -5777,6 +5864,12 @@ class RhythmVisualizer:
                 cam,
                 color=str(getattr(self, "RELAX_COUNTDOWN_COLOR", "#FFFFFF")),
                 max_show_sec=float(getattr(self, "RELAX_COUNTDOWN_MAX_SEC", 5.0)),
+                box=(
+                    float(getattr(self, "RELAX_COUNTDOWN_X", 0.88)),
+                    float(getattr(self, "RELAX_COUNTDOWN_Y", 0.04)),
+                    float(getattr(self, "RELAX_COUNTDOWN_W", 0.10)),
+                    float(getattr(self, "RELAX_COUNTDOWN_H", 0.16)),
+                ),
             )
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
                                   mode=mode)
@@ -5871,17 +5964,17 @@ class RhythmVisualizer:
         #     next_spawn = prev_die + delay*FPS
         #
         # prev_die is derived analytically from RelaxTarget.is_dead
-        # (`hit + travel·1.2/v2`).  Since every block has its
-        # spawn_frame = hit_frame − travel, the inter-hit step is:
+        # (`hit + travel·1.2/v2`).  With the current semantics, each
+        # beat marks SPAWN-at-horizon time, then the block waits
+        # `relax_wait_f`, then moves for `travel` frames until hit.
+        # So the spawn-to-spawn step is:
         #
-        #     step_f = travel + exit_pad + 1 + delay_f
-        #            = (travel to fly in) + (travel past camera) +
+        #     step_f = wait + travel + exit_pad + 1 + delay_f
+        #            = (wait before movement) + (travel to fly in) +
+        #              (travel past camera) +
         #              (requested idle delay)
-        #
-        # The very first block's hit is pinned at `travel` so it
-        # glides in cleanly from the horizon at t=0 instead of popping
-        # into the camera plane.
         solo_relax = (len(modes_seq) == 1 and modes_seq[0] == 'relax')
+        relax_wait_f = max(0, int(round(float(self.RELAX_WAIT_SEC) * self.FPS)))
         if solo_relax and self.RELAX_INTERVAL > 0.0:
             # Derive exit_pad from the RelaxTarget motion profile so
             # the schedule stays correct even if the phase parameters
@@ -5891,66 +5984,43 @@ class RhythmVisualizer:
             v2       = z_split / max(1e-6, 1.0 - T_split)
             exit_pad = int(round(travel * 1.2 / v2))
             delay_f  = max(0, int(round(self.RELAX_INTERVAL * self.FPS)))
-            step_f   = max(1, travel + exit_pad + 1 + delay_f)
-            first_f  = travel
+            step_f   = max(1, travel + relax_wait_f + exit_pad + 1 + delay_f)
+            first_f  = 0
             beat_frames = list(range(first_f, total_frames, step_f))
             print(f"[relax-timer] fixed-delay cadence: "
                   f"delay={self.RELAX_INTERVAL:.2f}s ({delay_f}f) "
                   f"after disappearance  "
-                  f"(travel={travel}f + exit_pad={exit_pad}f "
-                  f"+ delay={delay_f}f → step={step_f}f)  "
+                  f"(wait={relax_wait_f}f + travel={travel}f "
+                  f"+ exit_pad={exit_pad}f + delay={delay_f}f "
+                  f"→ step={step_f}f)  "
                   f"→ {len(beat_frames)} obstacles "
                   f"(first @ frame {first_f} / {first_f/self.FPS:.2f}s)")
         elif solo_relax and self.BEAT_SOURCE == 'array':
-            # Editor preview (``src/live_renderer.py``) feeds the user's
-            # beat array into ``pre_schedule`` unchanged — so each tick
-            # marks the HIT frame (the moment the slab arrives at the
-            # camera plane and the player must be dodging).  Match that
-            # interpretation here so the final MP4 plays back the exact
-            # cadence the user judged in the timeline editor: tick at
-            # t = 5 s ⇒ slab hits the camera at t = 5 s in BOTH paths.
-            #
-            # An earlier revision added ``+travel`` to every user entry
-            # (interpreting beats as SPAWN times instead).  That made
-            # every rendered dodge land ``travel`` frames late vs. the
-            # preview the user signed off on, which is exactly the
-            # "preview đúng nhưng render sai" desync this branch fixes.
-            # ``pre_schedule`` downstream still derives
-            # ``spawn_frame = hit_frame − travel`` so the slab visibly
-            # appears ``travel`` frames before its hit, identical to
-            # the preview.
+            # Array ticks are interpreted as SPAWN times for relax.
             n_before = len(beat_frames)
             beat_frames = [int(bf) for bf in beat_frames
                            if 0 <= int(bf) < total_frames]
             n_clipped = n_before - len(beat_frames)
             print(f"[relax-array] interpreting {n_before} array "
-                  f"beat(s) as obstacle HIT times "
-                  f"(spawn_frame = hit − travel={travel}f, "
+                  f"beat(s) as obstacle SPAWN times "
+                  f"(hit_frame = spawn + wait={relax_wait_f}f + travel={travel}f, "
                   f"matching preview).  {len(beat_frames)} block(s) "
                   f"fit within audio ({total_frames}f); dropped "
                   f"{n_clipped} that fell outside the song.")
         elif solo_relax:
-            # Music-driven solo-relax: drop any beat whose spawn would
-            # fall before frame 0.  Without this, early-song beats
-            # (bf < travel) materialise "already mid-flight" at frame
-            # 0 — the block appears close to the camera and zooms in
-            # aggressively, reading as a sudden fast pop-in instead of
-            # the slow horizon-to-camera glide this mode is meant to
-            # show.  We only apply it to relax because combo / punch
-            # modes intentionally accept mid-flight spawns so the song
-            # can start on-beat.
+            # Music-driven solo-relax: beat ticks are spawn times, so no
+            # early-spawn clipping is needed beyond non-negative frames.
             n_before = len(beat_frames)
-            beat_frames = [int(bf) for bf in beat_frames if bf >= travel]
+            beat_frames = [int(bf) for bf in beat_frames if bf >= 0]
             dropped = n_before - len(beat_frames)
             if dropped:
                 print(f"[relax-timer] dropped {dropped} early beat(s) "
-                      f"(bf<{travel}) so every obstacle glides in "
-                      f"cleanly from the horizon instead of popping "
-                      f"in mid-flight.")
+                      f"(bf<0).")
 
         game.RELAX_KIND_RATIO_MIDDLE = float(
             max(0.0, min(1.0, getattr(self, "RELAX_KIND_RATIO_MIDDLE", 0.33)))
         )
+        game.RELAX_WAIT_FRAMES = relax_wait_f
         game.RELAX_TEXTURE_LOW = getattr(self, "RELAX_TEXTURE_LOW", None)
         game.RELAX_TEXTURE_HIGH = getattr(self, "RELAX_TEXTURE_HIGH", None)
         game.RELAX_TEXTURE_MIDDLE = getattr(self, "RELAX_TEXTURE_MIDDLE", None)
@@ -6922,6 +6992,10 @@ def parse_arguments():
     p.add_argument('--relax_travel_sec', type=float, default=0.0,
                    help=('Relax block travel time in seconds. '
                          '>0 overrides auto travel only for solo relax.'))
+    p.add_argument('--relax_wait_sec', type=float, default=0.0,
+                  help=('Relax block hold time in seconds before movement. '
+                        'Block appears at horizon, waits this long, then '
+                        'moves with the normal travel duration.'))
     p.add_argument('--relax_texture_low', type=str, default=None, metavar='PATH',
                    help='Texture image for LOW relax block front face.')
     p.add_argument('--relax_texture_high', type=str, default=None, metavar='PATH',
@@ -6945,6 +7019,14 @@ def parse_arguments():
                    help='Relax countdown text color.')
     p.add_argument('--relax_countdown_max_sec', type=float, default=5.0,
                    help='Only show countdown if next hit <= this many seconds.')
+    p.add_argument('--relax_countdown_x', type=float, default=0.88,
+                   help='Countdown box x (0..1, normalized).')
+    p.add_argument('--relax_countdown_y', type=float, default=0.04,
+                   help='Countdown box y (0..1, normalized).')
+    p.add_argument('--relax_countdown_w', type=float, default=0.10,
+                   help='Countdown box width (0..1, normalized).')
+    p.add_argument('--relax_countdown_h', type=float, default=0.16,
+                   help='Countdown box height (0..1, normalized).')
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -7094,6 +7176,7 @@ if __name__ == '__main__':
     viz.LINE_ZIGZAG      = str(args.line_zigzag).lower().strip() or 'vertical'
     viz.RELAX_INTERVAL   = max(0.0, float(args.relax_interval))
     viz.RELAX_TRAVEL_SEC = max(0.0, float(args.relax_travel_sec))
+    viz.RELAX_WAIT_SEC   = max(0.0, float(args.relax_wait_sec))
     viz.RELAX_TEXTURE_LOW = args.relax_texture_low or None
     viz.RELAX_TEXTURE_HIGH = args.relax_texture_high or None
     viz.RELAX_TEXTURE_MIDDLE = args.relax_texture_middle or None
@@ -7107,6 +7190,10 @@ if __name__ == '__main__':
     viz.RELAX_COUNTDOWN_ENABLED = bool(int(args.relax_countdown_enabled))
     viz.RELAX_COUNTDOWN_COLOR = str(args.relax_countdown_color)
     viz.RELAX_COUNTDOWN_MAX_SEC = max(0.0, float(args.relax_countdown_max_sec))
+    viz.RELAX_COUNTDOWN_X = max(0.0, min(1.0, float(args.relax_countdown_x)))
+    viz.RELAX_COUNTDOWN_Y = max(0.0, min(1.0, float(args.relax_countdown_y)))
+    viz.RELAX_COUNTDOWN_W = max(0.02, min(1.0, float(args.relax_countdown_w)))
+    viz.RELAX_COUNTDOWN_H = max(0.02, min(1.0, float(args.relax_countdown_h)))
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:
