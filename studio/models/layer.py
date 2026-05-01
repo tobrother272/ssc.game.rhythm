@@ -76,7 +76,7 @@ def _default_floor_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def auto_create_default_layers(project: "object", segment: "Segment") -> None:
-    """Auto-generate Background + Floor layers covering a new segment.
+    """Auto-generate Background + Floor + Stickman layers for a new segment.
 
     Skips creation if a layer of the same kind already overlaps the
     segment's range (avoids stacking duplicates when a segment is
@@ -88,6 +88,10 @@ def auto_create_default_layers(project: "object", segment: "Segment") -> None:
     defaults: list[tuple[LayerKind, dict]] = [
         ("background", {"bg_type": "solid", "bg_color": "#000000"}),
         ("floor", _default_floor_config()),
+        ("stickman", {
+            "stickman": True,
+            "stickman_location": {"x": 0.010, "y": 0.090, "w": 0.135, "h": 0.540},
+        }),
     ]
 
     for kind, default_config in defaults:
@@ -110,6 +114,78 @@ def auto_create_default_layers(project: "object", segment: "Segment") -> None:
 # ---------------------------------------------------------------------------
 # Effective config resolution
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Migration helpers
+# ---------------------------------------------------------------------------
+
+# Visual fields per kind.  If any of these appear in segment.render_settings,
+# migration will extract them into a layer block.
+_VISUAL_FIELDS_BY_KIND: dict[str, list[str]] = {
+    "background": ["bg_type", "bg_color", "background_type", "background_color",
+                   "background_image", "background_video",
+                   "bg_image", "bg_video"],
+    "side_rails": [
+        "side_rails", "rail_color", "rail_shape", "rail_height", "rail_offset_x",
+        "rail_image", "rail_texture_non_loop", "rail_pulse", "rail_pulse_intensity",
+        "rail_chevron_depth", "rail_chevron_density",
+        "rail_pillar_count", "rail_pillar_radius",
+        "rail_chase_mode", "rail_chase_speed_frames",
+        "rail_dot_count", "rail_dot_lines", "rail_dot_size_px",
+        "rail_dot_anim_mode", "rail_dot_color_near", "rail_dot_color_far",
+    ],
+    "floor": [
+        "floor_panels", "floor_panel_color", "floor_panel_opacity",
+        "floor_panel_blink", "floor_panel_image", "floor_full_static_image",
+        "floor_layout", "floor_bg_color", "floor_bg_opacity",
+        "chevron_color", "chevron_scroll", "chevron_blink",
+        "chevron_width_frac", "chevron_count",
+    ],
+    "stickman": ["stickman", "stickman_location"],
+    "countdown": [
+        "relax_countdown_enabled", "relax_countdown_color",
+        "relax_countdown_max_sec", "relax_countdown_x", "relax_countdown_y",
+    ],
+}
+
+
+def migrate_render_settings_to_layers(project: "object") -> None:
+    """One-time migration: extract visual layer fields from each segment's
+    render_settings into layer blocks.
+
+    Idempotent — skips kind if a layer of that kind already overlaps the
+    segment's range.  Called by ProjectStore.load when project.layers is
+    empty so old projects transparently gain layer blocks on first load.
+    """
+    migrated_count = 0
+    for segment in project.segments:
+        rs = segment.render_settings or {}
+        for kind, fields in _VISUAL_FIELDS_BY_KIND.items():
+            extracted = {f: rs[f] for f in fields if f in rs}
+            if not extracted:
+                continue
+            existing = [
+                la for la in project.layers
+                if la.kind == kind
+                and la.overlaps(segment.start_time_sec, segment.end_time_sec)
+            ]
+            if existing:
+                continue
+            project.layers.append(Layer(
+                kind=kind,
+                start_time_sec=segment.start_time_sec,
+                end_time_sec=segment.end_time_sec,
+                z_index=0,
+                name=f"Migrated {kind.replace('_', ' ').title()}",
+                config=extracted,
+            ))
+            migrated_count += 1
+    if migrated_count:
+        print(
+            f"[migration] Extracted {migrated_count} layer block(s) "
+            f"from segment.render_settings"
+        )
+
 
 def resolve_segment_config(
     segment: "Segment",

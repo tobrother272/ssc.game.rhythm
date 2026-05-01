@@ -170,14 +170,33 @@ class RenderService(QObject):
         # log lines.
         if project_layers is not None:
             from studio.models.layer import resolve_segment_config
-            effective_settings = resolve_segment_config(segment, project_layers)
+            effective_settings = dict(resolve_segment_config(segment, project_layers))
+            # Layer absence = feature off: if no layer of a given kind overlaps
+            # the segment, force that feature off so deleting a layer actually
+            # disables it even when render_settings still has the old value.
+            s_start = segment.start_time_sec
+            s_end = segment.end_time_sec
+            _kind_absent = lambda kind: not any(  # noqa: E731
+                la.kind == kind and la.overlaps(s_start, s_end)
+                for la in project_layers
+            )
+            if _kind_absent("stickman"):
+                effective_settings["stickman"] = False
+            if _kind_absent("floor"):
+                effective_settings["floor_panels"] = False
+            if _kind_absent("side_rails"):
+                effective_settings["side_rails"] = False
+            if _kind_absent("countdown"):
+                effective_settings["relax_countdown_enabled"] = False
         else:
             effective_settings = segment.render_settings or {}
 
         stick_loc: dict = {}
         rs = effective_settings
         if bool(rs.get("stickman", True)):
-            sl = getattr(segment, "stickman_location", None) or {}
+            # Prefer stickman_location from the effective settings (layer config
+            # merges it in), fall back to segment.stickman_location.
+            sl = rs.get("stickman_location") or getattr(segment, "stickman_location", None) or {}
             try:
                 stick_loc = {
                     "x": float(sl.get("x", 0.010)),

@@ -642,6 +642,25 @@ class _FloorPanelSection(QGroupBox):
     def get_full_static_image(self) -> bool:
         return bool(self._full_static_cb.isChecked()) and self._has_image()
 
+    def get_config(self) -> dict:
+        """Export current state as a layer config dict."""
+        return {
+            "floor_panels": True,
+            "floor_panel_color": self.get_color(),
+            "floor_panel_opacity": self.get_floor_panel_opacity(),
+            "floor_panel_blink": self.get_blink(),
+            "floor_panel_image": self.get_image(),
+            "floor_full_static_image": self.get_full_static_image(),
+            "floor_layout": self.get_floor_layout(),
+            "floor_bg_color": self.get_floor_bg_color(),
+            "floor_bg_opacity": self.get_floor_bg_opacity(),
+            "chevron_color": self.get_chevron_color(),
+            "chevron_scroll": self.get_chevron_scroll(),
+            "chevron_blink": self.get_chevron_blink(),
+            "chevron_width_frac": self.get_chevron_width_frac(),
+            "chevron_count": self.get_chevron_count(),
+        }
+
 
 class _SideRailSection(QGroupBox):
     """Config sub-section for side-rail settings.
@@ -1156,6 +1175,32 @@ class _SideRailSection(QGroupBox):
     def get_dot_color_far(self) -> str:
         return self._dot_color_far
 
+    def get_config(self) -> dict:
+        """Export current state as a layer config dict."""
+        return {
+            "side_rails": True,
+            "rail_color": self.get_color(),
+            "rail_shape": self.get_shape(),
+            "rail_height": self.get_height(),
+            "rail_offset_x": self.get_offset_x(),
+            "rail_image": self.get_image(),
+            "rail_texture_non_loop": self.get_texture_non_loop(),
+            "rail_pulse": self.get_pulse(),
+            "rail_pulse_intensity": self.get_pulse_intensity(),
+            "rail_chevron_depth": self.get_chevron_depth(),
+            "rail_chevron_density": self.get_chevron_density(),
+            "rail_pillar_count": self.get_pillar_count(),
+            "rail_pillar_radius": self.get_pillar_radius(),
+            "rail_chase_mode": self.get_chase_mode(),
+            "rail_chase_speed_frames": self.get_chase_speed_frames(),
+            "rail_dot_count": self.get_dot_count(),
+            "rail_dot_lines": self.get_dot_lines(),
+            "rail_dot_size_px": self.get_dot_size_px(),
+            "rail_dot_anim_mode": self.get_dot_anim_mode(),
+            "rail_dot_color_near": self.get_dot_color_near(),
+            "rail_dot_color_far": self.get_dot_color_far(),
+        }
+
 
 def format_sec(value: float) -> str:
     total = max(0, int(value))
@@ -1175,8 +1220,6 @@ class SegmentConfigPanel(QWidget):
         self._project: Optional[Project] = None
         self._segment: Optional[Segment] = None
         self._setting_widgets: dict[str, QWidget] = {}
-        self._floor_panel_section: Optional[_FloorPanelSection] = None
-        self._side_rail_section: Optional[_SideRailSection] = None
         self._build_ui()
         self._set_empty_state(True)
 
@@ -1640,23 +1683,18 @@ class SegmentConfigPanel(QWidget):
         while self.dynamic_layout.rowCount() > 0:
             self.dynamic_layout.removeRow(0)
         self._setting_widgets.clear()
-        self._floor_panel_section = None
-        self._side_rail_section = None
 
     # Fields always shown in the Properties panel, in display order.
+    # Base fields — always shown.  Visual decoration (background, floor,
+    # rails, stickman, countdown) has moved to the layer system and is
+    # edited via double-click on the corresponding timeline layer block.
     _VISIBLE_FIELDS = (
         "beat_source",
         "beat_sens",
         "density",
         "speed",
         "max_per_lane",
-        "background_type",
-        "background_color",
-        "background_image",
-        "background_video",
-        "floor_panels",
-        "side_rails",
-        "stickman",
+        "bloom",
     )
 
     # Extra fields shown only for specific modes.  Keys must exist on the
@@ -1678,9 +1716,7 @@ class SegmentConfigPanel(QWidget):
             "relax_show_low",
             "relax_show_high",
             "relax_show_middle",
-            "relax_countdown_enabled",
-            "relax_countdown_color",
-            "relax_countdown_max_sec",
+            # countdown fields moved to Countdown layer — removed from here
         ),
     }
 
@@ -1690,13 +1726,7 @@ class SegmentConfigPanel(QWidget):
         "density":     "Density",
         "speed":       "Speed",
         "max_per_lane":"Max / lane",
-        "background_type": "Background",
-        "background_color": "Background color",
-        "background_image": "Background image",
-        "background_video": "Background video",
-        "floor_panels":"Floor panels",
-        "side_rails":  "Side rails",
-        "stickman":    "Stickman",
+        "bloom":       "Bloom",
         "mode_list":   "Sub-modes",
         "line_zigzag": "Zigzag",
         "relax_interval": "Relax interval",
@@ -1754,71 +1784,9 @@ class SegmentConfigPanel(QWidget):
             label = self._FIELD_LABELS.get(key, key.replace("_", " ").capitalize())
             self.dynamic_layout.addRow(label, widget)
 
-            # Inject the floor panel sub-section immediately after the
-            # "floor_panels" toggle row so it appears visually grouped.
-            if key == "floor_panels":
-                section = _FloorPanelSection(
-                    color=rs.get("floor_panel_color") or None,
-                    blink=bool(rs.get("floor_panel_blink", False)),
-                    image=rs.get("floor_panel_image") or None,
-                    floor_panel_opacity=float(rs.get("floor_panel_opacity", 1.0) or 1.0),
-                    floor_layout=str(rs.get("floor_layout", "auto")),
-                    floor_bg_color=rs.get("floor_bg_color") or None,
-                    floor_bg_opacity=float(rs.get("floor_bg_opacity", 1.0) or 1.0),
-                    chevron_color=str(rs.get("chevron_color", "#FFD700")),
-                    chevron_scroll=bool(rs.get("chevron_scroll", True)),
-                    chevron_blink=bool(rs.get("chevron_blink", False)),
-                    chevron_width_frac=float(rs.get("chevron_width_frac", 0.45) or 0.45),
-                    chevron_count=int(rs.get("chevron_count", 6) or 6),
-                    full_static_image=bool(rs.get("floor_full_static_image", False)),
-                    parent=self,
-                )
-                section.setVisible(bool(value))
-                section.changed.connect(self._commit_floor_panel_section)
-                self.dynamic_layout.addRow(section)
-                self._floor_panel_section = section
-                # Connect checkbox to show/hide the section.
-                widget.stateChanged.connect(
-                    lambda state, s=section:
-                        s.setVisible(state == Qt.CheckState.Checked.value
-                                     or state == 2)  # Qt5/Qt6 compat
-                )
-
-            # Inject the side rail sub-section after the "side_rails" toggle.
-            if key == "side_rails":
-                sr_section = _SideRailSection(
-                    color=rs.get("rail_color", "#FF60FF"),
-                    shape=rs.get("rail_shape", "chunky"),
-                    height=float(rs.get("rail_height", 0.14)),
-                    offset_x=float(rs.get("rail_offset_x", 0.08)),
-                    image=rs.get("rail_image") or None,
-                    texture_non_loop=bool(rs.get("rail_texture_non_loop", False)),
-                    pulse=rs.get("rail_pulse", "beat"),
-                    pulse_intensity=float(rs.get("rail_pulse_intensity", 0.6)),
-                    chevron_depth=float(rs.get("rail_chevron_depth", 1.0) or 1.0),
-                    chevron_density=int(rs.get("rail_chevron_density", 6) or 6),
-                    pillar_count=int(rs.get("rail_pillar_count", 16) or 16),
-                    pillar_radius=float(rs.get("rail_pillar_radius", 1.0) or 1.0),
-                    chase_mode=str(rs.get("rail_chase_mode", "time") or "time"),
-                    chase_speed_frames=int(rs.get("rail_chase_speed_frames", 4) or 4),
-                    dot_count=int(rs.get("rail_dot_count", 24) or 24),
-                    dot_lines=int(rs.get("rail_dot_lines", 1) or 1),
-                    dot_size_px=int(rs.get("rail_dot_size_px", 6) or 6),
-                    dot_anim_mode=str(rs.get("rail_dot_anim_mode", "audio") or "audio"),
-                    dot_color_near=str(rs.get("rail_dot_color_near", "#FF60FF") or "#FF60FF"),
-                    dot_color_far=str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
-                    parent=self,
-                )
-                sr_section.setVisible(bool(value))
-                sr_section.changed.connect(self._commit_side_rail_section)
-                self.dynamic_layout.addRow(sr_section)
-                self._side_rail_section = sr_section
-                widget.stateChanged.connect(
-                    lambda state, s=sr_section:
-                        s.setVisible(state == Qt.CheckState.Checked.value
-                                     or state == 2)
-                )
-        self._update_background_visibility()
+        # Visual decoration sections (floor, rails, background, stickman,
+        # countdown) have moved to the layer system.  They are now edited
+        # via double-click on the corresponding timeline layer block.
 
     # Per-key UI hints (range, step, decimals, tooltip).
     # Keys not listed fall back to generic wide-range spinboxes.
@@ -1865,7 +1833,7 @@ class SegmentConfigPanel(QWidget):
             combo.addItem("Image", "image")
             combo.addItem("Video", "video")
             combo.setCurrentIndex(max(0, combo.findData(str(value or "solid"))))
-            combo.currentIndexChanged.connect(self._on_background_type_changed)
+            combo.currentIndexChanged.connect(self._commit_settings)
             return _no_scroll(combo)
         if key == "background_color":
             widget = _ColorPickerWidget(
@@ -2012,25 +1980,6 @@ class SegmentConfigPanel(QWidget):
         except Exception:
             widget.setVisible(visible)
 
-    def _update_background_visibility(self) -> None:
-        bg_type_widget = self._setting_widgets.get("background_type")
-        if not isinstance(bg_type_widget, QComboBox):
-            return
-        bg_type = str(bg_type_widget.currentData() or "solid")
-        w_color = self._setting_widgets.get("background_color")
-        w_image = self._setting_widgets.get("background_image")
-        w_video = self._setting_widgets.get("background_video")
-        if isinstance(w_color, QWidget):
-            self._set_dynamic_row_visible(w_color, bg_type == "solid")
-        if isinstance(w_image, QWidget):
-            self._set_dynamic_row_visible(w_image, bg_type == "image")
-        if isinstance(w_video, QWidget):
-            self._set_dynamic_row_visible(w_video, bg_type == "video")
-
-    def _on_background_type_changed(self, *_args) -> None:
-        self._update_background_visibility()
-        self._commit_settings()
-
     def _collect_setting_widget_value(self, key: str, widget: QWidget):
         if isinstance(widget, _ModeListWidget):
             return widget.get_value()
@@ -2094,74 +2043,8 @@ class SegmentConfigPanel(QWidget):
             return
         for key, widget in self._setting_widgets.items():
             segment.render_settings[key] = self._collect_setting_widget_value(key, widget)
-        # Also persist floor panel sub-section values (if section exists).
-        if self._floor_panel_section is not None:
-            self._write_floor_panel_to_rs(segment, self._floor_panel_section)
-        if self._side_rail_section is not None:
-            self._write_side_rail_to_rs(segment, self._side_rail_section)
         validated = build_settings(segment.mode, segment.render_settings)
         segment.render_settings = validated.model_dump(mode="json", exclude_none=True)
-        self.segment_changed.emit(segment.id)
-
-    def _commit_floor_panel_section(self) -> None:
-        """Called when any floor panel sub-section control changes."""
-        segment = self._segment
-        if segment is None or self._floor_panel_section is None:
-            return
-        if self._is_video_segment_locked(segment):
-            return
-        self._write_floor_panel_to_rs(segment, self._floor_panel_section)
-        self.segment_changed.emit(segment.id)
-
-    @staticmethod
-    def _write_floor_panel_to_rs(
-        segment: "Segment", sec: "_FloorPanelSection"
-    ) -> None:
-        segment.render_settings["floor_panel_color"] = sec.get_color()
-        segment.render_settings["floor_panel_opacity"] = sec.get_floor_panel_opacity()
-        segment.render_settings["floor_panel_blink"] = sec.get_blink()
-        segment.render_settings["floor_panel_image"] = sec.get_image()
-        segment.render_settings["floor_full_static_image"] = sec.get_full_static_image()
-        segment.render_settings["floor_layout"]      = sec.get_floor_layout()
-        segment.render_settings["floor_bg_color"]    = sec.get_floor_bg_color()
-        segment.render_settings["floor_bg_opacity"]  = sec.get_floor_bg_opacity()
-        segment.render_settings["chevron_color"]     = sec.get_chevron_color()
-        segment.render_settings["chevron_scroll"]    = sec.get_chevron_scroll()
-        segment.render_settings["chevron_blink"]     = sec.get_chevron_blink()
-        segment.render_settings["chevron_width_frac"] = sec.get_chevron_width_frac()
-        segment.render_settings["chevron_count"]     = sec.get_chevron_count()
-
-    @staticmethod
-    def _write_side_rail_to_rs(segment: "Segment", sec: "_SideRailSection") -> None:
-        segment.render_settings["rail_color"]           = sec.get_color()
-        segment.render_settings["rail_shape"]           = sec.get_shape()
-        segment.render_settings["rail_height"]          = sec.get_height()
-        segment.render_settings["rail_offset_x"]        = sec.get_offset_x()
-        segment.render_settings["rail_image"]           = sec.get_image()
-        segment.render_settings["rail_texture_non_loop"] = sec.get_texture_non_loop()
-        segment.render_settings["rail_pulse"]            = sec.get_pulse()
-        segment.render_settings["rail_pulse_intensity"]  = sec.get_pulse_intensity()
-        segment.render_settings["rail_chevron_depth"]    = sec.get_chevron_depth()
-        segment.render_settings["rail_chevron_density"]  = sec.get_chevron_density()
-        segment.render_settings["rail_pillar_count"]     = sec.get_pillar_count()
-        segment.render_settings["rail_pillar_radius"]    = sec.get_pillar_radius()
-        segment.render_settings["rail_chase_mode"]       = sec.get_chase_mode()
-        segment.render_settings["rail_chase_speed_frames"] = sec.get_chase_speed_frames()
-        segment.render_settings["rail_dot_count"]        = sec.get_dot_count()
-        segment.render_settings["rail_dot_lines"]        = sec.get_dot_lines()
-        segment.render_settings["rail_dot_size_px"]      = sec.get_dot_size_px()
-        segment.render_settings["rail_dot_anim_mode"]    = sec.get_dot_anim_mode()
-        segment.render_settings["rail_dot_color_near"]   = sec.get_dot_color_near()
-        segment.render_settings["rail_dot_color_far"]    = sec.get_dot_color_far()
-
-    def _commit_side_rail_section(self) -> None:
-        """Called when any side rail sub-section control changes."""
-        segment = self._segment
-        if segment is None or self._side_rail_section is None:
-            return
-        if self._is_video_segment_locked(segment):
-            return
-        self._write_side_rail_to_rs(segment, self._side_rail_section)
         self.segment_changed.emit(segment.id)
 
     def _on_preview_clicked(self) -> None:

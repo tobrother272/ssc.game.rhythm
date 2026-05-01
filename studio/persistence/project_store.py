@@ -63,6 +63,11 @@ class ProjectStore:
             self._deserialize_layer(item, project_dir)
             for item in payload.get("layers", [])
         ]
+        # Auto-migration: old projects (no layers) get visual fields
+        # extracted from render_settings into layer blocks transparently.
+        if not project.layers:
+            from studio.models.layer import migrate_render_settings_to_layers
+            migrate_render_settings_to_layers(project)
         return project
 
     def _serialize_media(self, media: MediaItem, project_dir: Path) -> dict[str, Any]:

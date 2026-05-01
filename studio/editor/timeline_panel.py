@@ -454,8 +454,8 @@ def _zoom_control_icons(size: int = 18) -> tuple[QIcon, QIcon, QIcon, QIcon, QIc
     return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
 
 
-def _layer_button_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap]:
-    """Background / Floor layer button pixmaps (Phase 1 — 2 icons)."""
+def _layer_button_pixmaps(size: int, stroke: QColor) -> dict[str, QPixmap]:
+    """Return one pixmap per layer kind, keyed by kind name."""
     s = float(size)
     m = s * 0.10
 
@@ -469,52 +469,102 @@ def _layer_button_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap]:
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
 
+    result: dict[str, QPixmap] = {}
+
     # --- Background: rectangle outline + diagonal stripe ---
-    pm_bg = _blank()
-    p = QPainter(pm_bg)
+    pm = _blank()
+    p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setPen(pen)
     p.setBrush(Qt.BrushStyle.NoBrush)
     rx0, ry0 = m, m + s * 0.15
     rw, rh = s - 2 * m, s - 2 * m - s * 0.15
     p.drawRect(QRectF(rx0, ry0, rw, rh))
-    # diagonal stripe
     p.drawLine(QPointF(rx0, ry0 + rh * 0.55), QPointF(rx0 + rw * 0.45, ry0))
     p.drawLine(QPointF(rx0 + rw * 0.45, ry0 + rh), QPointF(rx0 + rw, ry0 + rh * 0.35))
     p.end()
+    result["background"] = pm
 
     # --- Floor: 3×2 tile grid ---
-    pm_floor = _blank()
-    p = QPainter(pm_floor)
+    pm = _blank()
+    p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setPen(pen)
     p.setBrush(Qt.BrushStyle.NoBrush)
     gx0, gy0 = m, m + s * 0.10
     gw, gh = s - 2 * m, s - 2 * m - s * 0.10
     p.drawRect(QRectF(gx0, gy0, gw, gh))
-    # 2 internal vertical dividers (3 columns)
     for xi in (1.0 / 3.0, 2.0 / 3.0):
         p.drawLine(QPointF(gx0 + gw * xi, gy0), QPointF(gx0 + gw * xi, gy0 + gh))
-    # 1 internal horizontal divider (2 rows)
     p.drawLine(QPointF(gx0, gy0 + gh * 0.5), QPointF(gx0 + gw, gy0 + gh * 0.5))
     p.end()
+    result["floor"] = pm
 
-    return pm_bg, pm_floor
+    # --- Side rails: two vertical bars (left + right) ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    bar_w = s * 0.22
+    bar_h = s - 2 * m
+    p.drawRect(QRectF(m, m, bar_w, bar_h))
+    p.drawRect(QRectF(s - m - bar_w, m, bar_w, bar_h))
+    p.end()
+    result["side_rails"] = pm
+
+    # --- Stickman: circle head + body lines ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    cx, head_r = s * 0.5, s * 0.14
+    head_y = m + head_r
+    p.drawEllipse(QPointF(cx, head_y), head_r, head_r)
+    body_top = head_y + head_r
+    body_bot = s - m - s * 0.22
+    mid_y = body_top + (body_bot - body_top) * 0.45
+    p.drawLine(QPointF(cx, body_top), QPointF(cx, body_bot))
+    p.drawLine(QPointF(m + s * 0.05, mid_y - s * 0.04), QPointF(s - m - s * 0.05, mid_y - s * 0.04))
+    p.drawLine(QPointF(cx, body_bot), QPointF(m + s * 0.12, s - m))
+    p.drawLine(QPointF(cx, body_bot), QPointF(s - m - s * 0.12, s - m))
+    p.end()
+    result["stickman"] = pm
+
+    # --- Countdown: clock circle + hands ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    cr = (s - 2 * m) * 0.48
+    ccx, ccy = s * 0.5, s * 0.52
+    p.drawEllipse(QPointF(ccx, ccy), cr, cr)
+    import math
+    p.drawLine(QPointF(ccx, ccy), QPointF(ccx, ccy - cr * 0.7))
+    angle = math.radians(45)
+    p.drawLine(QPointF(ccx, ccy),
+               QPointF(ccx + cr * 0.55 * math.sin(angle), ccy - cr * 0.55 * math.cos(angle)))
+    p.end()
+    result["countdown"] = pm
+
+    return result
 
 
-def _layer_button_icons(size: int = 18) -> tuple[QIcon, QIcon]:
-    """Return (background, floor) layer toolbar icons."""
+def _layer_button_icons(size: int = 18) -> dict[str, QIcon]:
+    """Return a dict mapping layer kind → QIcon for all 5 layer kinds."""
     c_on = QColor("#c8c8c8")
     c_off = QColor("#4f4f4f")
     pms_on = _layer_button_pixmaps(size, c_on)
     pms_off = _layer_button_pixmaps(size, c_off)
 
-    def _mk(pm_on: QPixmap, pm_off: QPixmap) -> QIcon:
-        ic = QIcon(pm_on)
-        ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
-        return ic
-
-    return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
+    return {
+        kind: (lambda a, b: (ic := QIcon(a), ic.addPixmap(b, QIcon.Mode.Disabled), ic)[2])(
+            pms_on[kind], pms_off[kind]
+        )
+        for kind in pms_on
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2350,14 +2400,41 @@ class TimelinePanel(QWidget):
             self._on_layer_block_double_clicked(layer_id)
 
     def _on_layer_block_double_clicked(self, layer_id: str) -> None:
-        """Double-click: open a simple time-range editor dialog."""
+        """Double-click: open config dialog then time-range dialog."""
         layer = self._get_layer(layer_id)
         if layer is None:
             return
+
+        # Config dialog — kind-specific form
+        from studio.editor.layer_edit_dialog import _LayerEditDialog
+        config_dlg = _LayerEditDialog(layer, parent=self)
+        if config_dlg.exec() == QDialog.DialogCode.Accepted:
+            new_config = config_dlg.get_config()
+            old_config = dict(layer.config)
+
+            def _undo_cfg():
+                la = self._get_layer(layer_id)
+                if la:
+                    la.config = old_config
+                    self.refresh()
+                    self.layer_changed.emit()
+
+            def _redo_cfg():
+                la = self._get_layer(layer_id)
+                if la:
+                    la.config = new_config
+                    self.refresh()
+                    self.layer_changed.emit()
+
+            layer.config = new_config
+            self.undo_stack.push(_Cmd(f"Edit {layer.kind} layer config", _undo_cfg, _redo_cfg))
+            self.refresh()
+            self.layer_changed.emit()
+            return
+
+        # If config dialog was cancelled, open a simpler time-range editor
         dlg = QDialog(self)
-        dlg.setWindowTitle(
-            f"Edit {layer.kind.replace('_', ' ').title()} Layer"
-        )
+        dlg.setWindowTitle(f"Edit {layer.kind.replace('_', ' ').title()} — Time Range")
         form = QFormLayout(dlg)
         start_edit = QLineEdit(f"{layer.start_time_sec:.3f}")
         end_edit = QLineEdit(f"{layer.end_time_sec:.3f}")
@@ -2366,8 +2443,7 @@ class TimelinePanel(QWidget):
         form.addRow("Start (sec):", start_edit)
         form.addRow("End (sec):", end_edit)
         btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         form.addRow(btns)
         btns.accepted.connect(dlg.accept)
@@ -2382,9 +2458,10 @@ class TimelinePanel(QWidget):
         old_start = layer.start_time_sec
         old_end = layer.end_time_sec
         old_name = layer.name
+        new_name = name_edit.text().strip() or old_name
         layer.start_time_sec = new_start
         layer.end_time_sec = new_end
-        layer.name = name_edit.text().strip() or old_name
+        layer.name = new_name
 
         def _undo():
             la = self._get_layer(layer_id)
@@ -2399,10 +2476,10 @@ class TimelinePanel(QWidget):
             if la:
                 la.start_time_sec = new_start
                 la.end_time_sec = new_end
-                la.name = name_edit.text().strip() or old_name
+                la.name = new_name
                 self.refresh()
 
-        self.undo_stack.push(_Cmd(f"Edit {layer.kind} layer", _undo, _redo))
+        self.undo_stack.push(_Cmd(f"Edit {layer.kind} layer range", _undo, _redo))
         self.refresh()
         self.layer_changed.emit()
 
@@ -2481,6 +2558,27 @@ class TimelinePanel(QWidget):
             config: dict = {"bg_type": "solid", "bg_color": "#000000"}
         elif kind == "floor":
             config = _default_floor_config()
+        elif kind == "side_rails":
+            config = {
+                "side_rails": True,
+                "rail_color": "#FF60FF",
+                "rail_shape": "chunky",
+                "rail_height": 0.14,
+                "rail_offset_x": 0.08,
+                "rail_pulse": "beat",
+                "rail_pulse_intensity": 0.6,
+            }
+        elif kind == "stickman":
+            config = {
+                "stickman": True,
+                "stickman_location": {"x": 0.010, "y": 0.090, "w": 0.135, "h": 0.540},
+            }
+        elif kind == "countdown":
+            config = {
+                "relax_countdown_enabled": True,
+                "relax_countdown_color": "#FFFFFF",
+                "relax_countdown_max_sec": 3.0,
+            }
         else:
             config = {}
 
@@ -3485,49 +3583,65 @@ class TimelinePanel(QWidget):
         self.clear_beats_button.clicked.connect(self._on_clear_beats_clicked)
         top.addWidget(self.clear_beats_button)
 
-        # ── Add Layer group (Phase 1: Background + Floor) ─────────────
+        # ── Add Layer group (all 5 kinds) ──────────────────────────────
         _layer_sep = QFrame()
         _layer_sep.setFrameShape(QFrame.Shape.VLine)
         _layer_sep.setStyleSheet("QFrame { color: #444; margin: 4px 2px; }")
         top.addWidget(_layer_sep)
 
-        _ic_add_bg, _ic_add_floor = _layer_button_icons(18)
+        _layer_icons = _layer_button_icons(18)
         _layer_icon_sz = QSize(18, 18)
         _layer_btn_sz = 28
 
-        self.add_bg_button = QPushButton()
-        self.add_bg_button.setIcon(_ic_add_bg)
-        self.add_bg_button.setIconSize(_layer_icon_sz)
-        self.add_bg_button.setText("")
-        self.add_bg_button.setFlat(True)
-        self.add_bg_button.setObjectName("zoomIconButton")
-        self.add_bg_button.setFixedSize(_layer_btn_sz, _layer_btn_sz)
-        self.add_bg_button.setToolTip(
-            "Add Background layer — color/image/video covering segment range.\n"
-            "Default: solid black #000000 covering selected segment.\n"
-            "Right-click block to edit, drag to resize."
-        )
-        self.add_bg_button.clicked.connect(
-            lambda: self._on_add_layer_clicked("background")
-        )
+        _layer_tooltips = {
+            "background": (
+                "Add Background layer — color/image/video covering segment range.\n"
+                "Default: solid black #000000. Double-click to edit."
+            ),
+            "floor": (
+                "Add Floor layer — floor panels / chevron config.\n"
+                "Default: floor_panels=True, chevron_color=#FFD700. Double-click to edit."
+            ),
+            "side_rails": (
+                "Add Side Rails layer — pillar/tube/chevron rails along lane edges.\n"
+                "Double-click to configure shape, color, and animation."
+            ),
+            "stickman": (
+                "Add Stickman layer — HUD stickman figure on the left.\n"
+                "Drag the box on video preview to reposition."
+            ),
+            "countdown": (
+                "Add Countdown layer — relax-mode countdown overlay.\n"
+                "Double-click to configure color and timing."
+            ),
+        }
+
+        def _make_layer_btn(kind: str) -> QPushButton:
+            btn = QPushButton()
+            btn.setIcon(_layer_icons[kind])
+            btn.setIconSize(_layer_icon_sz)
+            btn.setText("")
+            btn.setFlat(True)
+            btn.setObjectName("zoomIconButton")
+            btn.setFixedSize(_layer_btn_sz, _layer_btn_sz)
+            btn.setToolTip(_layer_tooltips.get(kind, f"Add {kind} layer"))
+            btn.clicked.connect(lambda _=False, k=kind: self._on_add_layer_clicked(k))
+            return btn
+
+        self.add_bg_button = _make_layer_btn("background")
         top.addWidget(self.add_bg_button)
 
-        self.add_floor_button = QPushButton()
-        self.add_floor_button.setIcon(_ic_add_floor)
-        self.add_floor_button.setIconSize(_layer_icon_sz)
-        self.add_floor_button.setText("")
-        self.add_floor_button.setFlat(True)
-        self.add_floor_button.setObjectName("zoomIconButton")
-        self.add_floor_button.setFixedSize(_layer_btn_sz, _layer_btn_sz)
-        self.add_floor_button.setToolTip(
-            "Add Floor layer — floor panels / chevron config covering segment range.\n"
-            "Default: floor_panels=True, chevron_color=#FFD700.\n"
-            "Right-click block to edit, drag to resize."
-        )
-        self.add_floor_button.clicked.connect(
-            lambda: self._on_add_layer_clicked("floor")
-        )
+        self.add_floor_button = _make_layer_btn("floor")
         top.addWidget(self.add_floor_button)
+
+        self.add_rails_button = _make_layer_btn("side_rails")
+        top.addWidget(self.add_rails_button)
+
+        self.add_stickman_button = _make_layer_btn("stickman")
+        top.addWidget(self.add_stickman_button)
+
+        self.add_countdown_button = _make_layer_btn("countdown")
+        top.addWidget(self.add_countdown_button)
 
         # CapCut-style zoom bar:  [Fit] [Ratio] [Rule]  [−]  [===O===]  [+]
         _ic_fit, _ic_ratio, _ic_rule, _ic_zout, _ic_zin = _zoom_control_icons(18)
@@ -3959,25 +4073,19 @@ class TimelinePanel(QWidget):
     _RULER_H = 22
     _SEGMENT_TRACK_Y = 24
     _SEGMENT_TRACK_H = 80
-    # Layer tracks (Phase 1: Background + Floor) sit between the segment
-    # track and the beat-strip / waveform.  Each track is 32 px tall.
+    # Layer tracks sit between the segment track and the beat-strip / waveform.
+    # All 5 kinds are active; each track row is 32 px tall.
     _LAYER_TRACK_Y = 104          # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
     _LAYER_TRACK_H = 32           # height per layer track row
-    # Phase 1 layer kinds — order determines top-to-bottom track position.
-    _LAYER_KINDS_PHASE1 = ("background", "floor")
-    _LAYER_TRACKS_TOTAL_H = 64    # len(_LAYER_KINDS_PHASE1) * _LAYER_TRACK_H
-    # The BEAT-DBG strip sits between the segment track and the waveform.
-    # Strip body and tick overhang were doubled vs the original
-    # rhythm.py-mirroring layout to make ticks easy to target with a
-    # mouse — the strip is now 16 px tall and ticks extend 12 px above
-    # and below it (40 px total).  Numbers go ~6 px above the tick top.
-    # The waveform track was nudged 10 px down to keep a comfortable gap
-    # below the lengthened ticks; scene height grew accordingly.
-    _BEAT_STRIP_Y = 178            # was 114; shifted +64 by layer tracks
+    # All layer kinds — order determines top-to-bottom track position.
+    _LAYER_KINDS = ("background", "floor", "side_rails", "stickman", "countdown")
+    _LAYER_TRACKS_TOTAL_H = 160   # len(_LAYER_KINDS) * _LAYER_TRACK_H  (5 × 32)
+    # The BEAT-DBG strip sits between the layer tracks and the waveform.
+    _BEAT_STRIP_Y = 274            # 104 + 160 + 10 gap
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 208            # was 144; shifted +64 by layer tracks
-    _WAVE_TRACK_H = 160            # doubled from 80
-    _SCENE_H = 378                 # was 314; +64 for layer tracks
+    _WAVE_TRACK_Y = 304            # 274 + 16 + 14 gap
+    _WAVE_TRACK_H = 160
+    _SCENE_H = 474                 # 304 + 160 + 10
 
     def _draw_tracks(self) -> None:
         """No-op kept for call-site compatibility.
@@ -4060,11 +4168,7 @@ class TimelinePanel(QWidget):
             ))
 
             # ── Layer track strips ──────────────────────────────────
-            _layer_track_labels = {
-                "background": "Background",
-                "floor": "Floor",
-            }
-            for idx, kind in enumerate(self._LAYER_KINDS_PHASE1):
+            for idx, kind in enumerate(self._LAYER_KINDS):
                 ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
                 # Slightly lighter than segment track to differentiate
                 painter.setBrush(QBrush(QColor("#141414")))
@@ -4085,9 +4189,9 @@ class TimelinePanel(QWidget):
                 QPointF(4.0, float(self._SEGMENT_TRACK_Y) + label_baseline_offset),
                 "Segments",
             )
-            for idx, kind in enumerate(self._LAYER_KINDS_PHASE1):
+            for idx, kind in enumerate(self._LAYER_KINDS):
                 ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
-                label = _layer_track_labels.get(kind, kind.replace("_", " ").title())
+                label = kind.replace("_", " ").title()
                 color = QColor(LAYER_KIND_COLORS.get(kind, "#888888"))
                 color.setAlphaF(0.55)
                 painter.setPen(QPen(color))
@@ -4234,9 +4338,9 @@ class TimelinePanel(QWidget):
         if not self._project:
             return
         for layer in self._project.layers:
-            if layer.kind not in self._LAYER_KINDS_PHASE1:
+            if layer.kind not in self._LAYER_KINDS:
                 continue
-            kind_idx = self._LAYER_KINDS_PHASE1.index(layer.kind)
+            kind_idx = self._LAYER_KINDS.index(layer.kind)
             x = self._time_to_x(layer.start_time_sec)
             w = max(4.0, layer.duration_sec * self._effective_pps)
             item_y = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)
@@ -4257,9 +4361,9 @@ class TimelinePanel(QWidget):
                 layer = self._project.get_layer(layer_id)
                 if layer is None:
                     continue
-                if layer.kind not in self._LAYER_KINDS_PHASE1:
+                if layer.kind not in self._LAYER_KINDS:
                     continue
-                kind_idx = self._LAYER_KINDS_PHASE1.index(layer.kind)
+                kind_idx = self._LAYER_KINDS.index(layer.kind)
                 x = self._time_to_x(layer.start_time_sec)
                 w = max(4.0, layer.duration_sec * self._effective_pps)
                 ty = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)

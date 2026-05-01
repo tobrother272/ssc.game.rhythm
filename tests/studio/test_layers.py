@@ -1,4 +1,4 @@
-"""Tests for multi-track timeline layer system — Phase 1 acceptance criteria."""
+"""Tests for multi-track timeline layer system — Phase 1 + cleanup spec."""
 
 from __future__ import annotations
 
@@ -8,7 +8,13 @@ import tempfile
 
 import pytest
 
-from studio.models import Layer, Project, auto_create_default_layers, resolve_segment_config
+from studio.models import (
+    Layer,
+    Project,
+    auto_create_default_layers,
+    migrate_render_settings_to_layers,
+    resolve_segment_config,
+)
 from studio.models.layer import _default_floor_config, LAYER_KIND_COLORS
 from studio.models.segment import Segment
 from studio.persistence.project_store import ProjectStore
@@ -80,12 +86,14 @@ def test_default_background_config():
 # auto_create_default_layers
 # ---------------------------------------------------------------------------
 
-def test_auto_create_creates_background_and_floor():
+def test_auto_create_creates_background_floor_stickman():
     proj, seg = _proj_with_seg(0.0, 30.0)
     auto_create_default_layers(proj, seg)
     kinds = {la.kind for la in proj.layers}
     assert "background" in kinds
     assert "floor" in kinds
+    assert "stickman" in kinds
+    assert len(proj.layers) == 3
 
 
 def test_auto_create_covers_segment_range():
@@ -96,15 +104,23 @@ def test_auto_create_covers_segment_range():
         assert la.end_time_sec == 25.0
 
 
+def test_auto_create_stickman_default_config():
+    proj, seg = _proj_with_seg(0.0, 30.0)
+    auto_create_default_layers(proj, seg)
+    stick = next(la for la in proj.layers if la.kind == "stickman")
+    assert stick.config["stickman"] is True
+    assert "stickman_location" in stick.config
+
+
 def test_auto_create_skips_if_overlap_exists():
     """Creating a second segment adjacent to the first should NOT stack."""
     proj = Project(name="T")
     seg1 = _seg(0.0, 10.0)
     proj.segments.append(seg1)
     auto_create_default_layers(proj, seg1)
-    assert len(proj.layers) == 2
+    assert len(proj.layers) == 3
 
-    # Extend background layer to cover full project
+    # Extend all layers to cover full project
     for la in proj.layers:
         la.end_time_sec = 30.0
 
@@ -112,7 +128,7 @@ def test_auto_create_skips_if_overlap_exists():
     seg2 = _seg(10.0, 20.0)
     proj.segments.append(seg2)
     auto_create_default_layers(proj, seg2)
-    assert len(proj.layers) == 2  # no new layers added
+    assert len(proj.layers) == 3  # no new layers added
 
 
 def test_auto_create_no_skip_if_adjacent_no_overlap():
@@ -121,12 +137,12 @@ def test_auto_create_no_skip_if_adjacent_no_overlap():
     seg1 = _seg(0.0, 10.0)
     proj.segments.append(seg1)
     auto_create_default_layers(proj, seg1)
-    assert len(proj.layers) == 2
+    assert len(proj.layers) == 3
 
     seg2 = _seg(10.0, 20.0)
     proj.segments.append(seg2)
     auto_create_default_layers(proj, seg2)
-    assert len(proj.layers) == 4  # 2 more layers for seg2
+    assert len(proj.layers) == 6  # 3 more layers for seg2
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +247,12 @@ def test_persistence_round_trip():
         store.save(proj, path)
         loaded = store.load(path)
 
-    assert len(loaded.layers) == 3
+    # 3 auto (background + floor + stickman) + 1 custom = 4
+    assert len(loaded.layers) == 4
     kinds = [la.kind for la in loaded.layers]
     assert kinds.count("background") == 2
     assert kinds.count("floor") == 1
+    assert kinds.count("stickman") == 1
 
     # Custom layer config preserved
     custom = next(la for la in loaded.layers if la.name == "Custom BG")
@@ -276,3 +294,105 @@ def test_layer_kind_colors_all_defined():
     for kind in ("background", "side_rails", "floor", "stickman", "countdown"):
         assert kind in LAYER_KIND_COLORS
         assert LAYER_KIND_COLORS[kind].startswith("#")
+
+
+# ---------------------------------------------------------------------------
+# Migration — migrate_render_settings_to_layers
+# ---------------------------------------------------------------------------
+
+def test_migration_extracts_rail_color():
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"rail_color": "#FF0000", "side_rails": True})
+    proj.segments.append(seg)
+    migrate_render_settings_to_layers(proj)
+    rail_layers = [la for la in proj.layers if la.kind == "side_rails"]
+    assert len(rail_layers) == 1
+    assert rail_layers[0].config["rail_color"] == "#FF0000"
+
+
+def test_migration_extracts_stickman():
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"stickman": True, "stickman_location": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.5}})
+    proj.segments.append(seg)
+    migrate_render_settings_to_layers(proj)
+    stick_layers = [la for la in proj.layers if la.kind == "stickman"]
+    assert len(stick_layers) == 1
+    assert stick_layers[0].config["stickman"] is True
+
+
+def test_migration_extracts_countdown():
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"relax_countdown_enabled": True, "relax_countdown_color": "#FFFF00"})
+    proj.segments.append(seg)
+    migrate_render_settings_to_layers(proj)
+    cd_layers = [la for la in proj.layers if la.kind == "countdown"]
+    assert len(cd_layers) == 1
+    assert cd_layers[0].config["relax_countdown_enabled"] is True
+
+
+def test_migration_idempotent():
+    """Running migration twice must not duplicate layers."""
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"side_rails": True, "rail_color": "#0000FF"})
+    proj.segments.append(seg)
+    migrate_render_settings_to_layers(proj)
+    count_after_first = len(proj.layers)
+    migrate_render_settings_to_layers(proj)
+    assert len(proj.layers) == count_after_first
+
+
+def test_migration_skips_kind_if_layer_exists():
+    """Migration skips a kind if a layer of that kind already overlaps."""
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"stickman": True})
+    proj.segments.append(seg)
+    # Pre-create a stickman layer
+    proj.layers.append(Layer(kind="stickman", start_time_sec=0.0, end_time_sec=30.0, config={}))
+    migrate_render_settings_to_layers(proj)
+    assert len([la for la in proj.layers if la.kind == "stickman"]) == 1
+
+
+def test_migration_no_fields_no_layer():
+    """Segment with no visual fields → no layers created."""
+    proj = Project(name="T")
+    seg = _seg(0.0, 30.0, rs={"beat_sens": 0.65, "density": 0.5})
+    proj.segments.append(seg)
+    migrate_render_settings_to_layers(proj)
+    assert proj.layers == []
+
+
+def test_migration_on_load_old_project():
+    """ProjectStore.load auto-migrates old project files on load."""
+    old_data = {
+        "id": "x",
+        "name": "old project",
+        "segments": [
+            {
+                "id": "s1",
+                "name": "Seg 1",
+                "start_time_sec": 0.0,
+                "end_time_sec": 30.0,
+                "mode": "punch",
+                "render_settings": {"stickman": True, "floor_panels": True},
+                "audio_path": None,
+            }
+        ],
+        "media_items": [],
+    }
+    store = ProjectStore()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "old.htproj"
+        path.write_text(json.dumps(old_data))
+        loaded = store.load(path)
+    kinds = {la.kind for la in loaded.layers}
+    assert "stickman" in kinds
+    assert "floor" in kinds
+
+
+def test_auto_create_does_not_include_side_rails_countdown():
+    """Side rails and countdown are NOT auto-created."""
+    proj, seg = _proj_with_seg(0.0, 30.0)
+    auto_create_default_layers(proj, seg)
+    kinds = {la.kind for la in proj.layers}
+    assert "side_rails" not in kinds
+    assert "countdown" not in kinds

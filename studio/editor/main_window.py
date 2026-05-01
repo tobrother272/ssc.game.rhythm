@@ -1203,15 +1203,11 @@ class MainWindow(QMainWindow):
     def _on_stickman_location_edited(
         self, segment_id: str, location: dict
     ) -> None:
-        """Persist a player-overlay drag/resize back onto the segment.
+        """Persist a stickman drag/resize into the overlapping stickman layer.
 
-        ``location`` is ``{"x", "y", "w", "h"}`` fractions (0..1) of
-        the rendered frame, exactly the shape stored on
-        :attr:`Segment.stickman_location` and consumed by
-        :meth:`RenderService._run_job` when building the
-        ``--stick_x0/y0/w/h`` CLI flags.  We round to 4 decimals so
-        the JSON file stays readable / diff-friendly without losing
-        sub-pixel precision at the project's max resolution.
+        Routes drag edits from the preview overlay into the layer system.
+        Auto-creates a stickman layer if none overlaps the segment.
+        Also keeps segment.stickman_location in sync for backward compat.
         """
         if not segment_id:
             return
@@ -1219,7 +1215,7 @@ class MainWindow(QMainWindow):
         if seg is None:
             return
         try:
-            seg.stickman_location = {
+            loc = {
                 "x": round(float(location.get("x", 0.0)), 4),
                 "y": round(float(location.get("y", 0.0)), 4),
                 "w": round(float(location.get("w", 0.0)), 4),
@@ -1227,19 +1223,39 @@ class MainWindow(QMainWindow):
             }
         except (TypeError, ValueError):
             return
+
+        # Update (or auto-create) the stickman layer overlapping this segment.
+        from studio.models.layer import Layer
+        layers = self.project.layers_overlapping(
+            "stickman", seg.start_time_sec, seg.end_time_sec
+        )
+        if not layers:
+            self.project.layers.append(Layer(
+                kind="stickman",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Stickman",
+                config={"stickman": True, "stickman_location": loc},
+            ))
+        else:
+            top = max(layers, key=lambda la: la.z_index)
+            top.config["stickman_location"] = loc
+            top.config.setdefault("stickman", True)
+
+        # Keep segment.stickman_location in sync for legacy code paths.
+        try:
+            seg.stickman_location = loc
+        except AttributeError:
+            pass
+
+        self.timeline_panel.refresh()
         self._on_project_changed()
-        # Hot-reload live preview so the dragged box lands on the
-        # rendered frame within the next ~80 ms debounce tick — same
-        # treatment as a mode/density edit.  Without this the user has
-        # to toggle Preview off + on for the new placement to show up,
-        # defeating the point of the drag-edit overlay.
         self._request_preview_restart(seg.id)
         self.statusBar().showMessage(
             f"Stickman box updated for {seg.name}: "
-            f"x={seg.stickman_location['x']*100:.1f}% "
-            f"y={seg.stickman_location['y']*100:.1f}% "
-            f"w={seg.stickman_location['w']*100:.1f}% "
-            f"h={seg.stickman_location['h']*100:.1f}%",
+            f"x={loc['x']*100:.1f}% y={loc['y']*100:.1f}% "
+            f"w={loc['w']*100:.1f}% h={loc['h']*100:.1f}%",
             2500,
         )
 
