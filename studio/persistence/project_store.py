@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from studio.models import MediaItem, MediaKind, Project, RenderStatus, Segment
+from studio.models import Layer, MediaItem, MediaKind, Project, RenderStatus, Segment
 
 
 class ProjectStore:
@@ -20,6 +20,7 @@ class ProjectStore:
         path = path.resolve()
         project_dir = path.parent
         payload = {
+            "version": 2,
             "id": project.id,
             "name": project.name,
             "project_dir": str(project_dir),
@@ -31,6 +32,7 @@ class ProjectStore:
             "output_fps": project.output_fps,
             "media_items": [self._serialize_media(item, project_dir) for item in project.media_items],
             "segments": [self._serialize_segment(item, project_dir) for item in project.segments],
+            "layers": [self._serialize_layer(la, project_dir) for la in project.layers],
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -56,6 +58,10 @@ class ProjectStore:
         project.segments = [
             self._deserialize_segment(item, project_dir)
             for item in payload.get("segments", [])
+        ]
+        project.layers = [
+            self._deserialize_layer(item, project_dir)
+            for item in payload.get("layers", [])
         ]
         return project
 
@@ -165,6 +171,36 @@ class ProjectStore:
                 payload.get("min_beat_spacing_sec", 0.0) or 0.0
             ))),
             stickman_location=stickman_location,
+        )
+
+    def _serialize_layer(self, layer: Layer, project_dir: Path) -> dict[str, Any]:
+        config = dict(layer.config)
+        for key in ("bg_image_path", "bg_video_path", "rail_image", "floor_panel_image"):
+            if key in config and config[key]:
+                config[key] = self._to_relative(config[key], project_dir)
+        return {
+            "id": layer.id,
+            "kind": layer.kind,
+            "start_time_sec": layer.start_time_sec,
+            "end_time_sec": layer.end_time_sec,
+            "z_index": layer.z_index,
+            "name": layer.name,
+            "config": config,
+        }
+
+    def _deserialize_layer(self, payload: dict[str, Any], project_dir: Path) -> Layer:
+        config = dict(payload.get("config", {}))
+        for key in ("bg_image_path", "bg_video_path", "rail_image", "floor_panel_image"):
+            if key in config and config[key]:
+                config[key] = self._to_absolute(config[key], project_dir)
+        return Layer(
+            id=payload.get("id", ""),
+            kind=payload.get("kind", "background"),
+            start_time_sec=float(payload.get("start_time_sec", 0.0)),
+            end_time_sec=float(payload.get("end_time_sec", 0.0)),
+            z_index=int(payload.get("z_index", 0)),
+            name=payload.get("name", ""),
+            config=config,
         )
 
     @staticmethod

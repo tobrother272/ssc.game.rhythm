@@ -437,6 +437,7 @@ class MainWindow(QMainWindow):
             self._on_segment_duplicated
         )
         self.timeline_panel.segment_moved.connect(self._on_segment_moved)
+        self.timeline_panel.layer_changed.connect(self._on_layer_changed)
 
         # Undo / redo — delegate to the timeline panel's undo stack.
         undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
@@ -1384,6 +1385,8 @@ class MainWindow(QMainWindow):
             is_video_segment=is_video,
         )
         self.project.segments.append(segment)
+        from studio.models.layer import auto_create_default_layers
+        auto_create_default_layers(self.project, segment)
         self.timeline_panel.refresh()
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
@@ -1561,6 +1564,18 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Handle timeline segment drag — mark project dirty."""
         self._on_project_changed()
+
+    def _on_layer_changed(self) -> None:
+        """A layer block was added / moved / resized / deleted.
+
+        Mark project dirty and trigger a live-preview hot-reload so the
+        effective config (layer overrides render_settings) is reflected
+        immediately in the preview frame.
+        """
+        self._on_project_changed()
+        seg_id = self._preview_active_segment_id
+        if seg_id:
+            self._request_preview_restart(seg_id)
 
     def _on_segment_delete_requested(self, segment_id: str) -> None:
         """Drop a segment from the project after user-confirmed delete.
@@ -2039,7 +2054,8 @@ class MainWindow(QMainWindow):
             def _parse_color(_: str) -> None:  # type: ignore[no-redef]
                 return None
 
-        rs = segment.render_settings or {}
+        from studio.models.layer import resolve_segment_config
+        rs = resolve_segment_config(segment, self.project.layers)
 
         def _get(key: str, default):
             val = rs.get(key, default)
@@ -2267,7 +2283,8 @@ class MainWindow(QMainWindow):
         # update — even when only the mode list changed — is harmless:
         # the renderer just rebinds attrs to their existing values.
         if do_mode:
-            rs = segment.render_settings or {}
+            from studio.models.layer import resolve_segment_config
+            rs = resolve_segment_config(segment, self.project.layers)
             show_stickman = bool(rs.get("stickman", True))
             show_floor_panels = bool(rs.get("floor_panels", True))
             # Use "" (not None) so update_mode's "if x is not None" guard
@@ -2451,6 +2468,7 @@ class MainWindow(QMainWindow):
             output_height=self.project.output_height,
             output_fps=self.project.output_fps,
             project_temps_dir=str(self._app_temps_dir()),
+            project_layers=self.project.layers,
         )
         self.render_service.enqueue(job)
         # Show "Rendering 0%" overlay over the player so the user gets clear

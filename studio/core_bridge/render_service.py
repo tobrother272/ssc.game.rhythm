@@ -126,6 +126,7 @@ class RenderService(QObject):
         output_fps: Optional[int] = None,
         is_preview: bool = False,
         project_temps_dir: Optional[str] = None,
+        project_layers: Optional[list] = None,
     ) -> RenderJob:
         """Build render job object from segment state.
 
@@ -167,8 +168,14 @@ class RenderService(QObject):
         # the ``--stick_*`` flags would be silently ignored anyway,
         # and we keep the CLI line shorter for the easier-to-read
         # log lines.
+        if project_layers is not None:
+            from studio.models.layer import resolve_segment_config
+            effective_settings = resolve_segment_config(segment, project_layers)
+        else:
+            effective_settings = segment.render_settings or {}
+
         stick_loc: dict = {}
-        rs = segment.render_settings or {}
+        rs = effective_settings
         if bool(rs.get("stickman", True)):
             sl = getattr(segment, "stickman_location", None) or {}
             try:
@@ -185,7 +192,7 @@ class RenderService(QObject):
             mode=segment.mode,
             audio_path=segment.audio_path,
             output_path=str(output_path),
-            render_settings=segment.render_settings or {},
+            render_settings=effective_settings,
             start_time_sec=segment.start_time_sec,
             duration_sec=dur,
             is_preview=is_preview,

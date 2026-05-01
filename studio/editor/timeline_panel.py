@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -22,6 +22,10 @@ from PySide6.QtGui import (
     QUndoStack,
 )
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsLineItem,
@@ -32,6 +36,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -42,7 +47,8 @@ from PySide6.QtWidgets import (
 )
 
 from studio.editor.media_library import MEDIA_ID_MIME
-from studio.models import Project, Segment
+from studio.models import Layer, Project, Segment
+from studio.models.layer import LAYER_KIND_COLORS
 
 
 def format_seconds(value: float) -> str:
@@ -448,6 +454,69 @@ def _zoom_control_icons(size: int = 18) -> tuple[QIcon, QIcon, QIcon, QIcon, QIc
     return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
 
 
+def _layer_button_pixmaps(size: int, stroke: QColor) -> tuple[QPixmap, QPixmap]:
+    """Background / Floor layer button pixmaps (Phase 1 — 2 icons)."""
+    s = float(size)
+    m = s * 0.10
+
+    def _blank() -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    pen = QPen(stroke)
+    pen.setWidthF(1.1)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    # --- Background: rectangle outline + diagonal stripe ---
+    pm_bg = _blank()
+    p = QPainter(pm_bg)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    rx0, ry0 = m, m + s * 0.15
+    rw, rh = s - 2 * m, s - 2 * m - s * 0.15
+    p.drawRect(QRectF(rx0, ry0, rw, rh))
+    # diagonal stripe
+    p.drawLine(QPointF(rx0, ry0 + rh * 0.55), QPointF(rx0 + rw * 0.45, ry0))
+    p.drawLine(QPointF(rx0 + rw * 0.45, ry0 + rh), QPointF(rx0 + rw, ry0 + rh * 0.35))
+    p.end()
+
+    # --- Floor: 3×2 tile grid ---
+    pm_floor = _blank()
+    p = QPainter(pm_floor)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    gx0, gy0 = m, m + s * 0.10
+    gw, gh = s - 2 * m, s - 2 * m - s * 0.10
+    p.drawRect(QRectF(gx0, gy0, gw, gh))
+    # 2 internal vertical dividers (3 columns)
+    for xi in (1.0 / 3.0, 2.0 / 3.0):
+        p.drawLine(QPointF(gx0 + gw * xi, gy0), QPointF(gx0 + gw * xi, gy0 + gh))
+    # 1 internal horizontal divider (2 rows)
+    p.drawLine(QPointF(gx0, gy0 + gh * 0.5), QPointF(gx0 + gw, gy0 + gh * 0.5))
+    p.end()
+
+    return pm_bg, pm_floor
+
+
+def _layer_button_icons(size: int = 18) -> tuple[QIcon, QIcon]:
+    """Return (background, floor) layer toolbar icons."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+    pms_on = _layer_button_pixmaps(size, c_on)
+    pms_off = _layer_button_pixmaps(size, c_off)
+
+    def _mk(pm_on: QPixmap, pm_off: QPixmap) -> QIcon:
+        ic = QIcon(pm_on)
+        ic.addPixmap(pm_off, QIcon.Mode.Disabled, QIcon.State.Off)
+        return ic
+
+    return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
+
+
 # ---------------------------------------------------------------------------
 # Zoom range — controls the timeline's pixels-per-second (pps) values.
 #
@@ -822,6 +891,129 @@ class SegmentRectItem(QGraphicsRectItem):
         # label) paint themselves on top of the background layer
         # via Qt's normal item recursion.
         return
+
+
+class LayerBlockItem(QGraphicsRectItem):
+    """Draggable / resizable timeline block for a layer.
+
+    Visuals are painted by :meth:`TimelinePanel._paint_layer_blocks` in the
+    scene background pass (same pattern as SegmentRectItem).  This item
+    only carries geometry + selection + mouse interaction.
+    """
+
+    EDGE_HIT_W = 8.0
+    MIN_DURATION_SEC = 0.1
+
+    def __init__(self, layer_id: str, panel: "TimelinePanel") -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self._panel = panel
+        self._resize_edge: Optional[str] = None  # "left" | "right" | None
+        self._drag_start_scene_x: float = 0.0
+        self._drag_start_layer_start: float = 0.0
+        self._drag_start_layer_end: float = 0.0
+        self.setFlags(
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(
+            Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton
+        )
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        return  # visuals painted in drawBackground pass
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            event.accept()
+            self._panel._on_layer_block_context_menu(
+                self.layer_id, event.screenPos().toPoint()
+            )
+            return
+        r = self.rect()
+        pos = event.pos()
+        if pos.x() <= self.EDGE_HIT_W:
+            self._resize_edge = "left"
+        elif pos.x() >= r.width() - self.EDGE_HIT_W:
+            self._resize_edge = "right"
+        else:
+            self._resize_edge = None
+        self._drag_start_scene_x = event.scenePos().x()
+        layer = self._panel._get_layer(self.layer_id)
+        if layer is not None:
+            self._drag_start_layer_start = layer.start_time_sec
+            self._drag_start_layer_end = layer.end_time_sec
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        dx = event.scenePos().x() - self._drag_start_scene_x
+        dt = dx / max(0.001, self._panel._effective_pps)
+        layer = self._panel._get_layer(self.layer_id)
+        if layer is None:
+            return
+        if self._resize_edge == "left":
+            new_start = max(0.0, self._drag_start_layer_start + dt)
+            new_start = min(
+                new_start, self._drag_start_layer_end - self.MIN_DURATION_SEC
+            )
+            layer.start_time_sec = new_start
+        elif self._resize_edge == "right":
+            new_end = max(
+                self._drag_start_layer_start + self.MIN_DURATION_SEC,
+                self._drag_start_layer_end + dt,
+            )
+            layer.end_time_sec = new_end
+        else:
+            dur = self._drag_start_layer_end - self._drag_start_layer_start
+            new_start = max(0.0, self._drag_start_layer_start + dt)
+            layer.start_time_sec = new_start
+            layer.end_time_sec = new_start + dur
+        # Trigger repaint without full rebuild
+        try:
+            self._panel.scene.invalidate(
+                self._panel.scene.sceneRect(),
+                QGraphicsScene.SceneLayer.BackgroundLayer,
+            )
+        except RuntimeError:
+            pass
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._resize_edge is not None or True:
+            self._panel._on_layer_move_finished(self.layer_id)
+        self._resize_edge = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        self._panel._on_layer_block_double_clicked(self.layer_id)
+        event.accept()
+
+    def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
+        r = self.rect()
+        pos = event.pos()
+        if pos.x() <= self.EDGE_HIT_W or pos.x() >= r.width() - self.EDGE_HIT_W:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def hoverLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+
+    def itemChange(self, change, value):  # type: ignore[override]
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemSelectedHasChanged:
+            scene = self.scene()
+            if scene is not None:
+                try:
+                    scene.invalidate(
+                        scene.sceneRect(),
+                        QGraphicsScene.SceneLayer.BackgroundLayer,
+                    )
+                except RuntimeError:
+                    pass
+        return super().itemChange(change, value)
 
 
 class WaveformThresholdLine(QGraphicsRectItem):
@@ -1461,6 +1653,7 @@ class TimelineScene(QGraphicsScene):
             # items and paint on top of this background pass.
             self._panel._paint_track_decorations(painter, rect)
             self._panel._paint_segment_blocks(painter, rect)
+            self._panel._paint_layer_blocks(painter, rect)
             self._panel._paint_waveform_background(painter, rect)
             self._panel._paint_beat_strip_decorations(painter, rect)
             self._panel._paint_beat_ticks(painter, rect)
@@ -1613,10 +1806,27 @@ class TimelineView(QGraphicsView):
         # also matches when ``itemAt`` returns ``None`` because Qt
         # filtered them out of hit-testing.
         panel = self._panel_ref
+        on_layer_block = isinstance(hit_item, LayerBlockItem)
         if panel is not None and not on_tick and not on_threshold and not on_segment:
             wave_top = float(panel._WAVE_TRACK_Y)
             wave_bot = wave_top + float(panel._WAVE_TRACK_H)
             if wave_top <= scene_pos.y() <= wave_bot:
+                event.accept()
+                return
+
+        # ── Layer-track-area guard ────────────────────────────────────
+        # Clicks on empty layer track area (not a LayerBlockItem) should
+        # not scrub the playhead, but also not do anything else.
+        if (
+            panel is not None
+            and not on_tick
+            and not on_threshold
+            and not on_segment
+            and not on_layer_block
+        ):
+            layer_top = float(panel._LAYER_TRACK_Y)
+            layer_bot = float(panel._LAYER_TRACK_Y + panel._LAYER_TRACKS_TOTAL_H)
+            if layer_top <= scene_pos.y() <= layer_bot:
                 event.accept()
                 return
 
@@ -1946,6 +2156,11 @@ class TimelinePanel(QWidget):
     # Emitted after Ctrl+D duplicates a segment.  Carries the new segment id.
     segment_duplicated = Signal(str)  # new_segment_id
 
+    # Emitted whenever a layer block is moved, resized, added, or deleted.
+    # MainWindow listens and triggers a live-preview hot-reload so the
+    # preview reflects the new effective config immediately.
+    layer_changed = Signal()
+
     # Emitted after a drag moves a segment to a new time position.
     # Carries segment_id, new_start_time_sec, new_end_time_sec.
     segment_moved = Signal(str, float, float)
@@ -1954,6 +2169,8 @@ class TimelinePanel(QWidget):
         super().__init__(parent)
         self._project: Optional[Project] = None
         self._block_map: dict[str, SegmentRectItem] = {}
+        # Maps layer_id → LayerBlockItem for Phase 1 layer tracks.
+        self._layer_block_map: dict[str, LayerBlockItem] = {}
         # Maps ``(segment_id, event_idx)`` → the BeatTickItem so the
         # background paint pass can read each tick's current
         # position / selection state without scanning ``scene.items()``.
@@ -2084,6 +2301,213 @@ class TimelinePanel(QWidget):
         self.view._pps = self.pixels_per_second
         self.refresh()
 
+    # -- Layer helpers -------------------------------------------------------
+    def _get_layer(self, layer_id: str) -> Optional[Layer]:
+        if self._project is None:
+            return None
+        return self._project.get_layer(layer_id)
+
+    def _get_selected_segment_id(self) -> Optional[str]:
+        return self._selected_segment_id
+
+    def _on_layer_moved(self, layer_id: str) -> None:
+        """Called during drag: just invalidate background for smooth repaint."""
+        try:
+            self.scene.invalidate(
+                self.scene.sceneRect(),
+                QGraphicsScene.SceneLayer.BackgroundLayer,
+            )
+        except RuntimeError:
+            pass
+
+    def _on_layer_move_finished(self, layer_id: str) -> None:
+        """Called on mouse release after dragging/resizing a layer block."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        # Rebuild the scene item at correct x/w after time change
+        self.refresh()
+        self.layer_changed.emit()
+
+    def _on_layer_block_context_menu(
+        self, layer_id: str, screen_pos: "QPoint"
+    ) -> None:
+        """Right-click context menu for a layer block."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        menu = QMenu(self)
+        edit_act = menu.addAction("Edit…")
+        dup_act = menu.addAction("Duplicate")
+        menu.addSeparator()
+        del_act = menu.addAction("Delete")
+        chosen = menu.exec(screen_pos)
+        if chosen == del_act:
+            self._do_delete_layer(layer_id)
+        elif chosen == dup_act:
+            self._do_duplicate_layer(layer_id)
+        elif chosen == edit_act:
+            self._on_layer_block_double_clicked(layer_id)
+
+    def _on_layer_block_double_clicked(self, layer_id: str) -> None:
+        """Double-click: open a simple time-range editor dialog."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"Edit {layer.kind.replace('_', ' ').title()} Layer"
+        )
+        form = QFormLayout(dlg)
+        start_edit = QLineEdit(f"{layer.start_time_sec:.3f}")
+        end_edit = QLineEdit(f"{layer.end_time_sec:.3f}")
+        name_edit = QLineEdit(layer.name)
+        form.addRow("Name:", name_edit)
+        form.addRow("Start (sec):", start_edit)
+        form.addRow("End (sec):", end_edit)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        form.addRow(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            new_start = max(0.0, float(start_edit.text()))
+            new_end = max(new_start + 0.1, float(end_edit.text()))
+        except ValueError:
+            return
+        old_start = layer.start_time_sec
+        old_end = layer.end_time_sec
+        old_name = layer.name
+        layer.start_time_sec = new_start
+        layer.end_time_sec = new_end
+        layer.name = name_edit.text().strip() or old_name
+
+        def _undo():
+            la = self._get_layer(layer_id)
+            if la:
+                la.start_time_sec = old_start
+                la.end_time_sec = old_end
+                la.name = old_name
+                self.refresh()
+
+        def _redo():
+            la = self._get_layer(layer_id)
+            if la:
+                la.start_time_sec = new_start
+                la.end_time_sec = new_end
+                la.name = name_edit.text().strip() or old_name
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Edit {layer.kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+
+    def _do_delete_layer(self, layer_id: str) -> None:
+        if self._project is None:
+            return
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        self._project.layers.remove(layer)
+
+        def _undo():
+            if self._project and layer not in self._project.layers:
+                self._project.layers.append(layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and layer in self._project.layers:
+                self._project.layers.remove(layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Delete {layer.kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+
+    def _do_duplicate_layer(self, layer_id: str) -> None:
+        if self._project is None:
+            return
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        from uuid import uuid4
+        new_layer = Layer(
+            id=str(uuid4()),
+            kind=layer.kind,
+            start_time_sec=layer.start_time_sec,
+            end_time_sec=layer.end_time_sec,
+            z_index=layer.z_index + 1,
+            name=f"{layer.name} (copy)" if layer.name else "",
+            config=dict(layer.config),
+        )
+        self._project.layers.append(new_layer)
+
+        def _undo():
+            if self._project and new_layer in self._project.layers:
+                self._project.layers.remove(new_layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and new_layer not in self._project.layers:
+                self._project.layers.append(new_layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Duplicate {layer.kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+
+    def _on_add_layer_clicked(self, kind: str) -> None:
+        """Create a new layer block at the appropriate time range."""
+        if self._project is None:
+            return
+        sel_id = self._get_selected_segment_id()
+        if sel_id:
+            seg = self._project.get_segment(sel_id)
+            start = seg.start_time_sec if seg else 0.0
+            end = seg.end_time_sec if seg else 30.0
+        elif self._project.segments:
+            start = 0.0
+            end = max(s.end_time_sec for s in self._project.segments)
+        else:
+            start = 0.0
+            end = 30.0
+
+        from studio.models.layer import _default_floor_config
+        if kind == "background":
+            config: dict = {"bg_type": "solid", "bg_color": "#000000"}
+        elif kind == "floor":
+            config = _default_floor_config()
+        else:
+            config = {}
+
+        new_layer = Layer(
+            kind=kind,
+            start_time_sec=start,
+            end_time_sec=end,
+            z_index=0,
+            name=kind.replace("_", " ").title(),
+            config=config,
+        )
+        self._project.layers.append(new_layer)
+
+        def _undo():
+            if self._project and new_layer in self._project.layers:
+                self._project.layers.remove(new_layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and new_layer not in self._project.layers:
+                self._project.layers.append(new_layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Add {kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+
     def refresh(self) -> None:
         """Rebuild scene from project segments.
 
@@ -2115,6 +2539,7 @@ class TimelinePanel(QWidget):
                 self._block_map.clear()
                 self._tick_map.clear()
                 self._threshold_map.clear()
+                self._layer_block_map.clear()
                 self._update_scene_width()
                 self._draw_ruler()
                 self._draw_tracks()
@@ -2123,6 +2548,7 @@ class TimelinePanel(QWidget):
                 if self._project:
                     for segment in self._project.sorted_segments():
                         self._draw_segment(segment)
+                    self._draw_layer_blocks()
                     # Restore selection silently while signals are blocked.
                     if prev_selected_id and prev_selected_id in self._block_map:
                         self._block_map[prev_selected_id].setSelected(True)
@@ -3059,6 +3485,50 @@ class TimelinePanel(QWidget):
         self.clear_beats_button.clicked.connect(self._on_clear_beats_clicked)
         top.addWidget(self.clear_beats_button)
 
+        # ── Add Layer group (Phase 1: Background + Floor) ─────────────
+        _layer_sep = QFrame()
+        _layer_sep.setFrameShape(QFrame.Shape.VLine)
+        _layer_sep.setStyleSheet("QFrame { color: #444; margin: 4px 2px; }")
+        top.addWidget(_layer_sep)
+
+        _ic_add_bg, _ic_add_floor = _layer_button_icons(18)
+        _layer_icon_sz = QSize(18, 18)
+        _layer_btn_sz = 28
+
+        self.add_bg_button = QPushButton()
+        self.add_bg_button.setIcon(_ic_add_bg)
+        self.add_bg_button.setIconSize(_layer_icon_sz)
+        self.add_bg_button.setText("")
+        self.add_bg_button.setFlat(True)
+        self.add_bg_button.setObjectName("zoomIconButton")
+        self.add_bg_button.setFixedSize(_layer_btn_sz, _layer_btn_sz)
+        self.add_bg_button.setToolTip(
+            "Add Background layer — color/image/video covering segment range.\n"
+            "Default: solid black #000000 covering selected segment.\n"
+            "Right-click block to edit, drag to resize."
+        )
+        self.add_bg_button.clicked.connect(
+            lambda: self._on_add_layer_clicked("background")
+        )
+        top.addWidget(self.add_bg_button)
+
+        self.add_floor_button = QPushButton()
+        self.add_floor_button.setIcon(_ic_add_floor)
+        self.add_floor_button.setIconSize(_layer_icon_sz)
+        self.add_floor_button.setText("")
+        self.add_floor_button.setFlat(True)
+        self.add_floor_button.setObjectName("zoomIconButton")
+        self.add_floor_button.setFixedSize(_layer_btn_sz, _layer_btn_sz)
+        self.add_floor_button.setToolTip(
+            "Add Floor layer — floor panels / chevron config covering segment range.\n"
+            "Default: floor_panels=True, chevron_color=#FFD700.\n"
+            "Right-click block to edit, drag to resize."
+        )
+        self.add_floor_button.clicked.connect(
+            lambda: self._on_add_layer_clicked("floor")
+        )
+        top.addWidget(self.add_floor_button)
+
         # CapCut-style zoom bar:  [Fit] [Ratio] [Rule]  [−]  [===O===]  [+]
         _ic_fit, _ic_ratio, _ic_rule, _ic_zout, _ic_zin = _zoom_control_icons(18)
         _zoom_icon_sz = QSize(18, 18)
@@ -3489,6 +3959,13 @@ class TimelinePanel(QWidget):
     _RULER_H = 22
     _SEGMENT_TRACK_Y = 24
     _SEGMENT_TRACK_H = 80
+    # Layer tracks (Phase 1: Background + Floor) sit between the segment
+    # track and the beat-strip / waveform.  Each track is 32 px tall.
+    _LAYER_TRACK_Y = 104          # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
+    _LAYER_TRACK_H = 32           # height per layer track row
+    # Phase 1 layer kinds — order determines top-to-bottom track position.
+    _LAYER_KINDS_PHASE1 = ("background", "floor")
+    _LAYER_TRACKS_TOTAL_H = 64    # len(_LAYER_KINDS_PHASE1) * _LAYER_TRACK_H
     # The BEAT-DBG strip sits between the segment track and the waveform.
     # Strip body and tick overhang were doubled vs the original
     # rhythm.py-mirroring layout to make ticks easy to target with a
@@ -3496,11 +3973,11 @@ class TimelinePanel(QWidget):
     # and below it (40 px total).  Numbers go ~6 px above the tick top.
     # The waveform track was nudged 10 px down to keep a comfortable gap
     # below the lengthened ticks; scene height grew accordingly.
-    _BEAT_STRIP_Y = 114
+    _BEAT_STRIP_Y = 178            # was 114; shifted +64 by layer tracks
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 144
-    _WAVE_TRACK_H = 160   # doubled from 80
-    _SCENE_H = 314        # ruler + segment + beat-strip + waveform + padding
+    _WAVE_TRACK_Y = 208            # was 144; shifted +64 by layer tracks
+    _WAVE_TRACK_H = 160            # doubled from 80
+    _SCENE_H = 378                 # was 314; +64 for layer tracks
 
     def _draw_tracks(self) -> None:
         """No-op kept for call-site compatibility.
@@ -3582,7 +4059,24 @@ class TimelinePanel(QWidget):
                 float(self._SEGMENT_TRACK_H),
             ))
 
-            # ── Lane labels ("Segments" / "Waveform") ───────────────
+            # ── Layer track strips ──────────────────────────────────
+            _layer_track_labels = {
+                "background": "Background",
+                "floor": "Floor",
+            }
+            for idx, kind in enumerate(self._LAYER_KINDS_PHASE1):
+                ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
+                # Slightly lighter than segment track to differentiate
+                painter.setBrush(QBrush(QColor("#141414")))
+                painter.setPen(QPen(QColor("#222222")))
+                painter.drawRect(QRectF(0.0, ty, float(scene_w), float(self._LAYER_TRACK_H)))
+                # Top border separator line
+                sep_pen = QPen(QColor("#2a2a2a"))
+                sep_pen.setWidthF(1.0)
+                painter.setPen(sep_pen)
+                painter.drawLine(QPointF(0.0, ty), QPointF(float(scene_w), ty))
+
+            # ── Lane labels ("Segments" / layer kinds / "Waveform") ─
             painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             fm = painter.fontMetrics()
@@ -3591,6 +4085,14 @@ class TimelinePanel(QWidget):
                 QPointF(4.0, float(self._SEGMENT_TRACK_Y) + label_baseline_offset),
                 "Segments",
             )
+            for idx, kind in enumerate(self._LAYER_KINDS_PHASE1):
+                ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
+                label = _layer_track_labels.get(kind, kind.replace("_", " ").title())
+                color = QColor(LAYER_KIND_COLORS.get(kind, "#888888"))
+                color.setAlphaF(0.55)
+                painter.setPen(QPen(color))
+                painter.drawText(QPointF(4.0, ty + label_baseline_offset), label)
+            painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
             painter.drawText(
                 QPointF(4.0, float(self._WAVE_TRACK_Y) + label_baseline_offset),
                 "Waveform",
@@ -3724,6 +4226,83 @@ class TimelinePanel(QWidget):
                     diamond.lineTo(insert_x - d, y_top - 4)
                     diamond.closeSubpath()
                     painter.drawPath(diamond)
+        finally:
+            painter.restore()
+
+    def _draw_layer_blocks(self) -> None:
+        """Create LayerBlockItem scene items for all Phase-1 layers."""
+        if not self._project:
+            return
+        for layer in self._project.layers:
+            if layer.kind not in self._LAYER_KINDS_PHASE1:
+                continue
+            kind_idx = self._LAYER_KINDS_PHASE1.index(layer.kind)
+            x = self._time_to_x(layer.start_time_sec)
+            w = max(4.0, layer.duration_sec * self._effective_pps)
+            item_y = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)
+            item_h = float(self._LAYER_TRACK_H - 4)
+            block = LayerBlockItem(layer.id, self)
+            block.setRect(0, 0, w, item_h)
+            block.setPos(x, item_y)
+            self.scene.addItem(block)
+            self._layer_block_map[layer.id] = block
+
+    def _paint_layer_blocks(self, painter, rect) -> None:
+        """Paint layer block fills, outlines and labels in the background pass."""
+        if not self._project or not self._layer_block_map:
+            return
+        painter.save()
+        try:
+            for layer_id, block in list(self._layer_block_map.items()):
+                layer = self._project.get_layer(layer_id)
+                if layer is None:
+                    continue
+                if layer.kind not in self._LAYER_KINDS_PHASE1:
+                    continue
+                kind_idx = self._LAYER_KINDS_PHASE1.index(layer.kind)
+                x = self._time_to_x(layer.start_time_sec)
+                w = max(4.0, layer.duration_sec * self._effective_pps)
+                ty = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)
+                th = float(self._LAYER_TRACK_H - 4)
+                scene_rect = QRectF(x, ty, w, th)
+
+                color = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                color.setAlphaF(0.65)
+                painter.setBrush(QBrush(color))
+                outline_pen = QPen(QColor(255, 255, 255, 60), 1.0)
+                painter.setPen(outline_pen)
+                painter.drawRoundedRect(scene_rect, 3.0, 3.0)
+
+                # Selection halo
+                try:
+                    is_selected = bool(block.isSelected())
+                except RuntimeError:
+                    is_selected = False
+                if is_selected:
+                    halo_pen = QPen(QColor("#ffffff"), 1)
+                    halo_pen.setStyle(Qt.PenStyle.DashLine)
+                    painter.setPen(halo_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRoundedRect(
+                        scene_rect.adjusted(0.5, 0.5, -0.5, -0.5), 3.0, 3.0
+                    )
+
+                # Label + duration text
+                if w > 30:
+                    painter.setPen(QPen(QColor(255, 255, 255, 210)))
+                    label = layer.name or layer.kind.replace("_", " ").title()
+                    dur_str = f"  ({format_seconds(layer.duration_sec)})"
+                    display = label + dur_str if w > 90 else label
+                    painter.drawText(
+                        QRectF(x + 5, ty, w - 10, th),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                        display,
+                    )
+
+                # Left/right resize-handle ticks
+                handle_color = QColor(255, 255, 255, 90)
+                painter.fillRect(QRectF(x, ty + 2, 3, th - 4), handle_color)
+                painter.fillRect(QRectF(x + w - 3, ty + 2, 3, th - 4), handle_color)
         finally:
             painter.restore()
 
