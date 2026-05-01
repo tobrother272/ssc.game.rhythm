@@ -78,12 +78,13 @@ def _default_floor_config() -> dict:
 def auto_create_default_layers(project: "object", segment: "Segment") -> None:
     """Auto-generate Background + Floor + Stickman layers for a new segment.
 
-    Skips creation if a layer of the same kind already overlaps the
-    segment's range (avoids stacking duplicates when a segment is
-    created under an existing layer).
+    Creates one default layer per kind for this segment's exact time range.
+    Repeated calls for the same segment are idempotent: a kind is skipped
+    only when an exact-range layer of that kind already exists.
     """
     s_start = segment.start_time_sec
     s_end = segment.end_time_sec
+    eps = 1e-6
 
     defaults: list[tuple[LayerKind, dict]] = [
         ("background", {"bg_type": "solid", "bg_color": "#000000"}),
@@ -97,7 +98,9 @@ def auto_create_default_layers(project: "object", segment: "Segment") -> None:
     for kind, default_config in defaults:
         existing = [
             la for la in project.layers
-            if la.kind == kind and la.overlaps(s_start, s_end)
+            if la.kind == kind
+            and abs(la.start_time_sec - s_start) <= eps
+            and abs(la.end_time_sec - s_end) <= eps
         ]
         if existing:
             continue
@@ -193,11 +196,28 @@ def resolve_segment_config(
 ) -> dict:
     """Compute effective render config for a segment.
 
-    Merges segment.render_settings (legacy fallback) with any overlapping
-    layer configs.  For each layer kind the highest-z_index overlap wins.
-    Layer config keys override the matching keys in render_settings.
+    Visual layer fields (background, floor, rails, stickman, countdown) are
+    ONLY sourced from layer blocks, never from segment.render_settings.
+    This prevents stale pydantic defaults (e.g. background_color='#000000')
+    baked into render_settings from shadowing a layer's actual config.
+
+    Non-visual fields (mode, BPM, beat_source, lanes, …) come from
+    segment.render_settings as before.
     """
-    effective = dict(segment.render_settings or {})
+    # Collect all visual field names that must come from layers only.
+    _visual_keys: set[str] = set()
+    for keys in _VISUAL_FIELDS_BY_KIND.values():
+        _visual_keys.update(keys)
+    # Also include the long-form background aliases used by the renderer.
+    _visual_keys.update({"background_type", "background_color",
+                         "background_image", "background_video"})
+
+    # Start from segment render_settings minus all visual fields.
+    effective = {
+        k: v
+        for k, v in (segment.render_settings or {}).items()
+        if k not in _visual_keys
+    }
 
     s_start = segment.start_time_sec
     s_end = segment.end_time_sec
@@ -211,5 +231,31 @@ def resolve_segment_config(
             continue
         top_layer = max(overlapping, key=lambda la: la.z_index)
         effective.update(top_layer.config)
+
+    # Normalize background key aliases.
+    # _BackgroundSection.get_config() writes the short form (bg_type/bg_color/…)
+    # while the renderer reads the long form (background_type/background_color/…).
+    # When both forms are present the SHORT form (from the layer) must win,
+    # because layers always override the segment's render_settings.
+    _BG_ALIASES = (
+        ("bg_type",  "background_type"),
+        ("bg_color", "background_color"),
+        ("bg_image", "background_image"),
+        ("bg_video", "background_video"),
+    )
+    for short, long in _BG_ALIASES:
+        if short in effective:
+            # Layer wrote the short form.  Propagate to the long alias only
+            # when the value is concrete; ``None`` means "unset", and for
+            # required long-form fields like ``background_color`` we must keep
+            # the key absent so Pydantic can apply its own defaults.
+            short_val = effective[short]
+            if short_val is not None:
+                effective[long] = short_val
+        if long in effective:
+            # Only the long form exists (legacy segment rs) → mirror to short.
+            long_val = effective[long]
+            if long_val is not None:
+                effective[short] = long_val
 
     return effective

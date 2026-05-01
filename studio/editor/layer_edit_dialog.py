@@ -61,6 +61,17 @@ class _BackgroundSection(QGroupBox):
         ("Video", "video"),
     ]
 
+    @staticmethod
+    def _normalize_bg_type(value: object) -> str:
+        """Map incoming/legacy values to one of: solid/image/video."""
+        raw = str(value or "").strip().lower()
+        if raw in {"image", "img"}:
+            return "image"
+        if raw in {"video", "vid", "movie"}:
+            return "video"
+        # Treat unknown / legacy labels as solid for backward compatibility.
+        return "solid"
+
     def __init__(self, config: dict, parent: QWidget | None = None) -> None:
         super().__init__("Background", parent)
         form = QFormLayout(self)
@@ -71,8 +82,13 @@ class _BackgroundSection(QGroupBox):
         self._type_cb = QComboBox()
         for label, val in self._BG_TYPES:
             self._type_cb.addItem(label, val)
-        bg_type = config.get("bg_type") or config.get("background_type") or "solid"
-        idx = next((i for i, (_, v) in enumerate(self._BG_TYPES) if v == bg_type), 0)
+        self._bg_type = self._normalize_bg_type(
+            config.get("bg_type") or config.get("background_type") or "solid"
+        )
+        idx = next(
+            (i for i, (_, v) in enumerate(self._BG_TYPES) if v == self._bg_type),
+            0,
+        )
         self._type_cb.setCurrentIndex(idx)
         self._type_cb.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("Type", self._type_cb)
@@ -132,24 +148,27 @@ class _BackgroundSection(QGroupBox):
             self.changed.emit()
 
     def _on_type_changed(self) -> None:
+        # Keep an explicit state variable instead of relying only on
+        # currentData(); this avoids transient Qt combo data mismatches.
+        self._bg_type = self._normalize_bg_type(
+            self._type_cb.currentData() or self._type_cb.currentText()
+        )
         self._update_visibility()
         self.changed.emit()
 
     def _update_visibility(self) -> None:
-        bg_type = self._type_cb.currentData() or "solid"
-        self._color_btn.setVisible(bg_type == "solid")
-        self._img_edit.setVisible(bg_type == "image")
-        self._img_row_label.setVisible(bg_type == "image")
-        self._vid_edit.setVisible(bg_type == "video")
-        self._vid_row_label.setVisible(bg_type == "video")
+        self._color_btn.setVisible(self._bg_type == "solid")
+        self._img_edit.setVisible(self._bg_type == "image")
+        self._img_row_label.setVisible(self._bg_type == "image")
+        self._vid_edit.setVisible(self._bg_type == "video")
+        self._vid_row_label.setVisible(self._bg_type == "video")
 
     def get_config(self) -> dict:
-        bg_type = self._type_cb.currentData() or "solid"
         return {
-            "bg_type": bg_type,
-            "bg_color": self._color if bg_type == "solid" else None,
-            "bg_image": self._img_edit.get_value() if bg_type == "image" else None,
-            "bg_video": self._vid_edit.get_value() if bg_type == "video" else None,
+            "bg_type": self._bg_type,
+            "bg_color": self._color if self._bg_type == "solid" else None,
+            "bg_image": self._img_edit.get_value() if self._bg_type == "image" else None,
+            "bg_video": self._vid_edit.get_value() if self._bg_type == "video" else None,
         }
 
 

@@ -721,7 +721,8 @@ class LiveFrameRenderer:
         """
         changed = False
         if floor_hit_frac is not None:
-            v = float(np.clip(floor_hit_frac, 0.70, 0.95))
+            # Allow full editor-driven range so Floor handle can move to screen edges.
+            v = float(np.clip(floor_hit_frac, 0.0, 1.0))
             if v != self._floor_hit_frac:
                 self._floor_hit_frac = v
                 changed = True

@@ -41,9 +41,10 @@ from studio.editor.export_dialog import ExportDialog
 from studio.editor.worker_update_dialog import WorkerUpdateDialog
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
-from studio.editor.segment_config_panel import SegmentConfigPanel
+from studio.editor.inspector_panel import InspectorPanel
+from studio.editor.segment_config_panel import SegmentConfigPanel  # kept for type hints
 from studio.editor.timeline_panel import TimelinePanel
-from studio.models import Project, RenderStatus, Segment, build_settings
+from studio.models import Layer, Project, RenderStatus, Segment, build_settings
 from studio.persistence import ProjectStore
 
 # Live preview is delivered by an in-process renderer (see
@@ -247,7 +248,7 @@ class MainWindow(QMainWindow):
 
         self.media_panel = MediaLibraryPanel(self.thumbnail_service)
         self.preview_panel = PreviewPanel()
-        self.segment_panel = SegmentConfigPanel()
+        self.segment_panel = InspectorPanel()   # replaces SegmentConfigPanel
         self.timeline_panel = TimelinePanel()
 
         self.top_splitter.addWidget(self.media_panel)
@@ -264,6 +265,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.outer_splitter)
         self.setCentralWidget(container)
+        # Share the timeline undo stack with the inspector panel so that
+        # layer edit sessions push onto the same stack as timeline operations.
+        self.segment_panel.set_undo_stack(self.timeline_panel.undo_stack)
         self._init_timeline_render_overlay()
 
     def _init_timeline_render_overlay(self) -> None:
@@ -414,6 +418,12 @@ class MainWindow(QMainWindow):
         self.media_panel.media_selected.connect(self.preview_panel.set_source_media)
         self.media_panel.project_changed.connect(self._on_project_changed)
         self.timeline_panel.create_segment_requested.connect(self._on_create_segment_requested)
+        self.timeline_panel.background_media_dropped.connect(
+            self._on_background_media_dropped
+        )
+        self.timeline_panel.floor_media_dropped.connect(
+            self._on_floor_media_dropped
+        )
         self.timeline_panel.segment_selected.connect(self._on_segment_selected)
         self.timeline_panel.segment_changed.connect(self._on_segment_changed_by_timeline)
         self.timeline_panel.playhead_seek_requested.connect(
@@ -438,6 +448,10 @@ class MainWindow(QMainWindow):
         )
         self.timeline_panel.segment_moved.connect(self._on_segment_moved)
         self.timeline_panel.layer_changed.connect(self._on_layer_changed)
+        # Inspector selection signals (polymorphic panel)
+        self.timeline_panel.layer_selected.connect(self._on_layer_selected)
+        self.timeline_panel.selection_cleared.connect(self._on_selection_cleared)
+        self.segment_panel.layer_changed.connect(self._on_inspector_layer_changed)
 
         # Undo / redo — delegate to the timeline panel's undo stack.
         undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
@@ -524,7 +538,7 @@ class MainWindow(QMainWindow):
                     seg.id, list(seg.beat_events)
                 )
         self.segment_panel.set_project(project)
-        self.segment_panel.set_segment(None)
+        self.segment_panel.set_segment(None)  # clears to KIND_NONE
         self.preview_panel.set_project_segments(project.segments)
         self._current_waveform_path = None
         # Restore waveform from the first audio MediaItem with cached data.
@@ -1393,7 +1407,10 @@ class MainWindow(QMainWindow):
             start_time_sec=start_time,
             end_time_sec=start_time + duration,
             audio_path=media.source_path if media.kind.value == "audio" else "",
-            audio_offset_sec=start_time,   # explicit: matches initial timeline position
+            # A freshly dropped media clip starts from the beginning of its
+            # own source file. Segment timing on the project timeline is
+            # independent from where the clip starts within that source.
+            audio_offset_sec=0.0,
             audio_duration_sec=duration,
             mode="punch",
             render_settings=build_settings("punch", {}).model_dump(mode="json", exclude_none=True),
@@ -1415,9 +1432,189 @@ class MainWindow(QMainWindow):
             self._request_audio_trim(segment)
         self._on_project_changed()
 
+    def _on_background_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop video/image onto Background track -> apply to segment background."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind not in {"video", "image"}:
+            # Fallback: non-background media drops still create timeline segments.
+            self._on_create_segment_requested(media_id, time_sec)
+            return
+
+        eps = 1e-6
+        ordered = self.project.sorted_segments()
+        target_segment = next(
+            (
+                seg
+                for seg in ordered
+                if seg.start_time_sec - eps <= time_sec < seg.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Background track.", 3000
+            )
+            return
+
+        bg_type = "video" if media_kind == "video" else "image"
+        bg_cfg = {
+            "bg_type": bg_type,
+            "bg_color": None,
+            "bg_image": media.source_path if bg_type == "image" else None,
+            "bg_video": media.source_path if bg_type == "video" else None,
+        }
+
+        candidates = [
+            la
+            for la in self.project.layers
+            if la.kind == "background"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+        exact = [
+            la
+            for la in candidates
+            if abs(la.start_time_sec - target_segment.start_time_sec) <= eps
+            and abs(la.end_time_sec - target_segment.end_time_sec) <= eps
+        ]
+
+        target_layer: Layer
+        if exact:
+            target_layer = max(exact, key=lambda la: la.z_index)
+            target_layer.config = dict(bg_cfg)
+        elif candidates:
+            target_layer = min(
+                candidates,
+                key=lambda la: (
+                    abs(la.start_time_sec - target_segment.start_time_sec)
+                    + abs(la.end_time_sec - target_segment.end_time_sec),
+                    -(la.z_index),
+                ),
+            )
+            target_layer.start_time_sec = target_segment.start_time_sec
+            target_layer.end_time_sec = target_segment.end_time_sec
+            target_layer.config = dict(bg_cfg)
+        else:
+            overlap_bg = [
+                la
+                for la in self.project.layers
+                if la.kind == "background"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = (max((la.z_index for la in overlap_bg), default=-1) + 1)
+            target_layer = Layer(
+                kind="background",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Background",
+                config=dict(bg_cfg),
+            )
+            self.project.layers.append(target_layer)
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Background set to {bg_type}: {media.display_name}", 3000
+        )
+
+    def _on_floor_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop image onto Floor track -> set floor tile image for segment."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind != "image":
+            # Fallback: audio/video drops here still create timeline segments.
+            self._on_create_segment_requested(media_id, time_sec)
+            return
+
+        eps = 1e-6
+        ordered = self.project.sorted_segments()
+        target_segment = next(
+            (
+                seg
+                for seg in ordered
+                if seg.start_time_sec - eps <= time_sec < seg.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Floor track.", 3000
+            )
+            return
+
+        floor_layers = [
+            la
+            for la in self.project.layers
+            if la.kind == "floor"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+        exact = [
+            la
+            for la in floor_layers
+            if abs(la.start_time_sec - target_segment.start_time_sec) <= eps
+            and abs(la.end_time_sec - target_segment.end_time_sec) <= eps
+        ]
+
+        target_layer: Layer
+        if exact:
+            target_layer = max(exact, key=lambda la: la.z_index)
+        elif floor_layers:
+            target_layer = min(
+                floor_layers,
+                key=lambda la: (
+                    abs(la.start_time_sec - target_segment.start_time_sec)
+                    + abs(la.end_time_sec - target_segment.end_time_sec),
+                    -(la.z_index),
+                ),
+            )
+            target_layer.start_time_sec = target_segment.start_time_sec
+            target_layer.end_time_sec = target_segment.end_time_sec
+        else:
+            from studio.models.layer import _default_floor_config
+
+            overlap_floor = [
+                la
+                for la in self.project.layers
+                if la.kind == "floor"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = (max((la.z_index for la in overlap_floor), default=-1) + 1)
+            target_layer = Layer(
+                kind="floor",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Floor",
+                config=_default_floor_config(),
+            )
+            self.project.layers.append(target_layer)
+
+        cfg = dict(target_layer.config or {})
+        cfg["floor_panels"] = True
+        cfg["floor_panel_image"] = media.source_path
+        # Keep current layout if exists (auto/chevron_strip), otherwise default auto.
+        cfg["floor_layout"] = str(cfg.get("floor_layout", "auto") or "auto")
+        target_layer.config = cfg
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Floor tile image set: {media.display_name}", 3000
+        )
+
     def _on_segment_selected(self, segment: Segment | None) -> None:
         full_mode = self.preview_panel.is_full_preview_mode()
         was_live = self._preview_mode_active
+        # InspectorPanel.set_segment routes to set_selection(KIND_SEGMENT, ...)
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
         # Load waveform for this segment’s audio, or show empty for a segment
@@ -1582,7 +1779,7 @@ class MainWindow(QMainWindow):
         self._on_project_changed()
 
     def _on_layer_changed(self) -> None:
-        """A layer block was added / moved / resized / deleted.
+        """A layer block was added / moved / resized / deleted on the timeline.
 
         Mark project dirty and trigger a live-preview hot-reload so the
         effective config (layer overrides render_settings) is reflected
@@ -1592,6 +1789,23 @@ class MainWindow(QMainWindow):
         seg_id = self._preview_active_segment_id
         if seg_id:
             self._request_preview_restart(seg_id)
+
+    def _on_inspector_layer_changed(self, layer_id: str) -> None:
+        """Inspector panel edited a layer's config — trigger preview + dirty."""
+        self._on_project_changed()
+        seg_id = self._preview_active_segment_id
+        if seg_id:
+            self._request_preview_restart(seg_id)
+
+    def _on_layer_selected(self, layer) -> None:
+        """User single-clicked a layer block — switch Inspector to layer form."""
+        from studio.editor.inspector_panel import InspectorPanel
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, layer)
+
+    def _on_selection_cleared(self) -> None:
+        """User clicked empty timeline area — clear Inspector."""
+        from studio.editor.inspector_panel import InspectorPanel
+        self.segment_panel.set_selection(InspectorPanel.KIND_NONE, None)
 
     def _on_segment_delete_requested(self, segment_id: str) -> None:
         """Drop a segment from the project after user-confirmed delete.
@@ -1620,20 +1834,44 @@ class MainWindow(QMainWindow):
         beat_snapshot = list(
             self.timeline_panel._beat_events.get(segment_id, [])
         )
+        # Collect layers that are fully contained within this segment's range;
+        # these are considered "owned" by the segment and deleted with it.
+        owned_layers = [
+            la for la in self.project.layers
+            if la.start_time_sec >= seg.start_time_sec
+            and la.end_time_sec <= seg.end_time_sec
+        ]
+        owned_layer_snapshots = _copy.deepcopy(owned_layers)
 
         if (
             self._preview_mode_active
             and self._preview_active_segment_id == segment_id
         ):
             self._stop_preview_mode()
+        # If the deleted segment is currently loaded in the player source,
+        # clear it immediately so Play cannot revive a stale media path.
+        pseg = getattr(self.preview_panel, "_selected_segment", None)
+        if pseg is not None and getattr(pseg, "id", None) == segment_id:
+            self.preview_panel.set_source_segment(None)
         current = self.segment_panel.current_segment
         if current is not None and current.id == segment_id:
             self.segment_panel.set_segment(None)
+        # Clear inspector if it is showing one of the owned layers.
+        owned_ids = {la.id for la in owned_layers}
+        if (
+            self.segment_panel._selection_kind == self.segment_panel.KIND_LAYER
+            and self.segment_panel._selected_obj is not None
+            and self.segment_panel._selected_obj.id in owned_ids
+        ):
+            self.segment_panel.set_selection(self.segment_panel.KIND_NONE, None)
         self.timeline_panel.clear_beat_events(segment_id)
         self._last_trim_signature.pop(segment_id, None)
         self._inflight_trim_segments.discard(segment_id)
         self.project.segments = [
             s for s in self.project.segments if s.id != segment_id
+        ]
+        self.project.layers = [
+            la for la in self.project.layers if la.id not in owned_ids
         ]
         self.timeline_panel.refresh()
         self._sync_preview_button_state()
@@ -1650,6 +1888,7 @@ class MainWindow(QMainWindow):
             if panel._project is None:
                 return
             panel._project.segments.append(_copy.deepcopy(seg_snapshot))
+            panel._project.layers.extend(_copy.deepcopy(owned_layer_snapshots))
             panel._beat_events[seg_snapshot.id] = list(beat_snapshot)
             panel._selected_segment_id = seg_snapshot.id
             panel.refresh()
@@ -1665,8 +1904,12 @@ class MainWindow(QMainWindow):
             main_win_cur = main_win.segment_panel.current_segment
             if main_win_cur is not None and main_win_cur.id == seg_snapshot.id:
                 main_win.segment_panel.set_segment(None)
+            snap_ids = {la.id for la in owned_layer_snapshots}
             panel._project.segments = [
                 s for s in panel._project.segments if s.id != seg_snapshot.id
+            ]
+            panel._project.layers = [
+                la for la in panel._project.layers if la.id not in snap_ids
             ]
             panel._beat_events.pop(seg_snapshot.id, None)
             if panel._selected_segment_id == seg_snapshot.id:
@@ -1945,6 +2188,26 @@ class MainWindow(QMainWindow):
             beat_times.append(max(0.0, t))
 
         kwargs = self._live_renderer_kwargs(segment)
+
+        # ── DEBUG: log resolved preview params ───────────────────────────
+        from studio.models.layer import resolve_segment_config
+        _rs_debug = resolve_segment_config(segment, self.project.layers)
+        print(f"\n[PREVIEW] segment='{segment.name}' id={segment.id}")
+        print(f"  audio_path      : {audio_path}")
+        print(f"  mode            : {segment.mode}")
+        _bg_keys = ['background_type','background_color','bg_type','bg_color',
+                    'background_image','bg_image','background_video','bg_video']
+        print("  --- resolved bg keys in rs ---")
+        for k in _bg_keys:
+            if k in _rs_debug:
+                print(f"    {k}: {_rs_debug[k]!r}")
+        print("  --- kwargs passed to renderer ---")
+        for k in ['background_type','background_color','background_image',
+                  'background_video','show_stickman','show_floor_panels',
+                  'show_side_rails']:
+            print(f"    {k}: {kwargs.get(k)!r}")
+        print()
+        # ─────────────────────────────────────────────────────────────────
 
         # For combo mode, ``segment.mode`` is the literal string ``"combo"``
         # which ``_parse_modes`` doesn't accept (only the individual sub-modes

@@ -112,8 +112,8 @@ def test_auto_create_stickman_default_config():
     assert "stickman_location" in stick.config
 
 
-def test_auto_create_skips_if_overlap_exists():
-    """Creating a second segment adjacent to the first should NOT stack."""
+def test_auto_create_still_creates_for_overlap_if_range_differs():
+    """Each new segment gets its own defaults even with overlapping globals."""
     proj = Project(name="T")
     seg1 = _seg(0.0, 10.0)
     proj.segments.append(seg1)
@@ -124,11 +124,12 @@ def test_auto_create_skips_if_overlap_exists():
     for la in proj.layers:
         la.end_time_sec = 30.0
 
-    # Second segment overlaps the extended layers → skip creation
+    # Second segment overlaps the extended layers but still gets its own
+    # exact-range defaults.
     seg2 = _seg(10.0, 20.0)
     proj.segments.append(seg2)
     auto_create_default_layers(proj, seg2)
-    assert len(proj.layers) == 3  # no new layers added
+    assert len(proj.layers) == 6
 
 
 def test_auto_create_no_skip_if_adjacent_no_overlap():
@@ -149,11 +150,14 @@ def test_auto_create_no_skip_if_adjacent_no_overlap():
 # resolve_segment_config
 # ---------------------------------------------------------------------------
 
-def test_resolve_no_layers_returns_render_settings():
-    seg = _seg(0.0, 30.0, rs={"bg_color": "blue", "floor_panels": False})
+def test_resolve_no_layers_strips_visual_fields():
+    # Visual fields in render_settings are stripped when there is no covering
+    # layer — "layer absence = feature off".  Non-visual fields survive.
+    seg = _seg(0.0, 30.0, rs={"bg_color": "blue", "floor_panels": False, "mode": "punch"})
     effective = resolve_segment_config(seg, [])
-    assert effective["bg_color"] == "blue"
-    assert effective["floor_panels"] is False
+    assert "bg_color" not in effective       # visual → stripped
+    assert "floor_panels" not in effective   # visual → stripped
+    assert effective.get("mode") == "punch"  # non-visual → kept
 
 
 def test_resolve_layer_overrides_render_settings():
@@ -165,11 +169,13 @@ def test_resolve_layer_overrides_render_settings():
 
 
 def test_resolve_non_overlapping_layer_ignored():
+    # Non-overlapping layer is ignored; visual field from render_settings is
+    # also stripped → result has no bg_color at all.
     seg = _seg(20.0, 30.0, rs={"bg_color": "blue"})
     la = Layer(kind="background", start_time_sec=0.0, end_time_sec=15.0,
                config={"bg_color": "#FF0000"})
     effective = resolve_segment_config(seg, [la])
-    assert effective["bg_color"] == "blue"  # layer does not overlap
+    assert "bg_color" not in effective  # neither source applies
 
 
 def test_resolve_highest_z_index_wins():
@@ -192,6 +198,29 @@ def test_resolve_multiple_kinds():
     assert effective["bg_color"] == "#000000"
     assert effective["floor_panels"] is True
     assert effective["chevron_color"] == "#FFD700"
+
+
+def test_resolve_background_image_keeps_default_color_type_safe():
+    """Image/video backgrounds may leave bg_color=None; this must not
+    force background_color=None (string field in render settings)."""
+    seg = _seg(0.0, 10.0, rs={})
+    bg_layer = Layer(
+        kind="background",
+        start_time_sec=0.0,
+        end_time_sec=10.0,
+        config={
+            "bg_type": "image",
+            "bg_color": None,
+            "bg_image": "C:/tmp/bg.jpg",
+        },
+    )
+    effective = resolve_segment_config(seg, [bg_layer])
+    assert effective["bg_type"] == "image"
+    assert effective["background_type"] == "image"
+    assert effective["bg_image"] == "C:/tmp/bg.jpg"
+    assert effective["background_image"] == "C:/tmp/bg.jpg"
+    # Must stay absent so build_settings() uses default "#000000".
+    assert "background_color" not in effective
 
 
 # ---------------------------------------------------------------------------
