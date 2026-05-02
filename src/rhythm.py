@@ -3575,6 +3575,7 @@ class SideRailRenderer:
         chevron_depth: float = 1.0,
         chevron_density: int = 6,
         pillar_count: int = 16,
+        pillar_highlight_count: int = 1,
         pillar_radius: float = 1.0,
         chase_mode: str = "time",
         chase_speed_frames: int = 4,
@@ -3596,6 +3597,9 @@ class SideRailRenderer:
         self._chev_depth   = float(max(0.1, chevron_depth))
         self._chev_density = int(max(2, min(20, chevron_density)))
         self._pillar_count = max(4, min(32, int(pillar_count)))
+        self._pillar_highlight_count = max(
+            1, min(self._pillar_count, int(pillar_highlight_count))
+        )
         self._pillar_radius = float(max(0.2, min(2.0, pillar_radius)))
         self._chase_mode = str(chase_mode).lower()
         if self._chase_mode not in ("time", "beat"):
@@ -3946,10 +3950,11 @@ class SideRailRenderer:
 
     def _draw_pillar(self, canvas: np.ndarray, wx_i: float, wx_o: float,
                      color: np.ndarray) -> np.ndarray:
-        """Draw cylindrical-looking pillar row with one running highlight head."""
+        """Draw cylindrical-looking pillar row with moving highlight span."""
         cam = self._cam
         bot, top = self._bot_y, self._top_y
         head_idx = self._chase_step
+        span = max(1, min(self._pillar_count, self._pillar_highlight_count))
         dim_color = np.clip(color * 0.25, 0, 255).astype(np.float32)
 
         # Cylinder approximation: high-sided round prism around the Y axis.
@@ -3963,7 +3968,8 @@ class SideRailRenderer:
         thetas = np.linspace(0.0, 2.0 * math.pi, n_sides + 1)
 
         for i, z_c in enumerate(self._pillar_zs):
-            is_head = (i == head_idx)
+            # Circular span: highlight N consecutive pillars moving as one group.
+            is_head = ((i - head_idx) % self._pillar_count) < span
             face_color = color if is_head else dim_color
 
             # Side facets
@@ -6017,6 +6023,7 @@ class RhythmVisualizer:
                 chevron_depth=getattr(self, "RAIL_CHEVRON_DEPTH", 1.0),
                 chevron_density=getattr(self, "RAIL_CHEVRON_DENSITY", 6),
                 pillar_count=getattr(self, "RAIL_PILLAR_COUNT", 16),
+                pillar_highlight_count=getattr(self, "RAIL_PILLAR_HIGHLIGHT_COUNT", 1),
                 pillar_radius=getattr(self, "RAIL_PILLAR_RADIUS", 1.0),
                 chase_mode=getattr(self, "RAIL_CHASE_MODE", "time"),
                 chase_speed_frames=getattr(self, "RAIL_CHASE_SPEED_FRAMES", 4),
@@ -7087,6 +7094,8 @@ def parse_arguments():
                    help='Pulse intensity 0=static, 1=full blink. Default 0.6.')
     p.add_argument('--rail_pillar_count', type=int, default=16, metavar='N',
                    help='Number of pillars in pillar shape (4..32). Default 16.')
+    p.add_argument('--rail_pillar_highlight_count', type=int, default=1, metavar='N',
+                   help='How many pillar columns are highlighted at once (1..32). Default 1.')
     p.add_argument('--rail_pillar_radius', type=float, default=1.0, metavar='MULT',
                    help='Pillar circumference scale (0.2..2.0). <1 smaller pillars, >1 thicker.')
     p.add_argument('--rail_chase_mode', type=str, default='time',
@@ -7477,6 +7486,7 @@ if __name__ == '__main__':
     viz.RAIL_PULSE             = str(args.rail_pulse)
     viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
     viz.RAIL_PILLAR_COUNT      = int(args.rail_pillar_count)
+    viz.RAIL_PILLAR_HIGHLIGHT_COUNT = int(args.rail_pillar_highlight_count)
     viz.RAIL_PILLAR_RADIUS     = float(args.rail_pillar_radius)
     viz.RAIL_CHASE_MODE        = str(args.rail_chase_mode)
     viz.RAIL_CHASE_SPEED_FRAMES = int(args.rail_chase_speed_frames)

@@ -406,6 +406,7 @@ class InspectorPanel(QWidget):
                     chevron_depth=float(cfg.get("rail_chevron_depth", 1.0)),
                     chevron_density=int(cfg.get("rail_chevron_density", 6)),
                     pillar_count=int(cfg.get("rail_pillar_count", 16)),
+                    pillar_highlight_count=int(cfg.get("rail_pillar_highlight_count", 1)),
                     pillar_radius=float(cfg.get("rail_pillar_radius", 1.0)),
                     chase_mode=str(cfg.get("rail_chase_mode", "time")),
                     chase_speed_frames=int(cfg.get("rail_chase_speed_frames", 4)),

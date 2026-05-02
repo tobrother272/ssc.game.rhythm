@@ -2731,6 +2731,7 @@ class TimelinePanel(QWidget):
                 "rail_offset_x": 0.08,
                 "rail_pulse": "beat",
                 "rail_pulse_intensity": 0.6,
+                "rail_pillar_highlight_count": 1,
             }
         if kind == "stickman":
             return {

@@ -252,11 +252,11 @@ class FloorWallOverlay(QWidget):
     Moving near does NOT move far, and vice versa.
     """
 
-    # 9 floats:
+    # 10 floats:
     # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
-    # countdown_x, countdown_y, countdown_w, countdown_h
-    changing  = Signal(float, float, float, float, float, float, float, float, float)
-    committed = Signal(float, float, float, float, float, float, float, float, float)
+    # countdown_x, countdown_y, countdown_w, countdown_h, rail_height
+    changing  = Signal(float, float, float, float, float, float, float, float, float, float)
+    committed = Signal(float, float, float, float, float, float, float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
@@ -280,6 +280,7 @@ class FloorWallOverlay(QWidget):
         self._near_spread:         float = 0.65   # controls floor_spread_frac
         self._far_spread:          float = 0.65   # controls far_spread_frac (independent)
         self._wall_floor_gap_frac: float = 0.0    # near-wall Y lifted above floor line
+        self._rail_height: float = 0.15
         self._countdown_enabled: bool = False
         self._cd_x: float = 0.88
         self._cd_y: float = 0.04
@@ -292,6 +293,7 @@ class FloorWallOverlay(QWidget):
         self._drag_cd_y0 = 0.0
         self._drag_cd_w0 = 0.0
         self._drag_cd_h0 = 0.0
+        self._drag_rail_h0 = 0.15
 
     # ── public API ──────────────────────────────────────────────────────
     def _hit_frac_bounds(self) -> tuple[float, float]:
@@ -309,6 +311,7 @@ class FloorWallOverlay(QWidget):
         near_spread: float,
         far_spread: float,
         wall_floor_gap_frac: float = 0.0,
+        rail_height: float = 0.15,
         countdown_enabled: bool = False,
         countdown_x: float = 0.88,
         countdown_y: float = 0.04,
@@ -321,6 +324,7 @@ class FloorWallOverlay(QWidget):
         self._near_spread          = max(0.20, min(3.00, float(near_spread)))
         self._far_spread           = max(0.05, min(3.00, float(far_spread)))
         self._wall_floor_gap_frac  = max(0.00, min(0.30, float(wall_floor_gap_frac)))
+        self._rail_height          = max(0.15, float(rail_height))
         self._countdown_enabled = bool(countdown_enabled)
         self._cd_x = max(0.0, min(0.98, float(countdown_x)))
         self._cd_y = max(0.0, min(0.98, float(countdown_y)))
@@ -328,11 +332,11 @@ class FloorWallOverlay(QWidget):
         self._cd_h = max(0.02, min(1.0 - self._cd_y, float(countdown_h)))
         self.update()
 
-    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float]:
+    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float, float]:
         return (self._hit_frac, self._horizon_frac,
                 self._near_spread, self._far_spread,
                 self._wall_floor_gap_frac,
-                self._cd_x, self._cd_y, self._cd_w, self._cd_h)
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h, self._rail_height)
 
     # ── geometry helpers ────────────────────────────────────────────────
     def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
@@ -366,6 +370,11 @@ class FloorWallOverlay(QWidget):
     def _gap_lx(self) -> int: return self._GAP_MARGIN
     def _gap_rx(self) -> int: return max(0, self.width() - 1 - self._GAP_MARGIN)
 
+    def _rail_handle_y(self) -> int:
+        # Visual proxy for rail height: higher rail => handle moves upward.
+        y = int(self._hit_y() - self._rail_height * self.height() * 0.55)
+        return max(self._hz_y() + self._HANDLE_R, min(self._hit_y() - self._HANDLE_R, y))
+
     def _countdown_rect_px(self) -> QRect:
         w = self.width()
         h = self.height()
@@ -392,6 +401,13 @@ class FloorWallOverlay(QWidget):
                     return kind
             if cd.contains(pos):
                 return "cd_move"
+        # Side-rail height handles (left/right), dragged vertically in sync.
+        r2 = self._HANDLE_R + 6
+        rhy = self._rail_handle_y()
+        if abs(pos.y() - rhy) <= r2 and (
+            abs(pos.x() - self._near_lx()) <= r2 or abs(pos.x() - self._near_rx()) <= r2
+        ):
+            return "rail_height"
         # Gap handles on the wall diagonal lines — checked before near handles
         gy = self._gap_y()
         if abs(pos.y() - gy) <= r and (
@@ -426,6 +442,9 @@ class FloorWallOverlay(QWidget):
             self._drag_cd_y0 = self._cd_y
             self._drag_cd_w0 = self._cd_w
             self._drag_cd_h0 = self._cd_h
+        if self._drag == "rail_height":
+            self._drag_anchor = ev.pos()
+            self._drag_rail_h0 = self._rail_height
 
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag in ("wall_near", "wall_far"):
@@ -436,12 +455,13 @@ class FloorWallOverlay(QWidget):
                 self._hit_frac, self._horizon_frac, self._near_spread,
                 self._far_spread, self._wall_floor_gap_frac,
                 self._cd_x, self._cd_y, self._cd_w, self._cd_h,
+                self._rail_height,
             )
 
     def mouseMoveEvent(self, ev) -> None:
         hover = self._handle_at(ev.pos()) if self._drag is None else None
         if hover:
-            if hover in ("hit", "horizon", "gap_side"):
+            if hover in ("hit", "horizon", "gap_side", "rail_height"):
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
             elif hover == "wall_near":
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -506,11 +526,16 @@ class FloorWallOverlay(QWidget):
                 ww = max(minf, min(1.0 - x, ww + dx))
                 hh = max(minf, min(1.0 - y, hh + dy))
             self._cd_x, self._cd_y, self._cd_w, self._cd_h = x, y, ww, hh
+        elif self._drag == "rail_height":
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._rail_height = max(0.15, self._drag_rail_h0 - (dy / h) * 1.8)
         self.update()
         self.changing.emit(
             self._hit_frac, self._horizon_frac, self._near_spread,
             self._far_spread, self._wall_floor_gap_frac,
             self._cd_x, self._cd_y, self._cd_w, self._cd_h,
+            self._rail_height,
         )
 
     # ── paint ────────────────────────────────────────────────────────────
@@ -557,6 +582,25 @@ class FloorWallOverlay(QWidget):
             p.drawEllipse(nx_pos - r, ny - r, r * 2, r * 2)
         p.setPen(QPen(self._WALL_CLR))
         p.drawText(self._near_rx() + r + 4, ny + 5, "Near")
+
+        # Rail-height handles (left/right, dragged vertically in sync).
+        rhy = self._rail_handle_y()
+        rrh = max(6, r - 2)
+        rail_col = QColor(255, 90, 90)
+        p.setBrush(QBrush(rail_col))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for rxh in (self._near_lx(), self._near_rx()):
+            p.drawEllipse(rxh - rrh, rhy - rrh, rrh * 2, rrh * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(rxh, rhy - rrh + 2, rxh, rhy + rrh - 2)
+            p.drawLine(rxh - 4, rhy - rrh + 6, rxh, rhy - rrh + 2)
+            p.drawLine(rxh + 4, rhy - rrh + 6, rxh, rhy - rrh + 2)
+            p.drawLine(rxh - 4, rhy + rrh - 6, rxh, rhy + rrh - 2)
+            p.drawLine(rxh + 4, rhy + rrh - 6, rxh, rhy + rrh - 2)
+            p.setBrush(QBrush(rail_col))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        p.setPen(QPen(rail_col))
+        p.drawText(self._near_rx() + rrh + 6, rhy + 5, f"Rail H {self._rail_height:.2f}")
 
         # Gap handles — front-bottom wall corners (left/right)
         # Drag vertically to change wall-floor gap.
@@ -623,7 +667,7 @@ class PreviewPanel(QWidget):
     # handles or the relax countdown box.
     # MainWindow saves these into segment.render_settings and requests a preview update.
     floor_wall_committed = Signal(
-        float, float, float, float, float, float, float, float, float
+        float, float, float, float, float, float, float, float, float, float
     )
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
@@ -1066,6 +1110,7 @@ class PreviewPanel(QWidget):
             cdy = float(rs.get("relax_countdown_y", 0.04) or 0.04)
             cdw = float(rs.get("relax_countdown_w", 0.10) or 0.10)
             cdh = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            rail_h = float(rs.get("rail_height", 0.14) or 0.14)
             # In layer-first config projects, segment.render_settings can be
             # stale while live renderer already uses resolved layer values.
             # Use renderer state when available so the edit box starts exactly
@@ -1075,8 +1120,9 @@ class PreviewPanel(QWidget):
                 cdy = float(getattr(self._live_renderer, "_relax_countdown_y", cdy))
                 cdw = float(getattr(self._live_renderer, "_relax_countdown_w", cdw))
                 cdh = float(getattr(self._live_renderer, "_relax_countdown_h", cdh))
+                rail_h = float(getattr(self._live_renderer, "_rail_height", rail_h))
             self.floor_wall_overlay.set_fractions(
-                hit, hz, near_sp, far_sp, gap,
+                hit, hz, near_sp, far_sp, gap, rail_h,
                 has_relax, cdx, cdy, cdw, cdh,
             )
             self._sync_floor_wall_overlay_pos()
@@ -1089,7 +1135,7 @@ class PreviewPanel(QWidget):
     def _on_floor_wall_changing(
         self,
         hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
-        cdx: float, cdy: float, cdw: float, cdh: float,
+        cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
     ) -> None:
         """Live-update the renderer while the user drags a handle."""
         if not self._live_active or self._live_renderer is None:
@@ -1101,13 +1147,14 @@ class PreviewPanel(QWidget):
             far_spread_frac=far_sp,
             wall_floor_gap_frac=gap,
         )
+        self._live_renderer.update_side_rail_height(rail_h)
         self._live_renderer.update_countdown_box(x=cdx, y=cdy, w=cdw, h=cdh)
         self._render_live_frame(self.player.position() / 1000.0)
 
     def _on_floor_wall_committed(
         self,
         hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
-        cdx: float, cdy: float, cdw: float, cdh: float,
+        cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
     ) -> None:
         """Persist the final drag result and notify MainWindow."""
         seg = self._selected_segment
@@ -1121,7 +1168,10 @@ class PreviewPanel(QWidget):
             seg.render_settings["relax_countdown_y"]    = round(cdy,     4)
             seg.render_settings["relax_countdown_w"]    = round(cdw,     4)
             seg.render_settings["relax_countdown_h"]    = round(cdh,     4)
-        self.floor_wall_committed.emit(hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh)
+            seg.render_settings["rail_height"]          = round(max(0.15, rail_h), 4)
+        self.floor_wall_committed.emit(
+            hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh, max(0.15, rail_h)
+        )
 
     def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
         """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""
@@ -2357,6 +2407,7 @@ class PreviewPanel(QWidget):
         rail_chevron_depth: Optional[float] = None,
         rail_chevron_density: Optional[int] = None,
         rail_pillar_count: Optional[int] = None,
+        rail_pillar_highlight_count: Optional[int] = None,
         rail_pillar_radius: Optional[float] = None,
         rail_chase_mode: Optional[str] = None,
         rail_chase_speed_frames: Optional[int] = None,
@@ -2447,6 +2498,7 @@ class PreviewPanel(QWidget):
             rail_chevron_depth=rail_chevron_depth,
             rail_chevron_density=rail_chevron_density,
             rail_pillar_count=rail_pillar_count,
+            rail_pillar_highlight_count=rail_pillar_highlight_count,
             rail_pillar_radius=rail_pillar_radius,
             rail_chase_mode=rail_chase_mode,
             rail_chase_speed_frames=rail_chase_speed_frames,

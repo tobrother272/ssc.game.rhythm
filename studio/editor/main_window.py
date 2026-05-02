@@ -1284,6 +1284,7 @@ class MainWindow(QMainWindow):
         relax_countdown_y: float = 0.04,
         relax_countdown_w: float = 0.10,
         relax_countdown_h: float = 0.16,
+        rail_height: float = 0.15,
     ) -> None:
         """Persist floor/wall drag result into segment + countdown layer config."""
         seg_id = self._preview_active_segment_id
@@ -1301,6 +1302,7 @@ class MainWindow(QMainWindow):
         seg.render_settings["relax_countdown_y"]    = round(relax_countdown_y,   4)
         seg.render_settings["relax_countdown_w"]    = round(relax_countdown_w,   4)
         seg.render_settings["relax_countdown_h"]    = round(relax_countdown_h,   4)
+        seg.render_settings["rail_height"]          = round(max(0.15, rail_height), 4)
 
         # Layer-first system: countdown box placement must live on the countdown
         # layer so future preview rebuilds/render resolve to the same values.
@@ -1334,13 +1336,23 @@ class MainWindow(QMainWindow):
             top.config["relax_countdown_h"] = round(relax_countdown_h, 4)
             top.config.setdefault("relax_countdown_enabled", True)
 
+        # Keep side-rails layer in sync with interactive rail-height drag.
+        rail_layers = self.project.layers_overlapping(
+            "side_rails", seg.start_time_sec, seg.end_time_sec
+        )
+        if rail_layers:
+            rail_top = max(rail_layers, key=lambda la: la.z_index)
+            rail_top.config["rail_height"] = round(max(0.15, rail_height), 4)
+            rail_top.config.setdefault("side_rails", True)
+
         self._on_project_changed()
         self.statusBar().showMessage(
             f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
             f"horizon:{horizon_frac*100:.1f}%  "
             f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%  "
             f"gap:{wall_floor_gap_frac*100:.1f}%  "
-            f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%",
+            f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%  "
+            f"rail h:{max(0.15, rail_height):.2f}",
             2500,
         )
 
@@ -2411,6 +2423,7 @@ class MainWindow(QMainWindow):
             "rail_chevron_depth":    float(_get("rail_chevron_depth", 1.0) or 1.0),
             "rail_chevron_density":  int(_get("rail_chevron_density", 6) or 6),
             "rail_pillar_count":     int(_get("rail_pillar_count", 16) or 16),
+            "rail_pillar_highlight_count": int(_get("rail_pillar_highlight_count", 1) or 1),
             "rail_pillar_radius":    float(_get("rail_pillar_radius", 1.0) or 1.0),
             "rail_chase_mode":       str(_get("rail_chase_mode", "time") or "time"),
             "rail_chase_speed_frames": int(_get("rail_chase_speed_frames", 4) or 4),
@@ -2637,6 +2650,9 @@ class MainWindow(QMainWindow):
             rail_chevron_depth   = float(rs.get("rail_chevron_depth", 1.0) or 1.0)
             rail_chevron_density = int(rs.get("rail_chevron_density", 6) or 6)
             rail_pillar_count = int(rs.get("rail_pillar_count", 16) or 16)
+            rail_pillar_highlight_count = int(
+                rs.get("rail_pillar_highlight_count", 1) or 1
+            )
             rail_pillar_radius = float(rs.get("rail_pillar_radius", 1.0) or 1.0)
             rail_chase_mode = str(rs.get("rail_chase_mode", "time") or "time")
             rail_chase_speed_frames = int(rs.get("rail_chase_speed_frames", 4) or 4)
@@ -2717,6 +2733,7 @@ class MainWindow(QMainWindow):
                     rail_chevron_depth=rail_chevron_depth,
                     rail_chevron_density=rail_chevron_density,
                     rail_pillar_count=rail_pillar_count,
+                    rail_pillar_highlight_count=rail_pillar_highlight_count,
                     rail_pillar_radius=rail_pillar_radius,
                     rail_chase_mode=rail_chase_mode,
                     rail_chase_speed_frames=rail_chase_speed_frames,

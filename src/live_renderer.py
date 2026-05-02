@@ -214,6 +214,7 @@ class LiveFrameRenderer:
         rail_chevron_depth: float = 1.0,
         rail_chevron_density: int = 6,
         rail_pillar_count: int = 16,
+        rail_pillar_highlight_count: int = 1,
         rail_pillar_radius: float = 1.0,
         rail_chase_mode: str = "time",
         rail_chase_speed_frames: int = 4,
@@ -304,6 +305,7 @@ class LiveFrameRenderer:
         self._rail_chevron_depth   = float(rail_chevron_depth)
         self._rail_chevron_density = int(rail_chevron_density)
         self._rail_pillar_count = int(rail_pillar_count)
+        self._rail_pillar_highlight_count = int(rail_pillar_highlight_count)
         self._rail_pillar_radius = float(rail_pillar_radius)
         self._rail_chase_mode = str(rail_chase_mode)
         self._rail_chase_speed_frames = int(rail_chase_speed_frames)
@@ -526,6 +528,7 @@ class LiveFrameRenderer:
         rail_chevron_depth: Optional[float] = None,
         rail_chevron_density: Optional[int] = None,
         rail_pillar_count: Optional[int] = None,
+        rail_pillar_highlight_count: Optional[int] = None,
         rail_pillar_radius: Optional[float] = None,
         rail_chase_mode: Optional[str] = None,
         rail_chase_speed_frames: Optional[int] = None,
@@ -650,6 +653,8 @@ class LiveFrameRenderer:
             self._rail_chevron_density = int(rail_chevron_density)
         if rail_pillar_count is not None:
             self._rail_pillar_count = int(rail_pillar_count)
+        if rail_pillar_highlight_count is not None:
+            self._rail_pillar_highlight_count = int(rail_pillar_highlight_count)
         if rail_pillar_radius is not None:
             self._rail_pillar_radius = float(rail_pillar_radius)
         if rail_chase_mode is not None:
@@ -742,6 +747,39 @@ class LiveFrameRenderer:
                 self._relax_countdown_w,
                 self._relax_countdown_h,
             )
+
+    def _build_side_rail(self) -> Optional[SideRailRenderer]:
+        if not self._show_side_rails:
+            return None
+        return SideRailRenderer(
+            self._cam,
+            color=self._rail_color,
+            shape=self._rail_shape,
+            height=self._rail_height,
+            offset_x=self._rail_offset_x,
+            image_path=self._rail_image,
+            texture_non_loop=self._rail_texture_non_loop,
+            pulse=self._rail_pulse,
+            pulse_intensity=self._rail_pulse_intensity,
+            chevron_depth=self._rail_chevron_depth,
+            chevron_density=self._rail_chevron_density,
+            pillar_count=self._rail_pillar_count,
+            pillar_highlight_count=self._rail_pillar_highlight_count,
+            pillar_radius=self._rail_pillar_radius,
+            chase_mode=self._rail_chase_mode,
+            chase_speed_frames=self._rail_chase_speed_frames,
+            dot_count=self._rail_dot_count,
+            dot_lines=self._rail_dot_lines,
+            dot_size_px=self._rail_dot_size_px,
+            dot_anim_mode=self._rail_dot_anim_mode,
+            dot_color_near=self._rail_dot_color_near,
+            dot_color_far=self._rail_dot_color_far,
+        )
+
+    def update_side_rail_height(self, height: float) -> None:
+        """Hot-update side-rail height from overlay drag."""
+        self._rail_height = max(0.15, float(height))
+        self._side_rail = self._build_side_rail()
 
     def update_floor_wall(
         self,
@@ -965,32 +1003,7 @@ class LiveFrameRenderer:
             chevron_width_frac=self._chevron_width_frac,
             chevron_count=self._chevron_count,
         )
-        if self._show_side_rails:
-            self._side_rail: Optional[SideRailRenderer] = SideRailRenderer(
-                self._cam,
-                color=self._rail_color,
-                shape=self._rail_shape,
-                height=self._rail_height,
-                offset_x=self._rail_offset_x,
-                image_path=self._rail_image,
-                texture_non_loop=self._rail_texture_non_loop,
-                pulse=self._rail_pulse,
-                pulse_intensity=self._rail_pulse_intensity,
-                chevron_depth=self._rail_chevron_depth,
-                chevron_density=self._rail_chevron_density,
-                pillar_count=self._rail_pillar_count,
-                pillar_radius=self._rail_pillar_radius,
-                chase_mode=self._rail_chase_mode,
-                chase_speed_frames=self._rail_chase_speed_frames,
-                dot_count=self._rail_dot_count,
-                dot_lines=self._rail_dot_lines,
-                dot_size_px=self._rail_dot_size_px,
-                dot_anim_mode=self._rail_dot_anim_mode,
-                dot_color_near=self._rail_dot_color_near,
-                dot_color_far=self._rail_dot_color_far,
-            )
-        else:
-            self._side_rail = None
+        self._side_rail = self._build_side_rail()
         self._particles = ParticleSystem()
         # Stickman action selection: combo runs use a dedicated
         # cross-mode pose library; solo runs match their mode's library

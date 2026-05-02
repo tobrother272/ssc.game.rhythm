@@ -29,6 +29,7 @@ def test_invalid_enum_raises_validation_error() -> None:
 def test_pillar_shape_defaults() -> None:
     s = build_settings("punch", {})
     assert s.rail_pillar_count == 16
+    assert s.rail_pillar_highlight_count == 1
     assert s.rail_pillar_radius == 1.0
     assert s.rail_chase_mode == "time"
     assert s.rail_chase_speed_frames == 4
@@ -40,6 +41,7 @@ def test_pillar_shape_round_trip() -> None:
         "rail_shape": "pillar",
         "rail_color": "#00FFFF",
         "rail_pillar_count": 24,
+        "rail_pillar_highlight_count": 5,
         "rail_pillar_radius": 0.75,
         "rail_chase_mode": "beat",
         "rail_chase_speed_frames": 8,
@@ -48,6 +50,7 @@ def test_pillar_shape_round_trip() -> None:
     d = s.model_dump(mode="json")
     assert d["rail_shape"] == "pillar"
     assert d["rail_pillar_count"] == 24
+    assert d["rail_pillar_highlight_count"] == 5
     assert d["rail_pillar_radius"] == 0.75
     assert d["rail_chase_mode"] == "beat"
     assert d["rail_chase_speed_frames"] == 8

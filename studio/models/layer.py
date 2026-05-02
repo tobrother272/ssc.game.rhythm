@@ -132,7 +132,7 @@ _VISUAL_FIELDS_BY_KIND: dict[str, list[str]] = {
         "side_rails", "rail_color", "rail_shape", "rail_height", "rail_offset_x",
         "rail_image", "rail_texture_non_loop", "rail_pulse", "rail_pulse_intensity",
         "rail_chevron_depth", "rail_chevron_density",
-        "rail_pillar_count", "rail_pillar_radius",
+        "rail_pillar_count", "rail_pillar_highlight_count", "rail_pillar_radius",
         "rail_chase_mode", "rail_chase_speed_frames",
         "rail_dot_count", "rail_dot_lines", "rail_dot_size_px",
         "rail_dot_anim_mode", "rail_dot_color_near", "rail_dot_color_far",

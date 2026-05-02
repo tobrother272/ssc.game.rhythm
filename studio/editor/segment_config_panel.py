@@ -692,6 +692,7 @@ class _SideRailSection(QGroupBox):
         chevron_depth: float = 1.0,
         chevron_density: int = 6,
         pillar_count: int = 16,
+        pillar_highlight_count: int = 1,
         pillar_radius: float = 1.0,
         chase_mode: str = "time",
         chase_speed_frames: int = 4,
@@ -873,25 +874,60 @@ class _SideRailSection(QGroupBox):
         self._pillar_header = QLabel("<b>Pillar options</b>")
         form.addRow(self._pillar_header)
 
-        self._pillar_count_sp = QSpinBox()
-        self._pillar_count_sp.setRange(4, 32)
-        self._pillar_count_sp.setValue(int(pillar_count))
-        self._pillar_count_sp.setToolTip("Number of pillars (4..32). More = denser LED row.")
-        _no_scroll(self._pillar_count_sp)
-        self._pillar_count_sp.valueChanged.connect(self.changed)
-        form.addRow("Count", self._pillar_count_sp)
+        pillar_count_row = QWidget()
+        pcr = QHBoxLayout(pillar_count_row)
+        pcr.setContentsMargins(0, 0, 0, 0)
+        pcr.setSpacing(6)
+        self._pillar_count_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_count_sl.setRange(4, 32)
+        self._pillar_count_sl.setSingleStep(1)
+        self._pillar_count_sl.setPageStep(2)
+        self._pillar_count_sl.setValue(max(4, min(32, int(pillar_count))))
+        self._pillar_count_sl.setToolTip("Number of pillars (4..32). More = denser LED row.")
+        self._pillar_count_lbl = QLabel(str(self._pillar_count_sl.value()))
+        self._pillar_count_lbl.setMinimumWidth(28)
+        self._pillar_count_sl.valueChanged.connect(self._on_pillar_count_changed)
+        pcr.addWidget(self._pillar_count_sl, stretch=1)
+        pcr.addWidget(self._pillar_count_lbl)
+        form.addRow("Count", pillar_count_row)
 
-        self._pillar_radius_sp = QDoubleSpinBox()
-        self._pillar_radius_sp.setRange(0.2, 2.0)
-        self._pillar_radius_sp.setSingleStep(0.05)
-        self._pillar_radius_sp.setDecimals(2)
-        self._pillar_radius_sp.setValue(float(pillar_radius))
-        self._pillar_radius_sp.setToolTip(
+        pillar_highlight_row = QWidget()
+        phr = QHBoxLayout(pillar_highlight_row)
+        phr.setContentsMargins(0, 0, 0, 0)
+        phr.setSpacing(6)
+        self._pillar_highlight_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_highlight_sl.setRange(1, 32)
+        self._pillar_highlight_sl.setSingleStep(1)
+        self._pillar_highlight_sl.setPageStep(2)
+        self._pillar_highlight_sl.setValue(max(1, min(32, int(pillar_highlight_count))))
+        self._pillar_highlight_sl.setToolTip(
+            "How many pillar columns glow at the same time."
+        )
+        self._pillar_highlight_lbl = QLabel(str(self._pillar_highlight_sl.value()))
+        self._pillar_highlight_lbl.setMinimumWidth(28)
+        self._pillar_highlight_sl.valueChanged.connect(self._on_pillar_highlight_changed)
+        phr.addWidget(self._pillar_highlight_sl, stretch=1)
+        phr.addWidget(self._pillar_highlight_lbl)
+        form.addRow("Highlight columns", pillar_highlight_row)
+
+        pillar_radius_row = QWidget()
+        prr = QHBoxLayout(pillar_radius_row)
+        prr.setContentsMargins(0, 0, 0, 0)
+        prr.setSpacing(6)
+        self._pillar_radius_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_radius_sl.setRange(20, 200)  # x100 of real value (0.20..2.00)
+        self._pillar_radius_sl.setSingleStep(1)
+        self._pillar_radius_sl.setPageStep(5)
+        self._pillar_radius_sl.setValue(max(20, min(200, round(float(pillar_radius) * 100))))
+        self._pillar_radius_sl.setToolTip(
             "Pillar circumference scale. <1 = thinner columns, >1 = thicker."
         )
-        _no_scroll(self._pillar_radius_sp)
-        self._pillar_radius_sp.valueChanged.connect(self.changed)
-        form.addRow("Radius", self._pillar_radius_sp)
+        self._pillar_radius_lbl = QLabel(f"{self._pillar_radius_sl.value() / 100.0:.2f}")
+        self._pillar_radius_lbl.setMinimumWidth(38)
+        self._pillar_radius_sl.valueChanged.connect(self._on_pillar_radius_changed)
+        prr.addWidget(self._pillar_radius_sl, stretch=1)
+        prr.addWidget(self._pillar_radius_lbl)
+        form.addRow("Radius", pillar_radius_row)
 
         self._chase_mode_cb = QComboBox()
         self._chase_mode_cb.addItems(["time", "beat"])
@@ -903,21 +939,31 @@ class _SideRailSection(QGroupBox):
         self._chase_mode_cb.currentTextChanged.connect(self.changed)
         form.addRow("Chase mode", self._chase_mode_cb)
 
-        self._chase_speed_sp = QSpinBox()
-        self._chase_speed_sp.setRange(1, 60)
-        self._chase_speed_sp.setValue(int(chase_speed_frames))
-        self._chase_speed_sp.setToolTip(
+        chase_speed_row = QWidget()
+        csr = QHBoxLayout(chase_speed_row)
+        csr.setContentsMargins(0, 0, 0, 0)
+        csr.setSpacing(6)
+        self._chase_speed_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chase_speed_sl.setRange(1, 60)
+        self._chase_speed_sl.setSingleStep(1)
+        self._chase_speed_sl.setPageStep(4)
+        self._chase_speed_sl.setValue(max(1, min(60, int(chase_speed_frames))))
+        self._chase_speed_sl.setToolTip(
             "Frames per chase advance (only for time mode). 4 ≈ 133ms @30fps."
         )
-        _no_scroll(self._chase_speed_sp)
-        self._chase_speed_sp.valueChanged.connect(self.changed)
-        form.addRow("Chase speed", self._chase_speed_sp)
+        self._chase_speed_lbl = QLabel(str(self._chase_speed_sl.value()))
+        self._chase_speed_lbl.setMinimumWidth(28)
+        self._chase_speed_sl.valueChanged.connect(self._on_chase_speed_changed)
+        csr.addWidget(self._chase_speed_sl, stretch=1)
+        csr.addWidget(self._chase_speed_lbl)
+        form.addRow("Chase speed", chase_speed_row)
 
         self._pillar_widgets = [
             self._pillar_sep, self._pillar_header,
-            self._pillar_count_sp, self._pillar_radius_sp,
-            self._chase_mode_cb, self._chase_speed_sp,
+            pillar_count_row, pillar_highlight_row, pillar_radius_row,
+            self._chase_mode_cb, chase_speed_row,
         ]
+        self._sync_pillar_highlight_limit()
 
         # ── Dot-only sub-group ─────────────────────────────────────────
         self._dot_sep = QFrame()
@@ -1010,6 +1056,30 @@ class _SideRailSection(QGroupBox):
     def _on_chev_density_changed(self, val: int) -> None:
         self._chev_density_lbl.setText(str(val))
         self._slider_debounce.start()   # restart 2-s window
+
+    def _on_pillar_count_changed(self, val: int) -> None:
+        self._pillar_count_lbl.setText(str(val))
+        self._sync_pillar_highlight_limit()
+        self._slider_debounce.start()
+
+    def _on_pillar_highlight_changed(self, val: int) -> None:
+        self._pillar_highlight_lbl.setText(str(val))
+        self._slider_debounce.start()
+
+    def _on_pillar_radius_changed(self, raw: int) -> None:
+        self._pillar_radius_lbl.setText(f"{raw / 100.0:.2f}")
+        self._slider_debounce.start()
+
+    def _on_chase_speed_changed(self, val: int) -> None:
+        self._chase_speed_lbl.setText(str(val))
+        self._slider_debounce.start()
+
+    def _sync_pillar_highlight_limit(self) -> None:
+        cap = max(1, int(self._pillar_count_sl.value()))
+        self._pillar_highlight_sl.setMaximum(cap)
+        if self._pillar_highlight_sl.value() > cap:
+            self._pillar_highlight_sl.setValue(cap)
+        self._pillar_highlight_lbl.setText(str(self._pillar_highlight_sl.value()))
 
     def _update_chev_visibility(self) -> None:
         is_chev = (self._shape_cb.currentData() == "chevron")
@@ -1146,16 +1216,19 @@ class _SideRailSection(QGroupBox):
         return self._chev_density_sl.value()
 
     def get_pillar_count(self) -> int:
-        return self._pillar_count_sp.value()
+        return self._pillar_count_sl.value()
 
     def get_pillar_radius(self) -> float:
-        return self._pillar_radius_sp.value()
+        return self._pillar_radius_sl.value() / 100.0
+
+    def get_pillar_highlight_count(self) -> int:
+        return self._pillar_highlight_sl.value()
 
     def get_chase_mode(self) -> str:
         return self._chase_mode_cb.currentText()
 
     def get_chase_speed_frames(self) -> int:
-        return self._chase_speed_sp.value()
+        return self._chase_speed_sl.value()
 
     def get_dot_count(self) -> int:
         return self._dot_count_sp.value()
@@ -1190,6 +1263,7 @@ class _SideRailSection(QGroupBox):
             "rail_chevron_depth": self.get_chevron_depth(),
             "rail_chevron_density": self.get_chevron_density(),
             "rail_pillar_count": self.get_pillar_count(),
+            "rail_pillar_highlight_count": self.get_pillar_highlight_count(),
             "rail_pillar_radius": self.get_pillar_radius(),
             "rail_chase_mode": self.get_chase_mode(),
             "rail_chase_speed_frames": self.get_chase_speed_frames(),
