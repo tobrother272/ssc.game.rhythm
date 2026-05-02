@@ -1,35 +1,25 @@
-"""Layer edit dialogs — per-kind configuration UI for timeline layer blocks.
+"""Layer edit sections for timeline layer blocks.
 
 Each layer kind has a dedicated section widget (QGroupBox) with:
   - __init__(config: dict)   — populate widgets from dict
   - changed = Signal()       — emitted on any user edit
   - get_config() -> dict     — export current state
 
-``_LayerEditDialog`` wraps the appropriate section in a modal dialog.
 """
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QPushButton,
-    QVBoxLayout,
     QWidget,
 )
-
-if TYPE_CHECKING:
-    from studio.models.layer import Layer
 
 # ---------------------------------------------------------------------------
 # Helpers imported from segment_config_panel — reuse existing section widgets
@@ -306,7 +296,7 @@ class _CountdownSection(QGroupBox):
         self._max_sec_sp.setRange(0.0, 20.0)
         self._max_sec_sp.setSingleStep(0.5)
         self._max_sec_sp.setDecimals(1)
-        self._max_sec_sp.setValue(float(config.get("relax_countdown_max_sec", 3.0)))
+        self._max_sec_sp.setValue(float(config.get("relax_countdown_max_sec", 5.0)))
         self._max_sec_sp.setToolTip("Countdown visible window in seconds")
         self._max_sec_sp.valueChanged.connect(self.changed)
         form.addRow("Max seconds", self._max_sec_sp)
@@ -395,6 +385,49 @@ class _CountdownSection(QGroupBox):
         self._audio_last_file_label = QLabel("Last sound file")
         form.addRow(self._audio_last_file_label, self._audio_last_file_edit)
 
+        self._bbox_group = QGroupBox("Position & size", self)
+        self._bbox_group.setToolTip(
+            "Vị trí và kích thước hộp số đếm ngược, tỉ lệ 0..1 theo khung hình. "
+            "Có thể kéo trực tiếp trong preview để chỉnh nhanh."
+        )
+        bbox_form = QFormLayout(self._bbox_group)
+        bbox_form.setContentsMargins(8, 8, 8, 8)
+        bbox_form.setSpacing(6)
+
+        self._x_sp = QDoubleSpinBox()
+        self._x_sp.setRange(0.0, 1.0)
+        self._x_sp.setSingleStep(0.01)
+        self._x_sp.setDecimals(3)
+        self._x_sp.setValue(float(config.get("relax_countdown_x", 0.88) or 0.88))
+        self._x_sp.valueChanged.connect(self.changed)
+        bbox_form.addRow("X (0..1)", self._x_sp)
+
+        self._y_sp = QDoubleSpinBox()
+        self._y_sp.setRange(0.0, 1.0)
+        self._y_sp.setSingleStep(0.01)
+        self._y_sp.setDecimals(3)
+        self._y_sp.setValue(float(config.get("relax_countdown_y", 0.04) or 0.04))
+        self._y_sp.valueChanged.connect(self.changed)
+        bbox_form.addRow("Y (0..1)", self._y_sp)
+
+        self._w_sp = QDoubleSpinBox()
+        self._w_sp.setRange(0.02, 1.0)
+        self._w_sp.setSingleStep(0.01)
+        self._w_sp.setDecimals(3)
+        self._w_sp.setValue(float(config.get("relax_countdown_w", 0.10) or 0.10))
+        self._w_sp.valueChanged.connect(self.changed)
+        bbox_form.addRow("Width (0..1)", self._w_sp)
+
+        self._h_sp = QDoubleSpinBox()
+        self._h_sp.setRange(0.02, 1.0)
+        self._h_sp.setSingleStep(0.01)
+        self._h_sp.setDecimals(3)
+        self._h_sp.setValue(float(config.get("relax_countdown_h", 0.16) or 0.16))
+        self._h_sp.valueChanged.connect(self.changed)
+        bbox_form.addRow("Height (0..1)", self._h_sp)
+
+        form.addRow(self._bbox_group)
+
         self._update_audio_visibility()
 
     def _refresh_color_btn(self) -> None:
@@ -457,92 +490,8 @@ class _CountdownSection(QGroupBox):
                 self._audio_last_mode_cb.currentData()
             ),
             "relax_countdown_audio_last_file": self._audio_last_file_edit.get_value(),
+            "relax_countdown_x": self._x_sp.value(),
+            "relax_countdown_y": self._y_sp.value(),
+            "relax_countdown_w": self._w_sp.value(),
+            "relax_countdown_h": self._h_sp.value(),
         }
-
-
-# ---------------------------------------------------------------------------
-# _LayerEditDialog
-# ---------------------------------------------------------------------------
-
-class _LayerEditDialog(QDialog):
-    """Modal dialog to edit a layer's config.
-
-    Dispatches to the appropriate section widget based on layer.kind.
-    Returns updated config via get_config() after Accepted.
-    """
-
-    def __init__(self, layer: "Layer", parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.layer = layer
-        self.setWindowTitle(f"Edit {layer.kind.replace('_', ' ').title()} Layer")
-        self.setMinimumWidth(380)
-        layout = QVBoxLayout(self)
-
-        kind = layer.kind
-        cfg = dict(layer.config)
-
-        if kind == "background":
-            self._section: QWidget = _BackgroundSection(cfg, self)
-        elif kind == "floor":
-            from .segment_config_panel import _FloorPanelSection
-            self._section = _FloorPanelSection(
-                color=cfg.get("floor_panel_color"),
-                blink=bool(cfg.get("floor_panel_blink", False)),
-                image=cfg.get("floor_panel_image"),
-                floor_panel_opacity=float(cfg.get("floor_panel_opacity", 1.0)),
-                floor_layout=str(cfg.get("floor_layout", "auto")),
-                floor_bg_color=cfg.get("floor_bg_color"),
-                floor_bg_opacity=float(cfg.get("floor_bg_opacity", 1.0)),
-                chevron_color=str(cfg.get("chevron_color", "#FFD700")),
-                chevron_scroll=bool(cfg.get("chevron_scroll", True)),
-                chevron_blink=bool(cfg.get("chevron_blink", False)),
-                chevron_width_frac=float(cfg.get("chevron_width_frac", 0.45)),
-                chevron_count=int(cfg.get("chevron_count", 6)),
-                full_static_image=bool(cfg.get("floor_full_static_image", False)),
-                parent=self,
-            )
-        elif kind == "side_rails":
-            from .segment_config_panel import _SideRailSection
-            self._section = _SideRailSection(
-                color=str(cfg.get("rail_color", "#FF60FF")),
-                shape=str(cfg.get("rail_shape", "chunky")),
-                height=float(cfg.get("rail_height", 0.14)),
-                offset_x=float(cfg.get("rail_offset_x", 0.08)),
-                image=cfg.get("rail_image"),
-                pulse=str(cfg.get("rail_pulse", "beat")),
-                pulse_intensity=float(cfg.get("rail_pulse_intensity", 0.6)),
-                texture_non_loop=bool(cfg.get("rail_texture_non_loop", False)),
-                chevron_depth=float(cfg.get("rail_chevron_depth", 1.0)),
-                chevron_density=int(cfg.get("rail_chevron_density", 6)),
-                pillar_count=int(cfg.get("rail_pillar_count", 16)),
-                pillar_highlight_count=int(cfg.get("rail_pillar_highlight_count", 1)),
-                pillar_radius=float(cfg.get("rail_pillar_radius", 1.0)),
-                chase_mode=str(cfg.get("rail_chase_mode", "time")),
-                chase_speed_frames=int(cfg.get("rail_chase_speed_frames", 4)),
-                dot_count=int(cfg.get("rail_dot_count", 24)),
-                dot_lines=int(cfg.get("rail_dot_lines", 1)),
-                dot_size_px=int(cfg.get("rail_dot_size_px", 6)),
-                dot_anim_mode=str(cfg.get("rail_dot_anim_mode", "audio")),
-                dot_color_near=str(cfg.get("rail_dot_color_near", "#FF60FF")),
-                dot_color_far=str(cfg.get("rail_dot_color_far", "#00FFFF")),
-                parent=self,
-            )
-        elif kind == "stickman":
-            self._section = _StickmanSection(cfg, self)
-        elif kind == "countdown":
-            self._section = _CountdownSection(cfg, self)
-        else:
-            raise ValueError(f"Unknown layer kind: {kind!r}")
-
-        layout.addWidget(self._section)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def get_config(self) -> dict:
-        """Return the section's current config dict."""
-        return self._section.get_config()  # type: ignore[attr-defined]

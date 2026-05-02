@@ -448,6 +448,9 @@ class MainWindow(QMainWindow):
         )
         self.timeline_panel.segment_moved.connect(self._on_segment_moved)
         self.timeline_panel.layer_changed.connect(self._on_layer_changed)
+        self.timeline_panel.layer_status_message.connect(
+            self._on_timeline_layer_status_message
+        )
         # Inspector selection signals (polymorphic panel)
         self.timeline_panel.layer_selected.connect(self._on_layer_selected)
         self.timeline_panel.selection_cleared.connect(self._on_selection_cleared)
@@ -527,6 +530,7 @@ class MainWindow(QMainWindow):
         self.media_panel.set_project(project)
         self.timeline_panel.set_project(project)
         self.timeline_panel.clear_beat_events()
+        self.preview_panel.set_project_layers(project.layers)
         # Re-paint the timeline strip from each segment's persisted
         # ``beat_events`` so the user sees the same ticks they last
         # generated, immediately after opening the project — no need
@@ -1298,10 +1302,6 @@ class MainWindow(QMainWindow):
         seg.render_settings["floor_spread_frac"]    = round(near_spread,         4)
         seg.render_settings["far_spread_frac"]      = round(far_spread,          4)
         seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
-        seg.render_settings["relax_countdown_x"]    = round(relax_countdown_x,   4)
-        seg.render_settings["relax_countdown_y"]    = round(relax_countdown_y,   4)
-        seg.render_settings["relax_countdown_w"]    = round(relax_countdown_w,   4)
-        seg.render_settings["relax_countdown_h"]    = round(relax_countdown_h,   4)
         seg.render_settings["rail_height"]          = round(max(0.15, rail_height), 4)
 
         # Layer-first system: countdown box placement must live on the countdown
@@ -1834,6 +1834,11 @@ class MainWindow(QMainWindow):
         seg_id = self._preview_active_segment_id
         if seg_id:
             self._request_preview_restart(seg_id)
+
+    def _on_timeline_layer_status_message(self, message: str, timeout_ms: int) -> None:
+        if not message:
+            return
+        self.statusBar().showMessage(str(message), int(timeout_ms))
 
     def _on_inspector_layer_changed(self, layer_id: str) -> None:
         """Inspector panel edited a layer's config — trigger preview + dirty."""

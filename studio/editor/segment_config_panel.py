@@ -1814,9 +1814,6 @@ class SegmentConfigPanel(QWidget):
         "relax_show_low": "Show low",
         "relax_show_high": "Show high",
         "relax_show_middle": "Show middle",
-        "relax_countdown_enabled": "Countdown",
-        "relax_countdown_color": "Countdown color",
-        "relax_countdown_max_sec": "Countdown max sec",
     }
 
     def _rebuild_dynamic_settings(self) -> None:
@@ -1897,7 +1894,6 @@ class SegmentConfigPanel(QWidget):
         "relax_travel_sec": (0.5, 10.0, 0.1, 2, "Relax block travel seconds (solo relax)."),
         "relax_wait_sec": (0.0, 10.0, 0.1, 2, "Hold time before relax block starts moving."),
         "relax_kind_ratio_middle": (0.0, 1.0, 0.01, 2, "Middle block spawn ratio (0..1)."),
-        "relax_countdown_max_sec": (0.0, 20.0, 0.1, 2, "Countdown visible window (seconds)."),
     }
 
     def _build_widget_for_value(self, key: str, value):
@@ -1928,15 +1924,6 @@ class SegmentConfigPanel(QWidget):
                 title=title,
                 file_filter=filt,
                 placeholder="Optional file path",
-                parent=self,
-            )
-            widget.changed.connect(self._commit_settings)
-            return widget
-        if key == "relax_countdown_color":
-            widget = _ColorPickerWidget(
-                None if value is None else str(value),
-                title="Relax countdown color",
-                default_color="#FFFFFF",
                 parent=self,
             )
             widget.changed.connect(self._commit_settings)

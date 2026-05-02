@@ -744,6 +744,8 @@ class PreviewPanel(QWidget):
         )
         # Cached timeline order pushed by MainWindow.
         self._project_segments: list[Segment] = []
+        # Shared project layers reference for layer-first visual resolves.
+        self._project_layers: list = []
         # Last observed playback state (used to decide auto-resume on advance).
         self._was_playing: bool = False
         # While user drags the seek slider in full-preview mode, we defer the
@@ -776,6 +778,10 @@ class PreviewPanel(QWidget):
             if self._project_segments:
                 self._show_empty("No segment selected - press Play to preview project")
         self._refresh_seek_ui(self.player.position(), self.player.duration())
+
+    def set_project_layers(self, layers: list) -> None:
+        """Set project layers reference used by overlay resolution."""
+        self._project_layers = layers if isinstance(layers, list) else []
 
     def _is_project_timeline_mode(self) -> bool:
         return bool(self._full_preview_mode or self._project_playback_mode)
@@ -1106,10 +1112,7 @@ class PreviewPanel(QWidget):
                 elif str(seg.mode) == "combo":
                     modes = rs.get("mode_list") or []
                     has_relax = "relax" in [str(m) for m in modes]
-            cdx = float(rs.get("relax_countdown_x", 0.88) or 0.88)
-            cdy = float(rs.get("relax_countdown_y", 0.04) or 0.04)
-            cdw = float(rs.get("relax_countdown_w", 0.10) or 0.10)
-            cdh = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            cdx, cdy, cdw, cdh = self._get_countdown_bbox(seg)
             rail_h = float(rs.get("rail_height", 0.14) or 0.14)
             # In layer-first config projects, segment.render_settings can be
             # stale while live renderer already uses resolved layer values.
@@ -1164,13 +1167,33 @@ class PreviewPanel(QWidget):
             seg.render_settings["floor_spread_frac"]    = round(near_sp, 4)
             seg.render_settings["far_spread_frac"]      = round(far_sp,  4)
             seg.render_settings["wall_floor_gap_frac"]  = round(gap,     4)
-            seg.render_settings["relax_countdown_x"]    = round(cdx,     4)
-            seg.render_settings["relax_countdown_y"]    = round(cdy,     4)
-            seg.render_settings["relax_countdown_w"]    = round(cdw,     4)
-            seg.render_settings["relax_countdown_h"]    = round(cdh,     4)
             seg.render_settings["rail_height"]          = round(max(0.15, rail_h), 4)
         self.floor_wall_committed.emit(
             hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh, max(0.15, rail_h)
+        )
+
+    def _get_countdown_bbox(
+        self, seg: Segment | None
+    ) -> tuple[float, float, float, float]:
+        """Resolve countdown box from countdown layer config."""
+        if seg is None or not self._project_layers:
+            return (0.88, 0.04, 0.10, 0.16)
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        cd_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "countdown"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not cd_layers:
+            return (0.88, 0.04, 0.10, 0.16)
+        top = max(cd_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        cfg = getattr(top, "config", {}) or {}
+        return (
+            float(cfg.get("relax_countdown_x", 0.88) or 0.88),
+            float(cfg.get("relax_countdown_y", 0.04) or 0.04),
+            float(cfg.get("relax_countdown_w", 0.10) or 0.10),
+            float(cfg.get("relax_countdown_h", 0.16) or 0.16),
         )
 
     def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
