@@ -174,6 +174,13 @@ class RelaxSettings(BaseRenderSettings):
     relax_countdown_enabled: bool = True
     relax_countdown_color: str = "#FFFFFF"
     relax_countdown_max_sec: float = 5.0
+    relax_countdown_anim: Literal["pop", "flash", "fade_cross", "shake"] = "pop"
+    relax_countdown_audio_enabled: bool = False
+    relax_countdown_audio_mode: Literal["default", "file"] = "default"
+    relax_countdown_audio_file: Optional[str] = None
+    relax_countdown_audio_volume: float = Field(default=0.65, ge=0.0, le=1.0)
+    relax_countdown_audio_last_mode: Literal["default", "file", "same"] = "default"
+    relax_countdown_audio_last_file: Optional[str] = None
     relax_countdown_x: float = Field(default=0.88, ge=0.0, le=1.0)
     relax_countdown_y: float = Field(default=0.04, ge=0.0, le=1.0)
     relax_countdown_w: float = Field(default=0.10, ge=0.02, le=1.0)

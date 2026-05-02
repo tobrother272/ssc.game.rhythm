@@ -132,6 +132,13 @@ def test_relax_extensions_round_trip() -> None:
         "relax_countdown_enabled": False,
         "relax_countdown_color": "#FF0000",
         "relax_countdown_max_sec": 4.2,
+        "relax_countdown_anim": "shake",
+        "relax_countdown_audio_enabled": True,
+        "relax_countdown_audio_mode": "file",
+        "relax_countdown_audio_file": "C:/tmp/count.wav",
+        "relax_countdown_audio_volume": 0.55,
+        "relax_countdown_audio_last_mode": "file",
+        "relax_countdown_audio_last_file": "C:/tmp/count_last.wav",
         "relax_countdown_x": 0.72,
         "relax_countdown_y": 0.08,
         "relax_countdown_w": 0.14,
@@ -146,6 +153,13 @@ def test_relax_extensions_round_trip() -> None:
     assert d["relax_countdown_enabled"] is False
     assert d["relax_countdown_color"] == "#FF0000"
     assert d["relax_countdown_max_sec"] == 4.2
+    assert d["relax_countdown_anim"] == "shake"
+    assert d["relax_countdown_audio_enabled"] is True
+    assert d["relax_countdown_audio_mode"] == "file"
+    assert d["relax_countdown_audio_file"] == "C:/tmp/count.wav"
+    assert d["relax_countdown_audio_volume"] == 0.55
+    assert d["relax_countdown_audio_last_mode"] == "file"
+    assert d["relax_countdown_audio_last_file"] == "C:/tmp/count_last.wav"
     assert d["relax_countdown_x"] == 0.72
     assert d["relax_countdown_h"] == 0.20
 
@@ -161,6 +175,11 @@ def test_relax_defaults_backward_compatible() -> None:
     assert d["relax_show_high"] is True
     assert d["relax_show_middle"] is True
     assert d["relax_countdown_enabled"] is True
+    assert d["relax_countdown_anim"] == "pop"
+    assert d["relax_countdown_audio_enabled"] is False
+    assert d["relax_countdown_audio_mode"] == "default"
+    assert d["relax_countdown_audio_volume"] == 0.65
+    assert d["relax_countdown_audio_last_mode"] == "default"
     assert d["relax_countdown_x"] == 0.88
     assert d["relax_countdown_h"] == 0.16
 

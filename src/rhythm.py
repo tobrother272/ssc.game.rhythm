@@ -26,6 +26,7 @@ import time
 import sys
 import subprocess
 import shlex
+from pathlib import Path
 import ffmpeg
 
 # ── GPU acceleration (CuPy + cuFFT) ──────────────────────────────────────────
@@ -4517,14 +4518,40 @@ class CountdownHUD:
 
     def __init__(self, cam: PerspectiveCamera, color: str = "#FFFFFF",
                  max_show_sec: float = 5.0,
-                 box: tuple[float, float, float, float] | None = None) -> None:
+                 box: tuple[float, float, float, float] | None = None,
+                 anim: str = "pop") -> None:
         self.cam = cam
         self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
         self._max_show_sec = float(max_show_sec)
         self._font = cv2.FONT_HERSHEY_DUPLEX
+        self._anim_mode = self._normalize_anim(anim)
+        self._last_text: str | None = None
+        self._prev_text: str | None = None
+        self._last_change_frame: int = -10_000_000
+        self._audio_events: list[tuple[float, bool]] = []
         if box is None:
             box = (0.88, 0.04, 0.10, 0.16)  # top-right default
         self.set_box(*box)
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw in {"flash"}:
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    def set_animation(self, mode: str) -> None:
+        self._anim_mode = self._normalize_anim(mode)
+
+    def pop_audio_events(self) -> list[tuple[float, bool]]:
+        """Return and clear queued (time_sec, is_last_count) events."""
+        out = list(self._audio_events)
+        self._audio_events.clear()
+        return out
 
     def set_box(self, x: float, y: float, w: float, h: float) -> None:
         x = max(0.0, min(0.98, float(x)))
@@ -4535,6 +4562,51 @@ class CountdownHUD:
         self._box_y = y
         self._box_w = w
         self._box_h = h
+
+    def _draw_glow_text(
+        self,
+        canvas: np.ndarray,
+        *,
+        text: str,
+        x: int,
+        y: int,
+        font_scale: float,
+        thickness: int,
+        alpha: float = 1.0,
+        glow_boost: float = 1.0,
+    ) -> None:
+        if alpha <= 1e-4:
+            return
+        alpha = float(max(0.0, min(1.0, alpha)))
+        glow_boost = float(max(0.2, glow_boost))
+
+        glow = np.zeros_like(canvas)
+        for thick, weight in (
+            (thickness + 10, 0.10),
+            (thickness + 6, 0.18),
+            (thickness + 3, 0.28),
+        ):
+            layer = np.zeros_like(canvas)
+            cv2.putText(
+                layer, text, (x, y), self._font, font_scale,
+                self._color_bgr, thick, cv2.LINE_AA
+            )
+            glow = cv2.addWeighted(
+                glow, 1.0, layer, float(weight * glow_boost), 0.0
+            )
+        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=4.0, sigmaY=4.0)
+        canvas[:] = cv2.addWeighted(canvas, 1.0, glow, 0.95 * alpha, 0.0)
+
+        crisp = np.zeros_like(canvas)
+        cv2.putText(
+            crisp, text, (x, y), self._font, font_scale,
+            self._color_bgr, max(1, thickness + 2), cv2.LINE_AA
+        )
+        cv2.putText(
+            crisp, text, (x, y), self._font, font_scale,
+            (255, 255, 255), max(1, thickness), cv2.LINE_AA
+        )
+        canvas[:] = cv2.addWeighted(canvas, 1.0, crisp, alpha, 0.0)
 
     def draw(self, canvas: np.ndarray, targets: list, cur_frame: int, fps: float) -> None:
         active_t = None
@@ -4562,6 +4634,13 @@ class CountdownHUD:
         if time_left < 0.0:
             return
         text = str(max(0, int(np.ceil(time_left))))
+        if self._last_text != text:
+            self._prev_text = self._last_text
+            self._last_text = text
+            self._last_change_frame = int(cur_frame)
+            self._audio_events.append(
+                (float(cur_frame) / max(1.0, float(fps)), text == "1")
+            )
         H, W = canvas.shape[:2]
         bx = int(round(self._box_x * W))
         by = int(round(self._box_y * H))
@@ -4574,45 +4653,81 @@ class CountdownHUD:
         if bw <= 1 or bh <= 1:
             return
 
-        # Fit font size tightly to the user box (very small padding).
-        # Compute scale from glyph bounds at scale=1 so large boxes
-        # produce large digits (not tiny centered text).
+        # Fit base font size tightly to the user box.
         t_ref = max(1, int(round(2.0)))
         (tw_ref, th_ref), _ = cv2.getTextSize(text, self._font, 1.0, t_ref)
         target_w = max(1, int(bw * 0.995))
         target_h = max(1, int(bh * 0.995))
         scale_w = target_w / max(1.0, float(tw_ref))
         scale_h = target_h / max(1.0, float(th_ref))
-        font_scale = max(0.20, min(scale_w, scale_h))
-        thickness = max(1, int(round(font_scale * 2.0)))
-        (tw, th), _ = cv2.getTextSize(text, self._font, font_scale, thickness)
-        # Thickness quantization can push text slightly over bounds.
-        while (tw > target_w or th > target_h) and font_scale > 0.12:
-            font_scale *= 0.97
-            thickness = max(1, int(round(font_scale * 2.0)))
-            (tw, th), _ = cv2.getTextSize(text, self._font, font_scale, thickness)
-        x = bx + (bw - tw) // 2
-        y = by + (bh + th) // 2
+        base_scale = max(0.20, min(scale_w, scale_h))
+        base_thickness = max(1, int(round(base_scale * 2.0)))
 
-        # Neon glow passes (blurred) using the user-selected color.
-        glow = np.zeros_like(canvas)
-        for thick, alpha in ((thickness + 10, 0.10),
-                             (thickness + 6, 0.18),
-                             (thickness + 3, 0.28)):
-            layer = np.zeros_like(canvas)
-            cv2.putText(
-                layer, text, (x, y), self._font, font_scale,
-                self._color_bgr, thick, cv2.LINE_AA
+        dt_sec = max(0.0, (float(cur_frame) - float(self._last_change_frame)) / max(1.0, float(fps)))
+        anim_progress = min(1.0, dt_sec / 0.16)
+
+        def _fit(scale_mul: float = 1.0) -> tuple[float, int, int, int, int, int]:
+            fs = max(0.12, base_scale * float(scale_mul))
+            thick = max(1, int(round(fs * 2.0)))
+            (tw, th), _ = cv2.getTextSize(text, self._font, fs, thick)
+            while (tw > target_w or th > target_h) and fs > 0.12:
+                fs *= 0.97
+                thick = max(1, int(round(fs * 2.0)))
+                (tw, th), _ = cv2.getTextSize(text, self._font, fs, thick)
+            tx = bx + (bw - tw) // 2
+            ty = by + (bh + th) // 2
+            return fs, thick, tw, th, tx, ty
+
+        if self._anim_mode == "flash":
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            boost = 1.0 + (1.35 * (1.0 - anim_progress))
+            self._draw_glow_text(
+                canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+                alpha=1.0, glow_boost=boost,
             )
-            glow = cv2.addWeighted(glow, 1.0, layer, alpha, 0.0)
-        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=4.0, sigmaY=4.0)
-        canvas[:] = cv2.addWeighted(canvas, 1.0, glow, 0.95, 0.0)
+            return
 
-        # Crisp neon outline + fixed white fill.
-        cv2.putText(canvas, text, (x, y), self._font, font_scale,
-                    self._color_bgr, thickness + 2, cv2.LINE_AA)
-        cv2.putText(canvas, text, (x, y), self._font, font_scale,
-                    (255, 255, 255), thickness, cv2.LINE_AA)
+        if self._anim_mode == "fade_cross" and self._prev_text is not None:
+            cur_a = max(0.0, min(1.0, anim_progress))
+            prev_a = max(0.0, 1.0 - cur_a)
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            if prev_a > 1e-4:
+                self._draw_glow_text(
+                    canvas,
+                    text=self._prev_text,
+                    x=x,
+                    y=y,
+                    font_scale=fs,
+                    thickness=thick,
+                    alpha=prev_a,
+                    glow_boost=1.0,
+                )
+            self._draw_glow_text(
+                canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+                alpha=cur_a, glow_boost=1.0,
+            )
+            if anim_progress >= 1.0:
+                self._prev_text = None
+            return
+
+        if self._anim_mode == "shake":
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            amp = 6.0 * (1.0 - anim_progress)
+            dx = int(round(math.sin(float(cur_frame) * 1.7) * amp * 0.45))
+            dy = int(round(math.sin(float(cur_frame) * 2.8) * amp))
+            self._draw_glow_text(
+                canvas, text=text, x=x + dx, y=y + dy, font_scale=fs, thickness=thick,
+                alpha=1.0, glow_boost=1.0,
+            )
+            return
+
+        # Default "pop" effect: overshoot scale then settle.
+        scale_mul = 1.0 + (0.25 * (1.0 - anim_progress))
+        fs, thick, _tw, _th, x, y = _fit(scale_mul)
+        self._draw_glow_text(
+            canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+            alpha=1.0, glow_boost=1.0,
+        )
 
 
 # ── GameManager ──────────────────────────────────────────────────────────────
@@ -5480,10 +5595,18 @@ class RhythmVisualizer:
         self.RELAX_COUNTDOWN_ENABLED: bool = True
         self.RELAX_COUNTDOWN_COLOR: str = "#FFFFFF"
         self.RELAX_COUNTDOWN_MAX_SEC: float = 5.0
+        self.RELAX_COUNTDOWN_ANIM: str = "pop"
+        self.RELAX_COUNTDOWN_AUDIO_ENABLED: bool = False
+        self.RELAX_COUNTDOWN_AUDIO_MODE: str = "default"
+        self.RELAX_COUNTDOWN_AUDIO_FILE: str | None = None
+        self.RELAX_COUNTDOWN_AUDIO_VOLUME: float = 0.65
+        self.RELAX_COUNTDOWN_AUDIO_LAST_MODE: str = "default"
+        self.RELAX_COUNTDOWN_AUDIO_LAST_FILE: str | None = None
         self.RELAX_COUNTDOWN_X: float = 0.88
         self.RELAX_COUNTDOWN_Y: float = 0.04
         self.RELAX_COUNTDOWN_W: float = 0.10
         self.RELAX_COUNTDOWN_H: float = 0.16
+        self._countdown_audio_events: list[tuple[float, bool]] = []
         # ── Camera perspective overrides ────────────────────────────────
         self.FLOOR_HIT_FRAC:    float | None = None
         self.HORIZON_FRAC:      float | None = None
@@ -5955,11 +6078,13 @@ class RhythmVisualizer:
             stick = None
         combo     = ComboHUD(cam)
         countdown_hud = None
+        countdown_audio_events: list[tuple[float, bool]] = []
         if bool(getattr(self, "RELAX_COUNTDOWN_ENABLED", True)):
             countdown_hud = CountdownHUD(
                 cam,
                 color=str(getattr(self, "RELAX_COUNTDOWN_COLOR", "#FFFFFF")),
                 max_show_sec=float(getattr(self, "RELAX_COUNTDOWN_MAX_SEC", 5.0)),
+                anim=str(getattr(self, "RELAX_COUNTDOWN_ANIM", "pop")),
                 box=(
                     float(getattr(self, "RELAX_COUNTDOWN_X", 0.88)),
                     float(getattr(self, "RELAX_COUNTDOWN_Y", 0.04)),
@@ -6596,6 +6721,7 @@ class RhythmVisualizer:
             combo.draw(canvas, fi)
             if countdown_hud is not None and 'relax' in modes_seq:
                 countdown_hud.draw(canvas, game.targets, fi, float(self.FPS))
+                countdown_audio_events.extend(countdown_hud.pop_audio_events())
 
             if self.LINE_DEBUG and line_dbg_events:
                 # Top timeline: visualize where each line block event lands.
@@ -6688,6 +6814,7 @@ class RhythmVisualizer:
             _vproc.wait()
 
         print(f"\nTotal time: {time.time()-t0:.2f}s")
+        self._countdown_audio_events = countdown_audio_events
         return temp_video
 
     # -------------------------------------------------------------------
@@ -6707,15 +6834,102 @@ class RhythmVisualizer:
             except Exception:
                 _ffmpeg_bin = 'ffmpeg'
 
-            # Use plain ffmpeg CLI with -c:v copy + -shortest to keep A/V aligned.
-            cmd = [_ffmpeg_bin, '-y',
-                   '-i', temp_video,       # already-encoded video (keep as-is)
-                   '-i', audio_file,       # source audio
-                   '-map', '0:v:0',        # take video from input 0
-                   '-map', '1:a:0',        # take audio from input 1
-                   '-c:v', 'copy',         # DON'T re-encode video
-                   '-c:a', 'aac', '-b:a', '192k',
-                   '-shortest']
+            def _norm_mode(v: object) -> str:
+                raw = str(v or "").strip().lower()
+                return "file" if raw == "file" else "default"
+
+            def _norm_last_mode(v: object) -> str:
+                raw = str(v or "").strip().lower()
+                if raw in {"file", "same"}:
+                    return raw
+                return "default"
+
+            def _resolve_event_source(is_last: bool) -> tuple[str, str | tuple[float, float]]:
+                # Returns ("file", path) or ("tone", (freq_hz, duration_sec)).
+                mode = _norm_mode(getattr(self, "RELAX_COUNTDOWN_AUDIO_MODE", "default"))
+                last_mode = _norm_last_mode(
+                    getattr(self, "RELAX_COUNTDOWN_AUDIO_LAST_MODE", "default")
+                )
+                regular_file = str(getattr(self, "RELAX_COUNTDOWN_AUDIO_FILE", "") or "").strip()
+                last_file = str(getattr(self, "RELAX_COUNTDOWN_AUDIO_LAST_FILE", "") or "").strip()
+
+                if is_last:
+                    if last_mode == "same":
+                        if mode == "file" and regular_file and Path(regular_file).exists():
+                            return ("file", regular_file)
+                        return ("tone", (940.0, 0.09))
+                    if last_mode == "file" and last_file and Path(last_file).exists():
+                        return ("file", last_file)
+                    return ("tone", (1260.0, 0.13))
+
+                if mode == "file" and regular_file and Path(regular_file).exists():
+                    return ("file", regular_file)
+                return ("tone", (940.0, 0.09))
+
+            events = list(getattr(self, "_countdown_audio_events", []) or [])
+            enable_cd_audio = bool(getattr(self, "RELAX_COUNTDOWN_AUDIO_ENABLED", False))
+            cd_volume = float(max(0.0, min(1.0, getattr(self, "RELAX_COUNTDOWN_AUDIO_VOLUME", 0.65))))
+
+            # Base command: copy pre-rendered video stream, build output audio from
+            # original track + optional countdown overlay sounds.
+            cmd = [
+                _ffmpeg_bin, '-y',
+                '-i', temp_video,   # 0: video
+                '-i', audio_file,   # 1: source audio
+            ]
+
+            filter_parts: list[str] = ["[1:a]aresample=44100,asetpts=PTS-STARTPTS[base]"]
+            mix_inputs = ["[base]"]
+
+            next_input_idx = 2
+            if enable_cd_audio and events:
+                for ev_idx, (ev_t, is_last) in enumerate(events):
+                    try:
+                        t_sec = max(0.0, float(ev_t))
+                    except (TypeError, ValueError):
+                        continue
+                    src_kind, src_data = _resolve_event_source(bool(is_last))
+                    if src_kind == "file":
+                        src_path = str(src_data)
+                        cmd += ['-i', src_path]
+                    else:
+                        freq_hz, dur_s = src_data  # type: ignore[misc]
+                        cmd += [
+                            '-f', 'lavfi',
+                            '-t', f'{float(dur_s):.4f}',
+                            '-i', f'sine=frequency={float(freq_hz):.2f}:sample_rate=44100',
+                        ]
+                    delay_ms = int(round(t_sec * 1000.0))
+                    label = f"cd{ev_idx}"
+                    filter_parts.append(
+                        f"[{next_input_idx}:a]aformat=sample_rates=44100,"
+                        f"volume={cd_volume:.4f},"
+                        f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[{label}]"
+                    )
+                    mix_inputs.append(f"[{label}]")
+                    next_input_idx += 1
+
+            if len(mix_inputs) > 1:
+                filter_parts.append(
+                    "".join(mix_inputs)
+                    + f"amix=inputs={len(mix_inputs)}:normalize=0[aout]"
+                )
+                cmd += [
+                    '-filter_complex', ';'.join(filter_parts),
+                    '-map', '0:v:0',
+                    '-map', '[aout]',
+                ]
+            else:
+                cmd += [
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                ]
+
+            cmd += [
+                '-c:v', 'copy',     # DON'T re-encode video
+                '-c:a', 'aac', '-b:a', '192k',
+                '-shortest',
+            ]
             if self.TIME_LIMIT:
                 cmd += ['-t', str(self.TIME_LIMIT)]
             cmd += [output_filename]
@@ -7125,6 +7339,23 @@ def parse_arguments():
                    help='Relax countdown text color.')
     p.add_argument('--relax_countdown_max_sec', type=float, default=5.0,
                    help='Only show countdown if next hit <= this many seconds.')
+    p.add_argument('--relax_countdown_anim', type=str, default='pop',
+                   choices=('pop', 'flash', 'fade_cross', 'shake'),
+                   help='Countdown number transition effect.')
+    p.add_argument('--relax_countdown_audio_enabled', type=int, default=0, metavar='0|1',
+                   help='Enable per-count countdown tick sounds.')
+    p.add_argument('--relax_countdown_audio_mode', type=str, default='default',
+                   choices=('default', 'file'),
+                   help='Regular count sound source.')
+    p.add_argument('--relax_countdown_audio_file', type=str, default=None, metavar='PATH',
+                   help='Audio file for regular count ticks (when mode=file).')
+    p.add_argument('--relax_countdown_audio_volume', type=float, default=0.65,
+                   help='Countdown sound mix volume (0..1).')
+    p.add_argument('--relax_countdown_audio_last_mode', type=str, default='default',
+                   choices=('default', 'file', 'same'),
+                   help='Last-count sound source (1 -> hit).')
+    p.add_argument('--relax_countdown_audio_last_file', type=str, default=None, metavar='PATH',
+                   help='Audio file for last-count tick (when last_mode=file).')
     p.add_argument('--relax_countdown_x', type=float, default=0.88,
                    help='Countdown box x (0..1, normalized).')
     p.add_argument('--relax_countdown_y', type=float, default=0.04,
@@ -7300,6 +7531,17 @@ if __name__ == '__main__':
     viz.RELAX_COUNTDOWN_ENABLED = bool(int(args.relax_countdown_enabled))
     viz.RELAX_COUNTDOWN_COLOR = str(args.relax_countdown_color)
     viz.RELAX_COUNTDOWN_MAX_SEC = max(0.0, float(args.relax_countdown_max_sec))
+    viz.RELAX_COUNTDOWN_ANIM = CountdownHUD._normalize_anim(args.relax_countdown_anim)
+    viz.RELAX_COUNTDOWN_AUDIO_ENABLED = bool(int(args.relax_countdown_audio_enabled))
+    viz.RELAX_COUNTDOWN_AUDIO_MODE = str(args.relax_countdown_audio_mode or "default")
+    viz.RELAX_COUNTDOWN_AUDIO_FILE = args.relax_countdown_audio_file or None
+    viz.RELAX_COUNTDOWN_AUDIO_VOLUME = max(
+        0.0, min(1.0, float(args.relax_countdown_audio_volume))
+    )
+    viz.RELAX_COUNTDOWN_AUDIO_LAST_MODE = str(
+        args.relax_countdown_audio_last_mode or "default"
+    )
+    viz.RELAX_COUNTDOWN_AUDIO_LAST_FILE = args.relax_countdown_audio_last_file or None
     viz.RELAX_COUNTDOWN_X = max(0.0, min(1.0, float(args.relax_countdown_x)))
     viz.RELAX_COUNTDOWN_Y = max(0.0, min(1.0, float(args.relax_countdown_y)))
     viz.RELAX_COUNTDOWN_W = max(0.02, min(1.0, float(args.relax_countdown_w)))

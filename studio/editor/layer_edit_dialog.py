@@ -243,6 +243,46 @@ class _CountdownSection(QGroupBox):
     """Config section for a Countdown layer block."""
 
     changed = Signal()
+    _ANIM_OPTIONS = [
+        ("Pop", "pop"),
+        ("Flash", "flash"),
+        ("Fade Cross", "fade_cross"),
+        ("Shake", "shake"),
+    ]
+    _AUDIO_MODE_OPTIONS = [
+        ("Default beep", "default"),
+        ("Audio file", "file"),
+    ]
+    _LAST_AUDIO_MODE_OPTIONS = [
+        ("Default last beep", "default"),
+        ("Use another file", "file"),
+        ("Same as regular", "same"),
+    ]
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw in {"flash"}:
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    @staticmethod
+    def _normalize_audio_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw == "file":
+            return "file"
+        return "default"
+
+    @staticmethod
+    def _normalize_last_audio_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"file", "same"}:
+            return raw
+        return "default"
 
     def __init__(self, config: dict, parent: QWidget | None = None) -> None:
         super().__init__("Countdown", parent)
@@ -271,6 +311,92 @@ class _CountdownSection(QGroupBox):
         self._max_sec_sp.valueChanged.connect(self.changed)
         form.addRow("Max seconds", self._max_sec_sp)
 
+        from PySide6.QtWidgets import QComboBox
+        self._anim_cb = QComboBox()
+        for label, val in self._ANIM_OPTIONS:
+            self._anim_cb.addItem(label, val)
+        current_anim = self._normalize_anim(config.get("relax_countdown_anim", "pop"))
+        idx = next((i for i, (_label, val) in enumerate(self._ANIM_OPTIONS) if val == current_anim), 0)
+        self._anim_cb.setCurrentIndex(idx)
+        self._anim_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Number effect", self._anim_cb)
+
+        self._audio_enabled_cb = QCheckBox("Enable countdown sound")
+        self._audio_enabled_cb.setChecked(
+            bool(config.get("relax_countdown_audio_enabled", False))
+        )
+        self._audio_enabled_cb.stateChanged.connect(self._on_audio_toggle_changed)
+        form.addRow("Audio", self._audio_enabled_cb)
+
+        from PySide6.QtWidgets import QComboBox
+        self._audio_mode_cb = QComboBox()
+        for label, val in self._AUDIO_MODE_OPTIONS:
+            self._audio_mode_cb.addItem(label, val)
+        audio_mode = self._normalize_audio_mode(
+            config.get("relax_countdown_audio_mode", "default")
+        )
+        idx = next(
+            (i for i, (_label, val) in enumerate(self._AUDIO_MODE_OPTIONS) if val == audio_mode),
+            0,
+        )
+        self._audio_mode_cb.setCurrentIndex(idx)
+        self._audio_mode_cb.currentIndexChanged.connect(self._on_audio_mode_changed)
+        self._audio_mode_label = QLabel("Sound source")
+        form.addRow(self._audio_mode_label, self._audio_mode_cb)
+
+        from .segment_config_panel import _PathBrowseWidget
+        audio_file = str(config.get("relax_countdown_audio_file", "") or "")
+        self._audio_file_edit = _PathBrowseWidget(
+            audio_file,
+            title="Select countdown audio",
+            file_filter="Audio (*.wav *.mp3 *.ogg *.m4a *.aac *.flac);;All files (*.*)",
+            placeholder="Optional countdown sound file",
+            parent=self,
+        )
+        self._audio_file_edit.changed.connect(self.changed)
+        self._audio_file_label = QLabel("Sound file")
+        form.addRow(self._audio_file_label, self._audio_file_edit)
+
+        self._audio_volume_sp = QDoubleSpinBox()
+        self._audio_volume_sp.setRange(0.0, 1.0)
+        self._audio_volume_sp.setSingleStep(0.05)
+        self._audio_volume_sp.setDecimals(2)
+        self._audio_volume_sp.setValue(
+            float(config.get("relax_countdown_audio_volume", 0.65) or 0.65)
+        )
+        self._audio_volume_sp.valueChanged.connect(self.changed)
+        self._audio_volume_label = QLabel("Sound volume")
+        form.addRow(self._audio_volume_label, self._audio_volume_sp)
+
+        self._audio_last_mode_cb = QComboBox()
+        for label, val in self._LAST_AUDIO_MODE_OPTIONS:
+            self._audio_last_mode_cb.addItem(label, val)
+        last_mode = self._normalize_last_audio_mode(
+            config.get("relax_countdown_audio_last_mode", "default")
+        )
+        idx = next(
+            (i for i, (_label, val) in enumerate(self._LAST_AUDIO_MODE_OPTIONS) if val == last_mode),
+            0,
+        )
+        self._audio_last_mode_cb.setCurrentIndex(idx)
+        self._audio_last_mode_cb.currentIndexChanged.connect(self._on_audio_mode_changed)
+        self._audio_last_mode_label = QLabel("Last count sound")
+        form.addRow(self._audio_last_mode_label, self._audio_last_mode_cb)
+
+        last_audio_file = str(config.get("relax_countdown_audio_last_file", "") or "")
+        self._audio_last_file_edit = _PathBrowseWidget(
+            last_audio_file,
+            title="Select countdown last sound",
+            file_filter="Audio (*.wav *.mp3 *.ogg *.m4a *.aac *.flac);;All files (*.*)",
+            placeholder="Optional last-count sound file",
+            parent=self,
+        )
+        self._audio_last_file_edit.changed.connect(self.changed)
+        self._audio_last_file_label = QLabel("Last sound file")
+        form.addRow(self._audio_last_file_label, self._audio_last_file_edit)
+
+        self._update_audio_visibility()
+
     def _refresh_color_btn(self) -> None:
         c = QColor(self._color)
         lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
@@ -287,11 +413,50 @@ class _CountdownSection(QGroupBox):
             self._refresh_color_btn()
             self.changed.emit()
 
+    def _on_audio_toggle_changed(self) -> None:
+        self._update_audio_visibility()
+        self.changed.emit()
+
+    def _on_audio_mode_changed(self) -> None:
+        self._update_audio_visibility()
+        self.changed.emit()
+
+    def _update_audio_visibility(self) -> None:
+        enabled = self._audio_enabled_cb.isChecked()
+        mode = self._normalize_audio_mode(self._audio_mode_cb.currentData())
+        last_mode = self._normalize_last_audio_mode(self._audio_last_mode_cb.currentData())
+
+        self._audio_mode_label.setVisible(enabled)
+        self._audio_mode_cb.setVisible(enabled)
+        self._audio_volume_label.setVisible(enabled)
+        self._audio_volume_sp.setVisible(enabled)
+        self._audio_last_mode_label.setVisible(enabled)
+        self._audio_last_mode_cb.setVisible(enabled)
+
+        show_main_file = enabled and mode == "file"
+        self._audio_file_label.setVisible(show_main_file)
+        self._audio_file_edit.setVisible(show_main_file)
+
+        show_last_file = enabled and last_mode == "file"
+        self._audio_last_file_label.setVisible(show_last_file)
+        self._audio_last_file_edit.setVisible(show_last_file)
+
     def get_config(self) -> dict:
         return {
             "relax_countdown_enabled": self._enabled_cb.isChecked(),
             "relax_countdown_color": self._color,
             "relax_countdown_max_sec": self._max_sec_sp.value(),
+            "relax_countdown_anim": self._normalize_anim(self._anim_cb.currentData()),
+            "relax_countdown_audio_enabled": self._audio_enabled_cb.isChecked(),
+            "relax_countdown_audio_mode": self._normalize_audio_mode(
+                self._audio_mode_cb.currentData()
+            ),
+            "relax_countdown_audio_file": self._audio_file_edit.get_value(),
+            "relax_countdown_audio_volume": self._audio_volume_sp.value(),
+            "relax_countdown_audio_last_mode": self._normalize_last_audio_mode(
+                self._audio_last_mode_cb.currentData()
+            ),
+            "relax_countdown_audio_last_file": self._audio_last_file_edit.get_value(),
         }
 
 

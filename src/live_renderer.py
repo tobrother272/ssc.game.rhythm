@@ -237,6 +237,13 @@ class LiveFrameRenderer:
         relax_countdown_enabled: bool = True,
         relax_countdown_color: str = "#FFFFFF",
         relax_countdown_max_sec: float = 5.0,
+        relax_countdown_anim: str = "pop",
+        relax_countdown_audio_enabled: bool = False,
+        relax_countdown_audio_mode: str = "default",
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: float = 0.65,
+        relax_countdown_audio_last_mode: str = "default",
+        relax_countdown_audio_last_file: Optional[str] = None,
         relax_countdown_x: float = 0.88,
         relax_countdown_y: float = 0.04,
         relax_countdown_w: float = 0.10,
@@ -320,6 +327,13 @@ class LiveFrameRenderer:
         self._relax_countdown_enabled = bool(relax_countdown_enabled)
         self._relax_countdown_color = str(relax_countdown_color)
         self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
+        self._relax_countdown_anim = CountdownHUD._normalize_anim(relax_countdown_anim)
+        self._relax_countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        self._relax_countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        self._relax_countdown_audio_file = relax_countdown_audio_file or None
+        self._relax_countdown_audio_volume = max(0.0, min(1.0, float(relax_countdown_audio_volume)))
+        self._relax_countdown_audio_last_mode = str(relax_countdown_audio_last_mode or "default")
+        self._relax_countdown_audio_last_file = relax_countdown_audio_last_file or None
         self._relax_countdown_x = max(0.0, min(1.0, float(relax_countdown_x)))
         self._relax_countdown_y = max(0.0, min(1.0, float(relax_countdown_y)))
         self._relax_countdown_w = max(0.02, min(1.0, float(relax_countdown_w)))
@@ -535,6 +549,13 @@ class LiveFrameRenderer:
         relax_countdown_enabled: Optional[bool] = None,
         relax_countdown_color: Optional[str] = None,
         relax_countdown_max_sec: Optional[float] = None,
+        relax_countdown_anim: Optional[str] = None,
+        relax_countdown_audio_enabled: Optional[bool] = None,
+        relax_countdown_audio_mode: Optional[str] = None,
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: Optional[float] = None,
+        relax_countdown_audio_last_mode: Optional[str] = None,
+        relax_countdown_audio_last_file: Optional[str] = None,
         relax_countdown_x: Optional[float] = None,
         relax_countdown_y: Optional[float] = None,
         relax_countdown_w: Optional[float] = None,
@@ -675,6 +696,24 @@ class LiveFrameRenderer:
             self._relax_countdown_color = str(relax_countdown_color)
         if relax_countdown_max_sec is not None:
             self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
+        if relax_countdown_anim is not None:
+            self._relax_countdown_anim = CountdownHUD._normalize_anim(relax_countdown_anim)
+        if relax_countdown_audio_enabled is not None:
+            self._relax_countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        if relax_countdown_audio_mode is not None:
+            self._relax_countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        if relax_countdown_audio_file is not None:
+            self._relax_countdown_audio_file = relax_countdown_audio_file or None
+        if relax_countdown_audio_volume is not None:
+            self._relax_countdown_audio_volume = max(
+                0.0, min(1.0, float(relax_countdown_audio_volume))
+            )
+        if relax_countdown_audio_last_mode is not None:
+            self._relax_countdown_audio_last_mode = str(
+                relax_countdown_audio_last_mode or "default"
+            )
+        if relax_countdown_audio_last_file is not None:
+            self._relax_countdown_audio_last_file = relax_countdown_audio_last_file or None
         if relax_countdown_x is not None:
             self._relax_countdown_x = max(0.0, min(1.0, float(relax_countdown_x)))
         if relax_countdown_y is not None:
@@ -981,6 +1020,7 @@ class LiveFrameRenderer:
                 self._cam,
                 color=self._relax_countdown_color,
                 max_show_sec=self._relax_countdown_max_sec,
+                anim=self._relax_countdown_anim,
                 box=(
                     self._relax_countdown_x,
                     self._relax_countdown_y,

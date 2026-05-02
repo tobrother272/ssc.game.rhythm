@@ -1285,7 +1285,7 @@ class MainWindow(QMainWindow):
         relax_countdown_w: float = 0.10,
         relax_countdown_h: float = 0.16,
     ) -> None:
-        """Persist floor/wall drag result into the active segment's render_settings."""
+        """Persist floor/wall drag result into segment + countdown layer config."""
         seg_id = self._preview_active_segment_id
         if not seg_id:
             return
@@ -1301,6 +1301,39 @@ class MainWindow(QMainWindow):
         seg.render_settings["relax_countdown_y"]    = round(relax_countdown_y,   4)
         seg.render_settings["relax_countdown_w"]    = round(relax_countdown_w,   4)
         seg.render_settings["relax_countdown_h"]    = round(relax_countdown_h,   4)
+
+        # Layer-first system: countdown box placement must live on the countdown
+        # layer so future preview rebuilds/render resolve to the same values.
+        from studio.models.layer import Layer
+        cd_layers = self.project.layers_overlapping(
+            "countdown", seg.start_time_sec, seg.end_time_sec
+        )
+        if not cd_layers:
+            self.project.layers.append(Layer(
+                kind="countdown",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Countdown",
+                config={
+                    "relax_countdown_enabled": True,
+                    "relax_countdown_color": "#FFFFFF",
+                    "relax_countdown_max_sec": 5.0,
+                    "relax_countdown_anim": "pop",
+                    "relax_countdown_x": round(relax_countdown_x, 4),
+                    "relax_countdown_y": round(relax_countdown_y, 4),
+                    "relax_countdown_w": round(relax_countdown_w, 4),
+                    "relax_countdown_h": round(relax_countdown_h, 4),
+                },
+            ))
+        else:
+            top = max(cd_layers, key=lambda la: la.z_index)
+            top.config["relax_countdown_x"] = round(relax_countdown_x, 4)
+            top.config["relax_countdown_y"] = round(relax_countdown_y, 4)
+            top.config["relax_countdown_w"] = round(relax_countdown_w, 4)
+            top.config["relax_countdown_h"] = round(relax_countdown_h, 4)
+            top.config.setdefault("relax_countdown_enabled", True)
+
         self._on_project_changed()
         self.statusBar().showMessage(
             f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
@@ -2401,6 +2434,13 @@ class MainWindow(QMainWindow):
             "relax_countdown_enabled": bool(_get("relax_countdown_enabled", True)),
             "relax_countdown_color": str(_get("relax_countdown_color", "#FFFFFF") or "#FFFFFF"),
             "relax_countdown_max_sec": float(_get("relax_countdown_max_sec", 5.0) or 5.0),
+            "relax_countdown_anim": str(_get("relax_countdown_anim", "pop") or "pop"),
+            "relax_countdown_audio_enabled": bool(_get("relax_countdown_audio_enabled", False)),
+            "relax_countdown_audio_mode": str(_get("relax_countdown_audio_mode", "default") or "default"),
+            "relax_countdown_audio_file": _get("relax_countdown_audio_file", None) or "",
+            "relax_countdown_audio_volume": float(_get("relax_countdown_audio_volume", 0.65) or 0.65),
+            "relax_countdown_audio_last_mode": str(_get("relax_countdown_audio_last_mode", "default") or "default"),
+            "relax_countdown_audio_last_file": _get("relax_countdown_audio_last_file", None) or "",
             "relax_countdown_x": float(_get("relax_countdown_x", 0.88) or 0.88),
             "relax_countdown_y": float(_get("relax_countdown_y", 0.04) or 0.04),
             "relax_countdown_w": float(_get("relax_countdown_w", 0.10) or 0.10),
@@ -2620,6 +2660,13 @@ class MainWindow(QMainWindow):
             relax_countdown_enabled = bool(rs.get("relax_countdown_enabled", True))
             relax_countdown_color = str(rs.get("relax_countdown_color", "#FFFFFF") or "#FFFFFF")
             relax_countdown_max_sec = float(rs.get("relax_countdown_max_sec", 5.0) or 5.0)
+            relax_countdown_anim = str(rs.get("relax_countdown_anim", "pop") or "pop")
+            relax_countdown_audio_enabled = bool(rs.get("relax_countdown_audio_enabled", False))
+            relax_countdown_audio_mode = str(rs.get("relax_countdown_audio_mode", "default") or "default")
+            relax_countdown_audio_file = rs.get("relax_countdown_audio_file") or ""
+            relax_countdown_audio_volume = float(rs.get("relax_countdown_audio_volume", 0.65) or 0.65)
+            relax_countdown_audio_last_mode = str(rs.get("relax_countdown_audio_last_mode", "default") or "default")
+            relax_countdown_audio_last_file = rs.get("relax_countdown_audio_last_file") or ""
             relax_countdown_x = float(rs.get("relax_countdown_x", 0.88) or 0.88)
             relax_countdown_y = float(rs.get("relax_countdown_y", 0.04) or 0.04)
             relax_countdown_w = float(rs.get("relax_countdown_w", 0.10) or 0.10)
@@ -2693,6 +2740,13 @@ class MainWindow(QMainWindow):
                     relax_countdown_enabled=relax_countdown_enabled,
                     relax_countdown_color=relax_countdown_color,
                     relax_countdown_max_sec=relax_countdown_max_sec,
+                    relax_countdown_anim=relax_countdown_anim,
+                    relax_countdown_audio_enabled=relax_countdown_audio_enabled,
+                    relax_countdown_audio_mode=relax_countdown_audio_mode,
+                    relax_countdown_audio_file=relax_countdown_audio_file,
+                    relax_countdown_audio_volume=relax_countdown_audio_volume,
+                    relax_countdown_audio_last_mode=relax_countdown_audio_last_mode,
+                    relax_countdown_audio_last_file=relax_countdown_audio_last_file,
                     relax_countdown_x=relax_countdown_x,
                     relax_countdown_y=relax_countdown_y,
                     relax_countdown_w=relax_countdown_w,

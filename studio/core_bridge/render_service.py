@@ -728,6 +728,13 @@ class RenderService(QObject):
         "relax_countdown_enabled",
         "relax_countdown_color",
         "relax_countdown_max_sec",
+        "relax_countdown_anim",
+        "relax_countdown_audio_enabled",
+        "relax_countdown_audio_mode",
+        "relax_countdown_audio_file",
+        "relax_countdown_audio_volume",
+        "relax_countdown_audio_last_mode",
+        "relax_countdown_audio_last_file",
         "relax_countdown_x",
         "relax_countdown_y",
         "relax_countdown_w",
@@ -768,6 +775,8 @@ class RenderService(QObject):
                 "relax_texture_high",
                 "relax_texture_middle",
                 "relax_hole_mask_path",
+                "relax_countdown_audio_file",
+                "relax_countdown_audio_last_file",
             } and not str(value).strip():
                 continue
             if key in {"background_image", "background_video"} and not str(value).strip():

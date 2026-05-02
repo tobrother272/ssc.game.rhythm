@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import struct
+import tempfile
+import wave
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -680,6 +684,20 @@ class PreviewPanel(QWidget):
         # no segment/source is selected. Behaves like full-preview chaining
         # without requiring the checkbox to be toggled manually.
         self._project_playback_mode: bool = False
+        # Countdown audio (preview-only playback of countdown ticks).
+        self._countdown_audio_enabled: bool = False
+        self._countdown_audio_mode: str = "default"
+        self._countdown_audio_file: str = ""
+        self._countdown_audio_volume: float = 0.65
+        self._countdown_audio_last_mode: str = "default"
+        self._countdown_audio_last_file: str = ""
+        self._countdown_prev_text: str | None = None
+        self._default_countdown_sound: str = self._ensure_countdown_default_sound(
+            "ssc_countdown_regular.wav", hz=940.0, duration_sec=0.09
+        )
+        self._default_countdown_last_sound: str = self._ensure_countdown_default_sound(
+            "ssc_countdown_last.wav", hz=1260.0, duration_sec=0.13
+        )
         # Cached timeline order pushed by MainWindow.
         self._project_segments: list[Segment] = []
         # Last observed playback state (used to decide auto-resume on advance).
@@ -1048,6 +1066,15 @@ class PreviewPanel(QWidget):
             cdy = float(rs.get("relax_countdown_y", 0.04) or 0.04)
             cdw = float(rs.get("relax_countdown_w", 0.10) or 0.10)
             cdh = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            # In layer-first config projects, segment.render_settings can be
+            # stale while live renderer already uses resolved layer values.
+            # Use renderer state when available so the edit box starts exactly
+            # where the number is currently being drawn.
+            if self._live_active and self._live_renderer is not None:
+                cdx = float(getattr(self._live_renderer, "_relax_countdown_x", cdx))
+                cdy = float(getattr(self._live_renderer, "_relax_countdown_y", cdy))
+                cdw = float(getattr(self._live_renderer, "_relax_countdown_w", cdw))
+                cdh = float(getattr(self._live_renderer, "_relax_countdown_h", cdh))
             self.floor_wall_overlay.set_fractions(
                 hit, hz, near_sp, far_sp, gap,
                 has_relax, cdx, cdy, cdw, cdh,
@@ -1413,6 +1440,18 @@ class PreviewPanel(QWidget):
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
+
+        # Dedicated media players for countdown SFX so play/pause of the main
+        # preview audio track does not interrupt short per-tick sounds.
+        self._countdown_sfx_out = QAudioOutput(self)
+        self._countdown_sfx_out.setVolume(self._countdown_audio_volume)
+        self._countdown_sfx_player = QMediaPlayer(self)
+        self._countdown_sfx_player.setAudioOutput(self._countdown_sfx_out)
+
+        self._countdown_sfx_last_out = QAudioOutput(self)
+        self._countdown_sfx_last_out.setVolume(self._countdown_audio_volume)
+        self._countdown_sfx_last_player = QMediaPlayer(self)
+        self._countdown_sfx_last_player.setAudioOutput(self._countdown_sfx_last_out)
 
         control_row = QHBoxLayout()
         self.play_button = QPushButton("Play")
@@ -1916,6 +1955,114 @@ class PreviewPanel(QWidget):
     def _on_volume_changed(self, value: int) -> None:
         self.audio_output.setVolume(value / 100.0)
 
+    @staticmethod
+    def _normalize_countdown_audio_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return "file" if raw == "file" else "default"
+
+    @staticmethod
+    def _normalize_countdown_last_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"file", "same"}:
+            return raw
+        return "default"
+
+    @staticmethod
+    def _ensure_countdown_default_sound(
+        filename: str, *, hz: float, duration_sec: float
+    ) -> str:
+        """Create a tiny wav beep file in temp dir if missing."""
+        out = Path(tempfile.gettempdir()) / filename
+        if out.exists():
+            return str(out)
+        sr = 44100
+        n = max(1, int(sr * float(duration_sec)))
+        with wave.open(str(out), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            frames = bytearray()
+            for i in range(n):
+                t = i / float(sr)
+                env = 1.0 - (i / float(n))
+                s = math.sin(2.0 * math.pi * float(hz) * t) * env
+                amp = int(max(-1.0, min(1.0, s)) * 28000)
+                frames.extend(struct.pack("<h", amp))
+            wf.writeframes(bytes(frames))
+        return str(out)
+
+    def _resolve_countdown_sfx_path(self, *, is_last: bool) -> str:
+        if is_last:
+            mode = self._normalize_countdown_last_mode(self._countdown_audio_last_mode)
+            if mode == "same":
+                return self._resolve_countdown_sfx_path(is_last=False)
+            if mode == "file" and self._countdown_audio_last_file:
+                p = Path(self._countdown_audio_last_file)
+                if p.exists():
+                    return str(p)
+            return self._default_countdown_last_sound
+
+        mode = self._normalize_countdown_audio_mode(self._countdown_audio_mode)
+        if mode == "file" and self._countdown_audio_file:
+            p = Path(self._countdown_audio_file)
+            if p.exists():
+                return str(p)
+        return self._default_countdown_sound
+
+    def _play_countdown_tick_sound(self, tick_text: str) -> None:
+        if not self._countdown_audio_enabled:
+            return
+        is_last = str(tick_text).strip() == "1"
+        path = self._resolve_countdown_sfx_path(is_last=is_last)
+        if not path:
+            return
+        player = self._countdown_sfx_last_player if is_last else self._countdown_sfx_player
+        out = self._countdown_sfx_last_out if is_last else self._countdown_sfx_out
+        out.setVolume(float(max(0.0, min(1.0, self._countdown_audio_volume))))
+        url = QUrl.fromLocalFile(str(Path(path).resolve()))
+        if player.source() != url:
+            player.setSource(url)
+        else:
+            player.setPosition(0)
+        player.play()
+
+    def _tick_countdown_audio(self) -> None:
+        """Play countdown SFX in live preview when the number changes."""
+        if not self._live_active or self._live_renderer is None:
+            self._countdown_prev_text = None
+            return
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        hud = getattr(self._live_renderer, "_countdown_hud", None)
+        text = getattr(hud, "_last_text", None) if hud is not None else None
+        if text != self._countdown_prev_text:
+            if text is not None:
+                self._play_countdown_tick_sound(str(text))
+            self._countdown_prev_text = text
+
+    def _sync_countdown_audio_config_from_renderer(self) -> None:
+        rdr = self._live_renderer
+        if rdr is None:
+            return
+        self._countdown_audio_enabled = bool(
+            getattr(rdr, "_relax_countdown_audio_enabled", self._countdown_audio_enabled)
+        )
+        self._countdown_audio_mode = str(
+            getattr(rdr, "_relax_countdown_audio_mode", self._countdown_audio_mode)
+        )
+        self._countdown_audio_file = str(
+            getattr(rdr, "_relax_countdown_audio_file", self._countdown_audio_file) or ""
+        )
+        self._countdown_audio_volume = float(max(
+            0.0, min(1.0, float(getattr(rdr, "_relax_countdown_audio_volume", self._countdown_audio_volume)))
+        ))
+        self._countdown_audio_last_mode = str(
+            getattr(rdr, "_relax_countdown_audio_last_mode", self._countdown_audio_last_mode)
+        )
+        self._countdown_audio_last_file = str(
+            getattr(rdr, "_relax_countdown_audio_last_file", self._countdown_audio_last_file) or ""
+        )
+
     def play(self) -> None:
         """Start playback; queues if media is still loading."""
         if self._media_ready:
@@ -2073,6 +2220,8 @@ class PreviewPanel(QWidget):
 
         self._live_active = True
         self._live_renderer = renderer
+        self._sync_countdown_audio_config_from_renderer()
+        self._countdown_prev_text = None
         self._playhead_offset_sec = float(project_offset_sec)
 
         # Hand the audio track to the existing player.  We deliberately
@@ -2120,6 +2269,7 @@ class PreviewPanel(QWidget):
             return
         self._live_active = False
         self._live_frame_timer.stop()
+        self._countdown_prev_text = None
         # Stop audio playback before dropping the renderer so the timer
         # tick that already fired (if any) doesn't land in a half-torn
         # state.
@@ -2230,6 +2380,13 @@ class PreviewPanel(QWidget):
         relax_countdown_enabled: Optional[bool] = None,
         relax_countdown_color: Optional[str] = None,
         relax_countdown_max_sec: Optional[float] = None,
+        relax_countdown_anim: Optional[str] = None,
+        relax_countdown_audio_enabled: Optional[bool] = None,
+        relax_countdown_audio_mode: Optional[str] = None,
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: Optional[float] = None,
+        relax_countdown_audio_last_mode: Optional[str] = None,
+        relax_countdown_audio_last_file: Optional[str] = None,
         relax_countdown_x: Optional[float] = None,
         relax_countdown_y: Optional[float] = None,
         relax_countdown_w: Optional[float] = None,
@@ -2239,6 +2396,23 @@ class PreviewPanel(QWidget):
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
         if not self._live_active or self._live_renderer is None:
             return
+        if relax_countdown_audio_enabled is not None:
+            self._countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        if relax_countdown_audio_mode is not None:
+            self._countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        if relax_countdown_audio_file is not None:
+            self._countdown_audio_file = str(relax_countdown_audio_file or "")
+        if relax_countdown_audio_volume is not None:
+            self._countdown_audio_volume = float(
+                max(0.0, min(1.0, float(relax_countdown_audio_volume)))
+            )
+        if relax_countdown_audio_last_mode is not None:
+            self._countdown_audio_last_mode = str(
+                relax_countdown_audio_last_mode or "default"
+            )
+        if relax_countdown_audio_last_file is not None:
+            self._countdown_audio_last_file = str(relax_countdown_audio_last_file or "")
+
         self._live_renderer.update_mode(
             mode,
             show_stickman=show_stickman,
@@ -2296,6 +2470,13 @@ class PreviewPanel(QWidget):
             relax_countdown_enabled=relax_countdown_enabled,
             relax_countdown_color=relax_countdown_color,
             relax_countdown_max_sec=relax_countdown_max_sec,
+            relax_countdown_anim=relax_countdown_anim,
+            relax_countdown_audio_enabled=relax_countdown_audio_enabled,
+            relax_countdown_audio_mode=relax_countdown_audio_mode,
+            relax_countdown_audio_file=relax_countdown_audio_file,
+            relax_countdown_audio_volume=relax_countdown_audio_volume,
+            relax_countdown_audio_last_mode=relax_countdown_audio_last_mode,
+            relax_countdown_audio_last_file=relax_countdown_audio_last_file,
             relax_countdown_x=relax_countdown_x,
             relax_countdown_y=relax_countdown_y,
             relax_countdown_w=relax_countdown_w,
@@ -2337,6 +2518,7 @@ class PreviewPanel(QWidget):
         # alloc each tick, but at 720p the BGR→RGB cost is ~0.4 ms in
         # OpenCV and negligible compared to the actual compose.
         bgr = rdr.render_at(float(t_sec))
+        self._tick_countdown_audio()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         # Force a contiguous C-order copy so QImage's memory view has
         # a deterministic stride; without this, ``cvtColor`` can in

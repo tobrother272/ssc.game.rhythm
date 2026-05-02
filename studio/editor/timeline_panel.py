@@ -2703,16 +2703,15 @@ class TimelinePanel(QWidget):
         """True when this segment already owns at least one layer of ``kind``."""
         if self._project is None:
             return False
-        eps = 1e-6
         seg_start = float(segment.start_time_sec or 0.0)
         seg_end = float(segment.end_time_sec or 0.0)
         for layer in self._project.layers:
             if layer.kind != kind:
                 continue
-            if (
-                float(layer.start_time_sec) >= seg_start - eps
-                and float(layer.end_time_sec) <= seg_end + eps
-            ):
+            # "+" should appear only when the segment has NO effective layer
+            # of this kind on its timeline span. Any overlap means the layer
+            # is already present for this segment view.
+            if layer.overlaps(seg_start, seg_end):
                 return True
         return False
 
@@ -2743,6 +2742,13 @@ class TimelinePanel(QWidget):
                 "relax_countdown_enabled": True,
                 "relax_countdown_color": "#FFFFFF",
                 "relax_countdown_max_sec": 3.0,
+                "relax_countdown_anim": "pop",
+                "relax_countdown_audio_enabled": False,
+                "relax_countdown_audio_mode": "default",
+                "relax_countdown_audio_file": "",
+                "relax_countdown_audio_volume": 0.65,
+                "relax_countdown_audio_last_mode": "default",
+                "relax_countdown_audio_last_file": "",
             }
         return {}
 

@@ -1,0 +1,26 @@
+---
+description: Confirm workflow before coding
+alwaysApply: true
+---
+
+# Confirm Before Code
+
+Ap dung quy trinh bat buoc truoc khi sua code:
+
+1. **Phan tich yeu cau**
+- Tom tat lai cau hoi/lenh cua user de xac nhan da hieu dung.
+
+2. **Khong tu doan y**
+- Neu con thieu thong tin hoac co nhieu cach hieu, phai hoi lai user.
+- Khong duoc tu chon mot gia dinh khi chua ro.
+
+3. **Giai thich cach lam**
+- Trinh bay cach tiep can truoc khi code (muc tieu, pham vi, tac dong).
+
+4. **Dua ra cac buoc va doi confirm**
+- Liet ke cac buoc se thuc hien.
+- Doi user confirm truoc khi bat dau sua file/chay lenh thay doi he thong.
+
+## Luu y
+- Sau khi da co confirm, thuc hien dung theo cac buoc da trinh bay.
+- Neu phat sinh thay doi lon so voi cach lam da noi, dung lai va xin confirm lai.

@@ -148,6 +148,14 @@ _VISUAL_FIELDS_BY_KIND: dict[str, list[str]] = {
     "countdown": [
         "relax_countdown_enabled", "relax_countdown_color",
         "relax_countdown_max_sec", "relax_countdown_x", "relax_countdown_y",
+        "relax_countdown_w", "relax_countdown_h",
+        "relax_countdown_anim",
+        "relax_countdown_audio_enabled",
+        "relax_countdown_audio_mode",
+        "relax_countdown_audio_file",
+        "relax_countdown_audio_volume",
+        "relax_countdown_audio_last_mode",
+        "relax_countdown_audio_last_file",
     ],
 }
 
