@@ -943,8 +943,8 @@ class SegmentRectItem(QGraphicsRectItem):
     re-rendered on every paint event regardless of mouse handling.
     """
 
-    # Y locked to the segment track body (ruler_h + 2px padding).
-    SEGMENT_Y = 40.0
+    # Y locked to the segment track body: _SEGMENT_TRACK_Y(24) + 4px margin.
+    SEGMENT_Y = 28.0
 
     def __init__(self, segment: Segment, pixels_per_second: float):
         super().__init__()
@@ -3017,6 +3017,13 @@ class TimelinePanel(QWidget):
         edit_act = menu.addAction("Edit…")
         dup_act = menu.addAction("Duplicate")
         menu.addSeparator()
+        # "Fill full this segment" — snap layer to cover the selected / overlapping segment.
+        cur_seg = self._find_current_segment_for_layer(layer)
+        fill_seg_act = menu.addAction("Fill full this segment")
+        fill_seg_act.setEnabled(cur_seg is not None)
+        if cur_seg is None:
+            fill_seg_act.setToolTip("No segment overlapping this layer")
+        menu.addSeparator()
         fill_prev_act = menu.addAction("Fill to previous segment")
         fill_next_act = menu.addAction("Fill to next segment")
         prev_seg = self._find_previous_segment_for_fill(layer)
@@ -3036,10 +3043,61 @@ class TimelinePanel(QWidget):
             self._do_duplicate_layer(layer_id)
         elif chosen == edit_act:
             self._on_layer_block_double_clicked(layer_id)
+        elif chosen == fill_seg_act:
+            self._do_fill_layer_to_segment(layer_id, cur_seg)
         elif chosen == fill_next_act:
             self._do_fill_layer_to_next_segment(layer_id)
         elif chosen == fill_prev_act:
             self._do_fill_layer_to_previous_segment(layer_id)
+
+    def _find_current_segment_for_layer(self, layer: Layer) -> Optional[Segment]:
+        """Return the segment this layer should 'fill full'.
+
+        Priority: (1) the currently selected segment if it overlaps the layer,
+        (2) the segment with the greatest overlap otherwise.
+        """
+        if self._project is None:
+            return None
+        la_s = float(layer.start_time_sec)
+        la_e = float(layer.end_time_sec)
+        overlapping = [
+            s for s in self._project.segments
+            if float(s.start_time_sec) < la_e and float(s.end_time_sec) > la_s
+        ]
+        if not overlapping:
+            return None
+        # Prefer the selected segment if it overlaps.
+        if self._selected_segment_id:
+            for seg in overlapping:
+                if seg.id == self._selected_segment_id:
+                    return seg
+        # Fall back to the segment with most overlap.
+        def _overlap(seg: Segment) -> float:
+            return min(float(seg.end_time_sec), la_e) - max(float(seg.start_time_sec), la_s)
+        return max(overlapping, key=_overlap)
+
+    def _do_fill_layer_to_segment(self, layer_id: str, seg: Optional[Segment]) -> None:
+        """Resize the layer to exactly cover ``seg``."""
+        layer = self._get_layer(layer_id)
+        if layer is None or seg is None:
+            return
+        old_start = float(layer.start_time_sec)
+        old_end   = float(layer.end_time_sec)
+        new_start = float(seg.start_time_sec)
+        new_end   = float(seg.end_time_sec)
+        if abs(new_start - old_start) < 1e-9 and abs(new_end - old_end) < 1e-9:
+            return  # already matches
+        kind_label = layer.kind.replace("_", " ")
+        self._commit_layer_change_with_undo(
+            layer=layer,
+            old_start=old_start,
+            old_end=old_end,
+            new_start=new_start,
+            new_end=new_end,
+            undo_label=f"Fill {kind_label} layer to segment",
+            base_status_text=f"Filled {kind_label} layer to segment bounds",
+            always_show_status=True,
+        )
 
     def _find_next_segment_for_fill(self, layer: Layer) -> Optional[Segment]:
         if self._project is None:
@@ -4756,10 +4814,10 @@ class TimelinePanel(QWidget):
     # Timeline Y layout constants (shared by draw methods).
     _RULER_H = 22
     _SEGMENT_TRACK_Y = 24
-    _SEGMENT_TRACK_H = 80
+    _SEGMENT_TRACK_H = 40
     # Layer tracks sit between the segment track and the beat-strip / waveform.
     # All 6 kinds are active; each track row is 16 px tall.
-    _LAYER_TRACK_Y = 104          # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
+    _LAYER_TRACK_Y = 64           # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
     _LAYER_TRACK_H = 16           # height per layer track row
     # All layer kinds — order determines top-to-bottom track position.
     _LAYER_KINDS = (
@@ -4767,11 +4825,11 @@ class TimelinePanel(QWidget):
     )
     _LAYER_TRACKS_TOTAL_H = 96    # len(_LAYER_KINDS) * _LAYER_TRACK_H  (6 × 16)
     # The BEAT-DBG strip sits between the layer tracks and the waveform.
-    _BEAT_STRIP_Y = 210            # 104 + 96 + 10 gap
+    _BEAT_STRIP_Y = 170            # 64 + 96 + 10 gap
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 240            # 210 + 16 + 14 gap
+    _WAVE_TRACK_Y = 200            # 170 + 16 + 14 gap
     _WAVE_TRACK_H = 160
-    _SCENE_H = 410                 # 240 + 160 + 10
+    _SCENE_H = 370                 # 200 + 160 + 10
     _LAYER_LABEL_FONT_PT = 7.0
     _LAYER_BLOCK_FONT_PT = 7.0
 

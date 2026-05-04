@@ -256,16 +256,16 @@ class FloorWallOverlay(QWidget):
     # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
     # countdown_x, countdown_y, countdown_w, countdown_h, rail_height,
     # start_gate_h, chevron_width_frac
-    changing  = Signal(float, float, float, float, float, float, float, float, float, float, float, float)
-    committed = Signal(float, float, float, float, float, float, float, float, float, float, float, float)
+    changing  = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
+    committed = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
     _HORIZON_CLR = QColor(220, 170,   0)
     _WALL_CLR    = QColor(220,  60, 220)
-    _GAP_CLR     = QColor(255, 150,  50)   # orange gap handles
-    # Far handles display scale: far_spread displayed at this fraction from centre
+    _GAP_CLR     = QColor(255, 150,  50)  
     _FAR_DISP    = 0.40
+    
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -304,6 +304,8 @@ class FloorWallOverlay(QWidget):
         self._sg_h: float = 0.0
         self._chevron_width_frac: float = 0.45
         self._drag_chevron_w0 = 0.45
+        self._vp_panel_depth: float = 0.6
+        self._drag_vp_panel_depth0: float = 0.6
         self._cached_frame_idx: int = 0
 
     def set_frame_idx(self, frame_idx: int) -> None:
@@ -336,6 +338,7 @@ class FloorWallOverlay(QWidget):
         countdown_w: float = 0.10,
         countdown_h: float = 0.16,
         chevron_width_frac: float = 0.45,
+        vp_panel_depth: float = 0.6,
     ) -> None:
         hit_lo, hit_hi = self._hit_frac_bounds()
         self._hit_frac             = max(hit_lo, min(hit_hi, float(hit_frac)))
@@ -350,14 +353,15 @@ class FloorWallOverlay(QWidget):
         self._cd_w = max(0.02, min(1.0 - self._cd_x, float(countdown_w)))
         self._cd_h = max(0.02, min(1.0 - self._cd_y, float(countdown_h)))
         self._chevron_width_frac = max(0.05, min(0.95, float(chevron_width_frac)))
+        self._vp_panel_depth = max(0.05, float(vp_panel_depth))
         self.update()
 
-    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float, float, float, float]:
+    def get_fractions(self) -> tuple:
         return (self._hit_frac, self._horizon_frac,
                 self._near_spread, self._far_spread,
                 self._wall_floor_gap_frac,
                 self._cd_x, self._cd_y, self._cd_w, self._cd_h, self._rail_height,
-                self._start_gate_h, self._chevron_width_frac)
+                self._start_gate_h, self._chevron_width_frac, self._vp_panel_depth)
 
     def set_start_gate_proxy(
         self,
@@ -449,6 +453,14 @@ class FloorWallOverlay(QWidget):
         """Middle handle for floor chevron width control."""
         y_mid = int((self._hit_y() + self._hz_y()) * 0.5)
         return QPoint(self.width() // 2, y_mid)
+
+    def _vp_panel_handle_y(self) -> int:
+        """Screen y of viewport-panel back-edge (pinhole: Z_NEAR / (Z_NEAR+depth))."""
+        hy = self._hit_y()
+        cy = self._hz_y()
+        Z_NEAR = 2.5
+        sy = cy + (hy - cy) * Z_NEAR / (Z_NEAR + max(0.05, self._vp_panel_depth))
+        return max(cy + self._HANDLE_R, min(hy - self._HANDLE_R, int(sy)))
 
     def _hit_block_polys(self, n: int = 4, frame_idx: int = 0) -> list:
         """Trapezoid polygons using pinhole projection matching cam.project()
@@ -555,6 +567,11 @@ class FloorWallOverlay(QWidget):
         cr = self._HANDLE_R - 1
         if abs(pos.x() - ch.x()) <= cr and abs(pos.y() - ch.y()) <= cr:
             return "chevron_width"
+        # Viewport panel depth handle — centered on screen, vertical drag.
+        vph_y = self._vp_panel_handle_y()
+        vph_x = self.width() * 3 // 4  # right-of-centre to avoid chevron overlap
+        if abs(pos.x() - vph_x) <= self._HANDLE_R + 4 and abs(pos.y() - vph_y) <= self._HANDLE_R + 4:
+            return "vp_panel_depth"
         # Side-rail height handles (left/right), dragged vertically in sync.
         r2 = self._HANDLE_R + 6
         rhy = self._rail_handle_y()
@@ -605,6 +622,9 @@ class FloorWallOverlay(QWidget):
         if self._drag == "chevron_width":
             self._drag_anchor = ev.pos()
             self._drag_chevron_w0 = self._chevron_width_frac
+        if self._drag == "vp_panel_depth":
+            self._drag_anchor = ev.pos()
+            self._drag_vp_panel_depth0 = self._vp_panel_depth
 
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag in ("wall_near", "wall_far"):
@@ -618,12 +638,13 @@ class FloorWallOverlay(QWidget):
                 self._rail_height,
                 self._start_gate_h,
                 self._chevron_width_frac,
+                self._vp_panel_depth,
             )
 
     def mouseMoveEvent(self, ev) -> None:
         hover = self._handle_at(ev.pos()) if self._drag is None else None
         if hover:
-            if hover in ("hit", "horizon", "gap_side", "rail_height", "gate_top"):
+            if hover in ("hit", "horizon", "gap_side", "rail_height", "gate_top", "vp_panel_depth"):
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
             elif hover == "chevron_width":
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -705,6 +726,12 @@ class FloorWallOverlay(QWidget):
                 0.05,
                 min(0.95, self._drag_chevron_w0 + (dx / w) * 1.6),
             )
+        elif self._drag == "vp_panel_depth":
+            # Drag up → larger depth (panels taller), drag down → smaller depth.
+            # One full widget height ≈ 8 world units.
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._vp_panel_depth = max(0.05, self._drag_vp_panel_depth0 - (dy / h) * 8.0)
         self.update()
         self.changing.emit(
             self._hit_frac, self._horizon_frac, self._near_spread,
@@ -713,6 +740,7 @@ class FloorWallOverlay(QWidget):
             self._rail_height,
             self._start_gate_h,
             self._chevron_width_frac,
+            self._vp_panel_depth,
         )
 
     # ── paint ────────────────────────────────────────────────────────────
@@ -743,14 +771,6 @@ class FloorWallOverlay(QWidget):
         p.setBrush(QBrush(QColor(8, 145, 178, 30)))
         p.setPen(QPen(QColor(8, 145, 178, 150), 1.2, Qt.PenStyle.DashLine))
         p.drawPolygon(floor_pts)
-
-        # Hit-zone blocks — 4 lane trapezoids (pinhole projection).
-        _hit_fill = QColor(90, 70, 20, 65)       # dark amber, translucent fill
-        _hit_edge = QColor(90, 140, 160, 210)    # CLR_LANE_EDGE in RGB
-        p.setBrush(QBrush(_hit_fill))
-        p.setPen(QPen(_hit_edge, 1.5))
-        for _poly in self._hit_block_polys(n=4, frame_idx=self._cached_frame_idx):
-            p.drawPolygon(_poly)
 
         # Dashed lines connecting far ↔ near handles (left and right)
         p.setPen(QPen(self._WALL_CLR, 1.2, Qt.PenStyle.DashLine))
@@ -826,6 +846,26 @@ class FloorWallOverlay(QWidget):
         p.setPen(QPen(QColor(8, 145, 178)))
         p.drawText(ch.x() + 10, ch.y() + 4, f"Chevron W {self._chevron_width_frac:.2f}")
 
+        # Viewport panel depth handle — right-of-centre, vertical arrow.
+        _vp_clr = QColor(255, 160, 30)   # amber
+        vph_y = self._vp_panel_handle_y()
+        vph_x = self.width() * 3 // 4
+        p.setBrush(QBrush(_vp_clr))
+        p.setPen(QPen(QColor(255, 255, 255), 1.4))
+        p.drawEllipse(vph_x - r, vph_y - r, r * 2, r * 2)
+        # Double-arrow icon
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.drawLine(vph_x, vph_y - r + 2, vph_x, vph_y + r - 2)
+        p.drawLine(vph_x - 4, vph_y - r + 6, vph_x, vph_y - r + 2)
+        p.drawLine(vph_x + 4, vph_y - r + 6, vph_x, vph_y - r + 2)
+        p.drawLine(vph_x - 4, vph_y + r - 6, vph_x, vph_y + r - 2)
+        p.drawLine(vph_x + 4, vph_y + r - 6, vph_x, vph_y + r - 2)
+        p.setPen(QPen(_vp_clr))
+        p.drawText(vph_x + r + 4, vph_y + 4, f"Panel H {self._vp_panel_depth:.2f}")
+        # Horizontal dashed line showing back-edge of panels
+        p.setPen(QPen(_vp_clr, 1.2, Qt.PenStyle.DashLine))
+        p.drawLine(0, vph_y, self.width(), vph_y)
+
         if self._start_gate_enabled:
             sg = self._start_gate_rect_px()
             gate_col = QColor(255, 70, 70)
@@ -893,7 +933,7 @@ class PreviewPanel(QWidget):
     # handles or the relax countdown box.
     # MainWindow saves these into segment.render_settings and requests a preview update.
     floor_wall_committed = Signal(
-        float, float, float, float, float, float, float, float, float, float, float, float
+        float, float, float, float, float, float, float, float, float, float, float, float, float
     )
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
@@ -1373,6 +1413,7 @@ class PreviewPanel(QWidget):
             gate_enabled = bool(rs.get("start_gate_enabled", False))
             gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
             chevron_w = self._get_floor_chevron_width(seg, rs=rs)
+            vp_depth = float(rs.get("viewport_panel_depth") or 0.6)
             gate_rect = None
             # Live renderer is the ground truth: its camera was already built
             # with the resolved values, so always prefer it over stale rs.
@@ -1401,6 +1442,7 @@ class PreviewPanel(QWidget):
                 gate_enabled = bool(getattr(lr, "_start_gate_enabled", gate_enabled))
                 gate_h = float(getattr(lr, "_start_gate_h", gate_h))
                 chevron_w = float(getattr(lr, "_chevron_width_frac", chevron_w))
+                vp_depth = float(getattr(lr, "_viewport_panel_depth", None) or vp_depth)
                 gate_rect = lr.get_start_gate_rect()
             # Set geometry BEFORE set_fractions so _hit_frac_bounds() has the
             # correct widget height. Without this, the overlay height is 0 at
@@ -1410,6 +1452,7 @@ class PreviewPanel(QWidget):
             self.floor_wall_overlay.set_fractions(
                 hit, hz, near_sp, far_sp, gap, rail_h,
                 has_relax, cdx, cdy, cdw, cdh, chevron_w,
+                vp_panel_depth=vp_depth,
             )
             if gate_rect is not None:
                 gx, gy, gw, gh = gate_rect
@@ -1439,6 +1482,7 @@ class PreviewPanel(QWidget):
         cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
         start_gate_h: float,
         chevron_width_frac: float,
+        vp_panel_depth: float = 0.6,
     ) -> None:
         """Live-update the renderer while the user drags a handle."""
         if not self._live_active or self._live_renderer is None:
@@ -1453,6 +1497,7 @@ class PreviewPanel(QWidget):
         self._live_renderer.update_side_rail_height(rail_h)
         self._live_renderer.update_start_gate_height(start_gate_h)
         self._live_renderer.update_floor_chevron_width(chevron_width_frac)
+        self._live_renderer.update_viewport_panel_depth(vp_panel_depth)
         self._live_renderer.update_countdown_box(x=cdx, y=cdy, w=cdw, h=cdh)
         gate_rect = self._live_renderer.get_start_gate_rect()
         if gate_rect is not None:
@@ -1473,24 +1518,27 @@ class PreviewPanel(QWidget):
         cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
         start_gate_h: float,
         chevron_width_frac: float,
+        vp_panel_depth: float = 0.6,
     ) -> None:
         """Persist the final drag result and notify MainWindow."""
         seg = self._selected_segment
         if seg is not None:
-            seg.render_settings["floor_hit_frac"]       = round(hit,     4)
-            seg.render_settings["horizon_frac"]         = round(hz,      4)
-            seg.render_settings["floor_spread_frac"]    = round(near_sp, 4)
-            seg.render_settings["far_spread_frac"]      = round(far_sp,  4)
-            seg.render_settings["wall_floor_gap_frac"]  = round(gap,     4)
-            seg.render_settings["rail_height"]          = round(max(0.15, rail_h), 4)
-            seg.render_settings["start_gate_h"]         = round(max(0.03, start_gate_h), 4)
-            seg.render_settings["chevron_width_frac"]   = round(
+            seg.render_settings["floor_hit_frac"]        = round(hit,     4)
+            seg.render_settings["horizon_frac"]          = round(hz,      4)
+            seg.render_settings["floor_spread_frac"]     = round(near_sp, 4)
+            seg.render_settings["far_spread_frac"]       = round(far_sp,  4)
+            seg.render_settings["wall_floor_gap_frac"]   = round(gap,     4)
+            seg.render_settings["rail_height"]           = round(max(0.15, rail_h), 4)
+            seg.render_settings["start_gate_h"]          = round(max(0.03, start_gate_h), 4)
+            seg.render_settings["chevron_width_frac"]    = round(
                 max(0.05, min(0.95, chevron_width_frac)), 4
             )
+            seg.render_settings["viewport_panel_depth"] = round(max(0.05, vp_panel_depth), 4)
         self.floor_wall_committed.emit(
             hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh,
             max(0.15, rail_h), max(0.03, start_gate_h),
             max(0.05, min(0.95, chevron_width_frac)),
+            max(0.05, vp_panel_depth),
         )
 
     def _get_countdown_bbox(
@@ -2830,6 +2878,7 @@ class PreviewPanel(QWidget):
         start_gate_y: Optional[float] = None,
         start_gate_w: Optional[float] = None,
         start_gate_h: Optional[float] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -2934,6 +2983,7 @@ class PreviewPanel(QWidget):
             start_gate_y=start_gate_y,
             start_gate_w=start_gate_w,
             start_gate_h=start_gate_h,
+            viewport_panel_depth=viewport_panel_depth,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)

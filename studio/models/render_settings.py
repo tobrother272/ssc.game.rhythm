@@ -138,6 +138,7 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     start_gate_y: float = Field(default=0.18, ge=0.0, le=1.0)
     start_gate_w: float = Field(default=0.40, ge=0.02, le=1.0)
     start_gate_h: float = Field(default=0.14, ge=0.03)
+    viewport_panel_depth: Optional[float] = None  # None = use mode default (0.6 punch / tile-depth dance)
 
 
 class PunchSettings(BaseRenderSettings):

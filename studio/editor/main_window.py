@@ -1297,6 +1297,7 @@ class MainWindow(QMainWindow):
         rail_height: float = 0.15,
         start_gate_h: float = 0.14,
         chevron_width_frac: float = 0.45,
+        viewport_panel_depth: float = 0.6,
     ) -> None:
         """Persist floor/wall drag result into segment + countdown layer config."""
         seg_id = self._preview_active_segment_id
@@ -1312,9 +1313,10 @@ class MainWindow(QMainWindow):
         seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
         seg.render_settings["rail_height"]          = round(max(0.15, rail_height), 4)
         seg.render_settings["start_gate_h"]         = round(max(0.03, start_gate_h), 4)
-        seg.render_settings["chevron_width_frac"]   = round(
+        seg.render_settings["chevron_width_frac"]    = round(
             max(0.05, min(0.95, chevron_width_frac)), 4
         )
+        seg.render_settings["viewport_panel_depth"] = round(max(0.05, viewport_panel_depth), 4)
 
         # Layer-first system: countdown box placement must live on the countdown
         # layer so future preview rebuilds/render resolve to the same values.
@@ -1422,7 +1424,8 @@ class MainWindow(QMainWindow):
             f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%  "
             f"rail h:{max(0.15, rail_height):.2f}  "
             f"gate h:{max(0.03, start_gate_h):.2f}  "
-            f"chevron w:{max(0.05, min(0.95, chevron_width_frac)):.2f}",
+            f"chevron w:{max(0.05, min(0.95, chevron_width_frac)):.2f}  "
+            f"panel depth:{max(0.05, viewport_panel_depth):.2f}",
             2500,
         )
 
@@ -2656,6 +2659,11 @@ class MainWindow(QMainWindow):
             kwargs.setdefault("cube_color_right", None)
             kwargs.setdefault("panel_neon_color", None)
 
+        _vpd = rs.get("viewport_panel_depth")
+        kwargs["viewport_panel_depth"] = (
+            max(0.05, float(_vpd)) if _vpd is not None else None
+        )
+
         # Lane filter: settings list is 1-based; renderer expects a
         # 0-based set, or ``None`` for "all enabled".
         lanes = rs.get("lanes")
@@ -2879,6 +2887,10 @@ class MainWindow(QMainWindow):
             start_gate_y = float(rs.get("start_gate_y", 0.18) or 0.18)
             start_gate_w = float(rs.get("start_gate_w", 0.40) or 0.40)
             start_gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
+            _vpd_raw = rs.get("viewport_panel_depth")
+            viewport_panel_depth_live = (
+                max(0.05, float(_vpd_raw)) if _vpd_raw is not None else None
+            )
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -2973,6 +2985,7 @@ class MainWindow(QMainWindow):
                     start_gate_y=start_gate_y,
                     start_gate_w=start_gate_w,
                     start_gate_h=start_gate_h,
+                    viewport_panel_depth=viewport_panel_depth_live,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

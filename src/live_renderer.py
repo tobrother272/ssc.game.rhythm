@@ -271,6 +271,7 @@ class LiveFrameRenderer:
         cube_color_left: Optional[tuple[int, int, int]] = None,
         cube_color_right: Optional[tuple[int, int, int]] = None,
         panel_neon_color: Optional[tuple[int, int, int]] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: int = 3,
         block_speed: float = 1.0,
         beat_min_gap: int = 4,
@@ -381,6 +382,9 @@ class LiveFrameRenderer:
         self._cube_color_left = cube_color_left
         self._cube_color_right = cube_color_right
         self._panel_neon_color = panel_neon_color
+        self._viewport_panel_depth: Optional[float] = (
+            max(0.05, float(viewport_panel_depth)) if viewport_panel_depth is not None else None
+        )
         self._max_per_lane = max(1, int(max_per_lane))
         self._block_speed = max(0.05, float(block_speed))
         self._beat_min_gap = max(1, int(beat_min_gap))
@@ -609,6 +613,7 @@ class LiveFrameRenderer:
         start_gate_y: Optional[float] = None,
         start_gate_w: Optional[float] = None,
         start_gate_h: Optional[float] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -816,6 +821,8 @@ class LiveFrameRenderer:
             self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
         if start_gate_h is not None:
             self._start_gate_h = max(0.03, float(start_gate_h))
+        if viewport_panel_depth is not None:
+            self._viewport_panel_depth = max(0.05, float(viewport_panel_depth))
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -864,6 +871,18 @@ class LiveFrameRenderer:
             dot_color_near=self._rail_dot_color_near,
             dot_color_far=self._rail_dot_color_far,
         )
+
+    def update_viewport_panel_depth(self, depth: float) -> None:
+        """Hot-update the viewport panel depth from overlay drag."""
+        new_depth = max(0.05, float(depth))
+        if new_depth != self._viewport_panel_depth:
+            self._viewport_panel_depth = new_depth
+            self._viewport = ViewportFrame(
+                self._cam,
+                neon_color=self._panel_neon_color,
+                mode=self._primary_mode,
+                panel_depth=self._viewport_panel_depth,
+            )
 
     def update_side_rail_height(self, height: float) -> None:
         """Hot-update side-rail height from overlay drag."""
@@ -1077,6 +1096,7 @@ class LiveFrameRenderer:
             primary_mode = "punch"
         else:  # solo line / relax both reuse punch dressing
             primary_mode = "punch"
+        self._primary_mode = primary_mode
         n_lanes_mode = N_LANES_DANCE if primary_mode == "dance" else N_LANES
         floor_spread = _FLOOR_SPREAD_BY_MODE.get(primary_mode, 0.50)
         cam_kwargs: dict = dict(n_lanes=n_lanes_mode,
@@ -1187,6 +1207,7 @@ class LiveFrameRenderer:
             self._cam,
             neon_color=self._panel_neon_color,
             mode=primary_mode,
+            panel_depth=self._viewport_panel_depth,
         )
 
         # Beat frames (post-density on array source: density disabled).

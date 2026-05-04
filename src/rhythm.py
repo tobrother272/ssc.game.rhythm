@@ -4442,7 +4442,8 @@ class ViewportFrame:
     def __init__(self, cam: PerspectiveCamera,
                  neon_color: tuple[int, int, int] | None = None,
                  lane_aligned: bool = False,
-                 mode: str = 'punch'):
+                 mode: str = 'punch',
+                 panel_depth: float | None = None):
         """`lane_aligned` is a legacy flag kept for API compat; ignored.
 
         Both modes now place panels ON the floor at hit zone:
@@ -4453,23 +4454,26 @@ class ViewportFrame:
         * ``mode='punch'`` — panel front-edge = ``Z_NEAR``, half_width =
           ``0.40 × lane_step_world``, depth = 0.6 world units.  Flying
           cubes land at the panel front and burst there.
+
+        ``panel_depth`` overrides the mode-specific default when provided.
         """
         self.cam = cam
         W, H = cam.W, cam.H
         _ = lane_aligned  # retained for back-compat; ignored
 
         if mode == 'dance':
-            half_x      = DanceTarget.HALF_X
-            panel_depth = 2.0 * DanceTarget.HALF_Z   # tile depth → flush landing
+            half_x       = DanceTarget.HALF_X
+            default_depth = 2.0 * DanceTarget.HALF_Z
         else:
             if cam.n_lanes > 1:
                 lane_step_world = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
             else:
                 lane_step_world = 0.40
-            half_x      = 0.40 * lane_step_world
-            panel_depth = 0.6
+            half_x        = 0.40 * lane_step_world
+            default_depth = 0.6
+        depth = float(panel_depth) if panel_depth is not None else default_depth
         panels = self._build_lane_aligned_panels(
-            half_x=half_x, z_front=cam.Z_NEAR, panel_depth=panel_depth,
+            half_x=half_x, z_front=cam.Z_NEAR, panel_depth=depth,
         )
         self.panels = panels
 
@@ -5767,7 +5771,8 @@ class RhythmVisualizer:
         # -- color overrides (None = use built-in defaults) --
         self.CUBE_COLOR_LEFT:   tuple | None = None
         self.CUBE_COLOR_RIGHT:  tuple | None = None
-        self.PANEL_NEON_COLOR:  tuple | None = None   # viewport 4-tile neon
+        self.PANEL_NEON_COLOR:   tuple | None = None   # viewport 4-tile neon
+        self.VIEWPORT_PANEL_DEPTH: float | None = None  # override panel depth
         # -- event export (for rendering a matched stickman-only video) --
         self.EXPORT_EVENTS:     str | None = None
         # -- detection-only mode: when True, run audio analysis + scheduler
@@ -6377,7 +6382,8 @@ class RhythmVisualizer:
                 ),
             )
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
-                                  mode=mode)
+                                  mode=mode,
+                                  panel_depth=self.VIEWPORT_PANEL_DEPTH)
         # ── auto-adjust TRAVEL so blocks flow smoothly ──────────────
         # Base auto-travel = one full L↔R cycle = 2 × beat_period, so a new
         # block enters the lane right as the previous one pops.
@@ -7512,6 +7518,12 @@ def parse_arguments():
                          '(only visible while they flash on each punch). '
                          'Accepts "#RRGGBB", "RRGGBB", or "R,G,B". '
                          'Default: amber (90,170,255).'))
+    p.add_argument('--viewport_panel_depth', type=float, default=None,
+                   metavar='DEPTH',
+                   help=('World depth of each viewport panel (front→back '
+                         'distance in world units, min 0.05). '
+                         'Controls how tall the panels appear on screen. '
+                         'Default: 0.6 (punch) or 2×HALF_Z (dance).'))
     p.add_argument('--mode', type=str, default='punch',
                    help=('Gameplay mode. '
                          '"punch" (default) = air cubes flying at chest '
@@ -7818,6 +7830,10 @@ if __name__ == '__main__':
     except ValueError as e:
         print(f"[color] {e}")
         sys.exit(1)
+    viz.VIEWPORT_PANEL_DEPTH = (
+        float(args.viewport_panel_depth)
+        if args.viewport_panel_depth is not None else None
+    )
     viz.EXPORT_EVENTS = args.export_events
     viz.DETECT_ONLY   = bool(args.detect_only)
     # Validate --mode early so bad spellings (e.g. "pouch,dance") surface

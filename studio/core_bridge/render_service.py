@@ -713,6 +713,7 @@ class RenderService(QObject):
         "chevron_scroll",
         "chevron_blink",
         "chevron_width_frac",
+        "viewport_panel_depth",
         "chevron_count",
         "rail_chevron_depth",
         "rail_chevron_density",
