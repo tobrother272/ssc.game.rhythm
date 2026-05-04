@@ -178,6 +178,46 @@ _RELAX_BOB_WINDOW_F     = 8       # ramp-in / ramp-out length (frames)
 _RELAX_BOB_HEIGHT_FRAC  = 0.08    # peak offset as a fraction of HEIGHT
 
 
+_MIDDLE_SHAKE_DURATION_F = 12      # frames after hit_frame (~400ms @30fps)
+_MIDDLE_SHAKE_PEAK_FRAC = 0.030    # 3.0% of min(W, H) at peak (~32px @1080p)
+
+
+def _relax_middle_shake_offset(
+    targets, cur_frame: int, width: int, height: int
+) -> tuple[int, int]:
+    """Screen-shake offset for `middle` block impact.
+
+    Full-canvas jitter triggered AT each `middle` RelaxTarget's
+    ``hit_frame`` (when the wall slams into the camera plane).  Amplitude
+    follows a punchy quartic decay (k**0.5 envelope: stays high for the
+    first half, then ramps off fast) over `_MIDDLE_SHAKE_DURATION_F`
+    frames.  Per-frame RNG is seeded by (hit_frame, cur_frame) so renders
+    are deterministic.
+    """
+    peak_px = max(2, int(min(width, height) * _MIDDLE_SHAKE_PEAK_FRAC))
+    amp = 0.0
+    seed = 0
+    for t in targets:
+        if not isinstance(t, RelaxTarget) or t.kind != 'middle':
+            continue
+        delta = cur_frame - t.hit_frame
+        if delta < 0 or delta >= _MIDDLE_SHAKE_DURATION_F:
+            continue
+        # Square-root envelope: k=1 → amp=1, k=0.5 → amp~0.71, holds
+        # impact longer than linear before falling off.
+        k_lin = 1.0 - delta / float(_MIDDLE_SHAKE_DURATION_F)
+        k = k_lin ** 0.5
+        if k > amp:
+            amp = k
+            seed = (int(t.hit_frame) & 0xFFFF) * 65537 + (int(cur_frame) & 0xFFFF)
+    if amp <= 0.0:
+        return 0, 0
+    rng = np.random.default_rng(seed)
+    jx = (float(rng.random()) - 0.5) * 2.0 * amp * peak_px
+    jy = (float(rng.random()) - 0.5) * 2.0 * amp * peak_px
+    return int(round(jx)), int(round(jy))
+
+
 def _relax_camera_dy(targets, cur_frame: int, height: int) -> int:
     """Compute the vertical canvas translation for relax-mode camera bob.
 
@@ -3017,6 +3057,18 @@ class RelaxTarget(Target):
     PHASE_SPLIT_D     = 0.70   # fraction of z-distance in Phase 1
     PHASE_SPEED_RATIO = 12.0   # Phase-2 world-speed / Phase-1 speed
 
+    # Wait-state hold depth for LOW / HIGH ─────────────────────────────
+    # At z=1.0 (Z_FAR) the perspective envelope (1-z)^1.6 collapses to
+    # zero, so a slab/bar held there during ``wait_frames`` would be
+    # invisible (zero height + zero width).  We therefore hold LOW/HIGH
+    # at a slightly nearer "entry" depth so the block is visibly parked
+    # at the horizon while the countdown ticks.  The motion phase is
+    # linearly rescaled so it animates from WAIT_HOLD_Z → 0 instead of
+    # 1.0 → 0, preserving the "70% drift + 30% vút" feel without a
+    # visual jump at move_start.  MIDDLE keeps z_entry=1.0 because its
+    # world rect already matches the StartGate footprint at z=Z_FAR.
+    WAIT_HOLD_Z       = 0.80
+
     # Dodge timing ─────────────────────────────────────────────────────
     # DODGE_OFFSET_{LOW,HIGH}:  where the stickman fires its pose
     #     relative to hit_frame, expressed as a SIGNED fraction of
@@ -3127,9 +3179,14 @@ class RelaxTarget(Target):
 
     def depth(self, cur_frame: int) -> float:
         move_start = self.move_start_frame
-        # Hold at the far horizon while waiting.
+        # Per-kind entry depth: MIDDLE holds at z=1.0 (its world rect is
+        # sized to fit the StartGate at Z_FAR); LOW/HIGH hold at
+        # WAIT_HOLD_Z so they have a non-zero projected size during the
+        # countdown wait and the motion phase animates smoothly from
+        # there to z=0 with no visual jump at move_start.
+        z_entry = 1.0 if self.kind == 'middle' else self.WAIT_HOLD_Z
         if cur_frame <= move_start:
-            return 1.0
+            return z_entry
         # Movement duration stays unchanged (configured travel), so it is
         # measured from move_start -> hit_frame.
         travel_f = max(1, self.hit_frame - move_start)
@@ -3149,24 +3206,25 @@ class RelaxTarget(Target):
             return max(-1.2, z)
 
         # ── LOW / HIGH: two-phase "70% chậm + 30% vút" ──────────────────
+        # The phase math is computed in a normalised z-range [0, 1] then
+        # scaled by ``z_entry`` so the actual motion runs from
+        # WAIT_HOLD_Z → 0 (approach) → −∞ (clamped, pass-by).
         D = self.PHASE_SPLIT_D
         T = self._phase_split_t()
-        z_split = 1.0 - D                  # z at the Phase 1 → 2 hand-off
+        z_split = 1.0 - D                  # normalised z at Phase 1 → 2
         if p_lin <= T:
-            # Phase 1 (drift): z: 1.0 → z_split over t: [0, T]
-            z = 1.0 - D * (p_lin / T)
+            # Phase 1 (drift): z_norm: 1.0 → z_split over t: [0, T]
+            z_norm = 1.0 - D * (p_lin / T)
         elif p_lin <= 1.0:
-            # Phase 2 (vút): z: z_split → 0 over t: [T, 1]
-            z = z_split * (1.0 - (p_lin - T) / (1.0 - T))
+            # Phase 2 (vút): z_norm: z_split → 0 over t: [T, 1]
+            z_norm = z_split * (1.0 - (p_lin - T) / (1.0 - T))
         else:
             # Pass-by: carry Phase-2 velocity forward so the block
-            # exits the viewport at the same sharp speed.  Phase-2
-            # world-velocity in z-units per unit of normalised time
-            # is z_split / (1 - T).
+            # exits the viewport at the same sharp speed.
             v2 = z_split / (1.0 - T)
-            z = -v2 * (p_lin - 1.0)
+            z_norm = -v2 * (p_lin - 1.0)
         # Clamp so numerical blowup in (1-z)**k stays bounded.
-        return max(-1.2, z)
+        return max(-1.2, z_norm * z_entry)
 
     @property
     def dodge_frame(self) -> int:
@@ -3228,24 +3286,36 @@ class RelaxTarget(Target):
 
     # ---------------- helpers ----------------
     def _span_x(self, cam: "PerspectiveCamera", z: float):
-        """Pink slab spans the full lane runway (outer lanes edge-to-edge).
+        """Horizontal extents of the pink slab at depth z.
 
-        We deliberately use the LANE boundaries — not the tunnel walls —
-        so the bar stays inside the visible runway even at z=0 where the
-        wall projection blows out past the screen edges.  A small extra
-        margin (half a lane step) keeps the slab reading as "spanning
-        everything" rather than ending exactly on the rails.
-
-        NOTE: we bypass `cam.lane_x()` because it applies
-        `int(round(lane))` and then uses the lane-bottom LUT whenever
-        the rounded index falls inside [0, n-1] — which, due to
-        Python's banker's rounding, collapses `-0.5 → 0` (no left
-        extrapolation) while `n-0.5 → n` correctly extrapolates to the
-        right.  That asymmetry skewed the slab visibly toward the
-        right edge.  Here we linearly extrapolate both bounds from
-        the lane-bottom step so the slab stays centered.
+        Both LOW and HIGH MUST match the rendered floor's x bounds at
+        the same depth so they read as "spanning the runway" cleanly:
+        TunnelRenderer._draw_floor_bg projects the world rect
+        [outer_lane ± half_step] × FLOOR_WORLD_Y via pinhole
+        `cam.project()`.  Using the legacy `(1-z)^1` converge here
+        tapers much slower than true 1/z and makes the slab/bar wider
+        than the runway at far/mid depths.  We therefore project the
+        SAME world x bounds the floor uses so the obstacle's left/right
+        edges glue to the runway edges all the way through travel.
+        Pass-by (z<0) falls back to legacy so the slab keeps sliding
+        off-screen (cam.project() rejects z_world <= 0).
         """
         n = max(1, cam.n_lanes)
+        if z >= 0.0:
+            if n >= 2:
+                outer_left  = cam.lane_world_x(0)
+                outer_right = cam.lane_world_x(n - 1)
+                half_step   = abs(outer_right - outer_left) / max(1, n - 1) * 0.5
+            else:
+                outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+            xw_left  = outer_left  - half_step
+            xw_right = outer_right + half_step
+            wz = cam.z_from_norm(max(0.0, min(1.0, z)))
+            p_l = cam.project(xw_left,  cam.FLOOR_WORLD_Y, wz)
+            p_r = cam.project(xw_right, cam.FLOOR_WORLD_Y, wz)
+            if p_l is not None and p_r is not None:
+                return int(round(p_l[0])), int(round(p_r[0]))
+        # ── Pass-by fallback (legacy converge, slab leaving viewport) ──
         if n >= 2:
             step = (cam.lane_x_bottom[-1] - cam.lane_x_bottom[0]) / (n - 1)
         else:
@@ -3274,9 +3344,22 @@ class RelaxTarget(Target):
                as a huge slab pinned at the top of the screen.
         """
         if self.kind == 'low':
-            fy = cam.floor_y(z)
-            cy = cam.ceil_y(z)
-            tunnel_h = fy - cy
+            # Bottom edge MUST track the rendered floor (TunnelRenderer
+            # uses pinhole `cam.project()` — NOT the legacy `floor_y(z)`
+            # envelope, which mismatches by up to ~10% of viewport
+            # height at the horizon).  We project the FLOOR_WORLD_Y
+            # plane at the same world depth so the slab visually slides
+            # along the floor surface at every z.  Pass-by (z<0) falls
+            # back to the legacy formula so the slab keeps sliding off
+            # the bottom of the viewport (project() rejects z_world<=0).
+            fy_legacy = cam.floor_y(z)
+            cy_legacy = cam.ceil_y(z)
+            if z >= 0.0:
+                p_f = cam.project(0.0, cam.FLOOR_WORLD_Y, cam.z_from_norm(z))
+                fy = float(p_f[1]) if p_f is not None else fy_legacy
+            else:
+                fy = fy_legacy
+            tunnel_h = max(0.0, fy_legacy - cy_legacy)
             h = tunnel_h * self.LOW_HEIGHT_FRAC
             y_b = fy
             y_t = fy - h
@@ -6994,8 +7077,11 @@ class RhythmVisualizer:
             # overlays stay pinned to their screen positions.
             if 'relax' in modes_seq:
                 _bob_dy = _relax_camera_dy(game.targets, fi, self.HEIGHT)
-                if _bob_dy != 0:
-                    _M = np.float32([[1, 0, 0], [0, 1, _bob_dy]])
+                _shake_dx, _shake_dy = _relax_middle_shake_offset(
+                    game.targets, fi, self.WIDTH, self.HEIGHT)
+                if _bob_dy != 0 or _shake_dx != 0 or _shake_dy != 0:
+                    _M = np.float32([[1, 0, _shake_dx],
+                                     [0, 1, _bob_dy + _shake_dy]])
                     canvas = cv2.warpAffine(
                         canvas, _M, (self.WIDTH, self.HEIGHT),
                         borderValue=(0, 0, 0))

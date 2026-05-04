@@ -110,6 +110,7 @@ from rhythm import (  # noqa: E402
     _FLOOR_SPREAD_BY_MODE,
     _parse_modes,
     _relax_camera_dy,
+    _relax_middle_shake_offset,
     _RELAX_BOB_WINDOW_F,
     detect_wave_columns,
     gpu_glow,
@@ -1493,8 +1494,11 @@ class LiveFrameRenderer:
         # jump / squat dodge.  Same logic as process_video.
         if "relax" in self._modes_seq:
             bob_dy = _relax_camera_dy(self._game.targets, fi, self._height)
-            if bob_dy != 0:
-                M = np.float32([[1, 0, 0], [0, 1, bob_dy]])
+            shake_dx, shake_dy = _relax_middle_shake_offset(
+                self._game.targets, fi, self._width, self._height)
+            if bob_dy != 0 or shake_dx != 0 or shake_dy != 0:
+                M = np.float32([[1, 0, shake_dx],
+                                [0, 1, bob_dy + shake_dy]])
                 canvas = cv2.warpAffine(
                     canvas, M, (self._width, self._height),
                     borderValue=(0, 0, 0),
