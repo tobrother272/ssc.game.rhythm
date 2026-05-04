@@ -2,7 +2,13 @@
 
 ## Mục tiêu
 
-Sửa 8 vấn đề đã phát hiện trong layer kind `countdown`, gồm 1 data-loss bug nghiêm trọng, vài inconsistency, missing UI controls, và dọn dead code. Spec này độc lập với 2 spec khác (`layer-resize-move-threshold-spec.md` và `drag-mechanics-offset-and-ergonomics-spec.md`).
+Sửa 8 vấn đề đã phát hiện trong layer kind `countdown`, gồm 1 data-loss bug nghiêm trọng, vài inconsistency, missing UI controls, và dọn dead code.
+
+Spec này độc lập với:
+
+- [`layer-countdown-border-glow-spec.md`](./layer-countdown-border-glow-spec.md) — feature thêm option border thickness + glow strength (dùng chung Section UI, nên implement Fix 1+5 trước).
+- [`layer-resize-move-threshold-spec.md`](./layer-resize-move-threshold-spec.md) — threshold-based snap-to-fill cho layer.
+- [`drag-mechanics-offset-and-ergonomics-spec.md`](./drag-mechanics-offset-and-ergonomics-spec.md) — segment offset + cursor + tooltip.
 
 ---
 
@@ -392,6 +398,9 @@ Cũng kiểm tra dòng 1935-1938 (xử lý đặc biệt cho `relax_countdown_co
 
 ---
 
+
+---
+
 ## Test scenarios
 
 ### Test 1: Inspector edit không nuốt bbox (Fix 1)
@@ -487,6 +496,7 @@ pytest tests/studio/test_layers.py
 - test_auto_create_does_not_include_side_rails_countdown: pass (Fix 6 đã chốt không làm)
 - mọi test khác: pass
 ```
+
 
 ---
 

@@ -252,11 +252,12 @@ class FloorWallOverlay(QWidget):
     Moving near does NOT move far, and vice versa.
     """
 
-    # 10 floats:
+    # 12 floats:
     # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
-    # countdown_x, countdown_y, countdown_w, countdown_h, rail_height
-    changing  = Signal(float, float, float, float, float, float, float, float, float, float)
-    committed = Signal(float, float, float, float, float, float, float, float, float, float)
+    # countdown_x, countdown_y, countdown_w, countdown_h, rail_height,
+    # start_gate_h, chevron_width_frac
+    changing  = Signal(float, float, float, float, float, float, float, float, float, float, float, float)
+    committed = Signal(float, float, float, float, float, float, float, float, float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
@@ -294,6 +295,23 @@ class FloorWallOverlay(QWidget):
         self._drag_cd_w0 = 0.0
         self._drag_cd_h0 = 0.0
         self._drag_rail_h0 = 0.15
+        self._drag_gate_h0 = 0.14
+        self._start_gate_enabled: bool = False
+        self._start_gate_h: float = 0.14
+        self._sg_x: float = 0.0
+        self._sg_y: float = 0.0
+        self._sg_w: float = 0.0
+        self._sg_h: float = 0.0
+        self._chevron_width_frac: float = 0.45
+        self._drag_chevron_w0 = 0.45
+        self._cached_frame_idx: int = 0
+
+    def set_frame_idx(self, frame_idx: int) -> None:
+        """Update tile-scroll frame index so hit-block overlay matches renderer."""
+        fi = int(frame_idx)
+        if fi != self._cached_frame_idx:
+            self._cached_frame_idx = fi
+            self.update()
 
     # ── public API ──────────────────────────────────────────────────────
     def _hit_frac_bounds(self) -> tuple[float, float]:
@@ -317,6 +335,7 @@ class FloorWallOverlay(QWidget):
         countdown_y: float = 0.04,
         countdown_w: float = 0.10,
         countdown_h: float = 0.16,
+        chevron_width_frac: float = 0.45,
     ) -> None:
         hit_lo, hit_hi = self._hit_frac_bounds()
         self._hit_frac             = max(hit_lo, min(hit_hi, float(hit_frac)))
@@ -330,13 +349,33 @@ class FloorWallOverlay(QWidget):
         self._cd_y = max(0.0, min(0.98, float(countdown_y)))
         self._cd_w = max(0.02, min(1.0 - self._cd_x, float(countdown_w)))
         self._cd_h = max(0.02, min(1.0 - self._cd_y, float(countdown_h)))
+        self._chevron_width_frac = max(0.05, min(0.95, float(chevron_width_frac)))
         self.update()
 
-    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float, float]:
+    def get_fractions(self) -> tuple[float, float, float, float, float, float, float, float, float, float, float, float]:
         return (self._hit_frac, self._horizon_frac,
                 self._near_spread, self._far_spread,
                 self._wall_floor_gap_frac,
-                self._cd_x, self._cd_y, self._cd_w, self._cd_h, self._rail_height)
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h, self._rail_height,
+                self._start_gate_h, self._chevron_width_frac)
+
+    def set_start_gate_proxy(
+        self,
+        *,
+        enabled: bool,
+        gate_height: float,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> None:
+        self._start_gate_enabled = bool(enabled)
+        self._start_gate_h = max(0.03, float(gate_height))
+        self._sg_x = max(0.0, min(1.0, float(x)))
+        self._sg_y = max(0.0, min(1.0, float(y)))
+        self._sg_w = max(0.0, min(1.0, float(w)))
+        self._sg_h = max(0.0, min(1.0, float(h)))
+        self.update()
 
     # ── geometry helpers ────────────────────────────────────────────────
     def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
@@ -385,6 +424,106 @@ class FloorWallOverlay(QWidget):
             max(1, int(self._cd_h * h)),
         )
 
+    def _start_gate_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._sg_x * w),
+            int(self._sg_y * h),
+            max(1, int(self._sg_w * w)),
+            max(1, int(self._sg_h * h)),
+        )
+
+    def _floor_footprint_points(self) -> list[QPoint]:
+        """Approximate floor trapezoid points for overlay visualization."""
+        y_bot = self._hit_y()
+        y_top = self._hz_y()
+        return [
+            QPoint(self._near_lx(), y_bot),
+            QPoint(self._near_rx(), y_bot),
+            QPoint(self._far_rx(), y_top),
+            QPoint(self._far_lx(), y_top),
+        ]
+
+    def _chevron_width_handle_pos(self) -> QPoint:
+        """Middle handle for floor chevron width control."""
+        y_mid = int((self._hit_y() + self._hz_y()) * 0.5)
+        return QPoint(self.width() // 2, y_mid)
+
+    def _hit_block_polys(self, n: int = 4, frame_idx: int = 0) -> list:
+        """Trapezoid polygons using pinhole projection matching cam.project()
+        in rhythm.py — exact equivalent of _draw_floor_tiles_legacy (lane_tiles).
+
+        All constants mirror PerspectiveCamera.__init__ and
+        _draw_floor_tiles_legacy exactly:
+          Z_NEAR=2.5, fov_deg=55, tile_len=1.6, z_slots=[3.0, 5.5, …]
+          tile_w = max(0.25, step_world * 0.80)
+          clip: wz < Z_NEAR + 0.2  (rhythm.py line 1196)
+
+        ``frame_idx`` enables tile-scroll sync; pass 0 for a static snapshot.
+        """
+        H_w = self.height()
+        W_w = self.width()
+        if H_w <= 0 or W_w <= 0 or n < 2:
+            return []
+        hy = self._hit_y()    # y_hit in widget pixels
+        cy = self._hz_y()     # horizon (cy_v) in widget pixels
+        if hy <= cy:
+            return []         # invalid: floor above horizon
+
+        # ── Mirror PerspectiveCamera constants ────────────────────────────
+        Z_NEAR   = 2.5
+        fov_deg  = 55.0
+        cx_pix   = W_w / 2.0
+        cy_pix   = float(cy)
+        fx       = W_w / 2.0 / math.tan(math.radians(fov_deg) / 2.0)
+        fy       = fx
+
+        # FLOOR_WORLD_Y — same formula as renderer
+        FLOOR_WORLD_Y = (float(hy) - cy_pix) * Z_NEAR / fy
+
+        # Lane world positions — match cam.lane_world_x(i)
+        lane_half_spread_px = W_w * self._near_spread * 0.5
+        LANE_WORLD_X        = lane_half_spread_px * Z_NEAR / fx
+        spacing             = 2.0 * LANE_WORLD_X / (n - 1)
+        x_centers           = [-LANE_WORLD_X + i * spacing for i in range(n)]
+
+        # Tile geometry — match _draw_floor_tiles_legacy
+        z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
+        tile_len  = 1.6
+        step_w    = abs(x_centers[1] - x_centers[0]) if n >= 2 else 0.0
+        tile_w    = max(0.25, step_w * 0.80)
+        scroll    = (float(frame_idx) * 0.30) % (z_slots[1] - z_slots[0])
+        z_clip    = Z_NEAR + 0.2
+
+        def _proj(wx: float, wy: float, wz: float):
+            if wz <= 1e-6:
+                return None
+            return QPoint(int(round(cx_pix + fx * wx / wz)),
+                          int(round(cy_pix + fy * wy / wz)))
+
+        polys = []
+        for xc in x_centers:
+            # Pick first visible tile (nearest, not clipped)
+            wz = None
+            for z_c in z_slots:
+                candidate = z_c - scroll
+                if candidate >= z_clip:
+                    wz = candidate
+                    break
+            if wz is None:
+                continue
+            corners = [
+                (xc - tile_w / 2.0, FLOOR_WORLD_Y, wz - tile_len / 2.0),
+                (xc + tile_w / 2.0, FLOOR_WORLD_Y, wz - tile_len / 2.0),
+                (xc + tile_w / 2.0, FLOOR_WORLD_Y, wz + tile_len / 2.0),
+                (xc - tile_w / 2.0, FLOOR_WORLD_Y, wz + tile_len / 2.0),
+            ]
+            pts = [_proj(*c) for c in corners]
+            if all(p is not None for p in pts):
+                polys.append(pts)
+        return polys
+
     def _handle_at(self, pos: QPoint) -> str | None:
         r = self._HANDLE_R + 7
         if self._countdown_enabled:
@@ -401,6 +540,21 @@ class FloorWallOverlay(QWidget):
                     return kind
             if cd.contains(pos):
                 return "cd_move"
+        if self._start_gate_enabled:
+            sg = self._start_gate_rect_px()
+            hs = 14
+            top_mid = QRect(
+                sg.center().x() - hs // 2,
+                sg.top() - hs // 2,
+                hs,
+                hs,
+            )
+            if top_mid.contains(pos):
+                return "gate_top"
+        ch = self._chevron_width_handle_pos()
+        cr = self._HANDLE_R - 1
+        if abs(pos.x() - ch.x()) <= cr and abs(pos.y() - ch.y()) <= cr:
+            return "chevron_width"
         # Side-rail height handles (left/right), dragged vertically in sync.
         r2 = self._HANDLE_R + 6
         rhy = self._rail_handle_y()
@@ -445,6 +599,12 @@ class FloorWallOverlay(QWidget):
         if self._drag == "rail_height":
             self._drag_anchor = ev.pos()
             self._drag_rail_h0 = self._rail_height
+        if self._drag == "gate_top":
+            self._drag_anchor = ev.pos()
+            self._drag_gate_h0 = self._start_gate_h
+        if self._drag == "chevron_width":
+            self._drag_anchor = ev.pos()
+            self._drag_chevron_w0 = self._chevron_width_frac
 
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag in ("wall_near", "wall_far"):
@@ -456,13 +616,17 @@ class FloorWallOverlay(QWidget):
                 self._far_spread, self._wall_floor_gap_frac,
                 self._cd_x, self._cd_y, self._cd_w, self._cd_h,
                 self._rail_height,
+                self._start_gate_h,
+                self._chevron_width_frac,
             )
 
     def mouseMoveEvent(self, ev) -> None:
         hover = self._handle_at(ev.pos()) if self._drag is None else None
         if hover:
-            if hover in ("hit", "horizon", "gap_side", "rail_height"):
+            if hover in ("hit", "horizon", "gap_side", "rail_height", "gate_top"):
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
+            elif hover == "chevron_width":
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
             elif hover == "wall_near":
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             elif hover in ("cd_tl", "cd_br"):
@@ -530,12 +694,25 @@ class FloorWallOverlay(QWidget):
             dy = float(ev.pos().y() - self._drag_anchor.y())
             h = max(1.0, float(self.height()))
             self._rail_height = max(0.15, self._drag_rail_h0 - (dy / h) * 1.8)
+        elif self._drag == "gate_top":
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._start_gate_h = max(0.03, self._drag_gate_h0 - (dy / h) * 1.8)
+        elif self._drag == "chevron_width":
+            dx = float(ev.pos().x() - self._drag_anchor.x())
+            w = max(1.0, float(self.width()))
+            self._chevron_width_frac = max(
+                0.05,
+                min(0.95, self._drag_chevron_w0 + (dx / w) * 1.6),
+            )
         self.update()
         self.changing.emit(
             self._hit_frac, self._horizon_frac, self._near_spread,
             self._far_spread, self._wall_floor_gap_frac,
             self._cd_x, self._cd_y, self._cd_w, self._cd_h,
             self._rail_height,
+            self._start_gate_h,
+            self._chevron_width_frac,
         )
 
     # ── paint ────────────────────────────────────────────────────────────
@@ -560,6 +737,20 @@ class FloorWallOverlay(QWidget):
 
         ny = self._hit_y()
         fy = self._far_y()
+
+        # Floor footprint outline (visual-only).
+        floor_pts = self._floor_footprint_points()
+        p.setBrush(QBrush(QColor(8, 145, 178, 30)))
+        p.setPen(QPen(QColor(8, 145, 178, 150), 1.2, Qt.PenStyle.DashLine))
+        p.drawPolygon(floor_pts)
+
+        # Hit-zone blocks — 4 lane trapezoids (pinhole projection).
+        _hit_fill = QColor(90, 70, 20, 65)       # dark amber, translucent fill
+        _hit_edge = QColor(90, 140, 160, 210)    # CLR_LANE_EDGE in RGB
+        p.setBrush(QBrush(_hit_fill))
+        p.setPen(QPen(_hit_edge, 1.5))
+        for _poly in self._hit_block_polys(n=4, frame_idx=self._cached_frame_idx):
+            p.drawPolygon(_poly)
 
         # Dashed lines connecting far ↔ near handles (left and right)
         p.setPen(QPen(self._WALL_CLR, 1.2, Qt.PenStyle.DashLine))
@@ -621,6 +812,41 @@ class FloorWallOverlay(QWidget):
         p.setPen(QPen(self._GAP_CLR))
         p.drawText(self._gap_rx() + rg + 4, gy + 5, "Gap")
 
+        # Chevron width handle (horizontal drag).
+        ch = self._chevron_width_handle_pos()
+        cmid_w = max(8, int((self._near_rx() - self._near_lx()) * self._chevron_width_frac))
+        x_l = ch.x() - cmid_w // 2
+        x_r = ch.x() + cmid_w // 2
+        p.setPen(QPen(QColor(8, 145, 178), 1.4))
+        p.drawLine(x_l, ch.y() - 6, x_l, ch.y() + 6)
+        p.drawLine(x_r, ch.y() - 6, x_r, ch.y() + 6)
+        p.setBrush(QBrush(QColor(8, 145, 178)))
+        p.setPen(QPen(QColor(255, 255, 255), 1.4))
+        p.drawEllipse(ch.x() - 7, ch.y() - 7, 14, 14)
+        p.setPen(QPen(QColor(8, 145, 178)))
+        p.drawText(ch.x() + 10, ch.y() + 4, f"Chevron W {self._chevron_width_frac:.2f}")
+
+        if self._start_gate_enabled:
+            sg = self._start_gate_rect_px()
+            gate_col = QColor(255, 70, 70)
+            p.setBrush(QBrush(QColor(255, 70, 70, 26)))
+            p.setPen(QPen(gate_col, 1.8, Qt.PenStyle.DashLine))
+            p.drawRect(sg)
+            hs = 8
+            hx = sg.center().x()
+            hy = sg.top()
+            p.setBrush(QBrush(gate_col))
+            p.setPen(QPen(QColor(255, 255, 255), 1.4))
+            p.drawRect(hx - hs, hy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(hx, hy - hs + 2, hx, hy + hs - 2)
+            p.drawLine(hx - 4, hy - hs + 6, hx, hy - hs + 2)
+            p.drawLine(hx + 4, hy - hs + 6, hx, hy - hs + 2)
+            p.drawLine(hx - 4, hy + hs - 6, hx, hy + hs - 2)
+            p.drawLine(hx + 4, hy + hs - 6, hx, hy + hs - 2)
+            p.setPen(QPen(gate_col))
+            p.drawText(sg.left() + 6, max(14, sg.top() - 8), f"Gate H {self._start_gate_h:.2f}")
+
         if self._countdown_enabled:
             cd = self._countdown_rect_px()
             p.setBrush(QBrush(QColor(255, 80, 220, 36)))
@@ -667,7 +893,7 @@ class PreviewPanel(QWidget):
     # handles or the relax countdown box.
     # MainWindow saves these into segment.render_settings and requests a preview update.
     floor_wall_committed = Signal(
-        float, float, float, float, float, float, float, float, float, float
+        float, float, float, float, float, float, float, float, float, float, float, float
     )
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
@@ -959,14 +1185,14 @@ class PreviewPanel(QWidget):
         return bool(val)
 
     def _refresh_stickman_button_state(self) -> None:
-        """Enable/disable the toolbar toggle based on current segment."""
+        """Sync stickman overlay state with current segment."""
         seg = self._selected_segment
         enabled = self._segment_stickman_enabled(seg)
-        self.stickman_button.setEnabled(enabled)
-        if not enabled and self.stickman_button.isChecked():
-            # Auto-untoggle when leaving a stickman-enabled segment so a
-            # stale overlay doesn't linger over an unrelated source.
-            self.stickman_button.setChecked(False)
+        # Stick box is controlled by the shared Floor/Wall toggle.
+        self.stickman_button.setVisible(False)
+        self.stickman_button.setEnabled(False)
+        if not enabled and self._stickman_edit_active:
+            self._on_stickman_edit_toggled(False)
         if enabled and seg is not None:
             self.stickman_overlay.set_normalized(
                 *self._segment_stick_fractions(seg)
@@ -1047,7 +1273,9 @@ class PreviewPanel(QWidget):
         if checked:
             seg = self._selected_segment
             if seg is None or not self._segment_stickman_enabled(seg):
-                self.stickman_button.setChecked(False)
+                self._stickman_edit_active = False
+                self._stickman_pos_timer.stop()
+                self.stickman_overlay.hide()
                 return
             self.stickman_overlay.set_normalized(
                 *self._segment_stick_fractions(seg)
@@ -1099,12 +1327,40 @@ class PreviewPanel(QWidget):
         self._floor_wall_edit_active = bool(checked)
         if checked:
             seg = self._selected_segment
-            rs  = seg.render_settings if seg is not None else {}
-            hit        = float(rs.get("floor_hit_frac")    or 0.86)
-            hz         = float(rs.get("horizon_frac")         or 0.45)
-            near_sp    = float(rs.get("floor_spread_frac")    or 0.65)
-            far_sp     = float(rs.get("far_spread_frac")      or near_sp)
-            gap        = float(rs.get("wall_floor_gap_frac")  or 0.0)
+            # Selection can become stale after undo/redo paths that replace
+            # project segment objects. Rebind by id to the latest instance.
+            if seg is not None and self._project_segments:
+                seg_latest = next(
+                    (s for s in self._project_segments if s.id == seg.id),
+                    seg,
+                )
+                if seg_latest is not seg:
+                    self._selected_segment = seg_latest
+                    seg = seg_latest
+            rs: dict = {}
+            if seg is not None:
+                # Use layer-resolved config so Adjust opens with the exact
+                # currently effective values (layer-first projects included).
+                try:
+                    from studio.models.layer import resolve_segment_config
+                    rs = dict(resolve_segment_config(seg, self._project_layers))
+                except Exception:
+                    rs = dict(getattr(seg, "render_settings", {}) or {})
+            # Default camera values (must match PerspectiveCamera defaults).
+            _CAM_HIT_DEFAULT   = 0.86
+            _CAM_HZ_DEFAULT    = 0.45
+            _CAM_NEAR_DEFAULT  = 0.65
+            try:
+                hit     = float(rs["floor_hit_frac"])  if rs.get("floor_hit_frac")  is not None else _CAM_HIT_DEFAULT
+                hz      = float(rs["horizon_frac"])     if rs.get("horizon_frac")     is not None else _CAM_HZ_DEFAULT
+                near_sp = float(rs["floor_spread_frac"])if rs.get("floor_spread_frac")is not None else _CAM_NEAR_DEFAULT
+            except (TypeError, ValueError):
+                hit, hz, near_sp = _CAM_HIT_DEFAULT, _CAM_HZ_DEFAULT, _CAM_NEAR_DEFAULT
+            try:
+                far_sp = float(rs["far_spread_frac"])   if rs.get("far_spread_frac")  is not None else near_sp
+                gap    = float(rs["wall_floor_gap_frac"])if rs.get("wall_floor_gap_frac")is not None else 0.0
+            except (TypeError, ValueError):
+                far_sp, gap = near_sp, 0.0
             has_relax = False
             if seg is not None:
                 if str(seg.mode) == "relax":
@@ -1114,31 +1370,75 @@ class PreviewPanel(QWidget):
                     has_relax = "relax" in [str(m) for m in modes]
             cdx, cdy, cdw, cdh = self._get_countdown_bbox(seg)
             rail_h = float(rs.get("rail_height", 0.14) or 0.14)
-            # In layer-first config projects, segment.render_settings can be
-            # stale while live renderer already uses resolved layer values.
-            # Use renderer state when available so the edit box starts exactly
-            # where the number is currently being drawn.
+            gate_enabled = bool(rs.get("start_gate_enabled", False))
+            gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
+            chevron_w = self._get_floor_chevron_width(seg, rs=rs)
+            gate_rect = None
+            # Live renderer is the ground truth: its camera was already built
+            # with the resolved values, so always prefer it over stale rs.
             if self._live_active and self._live_renderer is not None:
-                cdx = float(getattr(self._live_renderer, "_relax_countdown_x", cdx))
-                cdy = float(getattr(self._live_renderer, "_relax_countdown_y", cdy))
-                cdw = float(getattr(self._live_renderer, "_relax_countdown_w", cdw))
-                cdh = float(getattr(self._live_renderer, "_relax_countdown_h", cdh))
-                rail_h = float(getattr(self._live_renderer, "_rail_height", rail_h))
+                lr = self._live_renderer
+                _fhf = getattr(lr, "_floor_hit_frac", None)
+                if _fhf is not None:
+                    hit = float(_fhf)
+                _hzf = getattr(lr, "_horizon_frac", None)
+                if _hzf is not None:
+                    hz = float(_hzf)
+                _nsf = getattr(lr, "_floor_spread_frac", None)
+                if _nsf is not None:
+                    near_sp = float(_nsf)
+                _fsf = getattr(lr, "_far_spread_frac", None)
+                if _fsf is not None:
+                    far_sp = float(_fsf)
+                _wgf = getattr(lr, "_wall_floor_gap_frac", None)
+                if _wgf is not None:
+                    gap = float(_wgf)
+                cdx = float(getattr(lr, "_relax_countdown_x", cdx))
+                cdy = float(getattr(lr, "_relax_countdown_y", cdy))
+                cdw = float(getattr(lr, "_relax_countdown_w", cdw))
+                cdh = float(getattr(lr, "_relax_countdown_h", cdh))
+                rail_h = float(getattr(lr, "_rail_height", rail_h))
+                gate_enabled = bool(getattr(lr, "_start_gate_enabled", gate_enabled))
+                gate_h = float(getattr(lr, "_start_gate_h", gate_h))
+                chevron_w = float(getattr(lr, "_chevron_width_frac", chevron_w))
+                gate_rect = lr.get_start_gate_rect()
+            # Set geometry BEFORE set_fractions so _hit_frac_bounds() has the
+            # correct widget height. Without this, the overlay height is 0 at
+            # construction time, which makes the margin huge and clamps any
+            # hit_frac value to ~0.51 (screen middle).
+            self._sync_floor_wall_overlay_pos()
             self.floor_wall_overlay.set_fractions(
                 hit, hz, near_sp, far_sp, gap, rail_h,
-                has_relax, cdx, cdy, cdw, cdh,
+                has_relax, cdx, cdy, cdw, cdh, chevron_w,
             )
-            self._sync_floor_wall_overlay_pos()
+            if gate_rect is not None:
+                gx, gy, gw, gh = gate_rect
+            else:
+                gx, gy, gw, gh = (0.30, 0.18, 0.40, 0.22)
+            self.floor_wall_overlay.set_start_gate_proxy(
+                enabled=gate_enabled,
+                gate_height=gate_h,
+                x=gx,
+                y=gy,
+                w=gw,
+                h=gh,
+            )
+            self._on_stickman_edit_toggled(
+                seg is not None and self._segment_stickman_enabled(seg)
+            )
             self.floor_wall_overlay.show()
             self._floor_wall_pos_timer.start()
         else:
             self._floor_wall_pos_timer.stop()
             self.floor_wall_overlay.hide()
+            self._on_stickman_edit_toggled(False)
 
     def _on_floor_wall_changing(
         self,
         hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
         cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
+        start_gate_h: float,
+        chevron_width_frac: float,
     ) -> None:
         """Live-update the renderer while the user drags a handle."""
         if not self._live_active or self._live_renderer is None:
@@ -1151,13 +1451,28 @@ class PreviewPanel(QWidget):
             wall_floor_gap_frac=gap,
         )
         self._live_renderer.update_side_rail_height(rail_h)
+        self._live_renderer.update_start_gate_height(start_gate_h)
+        self._live_renderer.update_floor_chevron_width(chevron_width_frac)
         self._live_renderer.update_countdown_box(x=cdx, y=cdy, w=cdw, h=cdh)
+        gate_rect = self._live_renderer.get_start_gate_rect()
+        if gate_rect is not None:
+            gx, gy, gw, gh = gate_rect
+            self.floor_wall_overlay.set_start_gate_proxy(
+                enabled=bool(getattr(self._live_renderer, "_start_gate_enabled", False)),
+                gate_height=float(getattr(self._live_renderer, "_start_gate_h", start_gate_h)),
+                x=gx,
+                y=gy,
+                w=gw,
+                h=gh,
+            )
         self._render_live_frame(self.player.position() / 1000.0)
 
     def _on_floor_wall_committed(
         self,
         hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
         cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
+        start_gate_h: float,
+        chevron_width_frac: float,
     ) -> None:
         """Persist the final drag result and notify MainWindow."""
         seg = self._selected_segment
@@ -1168,8 +1483,14 @@ class PreviewPanel(QWidget):
             seg.render_settings["far_spread_frac"]      = round(far_sp,  4)
             seg.render_settings["wall_floor_gap_frac"]  = round(gap,     4)
             seg.render_settings["rail_height"]          = round(max(0.15, rail_h), 4)
+            seg.render_settings["start_gate_h"]         = round(max(0.03, start_gate_h), 4)
+            seg.render_settings["chevron_width_frac"]   = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
         self.floor_wall_committed.emit(
-            hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh, max(0.15, rail_h)
+            hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh,
+            max(0.15, rail_h), max(0.03, start_gate_h),
+            max(0.05, min(0.95, chevron_width_frac)),
         )
 
     def _get_countdown_bbox(
@@ -1195,6 +1516,37 @@ class PreviewPanel(QWidget):
             float(cfg.get("relax_countdown_w", 0.10) or 0.10),
             float(cfg.get("relax_countdown_h", 0.16) or 0.16),
         )
+
+    def _get_floor_chevron_width(
+        self,
+        seg: Segment | None,
+        *,
+        rs: Optional[dict] = None,
+    ) -> float:
+        """Resolve floor chevron width from floor layer config."""
+        base = 0.45
+        if rs is not None:
+            try:
+                base = float(rs.get("chevron_width_frac", base) or base)
+            except (TypeError, ValueError):
+                base = 0.45
+        if seg is None or not self._project_layers:
+            return max(0.05, min(0.95, base))
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        floor_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "floor"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not floor_layers:
+            return max(0.05, min(0.95, base))
+        top = max(floor_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        cfg = getattr(top, "config", {}) or {}
+        try:
+            return max(0.05, min(0.95, float(cfg.get("chevron_width_frac", base) or base)))
+        except (TypeError, ValueError):
+            return max(0.05, min(0.95, base))
 
     def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
         """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""
@@ -1565,12 +1917,13 @@ class PreviewPanel(QWidget):
             self._on_stickman_edit_toggled
         )
         self.stickman_button.setEnabled(False)
+        self.stickman_button.setVisible(False)
 
-        self.floor_wall_button = QPushButton("Floor/Wall")
+        self.floor_wall_button = QPushButton("Edit Layout")
         self.floor_wall_button.setCheckable(True)
         self.floor_wall_button.setToolTip(
-            "Toggle drag handles to adjust floor level, horizon, and wall width.\n"
-            "Drag the cyan line (floor), amber line (horizon), or magenta lines (walls)."
+            "Toggle drag handles to adjust floor/wall and stick box.\n"
+            "Drag directly on the player."
         )
         self.floor_wall_button.toggled.connect(self._on_floor_wall_edit_toggled)
         self.floor_wall_button.setEnabled(False)
@@ -1605,7 +1958,6 @@ class PreviewPanel(QWidget):
         control_row.addWidget(self.volume_slider)
         control_row.addWidget(self.fps_combo)
         control_row.addWidget(self._full_preview_cb)
-        control_row.addWidget(self.stickman_button)
         control_row.addWidget(self.floor_wall_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
@@ -2465,6 +2817,19 @@ class PreviewPanel(QWidget):
         relax_countdown_y: Optional[float] = None,
         relax_countdown_w: Optional[float] = None,
         relax_countdown_h: Optional[float] = None,
+        relax_countdown_border_thickness: Optional[float] = None,
+        relax_countdown_glow_strength: Optional[float] = None,
+        start_gate_enabled: Optional[bool] = None,
+        start_gate_type: Optional[str] = None,
+        start_gate_color: Optional[str] = None,
+        start_gate_border_color: Optional[str] = None,
+        start_gate_border_thickness: Optional[float] = None,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: Optional[float] = None,
+        start_gate_y: Optional[float] = None,
+        start_gate_w: Optional[float] = None,
+        start_gate_h: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Hot-reload the renderer's gameplay mode + decor and redraw."""
@@ -2556,6 +2921,19 @@ class PreviewPanel(QWidget):
             relax_countdown_y=relax_countdown_y,
             relax_countdown_w=relax_countdown_w,
             relax_countdown_h=relax_countdown_h,
+            relax_countdown_border_thickness=relax_countdown_border_thickness,
+            relax_countdown_glow_strength=relax_countdown_glow_strength,
+            start_gate_enabled=start_gate_enabled,
+            start_gate_type=start_gate_type,
+            start_gate_color=start_gate_color,
+            start_gate_border_color=start_gate_border_color,
+            start_gate_border_thickness=start_gate_border_thickness,
+            start_gate_image=start_gate_image,
+            start_gate_video=start_gate_video,
+            start_gate_x=start_gate_x,
+            start_gate_y=start_gate_y,
+            start_gate_w=start_gate_w,
+            start_gate_h=start_gate_h,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)
@@ -2616,4 +2994,8 @@ class PreviewPanel(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         self.live_label.setPixmap(pix)
+        # Keep hit-block overlay in sync with tile scroll animation.
+        if self._floor_wall_edit_active and hasattr(self, "floor_wall_overlay"):
+            fi = int(round(float(t_sec) * float(getattr(rdr, "fps", 30))))
+            self.floor_wall_overlay.set_frame_idx(fi)
 

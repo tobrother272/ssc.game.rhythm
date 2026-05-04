@@ -564,11 +564,25 @@ def _layer_button_pixmaps(size: int, stroke: QColor) -> dict[str, QPixmap]:
     p.end()
     result["countdown"] = pm
 
+    # --- Start Gate: two pillars + top beam ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    gx0, gy0 = m + s * 0.18, m + s * 0.20
+    gx1, gy1 = s - m - s * 0.18, s - m
+    p.drawLine(QPointF(gx0, gy0), QPointF(gx0, gy1))
+    p.drawLine(QPointF(gx1, gy0), QPointF(gx1, gy1))
+    p.drawLine(QPointF(gx0 - s * 0.05, gy0), QPointF(gx1 + s * 0.05, gy0))
+    p.end()
+    result["start_gate"] = pm
+
     return result
 
 
 def _layer_button_icons(size: int = 18) -> dict[str, QIcon]:
-    """Return a dict mapping layer kind → QIcon for all 5 layer kinds."""
+    """Return a dict mapping layer kind -> QIcon for all layer kinds."""
     c_on = QColor("#c8c8c8")
     c_off = QColor("#4f4f4f")
     pms_on = _layer_button_pixmaps(size, c_on)
@@ -1136,7 +1150,7 @@ class LayerBlockItem(QGraphicsRectItem):
 class LayerAddButtonItem(QGraphicsRectItem):
     """Small '+' button in a layer lane to create a missing layer."""
 
-    _SIZE = 14.0
+    _SIZE = 10.0
 
     def __init__(self, panel: "TimelinePanel", segment_id: str, kind: str) -> None:
         super().__init__(0.0, 0.0, self._SIZE, self._SIZE)
@@ -1167,8 +1181,9 @@ class LayerAddButtonItem(QGraphicsRectItem):
         plus_pen.setCosmetic(True)
         painter.setPen(plus_pen)
         c = r.center()
-        painter.drawLine(QPointF(c.x() - 3.0, c.y()), QPointF(c.x() + 3.0, c.y()))
-        painter.drawLine(QPointF(c.x(), c.y() - 3.0), QPointF(c.x(), c.y() + 3.0))
+        arm = 2.0
+        painter.drawLine(QPointF(c.x() - arm, c.y()), QPointF(c.x() + arm, c.y()))
+        painter.drawLine(QPointF(c.x(), c.y() - arm), QPointF(c.x(), c.y() + arm))
 
     def hoverEnterEvent(self, event) -> None:  # type: ignore[override]
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1846,6 +1861,7 @@ class TimelineView(QGraphicsView):
     media_dropped_at = Signal(str, float)  # media_id, time_sec
     background_media_dropped_at = Signal(str, float)  # media_id, time_sec
     floor_media_dropped_at = Signal(str, float)  # media_id, time_sec
+    start_gate_media_dropped_at = Signal(str, float)  # media_id, time_sec
     empty_clicked = Signal()
     playhead_scrubbed = Signal(float)  # time_sec
     segment_double_clicked = Signal(str)  # segment_id
@@ -1959,6 +1975,11 @@ class TimelineView(QGraphicsView):
                     if kind == "floor":
                         self.floor_media_dropped_at.emit(media_id, time_sec)
                         # Handled by floor-layer drop flow.
+                        event.acceptProposedAction()
+                        return
+                    if kind == "start_gate":
+                        self.start_gate_media_dropped_at.emit(media_id, time_sec)
+                        # Handled by start-gate-layer drop flow.
                         event.acceptProposedAction()
                         return
         self.media_dropped_at.emit(media_id, time_sec)
@@ -2364,6 +2385,7 @@ class TimelinePanel(QWidget):
     create_segment_requested = Signal(str, float)  # media_id, start_time
     background_media_dropped = Signal(str, float)  # media_id, project_time_sec
     floor_media_dropped = Signal(str, float)  # media_id, project_time_sec
+    start_gate_media_dropped = Signal(str, float)  # media_id, project_time_sec
     playhead_seek_requested = Signal(float)  # time_sec
     segment_split = Signal(str, str)   # original_id, new_id
     segment_joined = Signal(str, str)  # kept_id, removed_id
@@ -3251,6 +3273,22 @@ class TimelinePanel(QWidget):
                 "relax_countdown_y": 0.04,
                 "relax_countdown_w": 0.10,
                 "relax_countdown_h": 0.16,
+                "relax_countdown_border_thickness": 2.0,
+                "relax_countdown_glow_strength": 60.0,
+            }
+        if kind == "start_gate":
+            return {
+                "start_gate_enabled": True,
+                "start_gate_type": "color",
+                "start_gate_color": "#1a1a1a",
+                "start_gate_border_color": "#ffffff",
+                "start_gate_border_thickness": 0.0,
+                "start_gate_image": "",
+                "start_gate_video": "",
+                "start_gate_x": 0.30,
+                "start_gate_y": 0.18,
+                "start_gate_w": 0.40,
+                "start_gate_h": 0.14,
             }
         return {}
 
@@ -4475,6 +4513,7 @@ class TimelinePanel(QWidget):
         self.view.media_dropped_at.connect(self.create_segment_requested.emit)
         self.view.background_media_dropped_at.connect(self.background_media_dropped.emit)
         self.view.floor_media_dropped_at.connect(self.floor_media_dropped.emit)
+        self.view.start_gate_media_dropped_at.connect(self.start_gate_media_dropped.emit)
         self.view.empty_clicked.connect(self._on_empty_clicked)
         self.view.playhead_scrubbed.connect(self._on_playhead_scrubbed)
         self.view.segment_double_clicked.connect(self._on_segment_double_clicked)
@@ -4719,18 +4758,22 @@ class TimelinePanel(QWidget):
     _SEGMENT_TRACK_Y = 24
     _SEGMENT_TRACK_H = 80
     # Layer tracks sit between the segment track and the beat-strip / waveform.
-    # All 5 kinds are active; each track row is 32 px tall.
+    # All 6 kinds are active; each track row is 16 px tall.
     _LAYER_TRACK_Y = 104          # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
-    _LAYER_TRACK_H = 32           # height per layer track row
+    _LAYER_TRACK_H = 16           # height per layer track row
     # All layer kinds — order determines top-to-bottom track position.
-    _LAYER_KINDS = ("background", "floor", "side_rails", "stickman", "countdown")
-    _LAYER_TRACKS_TOTAL_H = 160   # len(_LAYER_KINDS) * _LAYER_TRACK_H  (5 × 32)
+    _LAYER_KINDS = (
+        "background", "floor", "side_rails", "stickman", "countdown", "start_gate"
+    )
+    _LAYER_TRACKS_TOTAL_H = 96    # len(_LAYER_KINDS) * _LAYER_TRACK_H  (6 × 16)
     # The BEAT-DBG strip sits between the layer tracks and the waveform.
-    _BEAT_STRIP_Y = 274            # 104 + 160 + 10 gap
+    _BEAT_STRIP_Y = 210            # 104 + 96 + 10 gap
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 304            # 274 + 16 + 14 gap
+    _WAVE_TRACK_Y = 240            # 210 + 16 + 14 gap
     _WAVE_TRACK_H = 160
-    _SCENE_H = 474                 # 304 + 160 + 10
+    _SCENE_H = 410                 # 240 + 160 + 10
+    _LAYER_LABEL_FONT_PT = 7.0
+    _LAYER_BLOCK_FONT_PT = 7.0
 
     def _draw_tracks(self) -> None:
         """No-op kept for call-site compatibility.
@@ -4826,10 +4869,13 @@ class TimelinePanel(QWidget):
                 painter.drawLine(QPointF(0.0, ty), QPointF(float(scene_w), ty))
 
             # ── Lane labels ("Segments" / layer kinds / "Waveform") ─
+            label_font = painter.font()
+            label_font.setPointSizeF(self._LAYER_LABEL_FONT_PT)
+            painter.setFont(label_font)
             painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             fm = painter.fontMetrics()
-            label_baseline_offset = float(fm.ascent()) + 2.0
+            label_baseline_offset = float(fm.ascent()) + 1.0
             painter.drawText(
                 QPointF(4.0, float(self._SEGMENT_TRACK_Y) + label_baseline_offset),
                 "Segments",
@@ -5108,6 +5154,9 @@ class TimelinePanel(QWidget):
             return
         painter.save()
         try:
+            block_font = painter.font()
+            block_font.setPointSizeF(self._LAYER_BLOCK_FONT_PT)
+            painter.setFont(block_font)
             for layer_id, block in list(self._layer_block_map.items()):
                 layer = self._project.get_layer(layer_id)
                 if layer is None:

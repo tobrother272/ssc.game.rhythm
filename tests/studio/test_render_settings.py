@@ -146,6 +146,8 @@ def test_relax_extensions_round_trip() -> None:
         "relax_countdown_y": 0.08,
         "relax_countdown_w": 0.14,
         "relax_countdown_h": 0.20,
+        "relax_countdown_border_thickness": 4.5,
+        "relax_countdown_glow_strength": 82.0,
     }
     s = build_settings("relax", raw)
     d = s.model_dump(mode="json")
@@ -165,6 +167,8 @@ def test_relax_extensions_round_trip() -> None:
     assert d["relax_countdown_audio_last_file"] == "C:/tmp/count_last.wav"
     assert d["relax_countdown_x"] == 0.72
     assert d["relax_countdown_h"] == 0.20
+    assert d["relax_countdown_border_thickness"] == 4.5
+    assert d["relax_countdown_glow_strength"] == 82.0
 
 
 def test_relax_defaults_backward_compatible() -> None:
@@ -185,6 +189,50 @@ def test_relax_defaults_backward_compatible() -> None:
     assert d["relax_countdown_audio_last_mode"] == "default"
     assert d["relax_countdown_x"] == 0.88
     assert d["relax_countdown_h"] == 0.16
+    assert d["relax_countdown_border_thickness"] == 2.0
+    assert d["relax_countdown_glow_strength"] == 60.0
+
+
+def test_relax_countdown_style_ranges() -> None:
+    from pydantic import ValidationError
+
+    try:
+        build_settings("relax", {"relax_countdown_border_thickness": 11.0})
+        assert False, "should reject border thickness > 10.0"
+    except ValidationError:
+        pass
+
+
+def test_start_gate_defaults_and_validation() -> None:
+    from pydantic import ValidationError
+
+    s = build_settings("punch", {})
+    d = s.model_dump(mode="json")
+    assert d["start_gate_enabled"] is False
+    assert d["start_gate_type"] == "color"
+    assert d["start_gate_color"] == "#1a1a1a"
+    assert d["start_gate_border_color"] == "#ffffff"
+    assert d["start_gate_border_thickness"] == 0.0
+    assert d["start_gate_x"] == 0.30
+    assert d["start_gate_h"] == 0.14
+
+    try:
+        build_settings("punch", {"start_gate_type": "solid"})
+        assert False, "should reject unsupported start_gate_type"
+    except ValidationError:
+        pass
+
+    try:
+        build_settings("punch", {"start_gate_border_thickness": 12.0})
+        assert False, "should reject start_gate_border_thickness > 10.0"
+    except ValidationError:
+        pass
+
+    try:
+        build_settings("relax", {"relax_countdown_glow_strength": -1.0})
+        assert False, "should reject glow strength < 0.0"
+    except ValidationError:
+        pass
 
 
 def test_background_fields_round_trip() -> None:

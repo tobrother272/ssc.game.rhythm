@@ -741,6 +741,19 @@ class RenderService(QObject):
         "relax_countdown_y",
         "relax_countdown_w",
         "relax_countdown_h",
+        "relax_countdown_border_thickness",
+        "relax_countdown_glow_strength",
+        "start_gate_enabled",
+        "start_gate_type",
+        "start_gate_color",
+        "start_gate_border_color",
+        "start_gate_border_thickness",
+        "start_gate_image",
+        "start_gate_video",
+        "start_gate_x",
+        "start_gate_y",
+        "start_gate_w",
+        "start_gate_h",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
@@ -779,6 +792,8 @@ class RenderService(QObject):
                 "relax_hole_mask_path",
                 "relax_countdown_audio_file",
                 "relax_countdown_audio_last_file",
+                "start_gate_image",
+                "start_gate_video",
             } and not str(value).strip():
                 continue
             if key in {"background_image", "background_video"} and not str(value).strip():

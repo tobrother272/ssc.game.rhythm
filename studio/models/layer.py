@@ -9,7 +9,9 @@ from uuid import uuid4
 if TYPE_CHECKING:
     from .segment import Segment
 
-LayerKind = Literal["background", "side_rails", "floor", "stickman", "countdown"]
+LayerKind = Literal[
+    "background", "side_rails", "floor", "stickman", "countdown", "start_gate"
+]
 
 # Category colours used by timeline UI (hex strings).
 LAYER_KIND_COLORS: dict[str, str] = {
@@ -18,6 +20,7 @@ LAYER_KIND_COLORS: dict[str, str] = {
     "floor":       "#0891b2",  # cyan
     "stickman":    "#ca8a04",  # yellow
     "countdown":   "#15803d",  # green
+    "start_gate":  "#ea580c",  # orange
 }
 
 
@@ -156,6 +159,21 @@ _VISUAL_FIELDS_BY_KIND: dict[str, list[str]] = {
         "relax_countdown_audio_volume",
         "relax_countdown_audio_last_mode",
         "relax_countdown_audio_last_file",
+        "relax_countdown_border_thickness",
+        "relax_countdown_glow_strength",
+    ],
+    "start_gate": [
+        "start_gate_enabled",
+        "start_gate_type",
+        "start_gate_color",
+        "start_gate_border_color",
+        "start_gate_border_thickness",
+        "start_gate_image",
+        "start_gate_video",
+        "start_gate_x",
+        "start_gate_y",
+        "start_gate_w",
+        "start_gate_h",
     ],
 }
 
@@ -230,7 +248,9 @@ def resolve_segment_config(
     s_start = segment.start_time_sec
     s_end = segment.end_time_sec
 
-    for kind in ("background", "side_rails", "floor", "stickman", "countdown"):
+    for kind in (
+        "background", "side_rails", "floor", "stickman", "countdown", "start_gate"
+    ):
         overlapping = [
             la for la in project_layers
             if la.kind == kind and la.overlaps(s_start, s_end)

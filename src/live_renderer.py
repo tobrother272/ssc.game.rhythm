@@ -101,6 +101,7 @@ from rhythm import (  # noqa: E402
     RelaxTarget,
     SideRailRenderer,
     SegmentBackgroundLayer,
+    StartGate,
     StickmanHUD,
     Target,
     TunnelRenderer,
@@ -249,6 +250,19 @@ class LiveFrameRenderer:
         relax_countdown_y: float = 0.04,
         relax_countdown_w: float = 0.10,
         relax_countdown_h: float = 0.16,
+        relax_countdown_border_thickness: float = 2.0,
+        relax_countdown_glow_strength: float = 60.0,
+        start_gate_enabled: bool = False,
+        start_gate_type: str = "color",
+        start_gate_color: str = "#1a1a1a",
+        start_gate_border_color: str = "#ffffff",
+        start_gate_border_thickness: float = 0.0,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: float = 0.30,
+        start_gate_y: float = 0.18,
+        start_gate_w: float = 0.40,
+        start_gate_h: float = 0.14,
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -340,6 +354,25 @@ class LiveFrameRenderer:
         self._relax_countdown_y = max(0.0, min(1.0, float(relax_countdown_y)))
         self._relax_countdown_w = max(0.02, min(1.0, float(relax_countdown_w)))
         self._relax_countdown_h = max(0.02, min(1.0, float(relax_countdown_h)))
+        self._relax_countdown_border_thickness = max(
+            0.0, min(10.0, float(relax_countdown_border_thickness))
+        )
+        self._relax_countdown_glow_strength = max(
+            0.0, min(100.0, float(relax_countdown_glow_strength))
+        )
+        self._start_gate_enabled = bool(start_gate_enabled)
+        self._start_gate_type = str(start_gate_type or "color")
+        self._start_gate_color = str(start_gate_color or "#1a1a1a")
+        self._start_gate_border_color = str(start_gate_border_color or "#ffffff")
+        self._start_gate_border_thickness = max(
+            0.0, min(10.0, float(start_gate_border_thickness))
+        )
+        self._start_gate_image = start_gate_image or None
+        self._start_gate_video = start_gate_video or None
+        self._start_gate_x = max(0.0, min(1.0, float(start_gate_x)))
+        self._start_gate_y = max(0.0, min(1.0, float(start_gate_y)))
+        self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
+        self._start_gate_h = max(0.03, float(start_gate_h))
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -563,6 +596,19 @@ class LiveFrameRenderer:
         relax_countdown_y: Optional[float] = None,
         relax_countdown_w: Optional[float] = None,
         relax_countdown_h: Optional[float] = None,
+        relax_countdown_border_thickness: Optional[float] = None,
+        relax_countdown_glow_strength: Optional[float] = None,
+        start_gate_enabled: Optional[bool] = None,
+        start_gate_type: Optional[str] = None,
+        start_gate_color: Optional[str] = None,
+        start_gate_border_color: Optional[str] = None,
+        start_gate_border_thickness: Optional[float] = None,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: Optional[float] = None,
+        start_gate_y: Optional[float] = None,
+        start_gate_w: Optional[float] = None,
+        start_gate_h: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -727,6 +773,49 @@ class LiveFrameRenderer:
             self._relax_countdown_w = max(0.02, min(1.0, float(relax_countdown_w)))
         if relax_countdown_h is not None:
             self._relax_countdown_h = max(0.02, min(1.0, float(relax_countdown_h)))
+        border_changed = relax_countdown_border_thickness is not None
+        glow_changed = relax_countdown_glow_strength is not None
+        if border_changed:
+            self._relax_countdown_border_thickness = max(
+                0.0, min(10.0, float(relax_countdown_border_thickness))
+            )
+        if glow_changed:
+            self._relax_countdown_glow_strength = max(
+                0.0, min(100.0, float(relax_countdown_glow_strength))
+            )
+        if (border_changed or glow_changed) and self._countdown_hud is not None:
+            self._countdown_hud.set_style(
+                border_thickness=(
+                    self._relax_countdown_border_thickness if border_changed else None
+                ),
+                glow_strength=(
+                    self._relax_countdown_glow_strength if glow_changed else None
+                ),
+            )
+        if start_gate_enabled is not None:
+            self._start_gate_enabled = bool(start_gate_enabled)
+        if start_gate_type is not None:
+            self._start_gate_type = str(start_gate_type or "color")
+        if start_gate_color is not None:
+            self._start_gate_color = str(start_gate_color or "#1a1a1a")
+        if start_gate_border_color is not None:
+            self._start_gate_border_color = str(start_gate_border_color or "#ffffff")
+        if start_gate_border_thickness is not None:
+            self._start_gate_border_thickness = max(
+                0.0, min(10.0, float(start_gate_border_thickness))
+            )
+        if start_gate_image is not None:
+            self._start_gate_image = start_gate_image or None
+        if start_gate_video is not None:
+            self._start_gate_video = start_gate_video or None
+        if start_gate_x is not None:
+            self._start_gate_x = max(0.0, min(1.0, float(start_gate_x)))
+        if start_gate_y is not None:
+            self._start_gate_y = max(0.0, min(1.0, float(start_gate_y)))
+        if start_gate_w is not None:
+            self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
+        if start_gate_h is not None:
+            self._start_gate_h = max(0.03, float(start_gate_h))
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
@@ -780,6 +869,34 @@ class LiveFrameRenderer:
         """Hot-update side-rail height from overlay drag."""
         self._rail_height = max(0.15, float(height))
         self._side_rail = self._build_side_rail()
+        if self._start_gate is not None:
+            self._start_gate.update_layout(rail_height=self._rail_height)
+
+    def update_start_gate_height(self, height: float) -> None:
+        """Hot-update start-gate height from overlay drag."""
+        self._start_gate_h = max(0.03, float(height))
+        if self._start_gate is not None:
+            self._start_gate.update_layout(gate_height=self._start_gate_h)
+
+    def update_floor_chevron_width(self, chevron_width_frac: float) -> None:
+        """Hot-update floor chevron strip width without rebuilding scene."""
+        self._chevron_width_frac = max(0.05, min(0.95, float(chevron_width_frac)))
+        if self._tunnel is not None:
+            try:
+                self._tunnel.set_chevron_width_frac(self._chevron_width_frac)
+            except Exception:
+                # Fallback for older tunnel implementations.
+                self._build_scene()
+                self._cur_fi = -1
+
+    def get_start_gate_rect(self) -> tuple[float, float, float, float] | None:
+        gate = getattr(self, "_start_gate", None)
+        if gate is None:
+            return None
+        try:
+            return gate.rect_fracs()
+        except Exception:
+            return None
 
     def update_floor_wall(
         self,
@@ -847,6 +964,9 @@ class LiveFrameRenderer:
         if getattr(self, "_background_layer", None) is not None:
             self._background_layer.close()
         self._background_layer = None
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.close()
+        self._start_gate = None
 
     # ------------------------------------------------------------------
     # construction helpers
@@ -945,6 +1065,9 @@ class LiveFrameRenderer:
         if getattr(self, "_background_layer", None) is not None:
             self._background_layer.close()
             self._background_layer = None
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.close()
+            self._start_gate = None
         combo_mode = len(modes_seq) >= 2
         self._combo_mode = combo_mode
         # Scene-dressing primary mode picks lane count + floor spread.
@@ -978,6 +1101,23 @@ class LiveFrameRenderer:
             video_path=self._background_video,
             fps=float(self._fps),
         )
+        self._start_gate = None
+        if self._start_gate_enabled:
+            self._start_gate = StartGate(
+                cam=self._cam,
+                view_w=self._width,
+                view_h=self._height,
+                gate_type=self._start_gate_type,
+                color=self._start_gate_color,
+                border_color=self._start_gate_border_color,
+                border_thickness=self._start_gate_border_thickness,
+                image_path=self._start_gate_image,
+                video_path=self._start_gate_video,
+                rail_height=self._rail_height,
+                rail_offset_x=self._rail_offset_x,
+                gate_height=self._start_gate_h,
+                fps=float(self._fps),
+            )
         # Tunnel + decorative HUDs.  ``show_floor_panels`` is sourced
         # from the segment's render setting (default True) and is
         # hot-toggleable through :meth:`update_mode` so the user can
@@ -1040,6 +1180,8 @@ class LiveFrameRenderer:
                     self._relax_countdown_w,
                     self._relax_countdown_h,
                 ),
+                border_thickness=self._relax_countdown_border_thickness,
+                glow_strength=self._relax_countdown_glow_strength,
             )
         self._viewport = ViewportFrame(
             self._cam,
@@ -1304,6 +1446,8 @@ class LiveFrameRenderer:
         else:
             canvas = np.full((self._height, self._width, 3),
                              CLR_BG, dtype=np.uint8)
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.draw(canvas, fi)
         # 1. tunnel walls + floor grid
         canvas = self._tunnel.draw(canvas, fi)
         # 1b. side rails

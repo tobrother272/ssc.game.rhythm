@@ -424,6 +424,9 @@ class InspectorPanel(QWidget):
             elif kind == "countdown":
                 from studio.editor.layer_edit_dialog import _CountdownSection
                 return _CountdownSection(cfg, self)
+            elif kind == "start_gate":
+                from studio.editor.layer_edit_dialog import _StartGateSection
+                return _StartGateSection(cfg, self)
         except Exception:
             pass
         return None

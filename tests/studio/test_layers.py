@@ -320,7 +320,7 @@ def test_persistence_backward_compat_no_layers_key():
 # ---------------------------------------------------------------------------
 
 def test_layer_kind_colors_all_defined():
-    for kind in ("background", "side_rails", "floor", "stickman", "countdown"):
+    for kind in ("background", "side_rails", "floor", "stickman", "countdown", "start_gate"):
         assert kind in LAYER_KIND_COLORS
         assert LAYER_KIND_COLORS[kind].startswith("#")
 
@@ -418,10 +418,11 @@ def test_migration_on_load_old_project():
     assert "floor" in kinds
 
 
-def test_auto_create_does_not_include_side_rails_countdown():
-    """Side rails and countdown are NOT auto-created."""
+def test_auto_create_does_not_include_side_rails_countdown_start_gate():
+    """Side rails, countdown, and start gate are NOT auto-created."""
     proj, seg = _proj_with_seg(0.0, 30.0)
     auto_create_default_layers(proj, seg)
     kinds = {la.kind for la in proj.layers}
     assert "side_rails" not in kinds
     assert "countdown" not in kinds
+    assert "start_gate" not in kinds

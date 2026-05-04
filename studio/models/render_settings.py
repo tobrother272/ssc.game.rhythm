@@ -127,6 +127,17 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     wall_floor_gap_frac: Optional[float] = None  # vertical gap between near wall bottom and floor (0-0.30)
     rail_chevron_depth: float = 1.0    # pointedness multiplier (1.0 = 120° opening angle)
     rail_chevron_density: int = 6      # number of chevrons per wall (2-20)
+    start_gate_enabled: bool = False
+    start_gate_type: Literal["color", "image", "video"] = "color"
+    start_gate_color: str = "#1a1a1a"
+    start_gate_border_color: str = "#ffffff"
+    start_gate_border_thickness: float = Field(default=0.0, ge=0.0, le=10.0)
+    start_gate_image: Optional[str] = None
+    start_gate_video: Optional[str] = None
+    start_gate_x: float = Field(default=0.30, ge=0.0, le=1.0)
+    start_gate_y: float = Field(default=0.18, ge=0.0, le=1.0)
+    start_gate_w: float = Field(default=0.40, ge=0.02, le=1.0)
+    start_gate_h: float = Field(default=0.14, ge=0.03)
 
 
 class PunchSettings(BaseRenderSettings):
@@ -186,6 +197,8 @@ class RelaxSettings(BaseRenderSettings):
     relax_countdown_y: float = Field(default=0.04, ge=0.0, le=1.0)
     relax_countdown_w: float = Field(default=0.10, ge=0.02, le=1.0)
     relax_countdown_h: float = Field(default=0.16, ge=0.02, le=1.0)
+    relax_countdown_border_thickness: float = Field(default=2.0, ge=0.0, le=10.0)
+    relax_countdown_glow_strength: float = Field(default=60.0, ge=0.0, le=100.0)
     relax_hole_mask_path: Optional[str] = None
 
 

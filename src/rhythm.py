@@ -643,6 +643,239 @@ class SegmentBackgroundLayer:
         return self._solid_frame()
 
 
+class StartGate:
+    """Visual gate anchored to floor + side-rail inner edges."""
+
+    def __init__(
+        self,
+        cam: PerspectiveCamera,
+        view_w: int,
+        view_h: int,
+        *,
+        gate_type: str = "color",
+        color: str = "#1a1a1a",
+        border_color: str = "#ffffff",
+        border_thickness: float = 0.0,
+        image_path: str | None = None,
+        video_path: str | None = None,
+        rail_height: float = 0.14,
+        rail_offset_x: float = 0.08,
+        gate_height: float = 0.14,
+        fps: float = 30.0,
+    ) -> None:
+        self._cam = cam
+        self._view_w = int(view_w)
+        self._view_h = int(view_h)
+        self._rail_height = max(0.03, float(rail_height))
+        self._rail_offset_x = max(0.0, float(rail_offset_x))
+        self._gate_height = max(0.03, float(gate_height))
+        self._fps = max(1e-6, float(fps))
+        t = str(gate_type or "color").strip().lower()
+        self._type = t if t in {"color", "image", "video"} else "color"
+        self._solid_bgr = _hex_to_bgr(color, default=(26, 26, 26))
+        self._border_bgr = _hex_to_bgr(border_color, default=(255, 255, 255))
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+
+        self._orig_image: np.ndarray | None = None
+        self._image: np.ndarray | None = None
+        self._cap: cv2.VideoCapture | None = None
+        self._video_fps = self._fps
+        self._video_frames = 0
+        self._last_src_idx = -1
+        self._last_frame: np.ndarray | None = None
+
+        self._px = 0
+        self._py = 0
+        self._pw = 1
+        self._ph = 1
+        self._recompute_rect()
+
+        if self._type == "image" and image_path:
+            try:
+                img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    self._orig_image = img
+                    self._image = self._fit_to_rect(img)
+            except Exception:
+                self._orig_image = None
+                self._image = None
+        elif self._type == "video" and video_path:
+            try:
+                cap = cv2.VideoCapture(str(video_path))
+                if cap is not None and cap.isOpened():
+                    self._cap = cap
+                    vf = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if vf > 1e-3:
+                        self._video_fps = vf
+                    self._video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                else:
+                    if cap is not None:
+                        cap.release()
+            except Exception:
+                self._cap = None
+
+    def _set_rect_px(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        x0 = max(0, min(self._view_w - 1, int(x0)))
+        y0 = max(0, min(self._view_h - 1, int(y0)))
+        x1 = max(x0 + 1, min(self._view_w, int(x1)))
+        y1 = max(y0 + 1, min(self._view_h, int(y1)))
+        new_px = x0
+        new_py = y0
+        new_pw = max(1, x1 - x0)
+        new_ph = max(1, y1 - y0)
+        if (
+            new_px != self._px or new_py != self._py
+            or new_pw != self._pw or new_ph != self._ph
+        ):
+            self._px = new_px
+            self._py = new_py
+            self._pw = new_pw
+            self._ph = new_ph
+            self._last_frame = None
+            self._last_src_idx = -1
+            if self._orig_image is not None:
+                self._image = self._fit_to_rect(self._orig_image)
+
+    def _recompute_rect(self) -> None:
+        cam = self._cam
+        if cam.n_lanes >= 2:
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+        else:
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+        inner_x = outer_tile_x + self._rail_offset_x
+        wx_l = -inner_x
+        wx_r = inner_x
+        wz = cam.Z_FAR
+        wy_bot = cam.FLOOR_WORLD_Y
+        wy_top = cam.FLOOR_WORLD_Y - self._gate_height
+        p_lb = cam.project(wx_l, wy_bot, wz)
+        p_rb = cam.project(wx_r, wy_bot, wz)
+        p_lt = cam.project(wx_l, wy_top, wz)
+        p_rt = cam.project(wx_r, wy_top, wz)
+        if any(p is None for p in (p_lb, p_rb, p_lt, p_rt)):
+            # Fallback box if projection fails unexpectedly.
+            self._set_rect_px(
+                int(self._view_w * 0.30),
+                int(self._view_h * 0.18),
+                int(self._view_w * 0.70),
+                int(self._view_h * 0.40),
+            )
+            return
+        x0 = int(round(min(p_lb[0], p_lt[0])))
+        x1 = int(round(max(p_rb[0], p_rt[0])))
+        y0 = int(round(min(p_lt[1], p_rt[1])))
+        y1 = int(round(max(p_lb[1], p_rb[1])))
+        self._set_rect_px(x0, y0, x1, y1)
+
+    def update_layout(
+        self,
+        *,
+        cam: PerspectiveCamera | None = None,
+        rail_height: float | None = None,
+        rail_offset_x: float | None = None,
+        gate_height: float | None = None,
+    ) -> None:
+        if cam is not None:
+            self._cam = cam
+        if rail_height is not None:
+            self._rail_height = max(0.03, float(rail_height))
+        if rail_offset_x is not None:
+            self._rail_offset_x = max(0.0, float(rail_offset_x))
+        if gate_height is not None:
+            self._gate_height = max(0.03, float(gate_height))
+        self._recompute_rect()
+
+    def rect_fracs(self) -> tuple[float, float, float, float]:
+        return (
+            float(self._px) / float(max(1, self._view_w)),
+            float(self._py) / float(max(1, self._view_h)),
+            float(self._pw) / float(max(1, self._view_w)),
+            float(self._ph) / float(max(1, self._view_h)),
+        )
+
+    def set_style(
+        self,
+        *,
+        color: str | None = None,
+        border_color: str | None = None,
+        border_thickness: float | None = None,
+    ) -> None:
+        if color is not None:
+            self._solid_bgr = _hex_to_bgr(color, default=self._solid_bgr)
+        if border_color is not None:
+            self._border_bgr = _hex_to_bgr(border_color, default=self._border_bgr)
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _fit_to_rect(self, img: np.ndarray) -> np.ndarray:
+        interp = cv2.INTER_AREA
+        if img.shape[1] < self._pw or img.shape[0] < self._ph:
+            interp = cv2.INTER_LINEAR
+        return cv2.resize(img, (self._pw, self._ph), interpolation=interp)
+
+    def _read_video_frame(self, frame_idx: int) -> np.ndarray | None:
+        if self._cap is None:
+            return None
+        src_idx = int(round((float(frame_idx) / self._fps) * self._video_fps))
+        if self._video_frames > 0:
+            src_idx %= self._video_frames
+        if src_idx != self._last_src_idx:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(src_idx))
+            ok, frm = self._cap.read()
+            if ok and frm is not None:
+                if frm.shape[1] != self._pw or frm.shape[0] != self._ph:
+                    frm = cv2.resize(frm, (self._pw, self._ph), interpolation=cv2.INTER_LINEAR)
+                self._last_frame = frm
+                self._last_src_idx = src_idx
+        return self._last_frame
+
+    def draw(self, canvas: np.ndarray, frame_idx: int) -> None:
+        self._recompute_rect()
+        content: np.ndarray | None = None
+        if self._type == "image" and self._image is not None:
+            content = self._image
+        elif self._type == "video":
+            content = self._read_video_frame(frame_idx)
+        if content is None:
+            content = np.full((self._ph, self._pw, 3), self._solid_bgr, dtype=np.uint8)
+
+        x0, y0 = self._px, self._py
+        x1, y1 = x0 + self._pw, y0 + self._ph
+        cx0, cy0 = max(0, x0), max(0, y0)
+        cx1, cy1 = min(canvas.shape[1], x1), min(canvas.shape[0], y1)
+        if cx0 >= cx1 or cy0 >= cy1:
+            return
+        sx0 = cx0 - x0
+        sy0 = cy0 - y0
+        src = content[sy0:sy0 + (cy1 - cy0), sx0:sx0 + (cx1 - cx0)]
+
+        if src.ndim == 3 and src.shape[2] == 4:
+            alpha = src[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = src[:, :, :3].astype(np.float32)
+            dst = canvas[cy0:cy1, cx0:cx1].astype(np.float32)
+            canvas[cy0:cy1, cx0:cx1] = (rgb * alpha + dst * (1.0 - alpha)).astype(np.uint8)
+        else:
+            canvas[cy0:cy1, cx0:cx1] = src[:, :, :3]
+
+        if self._border_thickness > 1e-6:
+            bt = max(1, int(round(self._border_thickness)))
+            cv2.rectangle(
+                canvas,
+                (cx0, cy0),
+                (max(cx0, cx1 - 1), max(cy0, cy1 - 1)),
+                tuple(int(v) for v in self._border_bgr),
+                thickness=bt,
+                lineType=cv2.LINE_AA,
+            )
+
+
 # ── TunnelRenderer ────────────────────────────────────────────────────────────
 class TunnelRenderer:
     """Draws the receding 3D tunnel: floor grid + side walls with neon strips."""
@@ -709,6 +942,10 @@ class TunnelRenderer:
                     self._tile_img = img
             except Exception:
                 pass
+
+    def set_chevron_width_frac(self, value: float) -> None:
+        """Hot-update chevron strip width (overlay drag)."""
+        self.chevron_width_frac = float(max(0.05, min(0.95, value)))
 
     def draw(self, canvas: np.ndarray, frame: int) -> np.ndarray:
         """Dark 3D tunnel with floor panels receding toward the horizon.
@@ -4190,52 +4427,50 @@ from stickman import StickmanHUD  # noqa: E402, F401
 
 # ── HUD: Viewport shake blocks (4 neon panels in front of the view) ─────────
 class ViewportFrame:
-    """Four neon-outlined blocks floating at eye-level.
+    """Four neon-outlined landing pads ON THE FLOOR at the hit zone.
 
-    Static decorative HUD that represents the player's "visor" / cockpit.
-    On each punch hit, all four blocks receive a brief random jitter that
-    decays over ~0.25s, selling the illusion of a real impact shaking the
-    camera/viewport.
+    Each panel sits flush on the floor plane at z = Z_NEAR (the hit
+    line), extending slightly backward toward the horizon.  Visually
+    represents the per-lane "drum pad" where flying targets land.
+
+    On each punch hit, all four pads receive a brief random jitter
+    that decays over ~0.25s, selling the illusion of a real impact
+    shake.  The jitter is purely visual — pad geometry stays anchored
+    on the floor between hits.
     """
 
     def __init__(self, cam: PerspectiveCamera,
                  neon_color: tuple[int, int, int] | None = None,
                  lane_aligned: bool = False,
                  mode: str = 'punch'):
-        """`lane_aligned` is a legacy flag kept for API compat; both modes
-        now always use lane-aligned panels so the 4 bottom tiles are the
-        forward extension of the 4 lane rails (matches where targets
-        actually fly along).  Internally we branch on `mode` to pick the
-        right panel depth / width:
+        """`lane_aligned` is a legacy flag kept for API compat; ignored.
 
-        * ``mode='dance'`` — panel back-edge coincides with
-          ``DanceTarget`` front-edge at hit_frame, so the stomp tile
-          lands flush onto its panel.
-        * ``mode='punch'`` — panel back-edge = ``Z_NEAR`` (the hit
-          line), panel half-width = ``0.40 × lane_step_world`` so
-          adjacent panels leave a small neon seam.  This replaces the
-          old hardcoded "cockpit HUD" trapezoids whose pixel positions
-          didn't match the 3D lane projection and made flying cubes
-          appear to drift off their lane rails near the horizon.
+        Both modes now place panels ON the floor at hit zone:
+
+        * ``mode='dance'`` — panel front-edge = ``Z_NEAR``, depth =
+          tile depth (2 × DanceTarget.HALF_Z) so the stomp tile lands
+          FLUSH ON TOP of its panel.
+        * ``mode='punch'`` — panel front-edge = ``Z_NEAR``, half_width =
+          ``0.40 × lane_step_world``, depth = 0.6 world units.  Flying
+          cubes land at the panel front and burst there.
         """
         self.cam = cam
         W, H = cam.W, cam.H
         _ = lane_aligned  # retained for back-compat; ignored
 
         if mode == 'dance':
-            # Flush with DanceTarget front-edge — matches tile landing.
-            half_x = DanceTarget.HALF_X
-            z_back = max(cam.Z_NEAR - DanceTarget.HALF_Z, 0.1)
+            half_x      = DanceTarget.HALF_X
+            panel_depth = 2.0 * DanceTarget.HALF_Z   # tile depth → flush landing
         else:
-            # Punch: auto-size to 80% of lane step; z_back = Z_NEAR (hit).
             if cam.n_lanes > 1:
                 lane_step_world = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
             else:
                 lane_step_world = 0.40
-            half_x = 0.40 * lane_step_world
-            z_back = cam.Z_NEAR
-        panels = self._build_lane_aligned_panels(half_x=half_x,
-                                                 z_back=z_back)
+            half_x      = 0.40 * lane_step_world
+            panel_depth = 0.6
+        panels = self._build_lane_aligned_panels(
+            half_x=half_x, z_front=cam.Z_NEAR, panel_depth=panel_depth,
+        )
         self.panels = panels
 
         # Shake state -------------------------------------------------------
@@ -4259,62 +4494,45 @@ class ViewportFrame:
     # ------------------------------------------------------------------
     def _build_lane_aligned_panels(self,
                                    half_x: float | None = None,
-                                   z_back: float | None = None,
-                                   y_target_frac: float = 0.985) -> list:
-        """Lane-aligned panels — each panel is lane *i*'s floor strip
-        projected forward toward the camera.
+                                   z_front: float | None = None,
+                                   panel_depth: float = 0.6) -> list:
+        """Lane-aligned landing pads on the floor — each panel is lane *i*'s
+        floor footprint at the hit zone.
+
+        The panels sit FLUSH on the floor plane (FLOOR_WORLD_Y), with their
+        front edge at z = Z_NEAR (= the Floor line in overlay) and back edge
+        at z = Z_NEAR + panel_depth.  This is opposite to the legacy "cockpit
+        visor" interpretation where panels extended FORWARD from Z_NEAR
+        toward the camera (z range [near 0, Z_NEAR]).
 
         Parameters
         ----------
         half_x : float | None
-            Panel half-width in world units.  ``None`` = ``DanceTarget.HALF_X``
-            (tile-flush).  Callers (e.g. punch mode) can pass a custom
-            value derived from lane step.
-        z_back : float | None
-            World depth of the panel's back edge (the edge nearer the
-            tunnel / hit zone).  ``None`` = ``Z_NEAR - DanceTarget.HALF_Z``
-            (coincides with dance tile's front-edge at hit_frame so the
-            tile lands flush onto the panel).  Punch mode passes
-            ``Z_NEAR`` so the panel back-edge = exactly the hit line —
-            flying cubes then visibly enter the panel along its rail.
-        y_target_frac : float
-            Fraction of screen height the panel's front (closest) edge
-            should project to.  Default 0.985 = just above the bottom.
-
-        Net result: panels are the true 3D forward-continuation of each
-        lane — both modes now share this geometry so targets flying in
-        from the horizon travel exactly down their panel's rail.
+            Panel half-width in world units.  ``None`` = ``DanceTarget.HALF_X``.
+        z_front : float | None
+            World depth of the panel's FRONT edge (closer to camera, lower
+            on screen).  ``None`` = ``Z_NEAR`` (panel front sits exactly at
+            the Floor line / hit zone).
+        panel_depth : float
+            World depth from front to back.  Default 0.6 — enough visual
+            depth without encroaching too far toward the horizon.
         """
-        cam = self.cam
-        hx  = DanceTarget.HALF_X if half_x is None else float(half_x)
-        if z_back is None:
-            z_back = max(cam.Z_NEAR - DanceTarget.HALF_Z, 0.1)
-        else:
-            z_back = max(float(z_back), 0.1)
-
-        # Solve z_front from the target bottom-of-screen y.  Floor plane Y
-        # projects as y = cy_pix + fy * FLOOR_WORLD_Y / z, so:
-        #   z = fy * FLOOR_WORLD_Y / (y_target - cy_pix)
-        y_target = cam.H * y_target_frac
-        denom    = y_target - cam.cy_pix
-        if denom > 1.0:
-            z_front = cam.fy * cam.FLOOR_WORLD_Y / denom
-        else:
-            z_front = max(z_back - 0.8, 0.1)
-        # Safety: keep z_front < z_back with a minimum gap so the
-        # trapezoid has real depth.
-        z_front = max(min(z_front, z_back - 0.05), 0.1)
+        cam    = self.cam
+        hx     = DanceTarget.HALF_X if half_x is None else float(half_x)
+        zf     = float(cam.Z_NEAR) if z_front is None else max(float(z_front), 0.1)
+        zb     = zf + max(0.1, float(panel_depth))
 
         panels = []
         for i in range(cam.n_lanes):
             wx = cam.lane_world_x(i)
-            # Corner order = (BL, BR, TR, TL) in screen coords →
-            # (front-left, front-right, back-right, back-left) in world.
+            # Corner order: (front-left, front-right, back-right, back-left)
+            # Front = closer to camera (lower y on screen, at hit zone)
+            # Back  = farther (higher y on screen, toward horizon)
             corners_w = (
-                (wx - hx, cam.FLOOR_WORLD_Y, z_front),  # BL (closer)
-                (wx + hx, cam.FLOOR_WORLD_Y, z_front),  # BR
-                (wx + hx, cam.FLOOR_WORLD_Y, z_back),   # TR (farther)
-                (wx - hx, cam.FLOOR_WORLD_Y, z_back),   # TL
+                (wx - hx, cam.FLOOR_WORLD_Y, zf),   # FL — at Floor line
+                (wx + hx, cam.FLOOR_WORLD_Y, zf),   # FR
+                (wx + hx, cam.FLOOR_WORLD_Y, zb),   # BR — into floor
+                (wx - hx, cam.FLOOR_WORLD_Y, zb),   # BL
             )
             proj = [cam.project(*p) for p in corners_w]
             if any(p is None for p in proj):
@@ -4525,12 +4743,16 @@ class CountdownHUD:
     def __init__(self, cam: PerspectiveCamera, color: str = "#FFFFFF",
                  max_show_sec: float = 5.0,
                  box: tuple[float, float, float, float] | None = None,
-                 anim: str = "pop") -> None:
+                 anim: str = "pop",
+                 border_thickness: float = 2.0,
+                 glow_strength: float = 60.0) -> None:
         self.cam = cam
         self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
         self._max_show_sec = float(max_show_sec)
         self._font = cv2.FONT_HERSHEY_DUPLEX
         self._anim_mode = self._normalize_anim(anim)
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
         self._last_text: str | None = None
         self._prev_text: str | None = None
         self._last_change_frame: int = -10_000_000
@@ -4569,6 +4791,18 @@ class CountdownHUD:
         self._box_w = w
         self._box_h = h
 
+    def set_style(
+        self,
+        *,
+        border_thickness: float | None = None,
+        glow_strength: float | None = None,
+    ) -> None:
+        """Hot-update countdown style without resetting HUD state."""
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        if glow_strength is not None:
+            self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+
     def _draw_glow_text(
         self,
         canvas: np.ndarray,
@@ -4586,28 +4820,35 @@ class CountdownHUD:
         alpha = float(max(0.0, min(1.0, alpha)))
         glow_boost = float(max(0.2, glow_boost))
 
-        glow = np.zeros_like(canvas)
-        for thick, weight in (
-            (thickness + 10, 0.10),
-            (thickness + 6, 0.18),
-            (thickness + 3, 0.28),
-        ):
-            layer = np.zeros_like(canvas)
-            cv2.putText(
-                layer, text, (x, y), self._font, font_scale,
-                self._color_bgr, thick, cv2.LINE_AA
-            )
-            glow = cv2.addWeighted(
-                glow, 1.0, layer, float(weight * glow_boost), 0.0
-            )
-        glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=4.0, sigmaY=4.0)
-        canvas[:] = cv2.addWeighted(canvas, 1.0, glow, 0.95 * alpha, 0.0)
+        glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0))
+        if glow_norm > 1e-4:
+            glow = np.zeros_like(canvas)
+            for thick_off, base_weight in ((10, 0.10), (6, 0.18), (3, 0.28)):
+                layer = np.zeros_like(canvas)
+                cv2.putText(
+                    layer,
+                    text,
+                    (x, y),
+                    self._font,
+                    font_scale,
+                    self._color_bgr,
+                    max(1, int(thickness + thick_off)),
+                    cv2.LINE_AA,
+                )
+                weight = float(base_weight * glow_boost * glow_norm)
+                glow = cv2.addWeighted(glow, 1.0, layer, weight, 0.0)
+            sigma = max(0.5, 4.0 * glow_norm)
+            glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=sigma, sigmaY=sigma)
+            final_blend = 0.95 * alpha * glow_norm
+            canvas[:] = cv2.addWeighted(canvas, 1.0, glow, final_blend, 0.0)
 
         crisp = np.zeros_like(canvas)
-        cv2.putText(
-            crisp, text, (x, y), self._font, font_scale,
-            self._color_bgr, max(1, thickness + 2), cv2.LINE_AA
-        )
+        border_off = max(0, int(round(float(self._border_thickness))))
+        if border_off > 0:
+            cv2.putText(
+                crisp, text, (x, y), self._font, font_scale,
+                self._color_bgr, max(1, thickness + border_off), cv2.LINE_AA
+            )
         cv2.putText(
             crisp, text, (x, y), self._font, font_scale,
             (255, 255, 255), max(1, thickness), cv2.LINE_AA
@@ -5612,6 +5853,19 @@ class RhythmVisualizer:
         self.RELAX_COUNTDOWN_Y: float = 0.04
         self.RELAX_COUNTDOWN_W: float = 0.10
         self.RELAX_COUNTDOWN_H: float = 0.16
+        self.RELAX_COUNTDOWN_BORDER_THICKNESS: float = 2.0
+        self.RELAX_COUNTDOWN_GLOW_STRENGTH: float = 60.0
+        self.START_GATE_ENABLED: bool = False
+        self.START_GATE_TYPE: str = "color"
+        self.START_GATE_COLOR: str = "#1a1a1a"
+        self.START_GATE_BORDER_COLOR: str = "#ffffff"
+        self.START_GATE_BORDER_THICKNESS: float = 0.0
+        self.START_GATE_IMAGE: str | None = None
+        self.START_GATE_VIDEO: str | None = None
+        self.START_GATE_X: float = 0.30
+        self.START_GATE_Y: float = 0.18
+        self.START_GATE_W: float = 0.40
+        self.START_GATE_H: float = 0.14
         self._countdown_audio_events: list[tuple[float, bool]] = []
         # ── Camera perspective overrides ────────────────────────────────
         self.FLOOR_HIT_FRAC:    float | None = None
@@ -6043,6 +6297,23 @@ class RhythmVisualizer:
             video_path=getattr(self, "BACKGROUND_VIDEO", None),
             fps=float(self.FPS),
         )
+        start_gate = None
+        if bool(getattr(self, "START_GATE_ENABLED", False)):
+            start_gate = StartGate(
+                cam=cam,
+                view_w=self.WIDTH,
+                view_h=self.HEIGHT,
+                gate_type=str(getattr(self, "START_GATE_TYPE", "color")),
+                color=str(getattr(self, "START_GATE_COLOR", "#1a1a1a")),
+                border_color=str(getattr(self, "START_GATE_BORDER_COLOR", "#ffffff")),
+                border_thickness=float(getattr(self, "START_GATE_BORDER_THICKNESS", 0.0)),
+                image_path=getattr(self, "START_GATE_IMAGE", None),
+                video_path=getattr(self, "START_GATE_VIDEO", None),
+                rail_height=float(getattr(self, "RAIL_HEIGHT", 0.14)),
+                rail_offset_x=float(getattr(self, "RAIL_OFFSET_X", 0.08)),
+                gate_height=float(getattr(self, "START_GATE_H", 0.14)),
+                fps=float(self.FPS),
+            )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
         # mode's action library.  Solo 'line' uses its own 'line' action
@@ -6097,6 +6368,12 @@ class RhythmVisualizer:
                     float(getattr(self, "RELAX_COUNTDOWN_Y", 0.04)),
                     float(getattr(self, "RELAX_COUNTDOWN_W", 0.10)),
                     float(getattr(self, "RELAX_COUNTDOWN_H", 0.16)),
+                ),
+                border_thickness=float(
+                    getattr(self, "RELAX_COUNTDOWN_BORDER_THICKNESS", 2.0)
+                ),
+                glow_strength=float(
+                    getattr(self, "RELAX_COUNTDOWN_GLOW_STRENGTH", 60.0)
                 ),
             )
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
@@ -6631,6 +6908,8 @@ class RhythmVisualizer:
 
             # ── canvas build ────────────────────────────────────────
             canvas = bg_layer.frame(fi)
+            if start_gate is not None:
+                start_gate.draw(canvas, fi)
 
             # 1. tunnel walls + floor grid
             canvas = tunnel.draw(canvas, fi)
@@ -6810,6 +7089,8 @@ class RhythmVisualizer:
 
         # ── finalise encoder ─────────────────────────────────────────
         bg_layer.close()
+        if start_gate is not None:
+            start_gate.close()
         if _vwriter is not None:
             _vwriter.release()
         if _vproc is not None:
@@ -7373,6 +7654,33 @@ def parse_arguments():
                    help='Countdown box width (0..1, normalized).')
     p.add_argument('--relax_countdown_h', type=float, default=0.16,
                    help='Countdown box height (0..1, normalized).')
+    p.add_argument('--relax_countdown_border_thickness', type=float, default=2.0,
+                   help='Countdown text border thickness in pixels (0..10).')
+    p.add_argument('--relax_countdown_glow_strength', type=float, default=60.0,
+                   help='Countdown text glow strength (0..100).')
+    p.add_argument('--start_gate_enabled', type=int, default=0, metavar='0|1',
+                   help='Show the start gate at the far end of floor.')
+    p.add_argument('--start_gate_type', type=str, default='color',
+                   choices=['color', 'image', 'video'],
+                   help='Start gate fill type.')
+    p.add_argument('--start_gate_color', type=str, default='#1a1a1a',
+                   help='Start gate solid color (used when type=color or fallback).')
+    p.add_argument('--start_gate_border_color', type=str, default='#ffffff',
+                   help='Start gate border color.')
+    p.add_argument('--start_gate_border_thickness', type=float, default=0.0,
+                   help='Start gate border thickness in px (0..10).')
+    p.add_argument('--start_gate_image', type=str, default=None, metavar='PATH',
+                   help='Start gate image (used when type=image).')
+    p.add_argument('--start_gate_video', type=str, default=None, metavar='PATH',
+                   help='Start gate video (used when type=video, loops).')
+    p.add_argument('--start_gate_x', type=float, default=0.30,
+                   help='Start gate left position (0..1, normalized).')
+    p.add_argument('--start_gate_y', type=float, default=0.18,
+                   help='Start gate top position (0..1, normalized).')
+    p.add_argument('--start_gate_w', type=float, default=0.40,
+                   help='Start gate width (0..1, normalized).')
+    p.add_argument('--start_gate_h', type=float, default=0.14,
+                   help='Start gate height in world units (>= 0.03).')
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -7556,6 +7864,25 @@ if __name__ == '__main__':
     viz.RELAX_COUNTDOWN_Y = max(0.0, min(1.0, float(args.relax_countdown_y)))
     viz.RELAX_COUNTDOWN_W = max(0.02, min(1.0, float(args.relax_countdown_w)))
     viz.RELAX_COUNTDOWN_H = max(0.02, min(1.0, float(args.relax_countdown_h)))
+    viz.RELAX_COUNTDOWN_BORDER_THICKNESS = max(
+        0.0, min(10.0, float(args.relax_countdown_border_thickness))
+    )
+    viz.RELAX_COUNTDOWN_GLOW_STRENGTH = max(
+        0.0, min(100.0, float(args.relax_countdown_glow_strength))
+    )
+    viz.START_GATE_ENABLED = bool(int(args.start_gate_enabled))
+    viz.START_GATE_TYPE = str(args.start_gate_type or "color")
+    viz.START_GATE_COLOR = str(args.start_gate_color or "#1a1a1a")
+    viz.START_GATE_BORDER_COLOR = str(args.start_gate_border_color or "#ffffff")
+    viz.START_GATE_BORDER_THICKNESS = max(
+        0.0, min(10.0, float(args.start_gate_border_thickness))
+    )
+    viz.START_GATE_IMAGE = args.start_gate_image or None
+    viz.START_GATE_VIDEO = args.start_gate_video or None
+    viz.START_GATE_X = max(0.0, min(1.0, float(args.start_gate_x)))
+    viz.START_GATE_Y = max(0.0, min(1.0, float(args.start_gate_y)))
+    viz.START_GATE_W = max(0.02, min(1.0, float(args.start_gate_w)))
+    viz.START_GATE_H = max(0.03, float(args.start_gate_h))
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:

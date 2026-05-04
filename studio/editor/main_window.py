@@ -424,6 +424,9 @@ class MainWindow(QMainWindow):
         self.timeline_panel.floor_media_dropped.connect(
             self._on_floor_media_dropped
         )
+        self.timeline_panel.start_gate_media_dropped.connect(
+            self._on_start_gate_media_dropped
+        )
         self.timeline_panel.segment_selected.connect(self._on_segment_selected)
         self.timeline_panel.segment_changed.connect(self._on_segment_changed_by_timeline)
         self.timeline_panel.playhead_seek_requested.connect(
@@ -786,6 +789,9 @@ class MainWindow(QMainWindow):
     def _on_project_changed(self) -> None:
         self.project.updated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         self.preview_panel.set_project_segments(self.project.segments)
+        # Keep PreviewPanel's layer reference fresh even when project.layers
+        # is reassigned to a brand-new list (undo/redo/delete paths).
+        self.preview_panel.set_project_layers(self.project.layers)
         self.timeline_panel.refresh()
         self._update_status()
 
@@ -1289,6 +1295,8 @@ class MainWindow(QMainWindow):
         relax_countdown_w: float = 0.10,
         relax_countdown_h: float = 0.16,
         rail_height: float = 0.15,
+        start_gate_h: float = 0.14,
+        chevron_width_frac: float = 0.45,
     ) -> None:
         """Persist floor/wall drag result into segment + countdown layer config."""
         seg_id = self._preview_active_segment_id
@@ -1303,6 +1311,10 @@ class MainWindow(QMainWindow):
         seg.render_settings["far_spread_frac"]      = round(far_spread,          4)
         seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
         seg.render_settings["rail_height"]          = round(max(0.15, rail_height), 4)
+        seg.render_settings["start_gate_h"]         = round(max(0.03, start_gate_h), 4)
+        seg.render_settings["chevron_width_frac"]   = round(
+            max(0.05, min(0.95, chevron_width_frac)), 4
+        )
 
         # Layer-first system: countdown box placement must live on the countdown
         # layer so future preview rebuilds/render resolve to the same values.
@@ -1326,6 +1338,8 @@ class MainWindow(QMainWindow):
                     "relax_countdown_y": round(relax_countdown_y, 4),
                     "relax_countdown_w": round(relax_countdown_w, 4),
                     "relax_countdown_h": round(relax_countdown_h, 4),
+                    "relax_countdown_border_thickness": 2.0,
+                    "relax_countdown_glow_strength": 60.0,
                 },
             ))
         else:
@@ -1340,10 +1354,64 @@ class MainWindow(QMainWindow):
         rail_layers = self.project.layers_overlapping(
             "side_rails", seg.start_time_sec, seg.end_time_sec
         )
-        if rail_layers:
+        if not rail_layers:
+            rail_cfg = dict(self.timeline_panel._default_layer_config("side_rails"))
+            rail_cfg["side_rails"] = True
+            rail_cfg["rail_height"] = round(max(0.15, rail_height), 4)
+            self.project.layers.append(Layer(
+                kind="side_rails",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Side Rails",
+                config=rail_cfg,
+            ))
+        else:
             rail_top = max(rail_layers, key=lambda la: la.z_index)
             rail_top.config["rail_height"] = round(max(0.15, rail_height), 4)
             rail_top.config.setdefault("side_rails", True)
+
+        gate_layers = self.project.layers_overlapping(
+            "start_gate", seg.start_time_sec, seg.end_time_sec
+        )
+        if not gate_layers:
+            gate_cfg = dict(self.timeline_panel._default_layer_config("start_gate"))
+            gate_cfg["start_gate_enabled"] = True
+            gate_cfg["start_gate_h"] = round(max(0.03, start_gate_h), 4)
+            self.project.layers.append(Layer(
+                kind="start_gate",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Start Gate",
+                config=gate_cfg,
+            ))
+        else:
+            gate_top = max(gate_layers, key=lambda la: la.z_index)
+            gate_top.config["start_gate_h"] = round(max(0.03, start_gate_h), 4)
+            gate_top.config.setdefault("start_gate_enabled", True)
+
+        floor_layers = self.project.layers_overlapping(
+            "floor", seg.start_time_sec, seg.end_time_sec
+        )
+        if not floor_layers:
+            floor_cfg = dict(self.timeline_panel._default_layer_config("floor"))
+            floor_cfg["chevron_width_frac"] = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
+            self.project.layers.append(Layer(
+                kind="floor",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Floor",
+                config=floor_cfg,
+            ))
+        else:
+            floor_top = max(floor_layers, key=lambda la: la.z_index)
+            floor_top.config["chevron_width_frac"] = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
 
         self._on_project_changed()
         self.statusBar().showMessage(
@@ -1352,7 +1420,9 @@ class MainWindow(QMainWindow):
             f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%  "
             f"gap:{wall_floor_gap_frac*100:.1f}%  "
             f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%  "
-            f"rail h:{max(0.15, rail_height):.2f}",
+            f"rail h:{max(0.15, rail_height):.2f}  "
+            f"gate h:{max(0.03, start_gate_h):.2f}  "
+            f"chevron w:{max(0.05, min(0.95, chevron_width_frac)):.2f}",
             2500,
         )
 
@@ -1654,6 +1724,81 @@ class MainWindow(QMainWindow):
         self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
         self.statusBar().showMessage(
             f"Floor tile image set: {media.display_name}", 3000
+        )
+
+    def _on_start_gate_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop image/video onto Start Gate track -> apply to start_gate layer."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind not in {"video", "image"}:
+            return
+
+        eps = 1e-6
+        target_segment = next(
+            (
+                s
+                for s in self.project.sorted_segments()
+                if s.start_time_sec - eps <= time_sec < s.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Start Gate track.", 3000
+            )
+            return
+
+        gate_type = "video" if media_kind == "video" else "image"
+        gate_cfg = {
+            "start_gate_enabled": True,
+            "start_gate_type": gate_type,
+            "start_gate_color": "#1a1a1a",
+            "start_gate_border_color": "#ffffff",
+            "start_gate_border_thickness": 0.0,
+            "start_gate_image": media.source_path if gate_type == "image" else "",
+            "start_gate_video": media.source_path if gate_type == "video" else "",
+            "start_gate_x": 0.30,
+            "start_gate_y": 0.18,
+            "start_gate_w": 0.40,
+            "start_gate_h": 0.14,
+        }
+
+        candidates = [
+            la
+            for la in self.project.layers
+            if la.kind == "start_gate"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+
+        if candidates:
+            target_layer = max(candidates, key=lambda la: la.z_index)
+            target_layer.config = dict(gate_cfg)
+        else:
+            overlap = [
+                la
+                for la in self.project.layers
+                if la.kind == "start_gate"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = max((la.z_index for la in overlap), default=-1) + 1
+            target_layer = Layer(
+                kind="start_gate",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Start Gate",
+                config=dict(gate_cfg),
+            )
+            self.project.layers.append(target_layer)
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Start gate set to {gate_type}: {media.display_name}", 3000
         )
 
     def _on_segment_selected(self, segment: Segment | None) -> None:
@@ -2463,6 +2608,27 @@ class MainWindow(QMainWindow):
             "relax_countdown_y": float(_get("relax_countdown_y", 0.04) or 0.04),
             "relax_countdown_w": float(_get("relax_countdown_w", 0.10) or 0.10),
             "relax_countdown_h": float(_get("relax_countdown_h", 0.16) or 0.16),
+            "relax_countdown_border_thickness": float(
+                _get("relax_countdown_border_thickness", 2.0) or 2.0
+            ),
+            "relax_countdown_glow_strength": float(
+                _get("relax_countdown_glow_strength", 60.0) or 60.0
+            ),
+            "start_gate_enabled": bool(_get("start_gate_enabled", False)),
+            "start_gate_type": str(_get("start_gate_type", "color") or "color"),
+            "start_gate_color": str(_get("start_gate_color", "#1a1a1a") or "#1a1a1a"),
+            "start_gate_border_color": str(
+                _get("start_gate_border_color", "#ffffff") or "#ffffff"
+            ),
+            "start_gate_border_thickness": float(
+                _get("start_gate_border_thickness", 0.0) or 0.0
+            ),
+            "start_gate_image": _get("start_gate_image", None) or "",
+            "start_gate_video": _get("start_gate_video", None) or "",
+            "start_gate_x": float(_get("start_gate_x", 0.30) or 0.30),
+            "start_gate_y": float(_get("start_gate_y", 0.18) or 0.18),
+            "start_gate_w": float(_get("start_gate_w", 0.40) or 0.40),
+            "start_gate_h": float(_get("start_gate_h", 0.14) or 0.14),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -2692,6 +2858,27 @@ class MainWindow(QMainWindow):
             relax_countdown_y = float(rs.get("relax_countdown_y", 0.04) or 0.04)
             relax_countdown_w = float(rs.get("relax_countdown_w", 0.10) or 0.10)
             relax_countdown_h = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            relax_countdown_border_thickness = float(
+                rs.get("relax_countdown_border_thickness", 2.0) or 2.0
+            )
+            relax_countdown_glow_strength = float(
+                rs.get("relax_countdown_glow_strength", 60.0) or 60.0
+            )
+            start_gate_enabled = bool(rs.get("start_gate_enabled", False))
+            start_gate_type = str(rs.get("start_gate_type", "color") or "color")
+            start_gate_color = str(rs.get("start_gate_color", "#1a1a1a") or "#1a1a1a")
+            start_gate_border_color = str(
+                rs.get("start_gate_border_color", "#ffffff") or "#ffffff"
+            )
+            start_gate_border_thickness = float(
+                rs.get("start_gate_border_thickness", 0.0) or 0.0
+            )
+            start_gate_image = rs.get("start_gate_image") or ""
+            start_gate_video = rs.get("start_gate_video") or ""
+            start_gate_x = float(rs.get("start_gate_x", 0.30) or 0.30)
+            start_gate_y = float(rs.get("start_gate_y", 0.18) or 0.18)
+            start_gate_w = float(rs.get("start_gate_w", 0.40) or 0.40)
+            start_gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -2773,6 +2960,19 @@ class MainWindow(QMainWindow):
                     relax_countdown_y=relax_countdown_y,
                     relax_countdown_w=relax_countdown_w,
                     relax_countdown_h=relax_countdown_h,
+                    relax_countdown_border_thickness=relax_countdown_border_thickness,
+                    relax_countdown_glow_strength=relax_countdown_glow_strength,
+                    start_gate_enabled=start_gate_enabled,
+                    start_gate_type=start_gate_type,
+                    start_gate_color=start_gate_color,
+                    start_gate_border_color=start_gate_border_color,
+                    start_gate_border_thickness=start_gate_border_thickness,
+                    start_gate_image=start_gate_image,
+                    start_gate_video=start_gate_video,
+                    start_gate_x=start_gate_x,
+                    start_gate_y=start_gate_y,
+                    start_gate_w=start_gate_w,
+                    start_gate_h=start_gate_h,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
     QPushButton,
+    QSpinBox,
     QWidget,
 )
 
@@ -385,48 +386,41 @@ class _CountdownSection(QGroupBox):
         self._audio_last_file_label = QLabel("Last sound file")
         form.addRow(self._audio_last_file_label, self._audio_last_file_edit)
 
-        self._bbox_group = QGroupBox("Position & size", self)
-        self._bbox_group.setToolTip(
-            "Vị trí và kích thước hộp số đếm ngược, tỉ lệ 0..1 theo khung hình. "
-            "Có thể kéo trực tiếp trong preview để chỉnh nhanh."
+        # Countdown box (x/y/w/h) is edited via drag handles in preview.
+        # Preserve these values on Inspector commits to avoid data loss.
+        self._countdown_x = float(config.get("relax_countdown_x", 0.88) or 0.88)
+        self._countdown_y = float(config.get("relax_countdown_y", 0.04) or 0.04)
+        self._countdown_w = float(config.get("relax_countdown_w", 0.10) or 0.10)
+        self._countdown_h = float(config.get("relax_countdown_h", 0.16) or 0.16)
+
+        self._style_group = QGroupBox("Style", self)
+        style_form = QFormLayout(self._style_group)
+        style_form.setContentsMargins(8, 8, 8, 8)
+        style_form.setSpacing(6)
+
+        self._border_thick_sp = QDoubleSpinBox()
+        self._border_thick_sp.setRange(0.0, 10.0)
+        self._border_thick_sp.setSingleStep(0.5)
+        self._border_thick_sp.setDecimals(1)
+        self._border_thick_sp.setValue(
+            float(config.get("relax_countdown_border_thickness", 2.0) or 2.0)
         )
-        bbox_form = QFormLayout(self._bbox_group)
-        bbox_form.setContentsMargins(8, 8, 8, 8)
-        bbox_form.setSpacing(6)
+        self._border_thick_sp.setToolTip("Độ dày viền (0 = không viền)")
+        self._border_thick_sp.valueChanged.connect(self.changed)
+        style_form.addRow("Border thickness", self._border_thick_sp)
 
-        self._x_sp = QDoubleSpinBox()
-        self._x_sp.setRange(0.0, 1.0)
-        self._x_sp.setSingleStep(0.01)
-        self._x_sp.setDecimals(3)
-        self._x_sp.setValue(float(config.get("relax_countdown_x", 0.88) or 0.88))
-        self._x_sp.valueChanged.connect(self.changed)
-        bbox_form.addRow("X (0..1)", self._x_sp)
+        self._glow_strength_sp = QSpinBox()
+        self._glow_strength_sp.setRange(0, 100)
+        self._glow_strength_sp.setSingleStep(5)
+        self._glow_strength_sp.setSuffix(" %")
+        self._glow_strength_sp.setValue(
+            int(round(float(config.get("relax_countdown_glow_strength", 60.0) or 60.0)))
+        )
+        self._glow_strength_sp.setToolTip("Cường độ vầng quang (0 = tắt)")
+        self._glow_strength_sp.valueChanged.connect(self.changed)
+        style_form.addRow("Glow strength", self._glow_strength_sp)
 
-        self._y_sp = QDoubleSpinBox()
-        self._y_sp.setRange(0.0, 1.0)
-        self._y_sp.setSingleStep(0.01)
-        self._y_sp.setDecimals(3)
-        self._y_sp.setValue(float(config.get("relax_countdown_y", 0.04) or 0.04))
-        self._y_sp.valueChanged.connect(self.changed)
-        bbox_form.addRow("Y (0..1)", self._y_sp)
-
-        self._w_sp = QDoubleSpinBox()
-        self._w_sp.setRange(0.02, 1.0)
-        self._w_sp.setSingleStep(0.01)
-        self._w_sp.setDecimals(3)
-        self._w_sp.setValue(float(config.get("relax_countdown_w", 0.10) or 0.10))
-        self._w_sp.valueChanged.connect(self.changed)
-        bbox_form.addRow("Width (0..1)", self._w_sp)
-
-        self._h_sp = QDoubleSpinBox()
-        self._h_sp.setRange(0.02, 1.0)
-        self._h_sp.setSingleStep(0.01)
-        self._h_sp.setDecimals(3)
-        self._h_sp.setValue(float(config.get("relax_countdown_h", 0.16) or 0.16))
-        self._h_sp.valueChanged.connect(self.changed)
-        bbox_form.addRow("Height (0..1)", self._h_sp)
-
-        form.addRow(self._bbox_group)
+        form.addRow(self._style_group)
 
         self._update_audio_visibility()
 
@@ -490,8 +484,168 @@ class _CountdownSection(QGroupBox):
                 self._audio_last_mode_cb.currentData()
             ),
             "relax_countdown_audio_last_file": self._audio_last_file_edit.get_value(),
-            "relax_countdown_x": self._x_sp.value(),
-            "relax_countdown_y": self._y_sp.value(),
-            "relax_countdown_w": self._w_sp.value(),
-            "relax_countdown_h": self._h_sp.value(),
+            "relax_countdown_x": self._countdown_x,
+            "relax_countdown_y": self._countdown_y,
+            "relax_countdown_w": self._countdown_w,
+            "relax_countdown_h": self._countdown_h,
+            "relax_countdown_border_thickness": self._border_thick_sp.value(),
+            "relax_countdown_glow_strength": float(self._glow_strength_sp.value()),
+        }
+
+
+class _StartGateSection(QGroupBox):
+    """Config section for a Start Gate layer block."""
+
+    changed = Signal()
+    _TYPE_OPTIONS = [
+        ("Solid color", "color"),
+        ("Image", "image"),
+        ("Video", "video"),
+    ]
+
+    @staticmethod
+    def _normalize_type(value: object) -> str:
+        raw = str(value or "color").strip().lower()
+        return raw if raw in {"color", "image", "video"} else "color"
+
+    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+        super().__init__("Start Gate", parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+
+        self._enabled_cb = QCheckBox("Enabled")
+        self._enabled_cb.setChecked(bool(config.get("start_gate_enabled", True)))
+        self._enabled_cb.stateChanged.connect(self.changed)
+        form.addRow("Start gate", self._enabled_cb)
+
+        from PySide6.QtWidgets import QComboBox
+
+        self._type_cb = QComboBox()
+        for label, val in self._TYPE_OPTIONS:
+            self._type_cb.addItem(label, val)
+        cur_type = self._normalize_type(config.get("start_gate_type", "color"))
+        idx = next(
+            (i for i, (_l, v) in enumerate(self._TYPE_OPTIONS) if v == cur_type),
+            0,
+        )
+        self._type_cb.setCurrentIndex(idx)
+        self._type_cb.currentIndexChanged.connect(self._on_type_changed)
+        form.addRow("Fill type", self._type_cb)
+
+        self._color: str = str(config.get("start_gate_color") or "#1a1a1a")
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        self._color_label = QLabel("Color")
+        form.addRow(self._color_label, self._color_btn)
+
+        self._border_color: str = str(
+            config.get("start_gate_border_color") or "#ffffff"
+        )
+        self._border_color_btn = QPushButton()
+        self._border_color_btn.setMinimumWidth(90)
+        self._refresh_border_color_btn()
+        self._border_color_btn.clicked.connect(self._pick_border_color)
+        form.addRow("Border color", self._border_color_btn)
+
+        self._border_thickness_sp = QDoubleSpinBox()
+        self._border_thickness_sp.setRange(0.0, 10.0)
+        self._border_thickness_sp.setSingleStep(0.5)
+        self._border_thickness_sp.setDecimals(1)
+        self._border_thickness_sp.setValue(
+            float(config.get("start_gate_border_thickness", 0.0) or 0.0)
+        )
+        self._border_thickness_sp.valueChanged.connect(self.changed)
+        form.addRow("Border thickness", self._border_thickness_sp)
+
+        from .segment_config_panel import _PathBrowseWidget
+
+        self._image_edit = _PathBrowseWidget(
+            str(config.get("start_gate_image", "") or ""),
+            title="Select gate image",
+            file_filter="Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)",
+            placeholder="Optional gate image (transparent PNG ok)",
+            parent=self,
+        )
+        self._image_edit.changed.connect(self.changed)
+        self._image_label = QLabel("Image file")
+        form.addRow(self._image_label, self._image_edit)
+
+        self._video_edit = _PathBrowseWidget(
+            str(config.get("start_gate_video", "") or ""),
+            title="Select gate video",
+            file_filter="Videos (*.mp4 *.mov *.mkv *.webm);;All files (*.*)",
+            placeholder="Optional gate video (loops automatically)",
+            parent=self,
+        )
+        self._video_edit.changed.connect(self.changed)
+        self._video_label = QLabel("Video file")
+        form.addRow(self._video_label, self._video_edit)
+        # Legacy bbox fields are preserved silently for old projects.
+        self._start_gate_x = float(config.get("start_gate_x", 0.30) or 0.30)
+        self._start_gate_y = float(config.get("start_gate_y", 0.18) or 0.18)
+        self._start_gate_w = float(config.get("start_gate_w", 0.40) or 0.40)
+        self._start_gate_h = float(config.get("start_gate_h", 0.14) or 0.14)
+        self._update_visibility()
+
+    def _refresh_color_btn(self) -> None:
+        c = QColor(self._color)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = "#000000" if lum > 128 else "#ffffff"
+        self._color_btn.setStyleSheet(
+            f"background-color:{self._color};color:{fg};border:1px solid #555;"
+        )
+        self._color_btn.setText(self._color.upper())
+
+    def _pick_color(self) -> None:
+        color = _pick_color(self._color, "Start gate color", self)
+        if color:
+            self._color = color
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _refresh_border_color_btn(self) -> None:
+        c = QColor(self._border_color)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = "#000000" if lum > 128 else "#ffffff"
+        self._border_color_btn.setStyleSheet(
+            f"background-color:{self._border_color};color:{fg};border:1px solid #555;"
+        )
+        self._border_color_btn.setText(self._border_color.upper())
+
+    def _pick_border_color(self) -> None:
+        color = _pick_color(self._border_color, "Start gate border color", self)
+        if color:
+            self._border_color = color
+            self._refresh_border_color_btn()
+            self.changed.emit()
+
+    def _on_type_changed(self) -> None:
+        self._update_visibility()
+        self.changed.emit()
+
+    def _update_visibility(self) -> None:
+        t = self._normalize_type(self._type_cb.currentData())
+        self._color_label.setVisible(t == "color")
+        self._color_btn.setVisible(t == "color")
+        self._image_label.setVisible(t == "image")
+        self._image_edit.setVisible(t == "image")
+        self._video_label.setVisible(t == "video")
+        self._video_edit.setVisible(t == "video")
+
+    def get_config(self) -> dict:
+        return {
+            "start_gate_enabled": self._enabled_cb.isChecked(),
+            "start_gate_type": self._normalize_type(self._type_cb.currentData()),
+            "start_gate_color": self._color,
+            "start_gate_border_color": self._border_color,
+            "start_gate_border_thickness": self._border_thickness_sp.value(),
+            "start_gate_image": self._image_edit.get_value(),
+            "start_gate_video": self._video_edit.get_value(),
+            "start_gate_x": self._start_gate_x,
+            "start_gate_y": self._start_gate_y,
+            "start_gate_w": self._start_gate_w,
+            "start_gate_h": self._start_gate_h,
         }
