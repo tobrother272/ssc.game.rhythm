@@ -2989,7 +2989,10 @@ class RelaxTarget(Target):
     HOLE_DEFAULT_WIDTH_FRAC = 0.18
     HOLE_DEFAULT_HEIGHT_FRAC = 0.55
 
-    # Motion profile (two-phase piecewise) ────────────────────────────
+    # Motion profile (two-phase piecewise) — ALL kinds ───────────────
+    # ALL three kinds (LOW, HIGH, MIDDLE) share the same two-phase
+    # motion.  MIDDLE previously used a separate visual-linear profile
+    # but is now unified so dodge urgency is consistent across kinds.
     # The block's spawn→hit travel is split into TWO distinct phases
     # with different world-speeds, per user spec:
     #   "70% quãng đường đầu tiên chạy chậm từ từ.
@@ -3080,6 +3083,12 @@ class RelaxTarget(Target):
         self.texture_path: str | None = None
         self.hole_mask_path: str | None = None
         self.wait_frames = max(0, int(wait_frames))
+        # Initial size of a `middle` wall is computed from these gate
+        # parameters so the wall fits inside the StartGate at z=Z_FAR
+        # (spawn point) and grows naturally via perspective as it
+        # approaches the camera.  Defaults match StartGate defaults.
+        self.gate_rail_offset_x: float = 0.08
+        self.gate_height: float = 0.14
 
     # ---------------- lifecycle ----------------
     #
@@ -3126,41 +3135,17 @@ class RelaxTarget(Target):
         travel_f = max(1, self.hit_frame - move_start)
         p_lin = (cur_frame - move_start) / travel_f
 
-        # ── MIDDLE blocks: visual-linear approach ────────────────────────
-        # Middle is a wall to dodge through — it should grow on screen
-        # at a roughly CONSTANT rate so the player can read its
-        # approach.  Using inverse-Z (1/wz linear in time) makes the
-        # block's screen-space size scale linearly: at p_lin=0.5 it's
-        # already roughly half-size, at p_lin=1 it's at the hit plane.
-        # Pass-by carries the same inverse velocity so it leaves the
-        # viewport without lingering.
+        # MIDDLE: drive z linearly with time so the wall covers the FULL
+        # screen path from gate-bottom to floor-bottom every frame at the
+        # same rate.  The (1-z)^1.6 perspective envelope naturally yields
+        # "drift slow far / vút near" feel without the brittle phase-split
+        # math (which at low fps + high ratio collapses the vút into a
+        # single inter-frame snap, making the wall vanish mid-screen).
         if self.kind == 'middle':
-            # Two-phase z_norm linear motion (per user spec):
-            #   • Phase 1 (drift):  t ∈ [0, 2/3], z: 1.0 → 0.2
-            #     covers 80 % of the z-distance in the first 2/3 of travel.
-            #     Block enters at the FAR horizon (start of floor) and
-            #     drifts forward — slow visual change because perspective
-            #     compresses the far field.
-            #   • Phase 2 (approach): t ∈ [2/3, 1], z: 0.2 → 0
-            #     covers the last 20 % of z in 1/3 of time — visually
-            #     this is the "rush to camera" because the same z-step
-            #     near the camera produces a much larger screen-scale
-            #     change.
-            # Velocities are CONTINUOUS in z (linear pieces), so the
-            # block moves smoothly without "jumping".
-            T_M = 2.0 / 3.0
-            D_M = 0.8                              # phase-1 z-distance fraction
-            z_split = 1.0 - D_M                    # = 0.2 — z at hand-off
-            if p_lin <= T_M:
-                z = 1.0 - D_M * (p_lin / T_M)
-            elif p_lin <= 1.0:
-                z = z_split * (1.0 - (p_lin - T_M) / (1.0 - T_M))
+            if p_lin <= 1.0:
+                z = 1.0 - p_lin
             else:
-                # Pass-by: continue at the phase-2 z-velocity.  At z<-0.1
-                # cam.project() returns None (behind camera) so the wall
-                # disappears almost immediately after p=1.
-                v2 = z_split / max(1e-6, 1.0 - T_M)
-                z = -v2 * (p_lin - 1.0)
+                z = -(p_lin - 1.0)
             return max(-1.2, z)
 
         # ── LOW / HIGH: two-phase "70% chậm + 30% vút" ──────────────────
@@ -3401,20 +3386,18 @@ class RelaxTarget(Target):
         base_canvas = canvas.copy()
         H, _W = canvas.shape[:2]
 
-        # CRITICAL: low/high use 2D-legacy converge ((1-z)^1) while the floor
-        # renderer projects WORLD coords with cam.project() (true 1/z).  At
-        # z>0 the legacy formula tapers slower → the slab ends up wider than
-        # the floor at the same depth.  For `middle` we MUST match the floor
-        # exactly, so we project the same world points that _draw_floor_bg
-        # projects.
+        # World rect MATCHES StartGate's footprint (see StartGate._recompute_rect):
+        # the wall projects to the exact gate rectangle at z=Z_FAR (spawn) and
+        # scales up via 1/z perspective as it approaches the camera.
         if cam.n_lanes >= 2:
-            outer_left = cam.lane_world_x(0)
-            outer_right = cam.lane_world_x(cam.n_lanes - 1)
-            half_step = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
         else:
-            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
-        xw_left = outer_left - half_step
-        xw_right = outer_right + half_step
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+        inner_x = outer_tile_x + float(self.gate_rail_offset_x)
+        xw_left = -inner_x
+        xw_right = +inner_x
         wz = cam.z_from_norm(max(0.0, min(1.0, z)))
         p_l = cam.project(xw_left, cam.FLOOR_WORLD_Y, wz)
         p_r = cam.project(xw_right, cam.FLOOR_WORLD_Y, wz)
@@ -3426,13 +3409,8 @@ class RelaxTarget(Target):
         if x_l > x_r:
             x_l, x_r = x_r, x_l
 
-        # Height in WORLD space, projected with the same 1/z perspective as
-        # width and floor.  Calibrated so at z_norm=0 (hit zone) the screen
-        # height equals 3× HIGH_HEIGHT_FRAC × cam.H (= 3× a high block at z=0).
-        # This gives true perspective scaling: as the block approaches,
-        # height grows at the SAME rate as width — feels like the block is
-        # moving toward the camera, not growing taller in place.
-        world_dh = 3.9 * self.HIGH_HEIGHT_FRAC * cam.H * cam.Z_NEAR / cam.fy
+        # Height matches StartGate's gate_height (world units).
+        world_dh = max(0.03, float(self.gate_height))
         p_top = cam.project(xw_left, cam.FLOOR_WORLD_Y - world_dh, wz)
         if p_top is None:
             return canvas
@@ -3460,20 +3438,29 @@ class RelaxTarget(Target):
         if self.hole_mask_path:
             self._punch_hole(canvas, wall_poly, base_canvas)
 
-        # Fade-out across the last 1/10 of travel time.  Alpha goes
-        # 1.0 → 0.0 as p_lin moves through [9/10, 1].  We blend the block
-        # back toward `base_canvas`; non-block pixels are identical in
-        # both buffers so they pass through unchanged.
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
-        p_lin = (cur_frame - self.spawn_frame) / travel_f
-        FADE_START = 0.9
-        if p_lin > FADE_START:
-            if p_lin >= 1.0:
-                canvas[:] = base_canvas
-            else:
-                alpha = 1.0 - (p_lin - FADE_START) / (1.0 - FADE_START)
-                alpha = max(0.0, min(1.0, alpha))
-                cv2.addWeighted(canvas, alpha, base_canvas, 1.0 - alpha, 0, canvas)
+        # Screen-path definition for middle movement/fade:
+        # progress = distance from gate-bottom line to wall-bottom, normalised by
+        # total distance from gate-bottom line to floor-bottom line.
+        # Fade starts at 90% of that visual path.
+        FADE_START_PROGRESS = 0.90
+        p_far = cam.project(xw_left, cam.FLOOR_WORLD_Y, cam.z_from_norm(1.0))
+        p_hit = cam.project(xw_left, cam.FLOOR_WORLD_Y, cam.z_from_norm(0.0))
+        if z < 0.0:
+            # Pass-by (after hit_frame): wall is behind camera, hard cut.
+            canvas[:] = base_canvas
+        elif p_far is not None and p_hit is not None:
+            y_far = float(p_far[1])
+            y_hit = float(p_hit[1])
+            denom = max(1e-6, y_hit - y_far)
+            progress = (y_bot_f - y_far) / denom
+            progress = max(0.0, min(1.0, progress))
+            if progress >= FADE_START_PROGRESS:
+                if progress >= 1.0:
+                    canvas[:] = base_canvas
+                else:
+                    alpha = 1.0 - (progress - FADE_START_PROGRESS) / (1.0 - FADE_START_PROGRESS)
+                    alpha = max(0.0, min(1.0, alpha))
+                    cv2.addWeighted(canvas, alpha, base_canvas, 1.0 - alpha, 0, canvas)
         return canvas
 
     def _punch_hole(self, canvas: np.ndarray, wall_poly: np.ndarray,
@@ -5258,6 +5245,12 @@ class GameManager:
                 target.texture_path = getattr(self, tex_attr, None)
                 if relax_kind == 'middle':
                     target.hole_mask_path = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+                    target.gate_rail_offset_x = float(
+                        getattr(self, "GATE_RAIL_OFFSET_X", 0.08)
+                    )
+                    target.gate_height = float(
+                        getattr(self, "GATE_HEIGHT", 0.14)
+                    )
                 return target
             return PunchTarget(spawn_f, bf, lane, is_left)
 
@@ -6536,6 +6529,8 @@ class RhythmVisualizer:
         game.RELAX_TEXTURE_HIGH = getattr(self, "RELAX_TEXTURE_HIGH", None)
         game.RELAX_TEXTURE_MIDDLE = getattr(self, "RELAX_TEXTURE_MIDDLE", None)
         game.RELAX_HOLE_MASK_PATH = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+        game.GATE_RAIL_OFFSET_X = float(getattr(self, "RAIL_OFFSET_X", 0.08))
+        game.GATE_HEIGHT = float(getattr(self, "START_GATE_H", 0.14))
         enabled_kinds: list[str] = []
         if bool(getattr(self, "RELAX_SHOW_LOW", True)):
             enabled_kinds.append("low")

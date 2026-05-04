@@ -1259,6 +1259,8 @@ class LiveFrameRenderer:
         self._game.RELAX_TEXTURE_HIGH = self._relax_texture_high
         self._game.RELAX_TEXTURE_MIDDLE = self._relax_texture_middle
         self._game.RELAX_HOLE_MASK_PATH = self._relax_hole_mask_path
+        self._game.GATE_RAIL_OFFSET_X = float(self._rail_offset_x)
+        self._game.GATE_HEIGHT = float(self._start_gate_h)
         enabled_kinds: list[str] = []
         if self._relax_show_low:
             enabled_kinds.append("low")
