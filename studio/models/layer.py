@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from .segment import Segment
 
 LayerKind = Literal[
-    "background", "side_rails", "floor", "stickman", "countdown", "start_gate"
+    "background", "side_rails", "floor", "stickman", "countdown", "start_gate", "combo"
 ]
 
 # Category colours used by timeline UI (hex strings).
@@ -21,6 +21,7 @@ LAYER_KIND_COLORS: dict[str, str] = {
     "stickman":    "#ca8a04",  # yellow
     "countdown":   "#15803d",  # green
     "start_gate":  "#ea580c",  # orange
+    "combo":       "#dc2626",  # red
 }
 
 
@@ -175,6 +176,27 @@ _VISUAL_FIELDS_BY_KIND: dict[str, list[str]] = {
         "start_gate_w",
         "start_gate_h",
     ],
+    "combo": [
+        "combo_enabled",
+        "combo_color",
+        "combo_label",
+        "combo_font_family",
+        "combo_fade_after_break_sec",
+        "combo_anim",
+        "combo_audio_enabled",
+        "combo_audio_mode",
+        "combo_audio_file",
+        "combo_audio_volume",
+        "combo_audio_milestone_mode",
+        "combo_audio_milestone_file",
+        "combo_x", "combo_y", "combo_w", "combo_h",
+        "combo_border_thickness",
+        "combo_glow_strength",
+        "combo_tier1_threshold", "combo_tier1_label",
+        "combo_tier2_threshold", "combo_tier2_label",
+        "combo_tier3_threshold", "combo_tier3_label",
+        "combo_tier4_threshold", "combo_tier4_label",
+    ],
 }
 
 
@@ -249,7 +271,7 @@ def resolve_segment_config(
     s_end = segment.end_time_sec
 
     for kind in (
-        "background", "side_rails", "floor", "stickman", "countdown", "start_gate"
+        "background", "side_rails", "floor", "stickman", "countdown", "start_gate", "combo"
     ):
         overlapping = [
             la for la in project_layers

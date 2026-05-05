@@ -1029,6 +1029,7 @@ class LayerBlockItem(QGraphicsRectItem):
             pos = sp.toPoint() if hasattr(sp, "toPoint") else sp
             self._panel._on_layer_block_context_menu(self.layer_id, pos)
             return
+        left_click = event.button() == Qt.MouseButton.LeftButton
         r = self.rect()
         pos = event.pos()
         if pos.x() <= self.EDGE_HIT_W:
@@ -1047,10 +1048,19 @@ class LayerBlockItem(QGraphicsRectItem):
         if layer is not None:
             self._drag_start_layer_start = layer.start_time_sec
             self._drag_start_layer_end = layer.end_time_sec
-        # Single-click: notify Inspector panel
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._panel._on_layer_block_clicked(self.layer_id)
-        super().mousePressEvent(event)
+        # IMPORTANT: call super() BEFORE notifying panel selection.
+        # ``_on_layer_block_clicked`` can emit signals that trigger a scene
+        # rebuild in other parts of the app; if that happens before
+        # ``super().mousePressEvent`` we may call into a deleted C++ item and
+        # crash with "Internal C++ object already deleted".
+        try:
+            super().mousePressEvent(event)
+        except RuntimeError:
+            return
+        if left_click:
+            QTimer.singleShot(
+                0, lambda lid=self.layer_id, p=self._panel: p._on_layer_block_clicked(lid)
+            )
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         self._drag_moved = True
@@ -3348,6 +3358,29 @@ class TimelinePanel(QWidget):
                 "start_gate_w": 0.40,
                 "start_gate_h": 0.14,
             }
+        if kind == "combo":
+            return {
+                "combo_enabled": True,
+                "combo_color": "#FFFFFF",
+                "combo_label": "COMBO",
+                "combo_font_family": "duplex",
+                "combo_fade_after_break_sec": 0.5,
+                "combo_anim": "pop",
+                "combo_audio_enabled": False,
+                "combo_audio_mode": "default",
+                "combo_audio_file": "",
+                "combo_audio_volume": 0.65,
+                "combo_audio_milestone_mode": "default",
+                "combo_audio_milestone_file": "",
+                "combo_x": 0.85, "combo_y": 0.08,
+                "combo_w": 0.13, "combo_h": 0.18,
+                "combo_border_thickness": 2.0,
+                "combo_glow_strength": 30.0,
+                "combo_tier1_threshold": 30,  "combo_tier1_label": "Great",
+                "combo_tier2_threshold": 60,  "combo_tier2_label": "Superb",
+                "combo_tier3_threshold": 90,  "combo_tier3_label": "Perfect",
+                "combo_tier4_threshold": 120, "combo_tier4_label": "Godlike",
+            }
         return {}
 
     def _create_layer(self, kind: str, start: float, end: float) -> None:
@@ -4821,15 +4854,15 @@ class TimelinePanel(QWidget):
     _LAYER_TRACK_H = 16           # height per layer track row
     # All layer kinds — order determines top-to-bottom track position.
     _LAYER_KINDS = (
-        "background", "floor", "side_rails", "stickman", "countdown", "start_gate"
+        "background", "floor", "side_rails", "stickman", "countdown", "start_gate", "combo"
     )
-    _LAYER_TRACKS_TOTAL_H = 96    # len(_LAYER_KINDS) * _LAYER_TRACK_H  (6 × 16)
+    _LAYER_TRACKS_TOTAL_H = 112   # len(_LAYER_KINDS) * _LAYER_TRACK_H  (7 × 16)
     # The BEAT-DBG strip sits between the layer tracks and the waveform.
-    _BEAT_STRIP_Y = 170            # 64 + 96 + 10 gap
+    _BEAT_STRIP_Y = 186            # 64 + 112 + 10 gap
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 200            # 170 + 16 + 14 gap
+    _WAVE_TRACK_Y = 216            # 186 + 16 + 14 gap
     _WAVE_TRACK_H = 160
-    _SCENE_H = 370                 # 200 + 160 + 10
+    _SCENE_H = 386                 # 216 + 160 + 10
     _LAYER_LABEL_FONT_PT = 7.0
     _LAYER_BLOCK_FONT_PT = 7.0
 

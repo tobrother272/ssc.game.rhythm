@@ -252,12 +252,14 @@ class FloorWallOverlay(QWidget):
     Moving near does NOT move far, and vice versa.
     """
 
-    # 12 floats:
+    # 13 floats:
     # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
     # countdown_x, countdown_y, countdown_w, countdown_h, rail_height,
-    # start_gate_h, chevron_width_frac
+    # start_gate_h, chevron_width_frac, vp_panel_depth
     changing  = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
     committed = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
+    # Separate signal for combo box drag (x, y, w, h)
+    combo_committed = Signal(float, float, float, float)
 
     _HANDLE_R    = 10
     _HIT_CLR     = QColor(0,   210, 210)
@@ -307,6 +309,16 @@ class FloorWallOverlay(QWidget):
         self._vp_panel_depth: float = 0.6
         self._drag_vp_panel_depth0: float = 0.6
         self._cached_frame_idx: int = 0
+        # ── Combo box ──────────────────────────────────────────────────────
+        self._combo_enabled: bool = False
+        self._cb_x: float = 0.85
+        self._cb_y: float = 0.08
+        self._cb_w: float = 0.13
+        self._cb_h: float = 0.18
+        self._drag_cb_x0 = 0.0
+        self._drag_cb_y0 = 0.0
+        self._drag_cb_w0 = 0.0
+        self._drag_cb_h0 = 0.0
 
     def set_frame_idx(self, frame_idx: int) -> None:
         """Update tile-scroll frame index so hit-block overlay matches renderer."""
@@ -381,6 +393,23 @@ class FloorWallOverlay(QWidget):
         self._sg_h = max(0.0, min(1.0, float(h)))
         self.update()
 
+    def set_combo_proxy(
+        self,
+        *,
+        enabled: bool,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> None:
+        """Set combo box position from caller (analogous to set_start_gate_proxy)."""
+        self._combo_enabled = bool(enabled)
+        self._cb_x = max(0.0, min(0.98, float(x)))
+        self._cb_y = max(0.0, min(0.98, float(y)))
+        self._cb_w = max(0.02, min(1.0 - self._cb_x, float(w)))
+        self._cb_h = max(0.02, min(1.0 - self._cb_y, float(h)))
+        self.update()
+
     # ── geometry helpers ────────────────────────────────────────────────
     def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
     def _hz_y(self)    -> int: return int(self._horizon_frac * self.height())
@@ -436,6 +465,16 @@ class FloorWallOverlay(QWidget):
             int(self._sg_y * h),
             max(1, int(self._sg_w * w)),
             max(1, int(self._sg_h * h)),
+        )
+
+    def _combo_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._cb_x * w),
+            int(self._cb_y * h),
+            max(1, int(self._cb_w * w)),
+            max(1, int(self._cb_h * h)),
         )
 
     def _floor_footprint_points(self) -> list[QPoint]:
@@ -563,6 +602,20 @@ class FloorWallOverlay(QWidget):
             )
             if top_mid.contains(pos):
                 return "gate_top"
+        if self._combo_enabled:
+            cb = self._combo_rect_px()
+            hs = 14
+            cb_corners = {
+                "cb_tl": QRect(cb.left() - hs // 2, cb.top() - hs // 2, hs, hs),
+                "cb_tr": QRect(cb.right() - hs // 2, cb.top() - hs // 2, hs, hs),
+                "cb_bl": QRect(cb.left() - hs // 2, cb.bottom() - hs // 2, hs, hs),
+                "cb_br": QRect(cb.right() - hs // 2, cb.bottom() - hs // 2, hs, hs),
+            }
+            for kind, rr in cb_corners.items():
+                if rr.contains(pos):
+                    return kind
+            if cb.contains(pos):
+                return "cb_move"
         ch = self._chevron_width_handle_pos()
         cr = self._HANDLE_R - 1
         if abs(pos.x() - ch.x()) <= cr and abs(pos.y() - ch.y()) <= cr:
@@ -613,6 +666,12 @@ class FloorWallOverlay(QWidget):
             self._drag_cd_y0 = self._cd_y
             self._drag_cd_w0 = self._cd_w
             self._drag_cd_h0 = self._cd_h
+        if self._drag and self._drag.startswith("cb_"):
+            self._drag_anchor = ev.pos()
+            self._drag_cb_x0 = self._cb_x
+            self._drag_cb_y0 = self._cb_y
+            self._drag_cb_w0 = self._cb_w
+            self._drag_cb_h0 = self._cb_h
         if self._drag == "rail_height":
             self._drag_anchor = ev.pos()
             self._drag_rail_h0 = self._rail_height
@@ -630,6 +689,7 @@ class FloorWallOverlay(QWidget):
         if self._drag in ("wall_near", "wall_far"):
             self.releaseMouse()
         if self._drag:
+            was_combo = self._drag.startswith("cb_")
             self._drag = None
             self.committed.emit(
                 self._hit_frac, self._horizon_frac, self._near_spread,
@@ -640,6 +700,10 @@ class FloorWallOverlay(QWidget):
                 self._chevron_width_frac,
                 self._vp_panel_depth,
             )
+            if was_combo:
+                self.combo_committed.emit(
+                    self._cb_x, self._cb_y, self._cb_w, self._cb_h
+                )
 
     def mouseMoveEvent(self, ev) -> None:
         hover = self._handle_at(ev.pos()) if self._drag is None else None
@@ -650,11 +714,11 @@ class FloorWallOverlay(QWidget):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             elif hover == "wall_near":
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-            elif hover in ("cd_tl", "cd_br"):
+            elif hover in ("cd_tl", "cd_br", "cb_tl", "cb_br"):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-            elif hover in ("cd_tr", "cd_bl"):
+            elif hover in ("cd_tr", "cd_bl", "cb_tr", "cb_bl"):
                 self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-            elif hover == "cd_move":
+            elif hover in ("cd_move", "cb_move"):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -711,6 +775,34 @@ class FloorWallOverlay(QWidget):
                 ww = max(minf, min(1.0 - x, ww + dx))
                 hh = max(minf, min(1.0 - y, hh + dy))
             self._cd_x, self._cd_y, self._cd_w, self._cd_h = x, y, ww, hh
+        elif self._drag and self._drag.startswith("cb_"):
+            dx = (ev.pos().x() - self._drag_anchor.x()) / float(max(1, w))
+            dy = (ev.pos().y() - self._drag_anchor.y()) / float(max(1, h))
+            x, y, ww, hh = self._drag_cb_x0, self._drag_cb_y0, self._drag_cb_w0, self._drag_cb_h0
+            minf = 0.02
+            if self._drag == "cb_move":
+                x = max(0.0, min(1.0 - ww, x + dx))
+                y = max(0.0, min(1.0 - hh, y + dy))
+            elif self._drag == "cb_tl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                ww = ww - (nx - x)
+                hh = hh - (ny - y)
+                x, y = nx, ny
+            elif self._drag == "cb_tr":
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                nw = max(minf, min(1.0 - x, ww + dx))
+                hh = hh - (ny - y)
+                y, ww = ny, nw
+            elif self._drag == "cb_bl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                nh = max(minf, min(1.0 - y, hh + dy))
+                ww = ww - (nx - x)
+                x, hh = nx, nh
+            elif self._drag == "cb_br":
+                ww = max(minf, min(1.0 - x, ww + dx))
+                hh = max(minf, min(1.0 - y, hh + dy))
+            self._cb_x, self._cb_y, self._cb_w, self._cb_h = x, y, ww, hh
         elif self._drag == "rail_height":
             dy = float(ev.pos().y() - self._drag_anchor.y())
             h = max(1.0, float(self.height()))
@@ -905,6 +997,24 @@ class FloorWallOverlay(QWidget):
             p.setPen(QPen(QColor(255, 120, 235)))
             p.drawText(cd.left() + 6, max(14, cd.top() - 6), "Countdown")
 
+        if self._combo_enabled:
+            cb = self._combo_rect_px()
+            p.setBrush(QBrush(QColor(220, 50, 50, 36)))
+            p.setPen(QPen(QColor(255, 90, 90), 2.0, Qt.PenStyle.DashLine))
+            p.drawRect(cb)
+            hs = 7
+            p.setBrush(QBrush(QColor(255, 90, 90)))
+            p.setPen(QPen(QColor(255, 255, 255), 1.2))
+            for cx, cy in (
+                (cb.left(), cb.top()),
+                (cb.right(), cb.top()),
+                (cb.left(), cb.bottom()),
+                (cb.right(), cb.bottom()),
+            ):
+                p.drawRect(cx - hs, cy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 90, 90)))
+            p.drawText(cb.left() + 6, max(14, cb.top() - 6), "Combo")
+
 
 def format_ms(ms: int) -> str:
     """Format milliseconds to mm:ss string."""
@@ -935,6 +1045,9 @@ class PreviewPanel(QWidget):
     floor_wall_committed = Signal(
         float, float, float, float, float, float, float, float, float, float, float, float, float
     )
+    # Emitted when user finishes dragging the combo box overlay.
+    # Carries (x, y, w, h) normalized floats.
+    combo_box_committed = Signal(float, float, float, float)
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
     # auto-stopped because a different source was loaded (user
@@ -1466,6 +1579,23 @@ class PreviewPanel(QWidget):
                 w=gw,
                 h=gh,
             )
+            # ── Combo box proxy ─────────────────────────────────────────────
+            combo_enabled_ov = bool(rs.get("combo_enabled", True))
+            cbx = float(rs.get("combo_x", 0.85) or 0.85)
+            cby = float(rs.get("combo_y", 0.08) or 0.08)
+            cbw = float(rs.get("combo_w", 0.13) or 0.13)
+            cbh = float(rs.get("combo_h", 0.18) or 0.18)
+            if self._live_active and self._live_renderer is not None:
+                lr = self._live_renderer
+                combo_enabled_ov = bool(getattr(lr, "_combo_enabled", combo_enabled_ov))
+                cbx = float(getattr(lr, "_combo_x", cbx))
+                cby = float(getattr(lr, "_combo_y", cby))
+                cbw = float(getattr(lr, "_combo_w", cbw))
+                cbh = float(getattr(lr, "_combo_h", cbh))
+            self.floor_wall_overlay.set_combo_proxy(
+                enabled=combo_enabled_ov,
+                x=cbx, y=cby, w=cbw, h=cbh,
+            )
             self._on_stickman_edit_toggled(
                 seg is not None and self._segment_stickman_enabled(seg)
             )
@@ -1540,6 +1670,33 @@ class PreviewPanel(QWidget):
             max(0.05, min(0.95, chevron_width_frac)),
             max(0.05, vp_panel_depth),
         )
+
+    def _on_combo_box_committed(
+        self, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Persist combo bbox from overlay drag into the combo layer config."""
+        seg = self._selected_segment
+        if seg is None or not self._project_layers:
+            return
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        combo_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "combo"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not combo_layers:
+            return
+        top = max(combo_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        top.config["combo_x"] = round(float(x), 4)
+        top.config["combo_y"] = round(float(y), 4)
+        top.config["combo_w"] = round(float(w), 4)
+        top.config["combo_h"] = round(float(h), 4)
+        # Hot-update the renderer bbox without rebuilding
+        if self._live_active and self._live_renderer is not None:
+            self._live_renderer.update_combo_box(x=x, y=y, w=w, h=h)
+            self._render_live_frame(self.player.position() / 1000.0)
+        self.combo_box_committed.emit(x, y, w, h)
 
     def _get_countdown_bbox(
         self, seg: Segment | None
@@ -1884,6 +2041,7 @@ class PreviewPanel(QWidget):
         self.floor_wall_overlay = FloorWallOverlay(self)
         self.floor_wall_overlay.changing.connect(self._on_floor_wall_changing)
         self.floor_wall_overlay.committed.connect(self._on_floor_wall_committed)
+        self.floor_wall_overlay.combo_committed.connect(self._on_combo_box_committed)
         self._floor_wall_edit_active: bool = False
         self._floor_wall_pos_timer = QTimer(self)
         self._floor_wall_pos_timer.setInterval(50)
@@ -2878,6 +3036,26 @@ class PreviewPanel(QWidget):
         start_gate_y: Optional[float] = None,
         start_gate_w: Optional[float] = None,
         start_gate_h: Optional[float] = None,
+        combo_enabled: Optional[bool] = None,
+        combo_color: Optional[str] = None,
+        combo_label: Optional[str] = None,
+        combo_font_family: Optional[str] = None,
+        combo_fade_after_break_sec: Optional[float] = None,
+        combo_anim: Optional[str] = None,
+        combo_x: Optional[float] = None,
+        combo_y: Optional[float] = None,
+        combo_w: Optional[float] = None,
+        combo_h: Optional[float] = None,
+        combo_border_thickness: Optional[float] = None,
+        combo_glow_strength: Optional[float] = None,
+        combo_tier1_threshold: Optional[int] = None,
+        combo_tier1_label: Optional[str] = None,
+        combo_tier2_threshold: Optional[int] = None,
+        combo_tier2_label: Optional[str] = None,
+        combo_tier3_threshold: Optional[int] = None,
+        combo_tier3_label: Optional[str] = None,
+        combo_tier4_threshold: Optional[int] = None,
+        combo_tier4_label: Optional[str] = None,
         viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
@@ -2983,6 +3161,26 @@ class PreviewPanel(QWidget):
             start_gate_y=start_gate_y,
             start_gate_w=start_gate_w,
             start_gate_h=start_gate_h,
+            combo_enabled=combo_enabled,
+            combo_color=combo_color,
+            combo_label=combo_label,
+            combo_font_family=combo_font_family,
+            combo_fade_after_break_sec=combo_fade_after_break_sec,
+            combo_anim=combo_anim,
+            combo_x=combo_x,
+            combo_y=combo_y,
+            combo_w=combo_w,
+            combo_h=combo_h,
+            combo_border_thickness=combo_border_thickness,
+            combo_glow_strength=combo_glow_strength,
+            combo_tier1_threshold=combo_tier1_threshold,
+            combo_tier1_label=combo_tier1_label,
+            combo_tier2_threshold=combo_tier2_threshold,
+            combo_tier2_label=combo_tier2_label,
+            combo_tier3_threshold=combo_tier3_threshold,
+            combo_tier3_label=combo_tier3_label,
+            combo_tier4_threshold=combo_tier4_threshold,
+            combo_tier4_label=combo_tier4_label,
             viewport_panel_depth=viewport_panel_depth,
             max_per_lane=max_per_lane,
         )

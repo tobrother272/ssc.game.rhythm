@@ -318,6 +318,8 @@ class InspectorPanel(QWidget):
         section.changed.connect(  # type: ignore[attr-defined]
             lambda: self._on_layer_section_changed(layer, section)
         )
+        if hasattr(section, "media_dropped"):
+            section.media_dropped.connect(self._on_section_media_dropped)  # type: ignore[attr-defined]
 
         # Undo session: save starting config
         self._edit_session_layer = layer
@@ -373,7 +375,7 @@ class InspectorPanel(QWidget):
         try:
             if kind == "background":
                 from studio.editor.layer_edit_dialog import _BackgroundSection
-                return _BackgroundSection(cfg, self)
+                return _BackgroundSection(cfg, self._project, self)
             elif kind == "floor":
                 from studio.editor.segment_config_panel import _FloorPanelSection
                 return _FloorPanelSection(
@@ -390,6 +392,7 @@ class InspectorPanel(QWidget):
                     chevron_width_frac=float(cfg.get("chevron_width_frac", 0.45)),
                     chevron_count=int(cfg.get("chevron_count", 6)),
                     full_static_image=bool(cfg.get("floor_full_static_image", False)),
+                    project=self._project,
                     parent=self,
                 )
             elif kind == "side_rails":
@@ -416,20 +419,30 @@ class InspectorPanel(QWidget):
                     dot_anim_mode=str(cfg.get("rail_dot_anim_mode", "audio")),
                     dot_color_near=str(cfg.get("rail_dot_color_near", "#FF60FF")),
                     dot_color_far=str(cfg.get("rail_dot_color_far", "#00FFFF")),
+                    project=self._project,
                     parent=self,
                 )
             elif kind == "stickman":
                 from studio.editor.layer_edit_dialog import _StickmanSection
-                return _StickmanSection(cfg, self)
+                return _StickmanSection(cfg, self._project, self)
             elif kind == "countdown":
                 from studio.editor.layer_edit_dialog import _CountdownSection
-                return _CountdownSection(cfg, self)
+                return _CountdownSection(cfg, self._project, self)
             elif kind == "start_gate":
                 from studio.editor.layer_edit_dialog import _StartGateSection
-                return _StartGateSection(cfg, self)
+                return _StartGateSection(cfg, self._project, self)
+            elif kind == "combo":
+                from studio.editor.layer_edit_dialog import _ComboSection
+                return _ComboSection(cfg, self)
         except Exception:
             pass
         return None
+
+    def _on_section_media_dropped(self, msg: str, is_error: bool) -> None:
+        win = self.window()
+        if win is not None and hasattr(win, "statusBar"):
+            timeout = 4000 if is_error else 3000
+            win.statusBar().showMessage(msg, timeout)  # type: ignore[attr-defined]
 
     def _clear_layer_section(self) -> None:
         """Remove the current layer section widget from the layout."""

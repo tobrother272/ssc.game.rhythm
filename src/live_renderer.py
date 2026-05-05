@@ -264,6 +264,32 @@ class LiveFrameRenderer:
         start_gate_y: float = 0.18,
         start_gate_w: float = 0.40,
         start_gate_h: float = 0.14,
+        combo_enabled: bool = True,
+        combo_color: str = "#FFFFFF",
+        combo_label: str = "COMBO",
+        combo_font_family: str = "duplex",
+        combo_fade_after_break_sec: float = 0.5,
+        combo_anim: str = "pop",
+        combo_audio_enabled: bool = False,
+        combo_audio_mode: str = "default",
+        combo_audio_file: Optional[str] = None,
+        combo_audio_volume: float = 0.65,
+        combo_audio_milestone_mode: str = "default",
+        combo_audio_milestone_file: Optional[str] = None,
+        combo_x: float = 0.85,
+        combo_y: float = 0.08,
+        combo_w: float = 0.13,
+        combo_h: float = 0.18,
+        combo_border_thickness: float = 2.0,
+        combo_glow_strength: float = 30.0,
+        combo_tier1_threshold: int = 30,
+        combo_tier1_label: str = "Great",
+        combo_tier2_threshold: int = 60,
+        combo_tier2_label: str = "Superb",
+        combo_tier3_threshold: int = 90,
+        combo_tier3_label: str = "Perfect",
+        combo_tier4_threshold: int = 120,
+        combo_tier4_label: str = "Godlike",
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -375,6 +401,32 @@ class LiveFrameRenderer:
         self._start_gate_y = max(0.0, min(1.0, float(start_gate_y)))
         self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
         self._start_gate_h = max(0.03, float(start_gate_h))
+        self._combo_enabled = bool(combo_enabled)
+        self._combo_color = str(combo_color or "#FFFFFF")
+        self._combo_label = str(combo_label or "COMBO")
+        self._combo_font_family = str(combo_font_family or "duplex")
+        self._combo_fade_after_break_sec = max(0.0, float(combo_fade_after_break_sec))
+        self._combo_anim = ComboHUD._normalize_anim(combo_anim)
+        self._combo_audio_enabled = bool(combo_audio_enabled)
+        self._combo_audio_mode = str(combo_audio_mode or "default")
+        self._combo_audio_file = combo_audio_file or None
+        self._combo_audio_volume = max(0.0, min(1.0, float(combo_audio_volume)))
+        self._combo_audio_milestone_mode = str(combo_audio_milestone_mode or "default")
+        self._combo_audio_milestone_file = combo_audio_milestone_file or None
+        self._combo_x = max(0.0, min(1.0, float(combo_x)))
+        self._combo_y = max(0.0, min(1.0, float(combo_y)))
+        self._combo_w = max(0.05, min(0.5, float(combo_w)))
+        self._combo_h = max(0.03, min(0.3, float(combo_h)))
+        self._combo_border_thickness = max(0.0, min(10.0, float(combo_border_thickness)))
+        self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
+        self._combo_tier1_threshold = max(0, int(combo_tier1_threshold))
+        self._combo_tier1_label = str(combo_tier1_label)
+        self._combo_tier2_threshold = max(0, int(combo_tier2_threshold))
+        self._combo_tier2_label = str(combo_tier2_label)
+        self._combo_tier3_threshold = max(0, int(combo_tier3_threshold))
+        self._combo_tier3_label = str(combo_tier3_label)
+        self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
+        self._combo_tier4_label = str(combo_tier4_label)
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -614,6 +666,26 @@ class LiveFrameRenderer:
         start_gate_y: Optional[float] = None,
         start_gate_w: Optional[float] = None,
         start_gate_h: Optional[float] = None,
+        combo_enabled: Optional[bool] = None,
+        combo_color: Optional[str] = None,
+        combo_label: Optional[str] = None,
+        combo_font_family: Optional[str] = None,
+        combo_fade_after_break_sec: Optional[float] = None,
+        combo_anim: Optional[str] = None,
+        combo_x: Optional[float] = None,
+        combo_y: Optional[float] = None,
+        combo_w: Optional[float] = None,
+        combo_h: Optional[float] = None,
+        combo_border_thickness: Optional[float] = None,
+        combo_glow_strength: Optional[float] = None,
+        combo_tier1_threshold: Optional[int] = None,
+        combo_tier1_label: Optional[str] = None,
+        combo_tier2_threshold: Optional[int] = None,
+        combo_tier2_label: Optional[str] = None,
+        combo_tier3_threshold: Optional[int] = None,
+        combo_tier3_label: Optional[str] = None,
+        combo_tier4_threshold: Optional[int] = None,
+        combo_tier4_label: Optional[str] = None,
         viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
@@ -822,6 +894,47 @@ class LiveFrameRenderer:
             self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
         if start_gate_h is not None:
             self._start_gate_h = max(0.03, float(start_gate_h))
+        # ── Combo HUD params ────────────────────────────────────────────────
+        if combo_enabled is not None:
+            self._combo_enabled = bool(combo_enabled)
+        if combo_color is not None:
+            self._combo_color = str(combo_color or "#FFFFFF")
+        if combo_label is not None:
+            self._combo_label = str(combo_label or "COMBO")
+        if combo_font_family is not None:
+            self._combo_font_family = str(combo_font_family or "duplex")
+        if combo_fade_after_break_sec is not None:
+            self._combo_fade_after_break_sec = max(0.0, float(combo_fade_after_break_sec))
+        if combo_anim is not None:
+            self._combo_anim = ComboHUD._normalize_anim(combo_anim)
+        if combo_x is not None:
+            self._combo_x = max(0.0, min(1.0, float(combo_x)))
+        if combo_y is not None:
+            self._combo_y = max(0.0, min(1.0, float(combo_y)))
+        if combo_w is not None:
+            self._combo_w = max(0.05, min(0.5, float(combo_w)))
+        if combo_h is not None:
+            self._combo_h = max(0.03, min(0.3, float(combo_h)))
+        if combo_border_thickness is not None:
+            self._combo_border_thickness = max(0.0, min(10.0, float(combo_border_thickness)))
+        if combo_glow_strength is not None:
+            self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
+        if combo_tier1_threshold is not None:
+            self._combo_tier1_threshold = max(0, int(combo_tier1_threshold))
+        if combo_tier1_label is not None:
+            self._combo_tier1_label = str(combo_tier1_label)
+        if combo_tier2_threshold is not None:
+            self._combo_tier2_threshold = max(0, int(combo_tier2_threshold))
+        if combo_tier2_label is not None:
+            self._combo_tier2_label = str(combo_tier2_label)
+        if combo_tier3_threshold is not None:
+            self._combo_tier3_threshold = max(0, int(combo_tier3_threshold))
+        if combo_tier3_label is not None:
+            self._combo_tier3_label = str(combo_tier3_label)
+        if combo_tier4_threshold is not None:
+            self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
+        if combo_tier4_label is not None:
+            self._combo_tier4_label = str(combo_tier4_label)
         if viewport_panel_depth is not None:
             self._viewport_panel_depth = max(0.05, float(viewport_panel_depth))
         if max_per_lane is not None:
@@ -843,6 +956,19 @@ class LiveFrameRenderer:
                 self._relax_countdown_y,
                 self._relax_countdown_w,
                 self._relax_countdown_h,
+            )
+
+    def update_combo_box(
+        self, *, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Hot-update combo bbox without full scene rebuild."""
+        self._combo_x = max(0.0, min(1.0, float(x)))
+        self._combo_y = max(0.0, min(1.0, float(y)))
+        self._combo_w = max(0.05, min(0.5, float(w)))
+        self._combo_h = max(0.03, min(0.3, float(h)))
+        if self._combo is not None:
+            self._combo.set_bbox(
+                self._combo_x, self._combo_y, self._combo_w, self._combo_h
             )
 
     def _build_side_rail(self) -> Optional[SideRailRenderer]:
@@ -1187,7 +1313,27 @@ class LiveFrameRenderer:
             )
         else:
             self._stick = None
-        self._combo = ComboHUD(self._cam)
+        self._combo = ComboHUD(
+            self._cam,
+            enabled=self._combo_enabled,
+            color=self._combo_color,
+            label=self._combo_label,
+            font_family=self._combo_font_family,
+            fade_after_break_sec=self._combo_fade_after_break_sec,
+            anim=self._combo_anim,
+            bbox=(self._combo_x, self._combo_y, self._combo_w, self._combo_h),
+            border_thickness=self._combo_border_thickness,
+            glow_strength=self._combo_glow_strength,
+            tier1_threshold=self._combo_tier1_threshold,
+            tier1_label=self._combo_tier1_label,
+            tier2_threshold=self._combo_tier2_threshold,
+            tier2_label=self._combo_tier2_label,
+            tier3_threshold=self._combo_tier3_threshold,
+            tier3_label=self._combo_tier3_label,
+            tier4_threshold=self._combo_tier4_threshold,
+            tier4_label=self._combo_tier4_label,
+            fps=float(self._fps),
+        )
         self._countdown_hud = None
         if self._relax_countdown_enabled:
             self._countdown_hud = CountdownHUD(

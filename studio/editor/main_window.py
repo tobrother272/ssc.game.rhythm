@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -378,6 +380,8 @@ class MainWindow(QMainWindow):
         menu.addMenu("Edit")
 
         help_menu = menu.addMenu("Help")
+        help_menu.addAction("Update Engine…", self._on_update_engine_clicked)
+        help_menu.addSeparator()
         help_menu.addAction("Update Worker…", self._on_update_worker_clicked)
 
     def _build_toolbar(self) -> None:
@@ -2167,6 +2171,55 @@ class MainWindow(QMainWindow):
         dlg = WorkerUpdateDialog(parent=self)
         dlg.exec()
 
+    def _on_update_engine_clicked(self) -> None:
+        """Spawn update.exe in background and keep editor responsive."""
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self,
+                "Update Engine",
+                "Update Engine is only available in the installed build.",
+            )
+            return
+
+        bundle_dir = Path(sys.executable).resolve().parent
+        updater_exe = bundle_dir / "update.exe"
+        if not updater_exe.exists():
+            QMessageBox.warning(
+                self,
+                "Update Engine",
+                f"Updater not found:\n{updater_exe}",
+            )
+            return
+
+        flags = 0
+        flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        flags |= int(getattr(subprocess, "DETACHED_PROCESS", 0))
+        flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            subprocess.Popen(
+                [
+                    str(updater_exe),
+                    "--apply-update",
+                    "--yes",
+                    "--wait-for-pid",
+                    str(os.getpid()),
+                ],
+                cwd=str(bundle_dir),
+                close_fds=True,
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self,
+                "Update Engine",
+                f"Failed to start updater:\n{exc}",
+            )
+            return
+
+        self.statusBar().showMessage(
+            "Update Engine started. Close SSCStudio to apply update.", 6000
+        )
+
     def _on_export_button_clicked(self) -> None:
         """Show the detailed Export dialog (stays open; user closes manually)."""
         if not self.project.segments:
@@ -2632,6 +2685,32 @@ class MainWindow(QMainWindow):
             "start_gate_y": float(_get("start_gate_y", 0.18) or 0.18),
             "start_gate_w": float(_get("start_gate_w", 0.40) or 0.40),
             "start_gate_h": float(_get("start_gate_h", 0.14) or 0.14),
+            "combo_enabled": bool(_get("combo_enabled", True)),
+            "combo_color": str(_get("combo_color", "#FFFFFF") or "#FFFFFF"),
+            "combo_label": str(_get("combo_label", "COMBO") or "COMBO"),
+            "combo_font_family": str(_get("combo_font_family", "duplex") or "duplex"),
+            "combo_fade_after_break_sec": float(_get("combo_fade_after_break_sec", 0.5) or 0.5),
+            "combo_anim": str(_get("combo_anim", "pop") or "pop"),
+            "combo_audio_enabled": bool(_get("combo_audio_enabled", False)),
+            "combo_audio_mode": str(_get("combo_audio_mode", "default") or "default"),
+            "combo_audio_file": _get("combo_audio_file", None) or "",
+            "combo_audio_volume": float(_get("combo_audio_volume", 0.65) or 0.65),
+            "combo_audio_milestone_mode": str(_get("combo_audio_milestone_mode", "default") or "default"),
+            "combo_audio_milestone_file": _get("combo_audio_milestone_file", None) or "",
+            "combo_x": float(_get("combo_x", 0.85) or 0.85),
+            "combo_y": float(_get("combo_y", 0.08) or 0.08),
+            "combo_w": float(_get("combo_w", 0.13) or 0.13),
+            "combo_h": float(_get("combo_h", 0.18) or 0.18),
+            "combo_border_thickness": float(_get("combo_border_thickness", 2.0) or 2.0),
+            "combo_glow_strength": float(_get("combo_glow_strength", 30.0) or 30.0),
+            "combo_tier1_threshold": int(_get("combo_tier1_threshold", 30) or 30),
+            "combo_tier1_label": str(_get("combo_tier1_label", "Great") or "Great"),
+            "combo_tier2_threshold": int(_get("combo_tier2_threshold", 60) or 60),
+            "combo_tier2_label": str(_get("combo_tier2_label", "Superb") or "Superb"),
+            "combo_tier3_threshold": int(_get("combo_tier3_threshold", 90) or 90),
+            "combo_tier3_label": str(_get("combo_tier3_label", "Perfect") or "Perfect"),
+            "combo_tier4_threshold": int(_get("combo_tier4_threshold", 120) or 120),
+            "combo_tier4_label": str(_get("combo_tier4_label", "Godlike") or "Godlike"),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -2887,6 +2966,26 @@ class MainWindow(QMainWindow):
             start_gate_y = float(rs.get("start_gate_y", 0.18) or 0.18)
             start_gate_w = float(rs.get("start_gate_w", 0.40) or 0.40)
             start_gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
+            combo_enabled = bool(rs.get("combo_enabled", True))
+            combo_color = str(rs.get("combo_color", "#FFFFFF") or "#FFFFFF")
+            combo_label = str(rs.get("combo_label", "COMBO") or "COMBO")
+            combo_font_family = str(rs.get("combo_font_family", "duplex") or "duplex")
+            combo_fade_after_break_sec = float(rs.get("combo_fade_after_break_sec", 0.5) or 0.5)
+            combo_anim = str(rs.get("combo_anim", "pop") or "pop")
+            combo_x = float(rs.get("combo_x", 0.85) or 0.85)
+            combo_y = float(rs.get("combo_y", 0.08) or 0.08)
+            combo_w = float(rs.get("combo_w", 0.13) or 0.13)
+            combo_h = float(rs.get("combo_h", 0.18) or 0.18)
+            combo_border_thickness = float(rs.get("combo_border_thickness", 2.0) or 2.0)
+            combo_glow_strength = float(rs.get("combo_glow_strength", 30.0) or 30.0)
+            combo_tier1_threshold = int(rs.get("combo_tier1_threshold", 30) or 30)
+            combo_tier1_label = str(rs.get("combo_tier1_label", "Great") or "Great")
+            combo_tier2_threshold = int(rs.get("combo_tier2_threshold", 60) or 60)
+            combo_tier2_label = str(rs.get("combo_tier2_label", "Superb") or "Superb")
+            combo_tier3_threshold = int(rs.get("combo_tier3_threshold", 90) or 90)
+            combo_tier3_label = str(rs.get("combo_tier3_label", "Perfect") or "Perfect")
+            combo_tier4_threshold = int(rs.get("combo_tier4_threshold", 120) or 120)
+            combo_tier4_label = str(rs.get("combo_tier4_label", "Godlike") or "Godlike")
             _vpd_raw = rs.get("viewport_panel_depth")
             viewport_panel_depth_live = (
                 max(0.05, float(_vpd_raw)) if _vpd_raw is not None else None
@@ -2985,6 +3084,26 @@ class MainWindow(QMainWindow):
                     start_gate_y=start_gate_y,
                     start_gate_w=start_gate_w,
                     start_gate_h=start_gate_h,
+                    combo_enabled=combo_enabled,
+                    combo_color=combo_color,
+                    combo_label=combo_label,
+                    combo_font_family=combo_font_family,
+                    combo_fade_after_break_sec=combo_fade_after_break_sec,
+                    combo_anim=combo_anim,
+                    combo_x=combo_x,
+                    combo_y=combo_y,
+                    combo_w=combo_w,
+                    combo_h=combo_h,
+                    combo_border_thickness=combo_border_thickness,
+                    combo_glow_strength=combo_glow_strength,
+                    combo_tier1_threshold=combo_tier1_threshold,
+                    combo_tier1_label=combo_tier1_label,
+                    combo_tier2_threshold=combo_tier2_threshold,
+                    combo_tier2_label=combo_tier2_label,
+                    combo_tier3_threshold=combo_tier3_threshold,
+                    combo_tier3_label=combo_tier3_label,
+                    combo_tier4_threshold=combo_tier4_threshold,
+                    combo_tier4_label=combo_tier4_label,
                     viewport_panel_depth=viewport_panel_depth_live,
                     max_per_lane=max_per_lane,
                 )

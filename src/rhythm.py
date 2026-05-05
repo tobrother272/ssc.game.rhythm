@@ -4706,7 +4706,11 @@ class ViewportFrame:
 
 # ── HUD: Combo + Rating (right panel) ────────────────────────────────────────
 class ComboHUD:
-    """Displays combo count and latest rating on the right side."""
+    """Displays combo count and latest rating on the right side.
+
+    Configurable via layer config (26 fields mirroring CountdownHUD pattern).
+    Rating badge (GOOD/GREAT/SUPERB/PERFECT) remains hardcoded per spec.
+    """
 
     RATINGS = ['GOOD', 'GREAT', 'SUPERB', 'PERFECT']
     RATING_COLORS = {
@@ -4717,97 +4721,485 @@ class ComboHUD:
         'MISS':    (80, 80, 220),
     }
 
-    def __init__(self, cam: PerspectiveCamera):
+    _FONT_MAP: dict[str, int] = {
+        "simplex":        cv2.FONT_HERSHEY_SIMPLEX,
+        "plain":          cv2.FONT_HERSHEY_PLAIN,
+        "duplex":         cv2.FONT_HERSHEY_DUPLEX,
+        "complex":        cv2.FONT_HERSHEY_COMPLEX,
+        "triplex":        cv2.FONT_HERSHEY_TRIPLEX,
+        "complex_small":  cv2.FONT_HERSHEY_COMPLEX_SMALL,
+        "script_simplex": cv2.FONT_HERSHEY_SCRIPT_SIMPLEX,
+        "script_complex": cv2.FONT_HERSHEY_SCRIPT_COMPLEX,
+    }
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw == "flash":
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    def __init__(
+        self,
+        cam: "PerspectiveCamera",
+        *,
+        enabled: bool = True,
+        color: str = "#FFFFFF",
+        label: str = "COMBO",
+        font_family: str = "duplex",
+        fade_after_break_sec: float = 0.5,
+        anim: str = "pop",
+        bbox: tuple[float, float, float, float] = (0.85, 0.08, 0.13, 0.18),
+        border_thickness: float = 2.0,
+        glow_strength: float = 30.0,
+        tier1_threshold: int = 30,  tier1_label: str = "Great",
+        tier2_threshold: int = 60,  tier2_label: str = "Superb",
+        tier3_threshold: int = 90,  tier3_label: str = "Perfect",
+        tier4_threshold: int = 120, tier4_label: str = "Godlike",
+        fps: float = 30.0,
+    ):
         self.cam = cam
         self.combo = 0
         self.rating = ''
         self.rating_frame = -999
+        self._fps = max(1.0, float(fps))
+        # ── config ──────────────────────────────────────────────────────────
+        self._enabled = bool(enabled)
+        self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
+        self._label = str(label) or "COMBO"
+        self._font_family = str(font_family)
+        self._fade_break_sec = max(0.0, float(fade_after_break_sec))
+        self._anim_mode = self._normalize_anim(anim)
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+        self.set_bbox(*bbox)
+        # ── tiers ───────────────────────────────────────────────────────────
+        self._tier1_threshold = max(0, int(tier1_threshold))
+        self._tier1_label = str(tier1_label)
+        self._tier2_threshold = max(0, int(tier2_threshold))
+        self._tier2_label = str(tier2_label)
+        self._tier3_threshold = max(0, int(tier3_threshold))
+        self._tier3_label = str(tier3_label)
+        self._tier4_threshold = max(0, int(tier4_threshold))
+        self._tier4_label = str(tier4_label)
+        # ── internal state ───────────────────────────────────────────────────
+        self._break_frame: int = -999_999
+        self._last_combo: int = 0
+        self._last_change_frame: int = -999_999
 
-    def register_hit(self, cur_frame: int):
+    # ── getters ──────────────────────────────────────────────────────────────
+
+    def _get_font(self) -> int:
+        return self._FONT_MAP.get(self._font_family, cv2.FONT_HERSHEY_DUPLEX)
+
+    def _resolve_label(self, combo: int) -> str:
+        """Return tier label for combo count (check tier4 first → tier1)."""
+        if self._tier4_threshold > 0 and combo >= self._tier4_threshold:
+            return self._tier4_label
+        if self._tier3_threshold > 0 and combo >= self._tier3_threshold:
+            return self._tier3_label
+        if self._tier2_threshold > 0 and combo >= self._tier2_threshold:
+            return self._tier2_label
+        if self._tier1_threshold > 0 and combo >= self._tier1_threshold:
+            return self._tier1_label
+        return self._label
+
+    # ── hot-update API (mirrors CountdownHUD) ────────────────────────────────
+
+    def set_bbox(self, x: float, y: float, w: float, h: float) -> None:
+        x = max(0.0, min(0.98, float(x)))
+        y = max(0.0, min(0.98, float(y)))
+        w = max(0.02, min(1.0 - x, float(w)))
+        h = max(0.02, min(1.0 - y, float(h)))
+        self._box_x = x
+        self._box_y = y
+        self._box_w = w
+        self._box_h = h
+
+    def set_style(
+        self,
+        *,
+        color: str | None = None,
+        label: str | None = None,
+        font_family: str | None = None,
+        anim: str | None = None,
+        border_thickness: float | None = None,
+        glow_strength: float | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        """Hot-update style fields without resetting combo state."""
+        if color is not None:
+            self._color_bgr = _hex_to_bgr(color, default=self._color_bgr)
+        if label is not None:
+            self._label = str(label) or "COMBO"
+        if font_family is not None:
+            self._font_family = str(font_family)
+        if anim is not None:
+            self._anim_mode = self._normalize_anim(anim)
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        if glow_strength is not None:
+            self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+        if enabled is not None:
+            self._enabled = bool(enabled)
+
+    def set_tier(self, n: int, *, threshold: int | None = None, label: str | None = None) -> None:
+        """Hot-update tier n (1..4)."""
+        if n not in (1, 2, 3, 4):
+            return
+        if threshold is not None:
+            setattr(self, f"_tier{n}_threshold", max(0, int(threshold)))
+        if label is not None:
+            setattr(self, f"_tier{n}_label", str(label))
+
+    # ── game events ─────────────────────────────────────────────────────────
+
+    def register_hit(self, cur_frame: int) -> None:
+        prev = self._last_combo
         self.combo += 1
-        # Reference style: always show a simple "GOOD" pill (single rating).
+        if self.combo != prev:
+            self._last_change_frame = cur_frame
+        self._last_combo = self.combo
         self.rating = 'GOOD'
         self.rating_frame = cur_frame
 
-    def register_miss(self, cur_frame: int):
+    def register_miss(self, cur_frame: int) -> None:
+        if self.combo > 0:
+            self._break_frame = cur_frame
         self.combo = 0
+        self._last_combo = 0
         self.rating = 'MISS'
         self.rating_frame = cur_frame
 
-    def draw(self, canvas: np.ndarray, cur_frame: int):
-        W, H = self.cam.W, self.cam.H
+    # ── rendering ───────────────────────────────────────────────────────────
 
-        # combo number (top right)
-        if self.combo > 0:
-            txt = f"{self.combo}"
-            fs = 2.5 if W >= 1600 else 1.9
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, fs, 4)
-            x = W - tw - int(W * 0.03)
-            y = int(H * 0.13)
-            cv2.putText(canvas, txt, (x, y),
-                        cv2.FONT_HERSHEY_DUPLEX, fs, CLR_WHITE, 4,
-                        lineType=cv2.LINE_AA)
-            lbl = 'COMBO'
-            lfs = 0.9 if W >= 1600 else 0.65
-            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_DUPLEX, lfs, 2)
-            cv2.putText(canvas, lbl, (W - lw - int(W * 0.03), y + int(lh * 1.4)),
-                        cv2.FONT_HERSHEY_DUPLEX, lfs, (200, 200, 210), 2,
-                        lineType=cv2.LINE_AA)
+    def _draw_glow_text(
+        self,
+        canvas: np.ndarray,
+        *,
+        text: str,
+        x: int,
+        y: int,
+        font_face: int,
+        font_scale: float,
+        thickness: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+    ) -> None:
+        """Draw text with optional glow + border (mirrors CountdownHUD._draw_glow_text)."""
+        if alpha <= 1e-4:
+            return
+        alpha = float(max(0.0, min(1.0, alpha)))
 
-        # Rating pop-up as a CYAN/BLUE rounded-rect badge (ref style):
-        #     ┌───────────┐
-        #     │  GOOD     │   blue gradient, white text, thin border
-        #     └───────────┘
-        age = cur_frame - self.rating_frame
-        if 0 <= age < 14 and self.rating:
-            # scale pop-in (0→1.25) over 3 frames then settle to 1.0
-            if age < 3:
-                scale = 0.6 + age / 3.0 * 0.65
-            elif age < 6:
-                scale = 1.25 - (age - 3) / 3.0 * 0.25
+        glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0))
+        if glow_norm > 1e-4:
+            glow = np.zeros_like(canvas)
+            for thick_off, base_weight in ((10, 0.10), (6, 0.18), (3, 0.28)):
+                layer_g = np.zeros_like(canvas)
+                cv2.putText(layer_g, text, (x, y), font_face, font_scale,
+                            color_bgr, thickness + thick_off, cv2.LINE_AA)
+                glow = cv2.addWeighted(glow, 1.0, layer_g,
+                                       base_weight * glow_norm * alpha, 0)
+            ksize = max(1, int(font_scale * 8)) | 1
+            glow = cv2.GaussianBlur(glow, (ksize, ksize), 0)
+            canvas[:] = cv2.add(canvas, glow)
+
+        if self._border_thickness > 0.1:
+            bthick = max(1, int(self._border_thickness) + thickness)
+            cv2.putText(canvas, text, (x, y), font_face, font_scale,
+                        (0, 0, 0), bthick, cv2.LINE_AA)
+
+        a_color = tuple(int(c * alpha) for c in color_bgr)
+        cv2.putText(canvas, text, (x, y), font_face, font_scale,
+                    a_color, thickness, cv2.LINE_AA)
+
+    def _anim_scale_alpha(self, cur_frame: int) -> tuple[float, float]:
+        """Return (scale, alpha) for pop/flash/shake/fade_cross animations."""
+        age = cur_frame - self._last_change_frame
+        if age < 0:
+            return 1.0, 1.0
+        fps = self._fps
+        anim_dur = max(1, int(fps * 0.4))  # ~12 frames at 30fps
+        if age >= anim_dur:
+            return 1.0, 1.0
+        t = age / float(anim_dur)
+        mode = self._anim_mode
+        if mode == "pop":
+            if t < 0.25:
+                scale = 1.0 + 0.30 * (t / 0.25)
+            elif t < 0.5:
+                scale = 1.30 - 0.30 * ((t - 0.25) / 0.25)
             else:
                 scale = 1.0
-            alpha = 1.0 if age < 10 else max(0.0, 1.0 - (age - 10) / 4.0)
+            return scale, 1.0
+        if mode == "flash":
+            brightness_scale = 1.0 + 0.6 * max(0.0, 1.0 - t * 2.5)
+            return brightness_scale, 1.0
+        if mode == "shake":
+            return 1.0, 1.0
+        if mode == "fade_cross":
+            return 1.0, min(1.0, t * 3.0)
+        return 1.0, 1.0
 
-            txt = self.rating
-            fs  = (1.25 if W >= 1600 else 0.95) * scale
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, fs, 2)
-            pad_x = int(th * 0.9)
-            pad_y = int(th * 0.55)
-            bw, bh = tw + 2 * pad_x, th + 2 * pad_y
-            bx1 = W - int(W * 0.03)
-            bx0 = bx1 - bw
-            by0 = int(H * 0.22)
-            by1 = by0 + bh
+    def _shake_offset(self, cur_frame: int) -> tuple[int, int]:
+        if self._anim_mode != "shake":
+            return 0, 0
+        age = cur_frame - self._last_change_frame
+        dur = max(1, int(self._fps * 0.3))
+        if age < 0 or age >= dur:
+            return 0, 0
+        decay = max(0.0, 1.0 - age / float(dur)) ** 2
+        import random as _rnd
+        rng = _rnd.Random(cur_frame * 7919)
+        amp = max(2, int(self.cam.W * 0.006 * decay))
+        return rng.randint(-amp, amp), rng.randint(-amp // 2, amp // 2)
 
-            # badge fill (cyan-blue gradient approximation: two horizontal bands)
-            blue_dk = (200, 130, 60)     # BGR darker cyan-blue
-            blue_lt = (255, 200, 120)    # BGR brighter cyan
+    # ── tier helpers ─────────────────────────────────────────────────────────
 
-            overlay = canvas.copy()
-            mid = (by0 + by1) // 2
-            cv2.rectangle(overlay, (bx0, by0), (bx1, mid),
-                          tuple(int(c * alpha) for c in blue_lt), -1)
-            cv2.rectangle(overlay, (bx0, mid), (bx1, by1),
-                          tuple(int(c * alpha) for c in blue_dk), -1)
-            canvas[:] = cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0)
+    _TIER_COLORS_BGR: dict[int, tuple] = {
+        1: (80,  220,  80),   # green
+        2: (200, 200,  50),   # cyan-yellow
+        3: (40,  180, 255),   # gold/orange
+        4: (200,  60, 200),   # magenta
+    }
 
-            # thin white border
-            cv2.rectangle(canvas, (bx0, by0), (bx1, by1),
-                          tuple(int(c * alpha) for c in (255, 255, 255)),
-                          max(1, int(2 * alpha)), lineType=cv2.LINE_AA)
+    def _resolve_tier_index(self, combo: int) -> int:
+        if self._tier4_threshold > 0 and combo >= self._tier4_threshold:
+            return 4
+        if self._tier3_threshold > 0 and combo >= self._tier3_threshold:
+            return 3
+        if self._tier2_threshold > 0 and combo >= self._tier2_threshold:
+            return 2
+        if self._tier1_threshold > 0 and combo >= self._tier1_threshold:
+            return 1
+        return 0
 
-            # text (white) centered in badge
-            tx = bx0 + pad_x
-            ty = by0 + pad_y + th - int(th * 0.05)
-            cv2.putText(canvas, txt, (tx, ty),
-                        cv2.FONT_HERSHEY_DUPLEX, fs,
-                        tuple(int(c * alpha) for c in CLR_WHITE), 2,
-                        lineType=cv2.LINE_AA)
+    def _tier_info(self, tier_idx: int) -> tuple[str, tuple]:
+        labels = {
+            1: self._tier1_label,
+            2: self._tier2_label,
+            3: self._tier3_label,
+            4: self._tier4_label,
+        }
+        return (
+            labels.get(tier_idx, self._label),
+            self._TIER_COLORS_BGR.get(tier_idx, self._color_bgr),
+        )
+
+    # ── badge renderer ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _draw_rounded_rect(
+        img: np.ndarray,
+        pt1: tuple,
+        pt2: tuple,
+        color: tuple,
+        radius: int,
+        thickness: int,
+    ) -> None:
+        x1, y1 = pt1
+        x2, y2 = pt2
+        r = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+        if thickness < 0:
+            cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
+            cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
+            for cx, cy in ((x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)):
+                cv2.circle(img, (cx, cy), r, color, -1)
+        else:
+            t = max(1, thickness)
+            cv2.line(img, (x1+r, y1), (x2-r, y1), color, t, cv2.LINE_AA)
+            cv2.line(img, (x1+r, y2), (x2-r, y2), color, t, cv2.LINE_AA)
+            cv2.line(img, (x1, y1+r), (x1, y2-r), color, t, cv2.LINE_AA)
+            cv2.line(img, (x2, y1+r), (x2, y2-r), color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x1+r, y1+r), (r, r), 180, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x2-r, y1+r), (r, r), 270, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x1+r, y2-r), (r, r),  90, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x2-r, y2-r), (r, r),   0, 0, 90, color, t, cv2.LINE_AA)
+
+    def _draw_tier_badge(
+        self,
+        canvas: np.ndarray,
+        text: str,
+        cx: int, cy: int,
+        badge_w: int, badge_h: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+        tilt_deg: float = -8.0,
+    ) -> None:
+        """Neon badge with dark rounded-rect bg, glowing border, bold tilted text."""
+        if alpha <= 1e-4 or badge_w < 8 or badge_h < 8:
+            return
+
+        pad = int(max(badge_w, badge_h) * 0.55)
+        buf_w = badge_w + 2 * pad
+        buf_h = badge_h + 2 * pad
+        rx0, ry0 = pad, pad
+        rx1, ry1 = pad + badge_w, pad + badge_h
+        rcx = (rx0 + rx1) // 2
+        rcy = (ry0 + ry1) // 2
+        rr = max(4, badge_h // 3)
+        border_t = max(2, badge_h // 10)
+
+        # dark background buffer
+        bg_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        self._draw_rounded_rect(bg_buf, (rx0, ry0), (rx1, ry1), (18, 18, 18), rr, -1)
+
+        # content buffer: glow border + text
+        content_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        for ksize, w in ((23, 0.35), (13, 0.55), (7, 0.75)):
+            tmp = np.zeros_like(content_buf)
+            self._draw_rounded_rect(tmp, (rx0, ry0), (rx1, ry1), color_bgr, rr, border_t)
+            tmp_blur = cv2.GaussianBlur(tmp, (ksize | 1, ksize | 1), 0)
+            content_buf = np.clip(
+                content_buf.astype(np.float32) + tmp_blur.astype(np.float32) * w,
+                0, 255,
+            ).astype(np.uint8)
+        self._draw_rounded_rect(content_buf, (rx0, ry0), (rx1, ry1), color_bgr, rr, border_t)
+
+        # bold text
+        font_b = cv2.FONT_HERSHEY_TRIPLEX
+        th_tgt = int(badge_h * 0.58)
+        tw_tgt = badge_w - 2 * max(4, int(badge_w * 0.10))
+        (rw, rh), _ = cv2.getTextSize(text, font_b, 1.0, 2)
+        tfs = max(0.3, min(th_tgt / max(1, rh), tw_tgt / max(1, rw)))
+        (tw, th), _ = cv2.getTextSize(text, font_b, tfs, 2)
+        tx, ty = rcx - tw // 2, rcy + th // 2
+
+        for off in (8, 4):
+            tmp = np.zeros_like(content_buf)
+            cv2.putText(tmp, text, (tx, ty), font_b, tfs, color_bgr, 2 + off, cv2.LINE_AA)
+            tmp = cv2.GaussianBlur(tmp, (9, 9), 0)
+            content_buf = np.clip(content_buf.astype(np.float32) + tmp.astype(np.float32),
+                                  0, 255).astype(np.uint8)
+        cv2.putText(content_buf, text, (tx, ty), font_b, tfs, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # rotate
+        ctr = (buf_w / 2.0, buf_h / 2.0)
+        M = cv2.getRotationMatrix2D(ctr, tilt_deg, 1.0)
+        rot_bg = cv2.warpAffine(bg_buf, M, (buf_w, buf_h))
+        rot_ct = cv2.warpAffine(content_buf, M, (buf_w, buf_h))
+
+        # composite onto canvas
+        x0 = cx - buf_w // 2;  y0 = cy - buf_h // 2
+        x1 = x0 + buf_w;       y1 = y0 + buf_h
+        sx0 = max(0, -x0);     sy0 = max(0, -y0)
+        sx1 = buf_w - max(0, x1 - canvas.shape[1])
+        sy1 = buf_h - max(0, y1 - canvas.shape[0])
+        dx0 = max(0, x0);      dy0 = max(0, y0)
+        dx1 = min(canvas.shape[1], x1)
+        dy1 = min(canvas.shape[0], y1)
+        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+            return
+
+        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+        bg_s  = rot_bg[sy0:sy1, sx0:sx1].astype(np.float32)
+        ct_s  = rot_ct[sy0:sy1, sx0:sx1].astype(np.float32)
+
+        bg_mask = np.clip(bg_s.max(axis=2, keepdims=True) / 18.0, 0, 1) * (0.78 * alpha)
+        c_roi = c_roi * (1 - bg_mask) + bg_s * bg_mask
+
+        ct_mask = np.clip(ct_s.max(axis=2, keepdims=True) / 25.0, 0, 1) * alpha
+        c_roi = c_roi * (1 - ct_mask) + ct_s * ct_mask
+
+        canvas[dy0:dy1, dx0:dx1] = np.clip(c_roi, 0, 255).astype(np.uint8)
+
+    def draw(self, canvas: np.ndarray, cur_frame: int) -> np.ndarray:
+        W, H = self.cam.W, self.cam.H
+
+        # ── combo number + label ─────────────────────────────────────────
+        if self._enabled:
+            show_combo = self.combo > 0
+            fading = False
+            fade_alpha = 1.0
+            if self.combo == 0 and self._break_frame > -999_000:
+                if self._fade_break_sec > 0.0:
+                    elapsed_f = cur_frame - self._break_frame
+                    elapsed_s = elapsed_f / self._fps
+                    if elapsed_s < self._fade_break_sec:
+                        fading = True
+                        fade_alpha = max(0.0, 1.0 - elapsed_s / self._fade_break_sec)
+                        show_combo = True  # draw fading ghost
+
+            if show_combo:
+                display_combo = self._last_combo if fading else self.combo
+                txt_num = f"{display_combo}"
+                tier_idx = self._resolve_tier_index(display_combo)
+
+                bx = int(W * self._box_x)
+                by = int(H * self._box_y)
+                bw = int(W * self._box_w)
+                bh = int(H * self._box_h)
+
+                scale, anim_a = self._anim_scale_alpha(cur_frame)
+                final_alpha = fade_alpha * anim_a
+                dx, dy = self._shake_offset(cur_frame)
+
+                _pad_x = max(2, int(bw * 0.05))
+                _pad_y = max(2, int(bh * 0.04))
+
+                # ── combo number — bold (TRIPLEX), fits ~62% bbox height ──
+                bold_font = cv2.FONT_HERSHEY_TRIPLEX
+                target_num_h = int(bh * 0.62)
+                target_num_w = bw - 2 * _pad_x
+                (ref_nw, ref_nh), _ = cv2.getTextSize(txt_num, bold_font, 1.0, 4)
+                if ref_nh > 0 and ref_nw > 0:
+                    num_fs = max(0.3, min(target_num_h / ref_nh,
+                                         target_num_w / ref_nw)) * scale
+                else:
+                    num_fs = max(0.3, bh * 0.006 * scale)
+
+                (nw, nh), _ = cv2.getTextSize(txt_num, bold_font, num_fs, 4)
+                nx = bx + (bw - nw) // 2 + dx
+                ny = by + int(bh * 0.65) + dy
+                self._draw_glow_text(
+                    canvas, text=txt_num, x=nx, y=ny,
+                    font_face=bold_font, font_scale=num_fs, thickness=4,
+                    color_bgr=self._color_bgr, alpha=final_alpha,
+                )
+
+                # ── "COMBO" label — small, always visible ─────────────────
+                lbl_font = self._get_font()
+                target_lbl_h = int(bh * 0.15)
+                target_lbl_w = bw - 2 * _pad_x
+                (ref_lw, ref_lh), _ = cv2.getTextSize(self._label, lbl_font, 1.0, 1)
+                if ref_lh > 0 and ref_lw > 0:
+                    lbl_fs = max(0.2, min(target_lbl_h / ref_lh,
+                                         target_lbl_w / ref_lw))
+                else:
+                    lbl_fs = 0.4
+                (lw, lh), _ = cv2.getTextSize(self._label, lbl_font, lbl_fs, 1)
+                lx = bx + (bw - lw) // 2 + dx
+                ly = by + int(bh * 0.84) + dy
+                lbl_color = tuple(int(c * 0.80) for c in self._color_bgr)
+                self._draw_glow_text(
+                    canvas, text=self._label, x=lx, y=ly,
+                    font_face=lbl_font, font_scale=lbl_fs, thickness=1,
+                    color_bgr=lbl_color, alpha=final_alpha,
+                )
+
+                # ── tier neon badge — below bbox, tilted ──────────────────
+                if tier_idx > 0:
+                    tier_text, tier_color = self._tier_info(tier_idx)
+                    b_w = int(bw * 0.92)
+                    b_h = int(bh * 0.35)
+                    b_cx = bx + bw // 2 + dx
+                    b_cy = by + bh + b_h // 2 + _pad_y * 2 + dy
+                    self._draw_tier_badge(
+                        canvas, tier_text,
+                        cx=b_cx, cy=b_cy,
+                        badge_w=b_w, badge_h=b_h,
+                        color_bgr=tier_color,
+                        alpha=final_alpha,
+                        tilt_deg=-8.0,
+                    )
+
         return canvas
 
     def current_mode(self, cur_frame: int) -> str:
-        """Return 'walk' unless recent punch → 'punch_l' / 'punch_r'."""
         return 'walk'
 
 
@@ -6435,7 +6827,32 @@ class RhythmVisualizer:
                                 box=_stick_box)
         else:
             stick = None
-        combo     = ComboHUD(cam)
+        combo = ComboHUD(
+            cam,
+            enabled=bool(getattr(self, "COMBO_ENABLED", True)),
+            color=str(getattr(self, "COMBO_COLOR", "#FFFFFF")),
+            label=str(getattr(self, "COMBO_LABEL", "COMBO")),
+            font_family=str(getattr(self, "COMBO_FONT_FAMILY", "duplex")),
+            fade_after_break_sec=float(getattr(self, "COMBO_FADE_AFTER_BREAK_SEC", 0.5)),
+            anim=str(getattr(self, "COMBO_ANIM", "pop")),
+            bbox=(
+                float(getattr(self, "COMBO_X", 0.85)),
+                float(getattr(self, "COMBO_Y", 0.08)),
+                float(getattr(self, "COMBO_W", 0.13)),
+                float(getattr(self, "COMBO_H", 0.18)),
+            ),
+            border_thickness=float(getattr(self, "COMBO_BORDER_THICKNESS", 2.0)),
+            glow_strength=float(getattr(self, "COMBO_GLOW_STRENGTH", 30.0)),
+            tier1_threshold=int(getattr(self, "COMBO_TIER1_THRESHOLD", 30)),
+            tier1_label=str(getattr(self, "COMBO_TIER1_LABEL", "Great")),
+            tier2_threshold=int(getattr(self, "COMBO_TIER2_THRESHOLD", 60)),
+            tier2_label=str(getattr(self, "COMBO_TIER2_LABEL", "Superb")),
+            tier3_threshold=int(getattr(self, "COMBO_TIER3_THRESHOLD", 90)),
+            tier3_label=str(getattr(self, "COMBO_TIER3_LABEL", "Perfect")),
+            tier4_threshold=int(getattr(self, "COMBO_TIER4_THRESHOLD", 120)),
+            tier4_label=str(getattr(self, "COMBO_TIER4_LABEL", "Godlike")),
+            fps=float(getattr(self, "FPS", 30.0)),
+        )
         countdown_hud = None
         countdown_audio_events: list[tuple[float, bool]] = []
         if bool(getattr(self, "RELAX_COUNTDOWN_ENABLED", True)):
@@ -7751,6 +8168,64 @@ def parse_arguments():
                    help='Countdown text border thickness in pixels (0..10).')
     p.add_argument('--relax_countdown_glow_strength', type=float, default=60.0,
                    help='Countdown text glow strength (0..100).')
+    # ── Combo HUD ─────────────────────────────────────────────────────────────
+    p.add_argument('--combo_enabled', type=int, default=1, metavar='0|1',
+                   help='Show combo counter HUD (default: 1).')
+    p.add_argument('--combo_color', type=str, default='#FFFFFF',
+                   help='Combo counter color (hex, default #FFFFFF).')
+    p.add_argument('--combo_label', type=str, default='COMBO',
+                   help='Combo label text below the number (default COMBO).')
+    p.add_argument('--combo_font_family', type=str, default='duplex',
+                   choices=['simplex','plain','duplex','complex','triplex',
+                            'complex_small','script_simplex','script_complex'],
+                   help='cv2 font family for combo text (default duplex).')
+    p.add_argument('--combo_fade_after_break_sec', type=float, default=0.5,
+                   help='Seconds to fade combo after a miss (0 = instant hide).')
+    p.add_argument('--combo_anim', type=str, default='pop',
+                   choices=['pop','flash','fade_cross','shake'],
+                   help='Animation when combo number increases (default pop).')
+    p.add_argument('--combo_audio_enabled', type=int, default=0, metavar='0|1',
+                   help='Play a sound on each combo increment (default: 0).')
+    p.add_argument('--combo_audio_mode', type=str, default='default',
+                   choices=['default','file'],
+                   help='Combo hit sound source (default beep or file).')
+    p.add_argument('--combo_audio_file', type=str, default=None, metavar='PATH',
+                   help='Path to custom combo hit sound file (wav/mp3).')
+    p.add_argument('--combo_audio_volume', type=float, default=0.65,
+                   help='Combo hit sound volume 0..1 (default 0.65).')
+    p.add_argument('--combo_audio_milestone_mode', type=str, default='default',
+                   choices=['default','file','same'],
+                   help='Milestone sound mode (default/file/same).')
+    p.add_argument('--combo_audio_milestone_file', type=str, default=None, metavar='PATH',
+                   help='Path to milestone sound file.')
+    p.add_argument('--combo_x', type=float, default=0.85,
+                   help='Combo box left position 0..1 (default 0.85).')
+    p.add_argument('--combo_y', type=float, default=0.08,
+                   help='Combo box top position 0..1 (default 0.08).')
+    p.add_argument('--combo_w', type=float, default=0.13,
+                   help='Combo box width 0..1 (default 0.13).')
+    p.add_argument('--combo_h', type=float, default=0.18,
+                   help='Combo box height 0..1 (default 0.18).')
+    p.add_argument('--combo_border_thickness', type=float, default=2.0,
+                   help='Combo text border thickness in px (0..10, default 2.0).')
+    p.add_argument('--combo_glow_strength', type=float, default=30.0,
+                   help='Combo text glow strength (0..100, default 30).')
+    p.add_argument('--combo_tier1_threshold', type=int, default=30,
+                   help='Combo count for Tier 1 label (0=disabled, default 30).')
+    p.add_argument('--combo_tier1_label', type=str, default='Great',
+                   help='Tier 1 label text (default Great).')
+    p.add_argument('--combo_tier2_threshold', type=int, default=60,
+                   help='Combo count for Tier 2 label (0=disabled, default 60).')
+    p.add_argument('--combo_tier2_label', type=str, default='Superb',
+                   help='Tier 2 label text (default Superb).')
+    p.add_argument('--combo_tier3_threshold', type=int, default=90,
+                   help='Combo count for Tier 3 label (0=disabled, default 90).')
+    p.add_argument('--combo_tier3_label', type=str, default='Perfect',
+                   help='Tier 3 label text (default Perfect).')
+    p.add_argument('--combo_tier4_threshold', type=int, default=120,
+                   help='Combo count for Tier 4 label (0=disabled, default 120).')
+    p.add_argument('--combo_tier4_label', type=str, default='Godlike',
+                   help='Tier 4 label text (default Godlike).')
     p.add_argument('--start_gate_enabled', type=int, default=0, metavar='0|1',
                    help='Show the start gate at the far end of floor.')
     p.add_argument('--start_gate_type', type=str, default='color',
@@ -7967,6 +8442,32 @@ if __name__ == '__main__':
     viz.RELAX_COUNTDOWN_GLOW_STRENGTH = max(
         0.0, min(100.0, float(args.relax_countdown_glow_strength))
     )
+    viz.COMBO_ENABLED = bool(int(args.combo_enabled))
+    viz.COMBO_COLOR = str(args.combo_color or "#FFFFFF")
+    viz.COMBO_LABEL = str(args.combo_label or "COMBO")
+    viz.COMBO_FONT_FAMILY = str(args.combo_font_family or "duplex")
+    viz.COMBO_FADE_AFTER_BREAK_SEC = max(0.0, float(args.combo_fade_after_break_sec))
+    viz.COMBO_ANIM = ComboHUD._normalize_anim(args.combo_anim)
+    viz.COMBO_AUDIO_ENABLED = bool(int(args.combo_audio_enabled))
+    viz.COMBO_AUDIO_MODE = str(args.combo_audio_mode or "default")
+    viz.COMBO_AUDIO_FILE = args.combo_audio_file or None
+    viz.COMBO_AUDIO_VOLUME = max(0.0, min(1.0, float(args.combo_audio_volume)))
+    viz.COMBO_AUDIO_MILESTONE_MODE = str(args.combo_audio_milestone_mode or "default")
+    viz.COMBO_AUDIO_MILESTONE_FILE = args.combo_audio_milestone_file or None
+    viz.COMBO_X = max(0.0, min(1.0, float(args.combo_x)))
+    viz.COMBO_Y = max(0.0, min(1.0, float(args.combo_y)))
+    viz.COMBO_W = max(0.05, min(0.5, float(args.combo_w)))
+    viz.COMBO_H = max(0.03, min(0.3, float(args.combo_h)))
+    viz.COMBO_BORDER_THICKNESS = max(0.0, min(10.0, float(args.combo_border_thickness)))
+    viz.COMBO_GLOW_STRENGTH = max(0.0, min(100.0, float(args.combo_glow_strength)))
+    viz.COMBO_TIER1_THRESHOLD = max(0, int(args.combo_tier1_threshold))
+    viz.COMBO_TIER1_LABEL = str(args.combo_tier1_label or "Great")
+    viz.COMBO_TIER2_THRESHOLD = max(0, int(args.combo_tier2_threshold))
+    viz.COMBO_TIER2_LABEL = str(args.combo_tier2_label or "Superb")
+    viz.COMBO_TIER3_THRESHOLD = max(0, int(args.combo_tier3_threshold))
+    viz.COMBO_TIER3_LABEL = str(args.combo_tier3_label or "Perfect")
+    viz.COMBO_TIER4_THRESHOLD = max(0, int(args.combo_tier4_threshold))
+    viz.COMBO_TIER4_LABEL = str(args.combo_tier4_label or "Godlike")
     viz.START_GATE_ENABLED = bool(int(args.start_gate_enabled))
     viz.START_GATE_TYPE = str(args.start_gate_type or "color")
     viz.START_GATE_COLOR = str(args.start_gate_color or "#1a1a1a")

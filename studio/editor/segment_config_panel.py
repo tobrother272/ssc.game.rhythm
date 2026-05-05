@@ -32,6 +32,11 @@ from PySide6.QtWidgets import (
 )
 
 from studio.models import Project, Segment, build_settings
+from studio.editor.inspector_drop_helper import (
+    get_media_from_drop,
+    set_drop_highlight,
+    set_drop_reject_flash,
+)
 
 
 class _NoScrollWheelFilter(QObject):
@@ -147,6 +152,11 @@ class _PathBrowseWidget(QWidget):
         text = self._edit.text().strip()
         return text or None
 
+    def set_value(self, value: Optional[str], *, emit_changed: bool = True) -> None:
+        self._edit.setText("" if value is None else str(value))
+        if emit_changed:
+            self.changed.emit()
+
 
 class _ColorPickerWidget(QWidget):
     """Simple color picker button that stores a #RRGGBB value."""
@@ -227,6 +237,7 @@ class _FloorPanelSection(QGroupBox):
     """
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
 
     _LAYOUTS = [
         ("Auto (mode default)", "auto"),
@@ -248,9 +259,12 @@ class _FloorPanelSection(QGroupBox):
         chevron_width_frac: float = 0.45,
         chevron_count: int = 6,
         full_static_image: bool = False,
+        project: Optional[Project] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Floor Panel Options", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         self._form = form
         form.setContentsMargins(8, 10, 8, 8)
@@ -464,6 +478,45 @@ class _FloorPanelSection(QGroupBox):
         self._update_chevron_visibility()
         self._update_full_static_visibility()
 
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind != "image":
+            self._notify_drop("Floor accepts image only.", True)
+            event.ignore()
+            return
+        self._img_edit.setText(str(media.source_path))
+        self._on_img_edit_changed()
+        self._notify_drop(f"Floor panel image set: {media.display_name}")
+        event.acceptProposedAction()
+
     # ------------------------------------------------------------------
     def _on_layout_changed(self) -> None:
         self._update_chevron_visibility()
@@ -669,6 +722,7 @@ class _SideRailSection(QGroupBox):
     """
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
 
     _SHAPES = [("Chunky (fence blocks)", "chunky"),
                ("Tube (strip)", "tube"),
@@ -702,9 +756,12 @@ class _SideRailSection(QGroupBox):
         dot_anim_mode: str = "audio",
         dot_color_near: str = "#FF60FF",
         dot_color_far: str = "#00FFFF",
+        project: Optional[Project] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__("Side Rail Options", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         self._form = form
         form.setContentsMargins(8, 10, 8, 8)
@@ -1039,6 +1096,45 @@ class _SideRailSection(QGroupBox):
         self._slider_debounce.setSingleShot(True)
         self._slider_debounce.setInterval(2000)
         self._slider_debounce.timeout.connect(self.changed)
+
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind != "image":
+            self._notify_drop("Side rails accept image only.", True)
+            event.ignore()
+            return
+        self._img_edit.setText(str(media.source_path))
+        self._on_texture_edited()
+        self._notify_drop(f"Side rail texture set: {media.display_name}")
+        event.acceptProposedAction()
 
     # ------------------------------------------------------------------
     def _on_shape_changed(self) -> None:

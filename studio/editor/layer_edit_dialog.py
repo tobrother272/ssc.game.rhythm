@@ -9,17 +9,25 @@ Each layer kind has a dedicated section widget (QGroupBox) with:
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSpinBox,
     QWidget,
+)
+from studio.editor.inspector_drop_helper import (
+    get_media_from_drop,
+    set_drop_highlight,
+    set_drop_reject_flash,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,7 @@ class _BackgroundSection(QGroupBox):
     """Config section for a Background layer block."""
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
 
     _BG_TYPES = [
         ("Solid color", "solid"),
@@ -63,8 +72,15 @@ class _BackgroundSection(QGroupBox):
         # Treat unknown / legacy labels as solid for backward compatibility.
         return "solid"
 
-    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        project=None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__("Background", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
@@ -121,6 +137,57 @@ class _BackgroundSection(QGroupBox):
 
         self._update_visibility()
 
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind == "image":
+            idx = next((i for i, (_label, val) in enumerate(self._BG_TYPES) if val == "image"), 1)
+            self._type_cb.setCurrentIndex(idx)
+            self._img_edit.set_value(str(media.source_path), emit_changed=False)
+            self._vid_edit.set_value("", emit_changed=False)
+            self.changed.emit()
+            self._notify_drop(f"Background -> image: {media.display_name}")
+            event.acceptProposedAction()
+            return
+        if kind == "video":
+            idx = next((i for i, (_label, val) in enumerate(self._BG_TYPES) if val == "video"), 2)
+            self._type_cb.setCurrentIndex(idx)
+            self._vid_edit.set_value(str(media.source_path), emit_changed=False)
+            self._img_edit.set_value("", emit_changed=False)
+            self.changed.emit()
+            self._notify_drop(f"Background -> video: {media.display_name}")
+            event.acceptProposedAction()
+            return
+        self._notify_drop("Background accepts image/video only.", True)
+        event.ignore()
+
     def _refresh_color_btn(self) -> None:
         from PySide6.QtGui import QColor
         c = QColor(self._color)
@@ -175,9 +242,17 @@ class _StickmanSection(QGroupBox):
     """
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
 
-    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        project=None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__("Stickman", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
@@ -214,6 +289,41 @@ class _StickmanSection(QGroupBox):
         note.setStyleSheet("color:#888;font-size:10px;")
         form.addRow(note)
 
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        self._notify_drop(
+            "Stickman doesn't accept media — edit position via spinboxes.",
+            True,
+        )
+        event.ignore()
+
     def get_config(self) -> dict:
         return {
             "stickman": self._enabled_cb.isChecked(),
@@ -234,6 +344,7 @@ class _CountdownSection(QGroupBox):
     """Config section for a Countdown layer block."""
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
     _ANIM_OPTIONS = [
         ("Pop", "pop"),
         ("Flash", "flash"),
@@ -275,8 +386,15 @@ class _CountdownSection(QGroupBox):
             return raw
         return "default"
 
-    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        project=None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__("Countdown", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
@@ -424,6 +542,52 @@ class _CountdownSection(QGroupBox):
 
         self._update_audio_visibility()
 
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind != "audio":
+            self._notify_drop("Countdown accepts audio only.", True)
+            event.ignore()
+            return
+        self._audio_enabled_cb.setChecked(True)
+        idx = next(
+            (i for i, (_label, val) in enumerate(self._AUDIO_MODE_OPTIONS) if val == "file"),
+            1,
+        )
+        self._audio_mode_cb.setCurrentIndex(idx)
+        self._audio_file_edit.set_value(str(media.source_path), emit_changed=False)
+        self._update_audio_visibility()
+        self.changed.emit()
+        self._notify_drop(f"Countdown audio set: {media.display_name}")
+        event.acceptProposedAction()
+
     def _refresh_color_btn(self) -> None:
         c = QColor(self._color)
         lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
@@ -497,6 +661,7 @@ class _StartGateSection(QGroupBox):
     """Config section for a Start Gate layer block."""
 
     changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
     _TYPE_OPTIONS = [
         ("Solid color", "color"),
         ("Image", "image"),
@@ -508,8 +673,15 @@ class _StartGateSection(QGroupBox):
         raw = str(value or "color").strip().lower()
         return raw if raw in {"color", "image", "video"} else "color"
 
-    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        project=None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__("Start Gate", parent)
+        self._project = project
+        self.setAcceptDrops(True)
         form = QFormLayout(self)
         form.setContentsMargins(8, 10, 8, 8)
         form.setSpacing(8)
@@ -590,6 +762,57 @@ class _StartGateSection(QGroupBox):
         self._start_gate_h = float(config.get("start_gate_h", 0.14) or 0.14)
         self._update_visibility()
 
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind == "image":
+            idx = next((i for i, (_label, v) in enumerate(self._TYPE_OPTIONS) if v == "image"), 1)
+            self._type_cb.setCurrentIndex(idx)
+            self._image_edit.set_value(str(media.source_path), emit_changed=False)
+            self._video_edit.set_value("", emit_changed=False)
+            self.changed.emit()
+            self._notify_drop(f"Start gate -> image: {media.display_name}")
+            event.acceptProposedAction()
+            return
+        if kind == "video":
+            idx = next((i for i, (_label, v) in enumerate(self._TYPE_OPTIONS) if v == "video"), 2)
+            self._type_cb.setCurrentIndex(idx)
+            self._video_edit.set_value(str(media.source_path), emit_changed=False)
+            self._image_edit.set_value("", emit_changed=False)
+            self.changed.emit()
+            self._notify_drop(f"Start gate -> video: {media.display_name}")
+            event.acceptProposedAction()
+            return
+        self._notify_drop("Start gate accepts image/video only.", True)
+        event.ignore()
+
     def _refresh_color_btn(self) -> None:
         c = QColor(self._color)
         lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
@@ -649,3 +872,343 @@ class _StartGateSection(QGroupBox):
             "start_gate_w": self._start_gate_w,
             "start_gate_h": self._start_gate_h,
         }
+
+
+# ---------------------------------------------------------------------------
+# Combo Counter section
+# ---------------------------------------------------------------------------
+
+
+class _ComboSection(QGroupBox):
+    """Config section for a Combo counter layer block."""
+
+    changed = Signal()
+    _ANIM_OPTIONS = [
+        ("Pop", "pop"),
+        ("Flash", "flash"),
+        ("Fade Cross", "fade_cross"),
+        ("Shake", "shake"),
+    ]
+    _AUDIO_MODE_OPTIONS = [
+        ("Default beep", "default"),
+        ("Audio file", "file"),
+    ]
+    _MILESTONE_MODE_OPTIONS = [
+        ("Default milestone beep", "default"),
+        ("Use another file", "file"),
+        ("Same as regular", "same"),
+    ]
+    _FONT_OPTIONS = [
+        ("Simplex", "simplex"),
+        ("Plain", "plain"),
+        ("Duplex", "duplex"),
+        ("Complex", "complex"),
+        ("Triplex", "triplex"),
+        ("Complex Small", "complex_small"),
+        ("Script Simplex", "script_simplex"),
+        ("Script Complex", "script_complex"),
+    ]
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw == "flash":
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    @staticmethod
+    def _normalize_audio_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return "file" if raw == "file" else "default"
+
+    @staticmethod
+    def _normalize_milestone_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"file", "same"}:
+            return raw
+        return "default"
+
+    def __init__(self, config: dict, parent: QWidget | None = None) -> None:
+        super().__init__("Combo Counter", parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+
+        # ── Enabled ──────────────────────────────────────────────────────────
+        self._enabled_cb = QCheckBox("Enabled")
+        self._enabled_cb.setChecked(bool(config.get("combo_enabled", True)))
+        self._enabled_cb.stateChanged.connect(self.changed)
+        form.addRow("Combo", self._enabled_cb)
+
+        # ── Color ─────────────────────────────────────────────────────────────
+        self._color: str = str(config.get("combo_color") or "#FFFFFF")
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        form.addRow("Color", self._color_btn)
+
+        # ── Font family ───────────────────────────────────────────────────────
+        self._font_cb = QComboBox()
+        for label, val in self._FONT_OPTIONS:
+            self._font_cb.addItem(label, val)
+        cur_font = str(config.get("combo_font_family", "duplex") or "duplex")
+        idx = next(
+            (i for i, (_l, v) in enumerate(self._FONT_OPTIONS) if v == cur_font), 2
+        )
+        self._font_cb.setCurrentIndex(idx)
+        self._font_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Font family", self._font_cb)
+
+        # ── Label text ────────────────────────────────────────────────────────
+        self._label_edit = QLineEdit(str(config.get("combo_label", "COMBO") or "COMBO"))
+        self._label_edit.setMaxLength(20)
+        self._label_edit.setPlaceholderText("e.g. COMBO, HITS, STREAK")
+        self._label_edit.textChanged.connect(self.changed)
+        form.addRow("Label text", self._label_edit)
+
+        # ── Fade after break ──────────────────────────────────────────────────
+        self._fade_sp = QDoubleSpinBox()
+        self._fade_sp.setRange(0.0, 10.0)
+        self._fade_sp.setSingleStep(0.5)
+        self._fade_sp.setDecimals(1)
+        self._fade_sp.setValue(float(config.get("combo_fade_after_break_sec", 0.5) or 0.5))
+        self._fade_sp.setSuffix(" s")
+        self._fade_sp.setToolTip("Fade duration after combo breaks (0 = hide instantly)")
+        self._fade_sp.valueChanged.connect(self.changed)
+        form.addRow("Fade after break", self._fade_sp)
+
+        # ── Animation ─────────────────────────────────────────────────────────
+        self._anim_cb = QComboBox()
+        for label, val in self._ANIM_OPTIONS:
+            self._anim_cb.addItem(label, val)
+        cur_anim = self._normalize_anim(config.get("combo_anim", "pop"))
+        idx = next(
+            (i for i, (_l, v) in enumerate(self._ANIM_OPTIONS) if v == cur_anim), 0
+        )
+        self._anim_cb.setCurrentIndex(idx)
+        self._anim_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Number effect", self._anim_cb)
+
+        # ── Audio ─────────────────────────────────────────────────────────────
+        self._audio_enabled_cb = QCheckBox("Enable combo hit sound")
+        self._audio_enabled_cb.setChecked(bool(config.get("combo_audio_enabled", False)))
+        self._audio_enabled_cb.stateChanged.connect(self._on_audio_toggle)
+        form.addRow("Audio", self._audio_enabled_cb)
+
+        self._audio_mode_cb = QComboBox()
+        for label, val in self._AUDIO_MODE_OPTIONS:
+            self._audio_mode_cb.addItem(label, val)
+        am = self._normalize_audio_mode(config.get("combo_audio_mode", "default"))
+        self._audio_mode_cb.setCurrentIndex(
+            next((i for i, (_l, v) in enumerate(self._AUDIO_MODE_OPTIONS) if v == am), 0)
+        )
+        self._audio_mode_cb.currentIndexChanged.connect(self._on_audio_mode_changed)
+        self._audio_mode_label = QLabel("Sound source")
+        form.addRow(self._audio_mode_label, self._audio_mode_cb)
+
+        from .segment_config_panel import _PathBrowseWidget
+        self._audio_file_edit = _PathBrowseWidget(
+            str(config.get("combo_audio_file", "") or ""),
+            title="Select combo hit sound",
+            file_filter="Audio (*.wav *.mp3 *.ogg *.m4a *.aac *.flac);;All files (*.*)",
+            placeholder="Optional hit sound file",
+            parent=self,
+        )
+        self._audio_file_edit.changed.connect(self.changed)
+        self._audio_file_label = QLabel("Sound file")
+        form.addRow(self._audio_file_label, self._audio_file_edit)
+
+        self._audio_volume_sp = QDoubleSpinBox()
+        self._audio_volume_sp.setRange(0.0, 1.0)
+        self._audio_volume_sp.setSingleStep(0.05)
+        self._audio_volume_sp.setDecimals(2)
+        self._audio_volume_sp.setValue(
+            float(config.get("combo_audio_volume", 0.65) or 0.65)
+        )
+        self._audio_volume_sp.valueChanged.connect(self.changed)
+        self._audio_volume_label = QLabel("Sound volume")
+        form.addRow(self._audio_volume_label, self._audio_volume_sp)
+
+        self._milestone_mode_cb = QComboBox()
+        for label, val in self._MILESTONE_MODE_OPTIONS:
+            self._milestone_mode_cb.addItem(label, val)
+        mm = self._normalize_milestone_mode(
+            config.get("combo_audio_milestone_mode", "default")
+        )
+        self._milestone_mode_cb.setCurrentIndex(
+            next((i for i, (_l, v) in enumerate(self._MILESTONE_MODE_OPTIONS) if v == mm), 0)
+        )
+        self._milestone_mode_cb.currentIndexChanged.connect(self._on_audio_mode_changed)
+        self._milestone_mode_label = QLabel("Milestone sound")
+        form.addRow(self._milestone_mode_label, self._milestone_mode_cb)
+
+        self._milestone_file_edit = _PathBrowseWidget(
+            str(config.get("combo_audio_milestone_file", "") or ""),
+            title="Select milestone sound",
+            file_filter="Audio (*.wav *.mp3 *.ogg *.m4a *.aac *.flac);;All files (*.*)",
+            placeholder="Optional milestone sound file",
+            parent=self,
+        )
+        self._milestone_file_edit.changed.connect(self.changed)
+        self._milestone_file_label = QLabel("Milestone file")
+        form.addRow(self._milestone_file_label, self._milestone_file_edit)
+
+        # ── Position & size (stored internally; dragged via overlay) ──────────
+        self._combo_x = float(config.get("combo_x", 0.85) or 0.85)
+        self._combo_y = float(config.get("combo_y", 0.08) or 0.08)
+        self._combo_w = float(config.get("combo_w", 0.13) or 0.13)
+        self._combo_h = float(config.get("combo_h", 0.18) or 0.18)
+
+        # ── Style groupbox ────────────────────────────────────────────────────
+        self._style_group = QGroupBox("Style", self)
+        style_form = QFormLayout(self._style_group)
+        style_form.setContentsMargins(8, 8, 8, 8)
+        style_form.setSpacing(6)
+
+        self._border_sp = QDoubleSpinBox()
+        self._border_sp.setRange(0.0, 10.0)
+        self._border_sp.setSingleStep(0.5)
+        self._border_sp.setDecimals(1)
+        self._border_sp.setValue(float(config.get("combo_border_thickness", 2.0) or 2.0))
+        self._border_sp.setToolTip("Text border thickness (0 = none)")
+        self._border_sp.valueChanged.connect(self.changed)
+        style_form.addRow("Border thickness", self._border_sp)
+
+        self._glow_sp = QSpinBox()
+        self._glow_sp.setRange(0, 100)
+        self._glow_sp.setSingleStep(5)
+        self._glow_sp.setSuffix(" %")
+        self._glow_sp.setValue(
+            int(round(float(config.get("combo_glow_strength", 30.0) or 30.0)))
+        )
+        self._glow_sp.setToolTip("Glow intensity (0 = off)")
+        self._glow_sp.valueChanged.connect(self.changed)
+        style_form.addRow("Glow strength", self._glow_sp)
+
+        form.addRow(self._style_group)
+
+        # ── Tier milestones groupbox ──────────────────────────────────────────
+        self._tier_group = QGroupBox("Tier milestones", self)
+        tier_form = QFormLayout(self._tier_group)
+        tier_form.setContentsMargins(8, 10, 8, 8)
+        tier_form.setSpacing(6)
+
+        _tier_defaults = [
+            (30, "Great"),
+            (60, "Superb"),
+            (90, "Perfect"),
+            (120, "Godlike"),
+        ]
+        self._tier_widgets: list[tuple[QSpinBox, QLineEdit]] = []
+        for i, (def_thresh, def_label) in enumerate(_tier_defaults, 1):
+            thresh_sp = QSpinBox()
+            thresh_sp.setRange(0, 9999)
+            thresh_sp.setValue(int(config.get(f"combo_tier{i}_threshold", def_thresh) or def_thresh))
+            thresh_sp.setToolTip("Combo count to activate this tier (0 = disabled)")
+            thresh_sp.valueChanged.connect(self.changed)
+
+            label_edit = QLineEdit(str(config.get(f"combo_tier{i}_label", def_label) or def_label))
+            label_edit.setMaxLength(20)
+            label_edit.setPlaceholderText(f"e.g. {def_label}")
+            label_edit.textChanged.connect(self.changed)
+
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(6)
+            row_l.addWidget(thresh_sp, 1)
+            row_l.addWidget(label_edit, 2)
+            tier_form.addRow(f"Tier {i} ≥", row_w)
+            self._tier_widgets.append((thresh_sp, label_edit))
+
+        hint = QLabel("<i>Set threshold = 0 to disable a tier.</i>")
+        hint.setStyleSheet("color: #888;")
+        tier_form.addRow(hint)
+        form.addRow(self._tier_group)
+
+        self._update_audio_visibility()
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _refresh_color_btn(self) -> None:
+        c = QColor(self._color)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = "#000000" if lum > 128 else "#ffffff"
+        self._color_btn.setStyleSheet(
+            f"background-color:{self._color};color:{fg};border:1px solid #555;"
+        )
+        self._color_btn.setText(self._color.upper())
+
+    def _pick_color(self) -> None:
+        color = _pick_color(self._color, "Combo color", self)
+        if color:
+            self._color = color
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _on_audio_toggle(self) -> None:
+        self._update_audio_visibility()
+        self.changed.emit()
+
+    def _on_audio_mode_changed(self) -> None:
+        self._update_audio_visibility()
+        self.changed.emit()
+
+    def _update_audio_visibility(self) -> None:
+        enabled = self._audio_enabled_cb.isChecked()
+        mode = self._normalize_audio_mode(self._audio_mode_cb.currentData())
+        ms_mode = self._normalize_milestone_mode(self._milestone_mode_cb.currentData())
+
+        self._audio_mode_label.setVisible(enabled)
+        self._audio_mode_cb.setVisible(enabled)
+        self._audio_volume_label.setVisible(enabled)
+        self._audio_volume_sp.setVisible(enabled)
+        self._milestone_mode_label.setVisible(enabled)
+        self._milestone_mode_cb.setVisible(enabled)
+
+        self._audio_file_label.setVisible(enabled and mode == "file")
+        self._audio_file_edit.setVisible(enabled and mode == "file")
+        self._milestone_file_label.setVisible(enabled and ms_mode == "file")
+        self._milestone_file_edit.setVisible(enabled and ms_mode == "file")
+
+    def set_bbox(self, x: float, y: float, w: float, h: float) -> None:
+        """Called by overlay drag to update internal bbox without UI rebuild."""
+        self._combo_x = float(x)
+        self._combo_y = float(y)
+        self._combo_w = float(w)
+        self._combo_h = float(h)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_config(self) -> dict:
+        cfg: dict = {
+            "combo_enabled": self._enabled_cb.isChecked(),
+            "combo_color": self._color,
+            "combo_font_family": self._font_cb.currentData() or "duplex",
+            "combo_label": self._label_edit.text().strip() or "COMBO",
+            "combo_fade_after_break_sec": self._fade_sp.value(),
+            "combo_anim": self._normalize_anim(self._anim_cb.currentData()),
+            "combo_audio_enabled": self._audio_enabled_cb.isChecked(),
+            "combo_audio_mode": self._normalize_audio_mode(self._audio_mode_cb.currentData()),
+            "combo_audio_file": self._audio_file_edit.get_value(),
+            "combo_audio_volume": self._audio_volume_sp.value(),
+            "combo_audio_milestone_mode": self._normalize_milestone_mode(
+                self._milestone_mode_cb.currentData()
+            ),
+            "combo_audio_milestone_file": self._milestone_file_edit.get_value(),
+            "combo_x": self._combo_x,
+            "combo_y": self._combo_y,
+            "combo_w": self._combo_w,
+            "combo_h": self._combo_h,
+            "combo_border_thickness": self._border_sp.value(),
+            "combo_glow_strength": float(self._glow_sp.value()),
+        }
+        for i, (thresh_sp, label_edit) in enumerate(self._tier_widgets, 1):
+            cfg[f"combo_tier{i}_threshold"] = thresh_sp.value()
+            cfg[f"combo_tier{i}_label"] = label_edit.text().strip() or f"Tier{i}"
+        return cfg

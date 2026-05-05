@@ -419,10 +419,11 @@ def test_migration_on_load_old_project():
 
 
 def test_auto_create_does_not_include_side_rails_countdown_start_gate():
-    """Side rails, countdown, and start gate are NOT auto-created."""
+    """Side rails, countdown, start gate, and combo are NOT auto-created."""
     proj, seg = _proj_with_seg(0.0, 30.0)
     auto_create_default_layers(proj, seg)
     kinds = {la.kind for la in proj.layers}
     assert "side_rails" not in kinds
     assert "countdown" not in kinds
     assert "start_gate" not in kinds
+    assert "combo" not in kinds

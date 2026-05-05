@@ -139,6 +139,37 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     start_gate_w: float = Field(default=0.40, ge=0.02, le=1.0)
     start_gate_h: float = Field(default=0.14, ge=0.03)
     viewport_panel_depth: Optional[float] = None  # None = use mode default (0.6 punch / tile-depth dance)
+    # ── Combo HUD (applicable to all modes) ─────────────────────────────────
+    combo_enabled: bool = True
+    combo_color: str = "#FFFFFF"
+    combo_label: str = "COMBO"
+    combo_font_family: Literal[
+        "simplex", "plain", "duplex", "complex", "triplex",
+        "complex_small", "script_simplex", "script_complex"
+    ] = "duplex"
+    combo_fade_after_break_sec: float = Field(default=0.5, ge=0.0, le=10.0)
+    combo_anim: Literal["pop", "flash", "fade_cross", "shake"] = "pop"
+    combo_audio_enabled: bool = False
+    combo_audio_mode: Literal["default", "file"] = "default"
+    combo_audio_file: Optional[str] = None
+    combo_audio_volume: float = Field(default=0.65, ge=0.0, le=1.0)
+    combo_audio_milestone_mode: Literal["default", "file", "same"] = "default"
+    combo_audio_milestone_file: Optional[str] = None
+    combo_x: float = Field(default=0.85, ge=0.0, le=1.0)
+    combo_y: float = Field(default=0.08, ge=0.0, le=1.0)
+    combo_w: float = Field(default=0.13, ge=0.05, le=0.5)
+    combo_h: float = Field(default=0.18, ge=0.03, le=0.3)
+    combo_border_thickness: float = Field(default=2.0, ge=0.0, le=10.0)
+    combo_glow_strength: float = Field(default=30.0, ge=0.0, le=100.0)
+    # Tier milestones — threshold = 0 to disable tier
+    combo_tier1_threshold: int = Field(default=30, ge=0, le=9999)
+    combo_tier1_label: str = "Great"
+    combo_tier2_threshold: int = Field(default=60, ge=0, le=9999)
+    combo_tier2_label: str = "Superb"
+    combo_tier3_threshold: int = Field(default=90, ge=0, le=9999)
+    combo_tier3_label: str = "Perfect"
+    combo_tier4_threshold: int = Field(default=120, ge=0, le=9999)
+    combo_tier4_label: str = "Godlike"
 
 
 class PunchSettings(BaseRenderSettings):
