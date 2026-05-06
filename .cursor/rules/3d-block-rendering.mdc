@@ -1,0 +1,101 @@
+# 3D Block Rendering — Nguyên lý vẽ khối
+
+Quy tắc bắt buộc khi vẽ bất kỳ block/cube/slab nào trên canvas (OpenCV). Áp dụng cho mọi hình dạng và kích thước — chỉ thay đổi shape/size, KHÔNG thay đổi nguyên lý màu sắc và phối cảnh.
+
+## 1. Cấu trúc 3 mặt nhìn thấy
+
+Mỗi block luôn có tối đa 3 mặt hiển thị:
+- **Top face** (mặt trên): sáng nhất, là mặt chính
+- **Front face** (mặt trước, hướng camera): tối hơn top
+- **Side face** (cạnh bên): tối nhất, chỉ hiển thị 1 bên dựa vào vị trí block
+
+## 2. Nguyên lý sáng tối (KHÔNG ĐƯỢC THAY ĐỔI)
+
+Cho `base` = màu gốc BGR của block:
+
+```python
+# Top face: sáng, saturated (90% base + 10% white)
+top_col = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
+
+# Side/front face: tối hơn (~50% base)
+side_col = tuple(int(c * 0.50) for c in base)
+
+# depth_gain điều chỉnh theo khoảng cách (xa = tối hơn)
+depth_gain = 0.70 + 0.30 * (1.0 - z_norm)  # range [0.70, 1.0]
+
+# Áp dụng depth_gain khi vẽ:
+top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)       # sáng nhất
+front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)  # trung bình
+side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)      # tối nhất
+```
+
+Tỉ lệ sáng: **top > front (×1.15) > side**
+
+## 3. Quy tắc hiển thị cạnh bên (perspective-correct)
+
+Dựa vào vị trí block trên screen so với vanishing point (camera center X):
+
+```python
+block_screen_cx = float(pts[:, 0].mean())
+cam_cx = getattr(cam, 'cx_pix', W / 2.0)
+
+if block_screen_cx < cam_cx - 2:
+    # Block ở BÊN TRÁI → viewer nhìn thấy cạnh PHẢI
+    # Vẽ right_face = [fr, br, br+ex, fr+ex]
+elif block_screen_cx > cam_cx + 2:
+    # Block ở BÊN PHẢI → viewer nhìn thấy cạnh TRÁI
+    # Vẽ left_face = [bl, fl, fl+ex, bl+ex]
+# Block ở giữa (±2px): chỉ vẽ front + top
+```
+
+**KHÔNG BAO GIỜ** vẽ cả 2 cạnh bên cùng lúc.
+
+## 4. Thứ tự vẽ (Painter's Algorithm)
+
+Luôn vẽ theo thứ tự xa → gần:
+1. **Side face** (xa nhất, bị che 1 phần)
+2. **Front face** (giữa)
+3. **Top face** (gần nhất, trên cùng)
+
+## 5. Glow effect (ánh sáng tỏa)
+
+Block phải có glow additive tỏa ra xung quanh (chiếu sáng sàn):
+
+```python
+glow_src = np.zeros((H, W), dtype=np.uint8)
+cv2.fillConvexPoly(glow_src, pts, 255, lineType=cv2.LINE_AA)
+glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in top_col], dtype=np.float32)
+for k, w in ((101, 0.28), (61, 0.35), (31, 0.30), (15, 0.20)):
+    gb = cv2.GaussianBlur(glow_src, (k | 1, k | 1), 0)
+    a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (w * depth_gain)
+    canvas[:] = np.clip(canvas.astype(np.float32) + glow_bgr * a3, 0, 255).astype(np.uint8)
+```
+
+Glow vẽ **TRƯỚC** tất cả các mặt solid.
+
+## 6. Extrusion (độ dày khối)
+
+```python
+fwd_n = (front_c - back_c) / (norm + 1e-6)
+extrude = max(6, int(norm * THICKNESS_RATIO))  # THICKNESS_RATIO tùy loại block
+ex = (fwd_n * extrude).astype(np.int32)
+```
+
+`THICKNESS_RATIO` có thể thay đổi theo loại block (mặc định 0.22).
+
+## 7. Cấm tuyệt đối
+
+- ❌ Vẽ cả left_face VÀ right_face cho cùng 1 block
+- ❌ Vẽ viền/rim bao quanh tất cả các mặt (phá vỡ 3D)
+- ❌ Thay đổi tỉ lệ sáng tối giữa các mặt (top 90%+10%white, side 50% base)
+- ❌ Vẽ seam line (đường viền đen) giữa các mặt
+- ❌ Bỏ glow effect
+- ❌ Đảo thứ tự vẽ (top phải luôn vẽ cuối cùng)
+
+## 8. Được phép thay đổi
+
+- ✅ Hình dạng block (hình vuông, hình chữ nhật, hình thoi, bo góc...)
+- ✅ Kích thước (HALF_X, HALF_Z, THICKNESS_RATIO)
+- ✅ Màu base (self.color)
+- ✅ Glow kernel sizes/weights (tùy kích thước block)
+- ✅ Thêm icon/texture lên top face

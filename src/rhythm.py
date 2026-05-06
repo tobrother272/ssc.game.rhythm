@@ -1319,11 +1319,32 @@ class TunnelRenderer:
             l_xb1 = int(cam.lane_x(i + 0.5, 0.12))
             poly = np.array([(l_x0, y), (l_x1, y),
                              (l_xb1, y_back), (l_xb0, y_back)], dtype=np.int32)
-            # translucent fill
-            overlay = canvas.copy()
-            cv2.fillPoly(overlay, [poly], (50, 40, 15))
-            canvas = cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0)
-            cv2.polylines(canvas, [poly], True, CLR_LANE_EDGE, 2, lineType=cv2.LINE_AA)
+            # Gradient fill (top brighter, bottom darker) + slight side vignette.
+            mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            x, y0, w, h = cv2.boundingRect(poly)
+            if w > 0 and h > 0:
+                gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+                gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
+                top = np.array([82.0, 82.0, 82.0], dtype=np.float32)
+                bot = np.array([42.0, 42.0, 42.0], dtype=np.float32)
+                grad = top * (1.0 - gy) + bot * gy
+                grad = np.repeat(grad, w, axis=1)
+                grad *= (1.0 - 0.18 * gx)  # darker toward left/right edges
+                grad = np.clip(grad, 0, 255).astype(np.uint8)
+
+                fill_layer = np.zeros_like(canvas)
+                fill_layer[y0:y0 + h, x:x + w] = grad
+                alpha = 0.78
+                roi = mask > 0
+                canvas[roi] = (
+                    canvas[roi].astype(np.float32) * (1.0 - alpha)
+                    + fill_layer[roi].astype(np.float32) * alpha
+                ).astype(np.uint8)
+
+            # Edge treatment: dark outer + light inner for depth.
+            cv2.polylines(canvas, [poly], True, (26, 26, 26), 2, lineType=cv2.LINE_AA)
+            cv2.polylines(canvas, [poly], True, (120, 120, 120), 1, lineType=cv2.LINE_AA)
         return canvas
 
 
@@ -2829,80 +2850,63 @@ class DanceTarget(Target):
         if xs.max() < 0 or xs.min() >= W or ys.max() < 0 or ys.min() >= H:
             return
 
-        # Proximity gain: closer tiles glow brighter, far ones dim toward
-        # the tunnel floor so they don't fight the foreground for attention.
-        depth_gain = 0.35 + 0.65 * (1.0 - z_norm)
+        depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
 
-        base = tuple(int(c) for c in self.color)          # lane BGR
-        # Neon "hot" version of the lane color (lerp toward white).
-        neon = tuple(int(min(255, c * 0.30 + 255 * 0.70)) for c in base)
-        # Dark outline version for the back of the rim.
-        dark = tuple(int(c * 0.35) for c in base)
+        base = tuple(int(c) for c in self.color)
+        # Top face: near-full saturation (90% base + 10% white for punch)
+        top_col = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
+        # Side/front face: medium-dark (~50% of top)
+        side_col = tuple(int(c * 0.50) for c in base)
 
-        # 1) Outer soft glow — two passes at different widths, alpha-blended
-        #    so the tile "bleeds" onto the surrounding tunnel floor.
-        glow_col = tuple(int(c * depth_gain) for c in neon)
-        for gw, base_a in ((14, 0.22), (7, 0.38)):
-            a = base_a * depth_gain
-            if a < 0.02:
-                continue
-            overlay = canvas.copy()
-            cv2.polylines(overlay, [pts], True, glow_col,
-                          gw, lineType=cv2.LINE_AA)
-            cv2.addWeighted(overlay, a, canvas, 1.0 - a, 0, dst=canvas)
+        # ── 0) Strong glow: large spread illuminating floor ──────────────────
+        glow_src = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(glow_src, pts, 255, lineType=cv2.LINE_AA)
+        glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in top_col],
+                            dtype=np.float32)
+        for k, w in ((101, 0.28), (61, 0.35), (31, 0.30), (15, 0.20)):
+            gb = cv2.GaussianBlur(glow_src, (k | 1, k | 1), 0)
+            a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (w * depth_gain)
+            canvas[:] = np.clip(canvas.astype(np.float32) + glow_bgr * a3,
+                                0, 255).astype(np.uint8)
 
-        # 2) Main tile fill — translucent bright color so the tunnel floor
-        #    still shows a faint grid through the pad (reference look).
-        mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, pts, 255)
-        idx = mask > 0
-        if not idx.any():
-            return
-        fill_col = np.array(
-            [c * depth_gain for c in base], dtype=np.float32)
-        fill_a = 0.55 + 0.30 * depth_gain
-        canvas[idx] = (canvas[idx].astype(np.float32) * (1.0 - fill_a)
-                       + fill_col * fill_a).astype(np.uint8)
+        # ── 1) 3D extrusion geometry ─────────────────────────────────────────
+        fl, fr, br, bl = pts[0], pts[1], pts[2], pts[3]
+        front_c = np.array([(fl[0] + fr[0]) * 0.5, (fl[1] + fr[1]) * 0.5],
+                           dtype=np.float32)
+        back_c  = np.array([(bl[0] + br[0]) * 0.5, (bl[1] + br[1]) * 0.5],
+                           dtype=np.float32)
+        fwd_n   = (front_c - back_c) / (np.linalg.norm(front_c - back_c) + 1e-6)
+        extrude = max(6, int(np.linalg.norm(front_c - back_c) * 0.22))
+        ex = np.array([fwd_n[0] * extrude, fwd_n[1] * extrude]).astype(np.int32)
 
-        # 3) Inner "hot" highlight — a shrunken trapezoid biased toward the
-        #    FRONT edge (closer to camera) so the tile reads as a lit-up
-        #    pad instead of a flat sticker.
-        cx_px = float(pts[:, 0].mean())
-        cy_px = float(pts[:, 1].mean())
-        front_cx = (pts[0][0] + pts[1][0]) * 0.5
-        front_cy = (pts[0][1] + pts[1][1]) * 0.5
-        # Shift the shrink center 25% toward the front edge.
-        sc_x = cx_px * 0.75 + front_cx * 0.25
-        sc_y = cy_px * 0.75 + front_cy * 0.25
-        shrink = 0.65
-        inner = np.array([
-            (int(round(sc_x + (p[0] - sc_x) * shrink)),
-             int(round(sc_y + (p[1] - sc_y) * shrink)))
-            for p in pts
-        ], dtype=np.int32)
-        inner_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillConvexPoly(inner_mask, inner, 255)
-        idx2 = inner_mask > 0
-        if idx2.any():
-            hot = np.array(
-                [min(255, c * 0.40 + 255 * 0.55 * depth_gain) for c in base],
-                dtype=np.float32)
-            hot_a = 0.35 * depth_gain
-            canvas[idx2] = (canvas[idx2].astype(np.float32) * (1.0 - hot_a)
-                            + hot * hot_a).astype(np.uint8)
+        # Determine which side face is visible based on block position
+        # relative to vanishing point (camera center X)
+        block_screen_cx = float(pts[:, 0].mean())
+        cam_cx = getattr(cam, 'cx_pix', W / 2.0)
 
-        # 4) Crisp neon rim so the tile edges are unambiguous (the
-        #    reference video has a sharp bright border around each pad).
-        rim_col = tuple(int(min(255, c * 0.20 + 255 * 0.80 * depth_gain))
-                        for c in base)
-        rim_w = max(2, int(round(3 * depth_gain + 1)))
-        cv2.polylines(canvas, [pts], True, rim_col, rim_w,
-                      lineType=cv2.LINE_AA)
-        # Darker inner shadow line just below the neon rim — sells the
-        # "recessed into the floor" look.
-        cv2.polylines(canvas, [pts], True, dark, 1, lineType=cv2.LINE_AA)
+        # Front face quad (always visible)
+        front_face = np.array([fl, fr, fr + ex, fl + ex], dtype=np.int32)
 
-        # 5) Footprint / stomp icon in the middle of the tile.
+        side_scaled = tuple(int(min(255, c * depth_gain)) for c in side_col)
+        front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)
+
+        if block_screen_cx < cam_cx - 2:
+            # Block is LEFT of center → viewer sees RIGHT side face
+            right_face = np.array([fr, br, br + ex, fr + ex], dtype=np.int32)
+            cv2.fillConvexPoly(canvas, right_face, side_scaled, lineType=cv2.LINE_AA)
+        elif block_screen_cx > cam_cx + 2:
+            # Block is RIGHT of center → viewer sees LEFT side face
+            left_face = np.array([bl, fl, fl + ex, bl + ex], dtype=np.int32)
+            cv2.fillConvexPoly(canvas, left_face, side_scaled, lineType=cv2.LINE_AA)
+
+        # Front face (always visible, slightly brighter than sides)
+        cv2.fillConvexPoly(canvas, front_face, front_scaled, lineType=cv2.LINE_AA)
+
+        # ── 2) Top face: bright saturated fill ───────────────────────────────
+        top_scaled = tuple(int(min(255, c * depth_gain)) for c in top_col)
+        cv2.fillConvexPoly(canvas, pts, top_scaled, lineType=cv2.LINE_AA)
+
+        # ── 3) Footprint icon ────────────────────────────────────────────────
         self._draw_stomp_icon(canvas, pts, depth_gain)
 
     # ------------------------------------------------------------------
@@ -2931,7 +2935,8 @@ class DanceTarget(Target):
         ang = math.degrees(math.atan2(fwd[1], fwd[0]))
         fw_u = fwd / (np.linalg.norm(fwd) + 1e-6)
 
-        icon_col = (18, 18, 18)   # near-black → strong contrast vs. neon
+        # Draw icon into a separate mask, then blur/blend as a soft shadow.
+        icon_mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
 
         # Heel ellipse: centered slightly backward from tile center.
         heel_off = tile_len * 0.10
@@ -2939,9 +2944,8 @@ class DanceTarget(Target):
         heel_cy = int(cy - fw_u[1] * heel_off)
         heel_rx = max(3, int(tile_len * 0.22))   # along fwd
         heel_ry = max(3, int(front_w * 0.20))    # across fwd
-        cv2.ellipse(canvas, (heel_cx, heel_cy),
-                    (heel_rx, heel_ry), ang, 0, 360,
-                    icon_col, -1, cv2.LINE_AA)
+        cv2.ellipse(icon_mask, (heel_cx, heel_cy),
+                    (heel_rx, heel_ry), ang, 0, 360, 255, -1, cv2.LINE_AA)
 
         # Toe pad: smaller ellipse forward of the heel, with a visible gap.
         toe_off = tile_len * 0.22
@@ -2949,9 +2953,20 @@ class DanceTarget(Target):
         toe_cy = int(cy + fw_u[1] * toe_off)
         toe_rx = max(2, int(tile_len * 0.10))
         toe_ry = max(2, int(front_w * 0.15))
-        cv2.ellipse(canvas, (toe_cx, toe_cy),
-                    (toe_rx, toe_ry), ang, 0, 360,
-                    icon_col, -1, cv2.LINE_AA)
+        cv2.ellipse(icon_mask, (toe_cx, toe_cy),
+                    (toe_rx, toe_ry), ang, 0, 360, 255, -1, cv2.LINE_AA)
+
+        # Soft shadow pass (blurry, reference-like)
+        k = max(5, int(min(tile_len, front_w) * 0.18)) | 1
+        blur = cv2.GaussianBlur(icon_mask, (k, k), 0)
+        a = (blur.astype(np.float32) / 255.0) * (0.55 + 0.20 * depth_gain)
+        a3 = a[:, :, None]
+        canvas[:] = np.clip(canvas.astype(np.float32) * (1.0 - a3), 0, 255).astype(np.uint8)
+
+        # Core footprint to keep the icon readable after blur.
+        core_a = (icon_mask.astype(np.float32) / 255.0) * (0.22 + 0.10 * depth_gain)
+        core3 = core_a[:, :, None]
+        canvas[:] = np.clip(canvas.astype(np.float32) * (1.0 - core3), 0, 255).astype(np.uint8)
 
 
 def _rounded_rect_points(x1: int, y1: int, x2: int, y2: int,
@@ -4647,13 +4662,30 @@ class ViewportFrame:
             offset = np.array([int(round(jx)), int(round(jy))], dtype=np.int32)
             pts = poly + offset
 
-            # Dark semi-transparent interior so tunnel floor shows through.
+            # Gradient interior (top brighter, bottom darker, side vignette)
+            # to match the sample style even in idle state.
             mask = np.zeros((H, W), dtype=np.uint8)
             cv2.fillConvexPoly(mask, pts, 255)
-            idx = mask > 0
-            if idx.any():
-                canvas[idx] = (canvas[idx].astype(np.float32) * 0.45
-                               ).astype(np.uint8)
+            x, y0, w, h = cv2.boundingRect(pts)
+            if w > 0 and h > 0:
+                gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+                gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
+                top = np.array([92.0, 92.0, 92.0], dtype=np.float32)
+                bot = np.array([40.0, 40.0, 40.0], dtype=np.float32)
+                grad = top * (1.0 - gy) + bot * gy
+                grad = np.repeat(grad, w, axis=1)
+                grad *= (1.0 - 0.16 * gx)
+                grad = np.clip(grad, 0, 255).astype(np.uint8)
+
+                fill_layer = np.zeros_like(canvas)
+                fill_layer[y0:y0 + h, x:x + w] = grad
+                idx = mask > 0
+                if idx.any():
+                    fill_alpha = 0.74 if active else 0.58
+                    canvas[idx] = (
+                        canvas[idx].astype(np.float32) * (1.0 - fill_alpha)
+                        + fill_layer[idx].astype(np.float32) * fill_alpha
+                    ).astype(np.uint8)
 
             if active:
                 # Neon glow — alpha modulated by amp so it fades with decay.
@@ -4669,9 +4701,10 @@ class ViewportFrame:
 
                 # Crisp neon border (color lerped from dim grey → amber).
                 mix = min(1.0, amp * 1.4)
+                # Keep border darker so panels blend better with background.
                 border_col = tuple(
                     int(self._idle_col[i] * (1 - mix)
-                        + self._neon_col[i] * mix)
+                        + (self._neon_col[i] * 0.58) * mix)
                     for i in range(3))
                 cv2.polylines(canvas, [pts], True, border_col, 2,
                               lineType=cv2.LINE_AA)
@@ -4697,9 +4730,9 @@ class ViewportFrame:
                          (ccx - tick_w, ccy), (ccx + tick_w, ccy),
                          acc_col, 2, cv2.LINE_AA)
             else:
-                # Idle: just a thin faint grey outline — no glow, no tick.
-                cv2.polylines(canvas, [pts], True, self._idle_col, 1,
-                              lineType=cv2.LINE_AA)
+                # Idle: darker dual-edge outline to avoid popping from background.
+                cv2.polylines(canvas, [pts], True, (16, 16, 16), 2, lineType=cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], True, (78, 78, 78), 1, lineType=cv2.LINE_AA)
 
         return canvas
 
