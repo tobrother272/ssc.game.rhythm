@@ -45,7 +45,7 @@ class SideRailMixin(BaseModel):
     rail_texture_non_loop: bool = False
     rail_pulse: RailPulse = RailPulse.BEAT
     rail_pulse_intensity: float = 0.6
-    rail_pillar_count: int = Field(default=16, ge=4, le=32)
+    rail_pillar_count: int = Field(default=40, ge=4, le=100)
     rail_pillar_highlight_count: int = Field(default=1, ge=1, le=32)
     rail_pillar_radius: float = Field(default=1.0, ge=0.2, le=2.0)
     rail_chase_mode: Literal["time", "beat"] = "time"

@@ -81,7 +81,7 @@ def _fft_blur_gpu(arr_gpu, sigma_y: float, sigma_x: float):
     return cp.real(cp.fft.ifft2(cp.fft.fft2(ch) * k_fft)).astype(cp.float32)
 
 
-def gpu_glow(canvas: np.ndarray, sigma: float = 18.0, gain: float = 0.55) -> np.ndarray:
+def gpu_glow(canvas: np.ndarray, sigma: float = 24.0, gain: float = 0.75) -> np.ndarray:
     """Additive bloom glow for whole frame (screen-space bloom)."""
     if not _CUPY:
         ks = max(3, int(6 * sigma + 1) | 1)
@@ -2088,10 +2088,132 @@ def _draw_fist_icon(canvas: np.ndarray, cx: int, cy: int, size: int,
                   color, -1, lineType=cv2.LINE_AA)
 
 
+def _draw_fist_icon_v2(canvas: np.ndarray, cx: int, cy: int, size: int,
+                       color=CLR_WHITE):
+    """Bold single-polygon fist silhouette on the FRONT face.
+
+    Layout: 4 knuckle bumps on top, palm body, thumb on left.
+    Matches reference image — one filled shape, no separate parts.
+    """
+    if size < 8:
+        return
+    s = float(size)
+    pts = []
+    # Palm top-left start
+    pts.append((-0.40, -0.10))
+    # 4 knuckle bumps
+    k_y_base = -0.20
+    k_y_top  = -0.42
+    k_xs     = [-0.30, -0.10, 0.10, 0.30]
+    k_hw     = 0.09
+    for kx in k_xs:
+        pts.append((kx - k_hw, k_y_base))
+        pts.append((kx - k_hw, k_y_top))
+        pts.append((kx + k_hw, k_y_top))
+        pts.append((kx + k_hw, k_y_base))
+    pts.append((0.40, -0.10))
+    pts.append((0.42,  0.20))
+    pts.append((0.36,  0.36))
+    pts.append((0.20,  0.42))
+    pts.append((-0.20, 0.42))
+    pts.append((-0.36, 0.36))
+    pts.append((-0.42, 0.20))
+    pts.append((-0.40, 0.05))
+    # Thumb
+    pts.append((-0.50,  0.00))
+    pts.append((-0.55, -0.10))
+    pts.append((-0.50, -0.18))
+    pts.append((-0.40, -0.15))
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(canvas, [abs_pts], color, lineType=cv2.LINE_AA)
+    # Finger grooves (3 dark lines between 4 knuckles)
+    groove = tuple(int(c * 0.55) for c in color)
+    for kx in (-0.20, 0.00, 0.20):
+        x = int(cx + kx * s)
+        y0_g = int(cy - 0.38 * s)
+        y1_g = int(cy - 0.06 * s)
+        cv2.line(canvas, (x, y0_g), (x, y1_g), groove,
+                 max(1, int(s * 0.04)), lineType=cv2.LINE_AA)
+
+
+def _draw_fist_icon_simple_v2(canvas: np.ndarray, cx: int, cy: int, size: int,
+                               color=CLR_WHITE):
+    """Simplified bold fist for far/small blocks — knuckle bumps + palm."""
+    if size < 6:
+        return
+    s = float(size)
+    pts = [
+        (-0.35, -0.28), (-0.22, -0.40), (-0.08, -0.28),
+        (0.08, -0.40),  (0.22, -0.28),  (0.36, -0.40),
+        (0.40,  0.30),  (-0.40, 0.30),
+    ]
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(canvas, [abs_pts], color, lineType=cv2.LINE_AA)
+
+
+def _fill_rounded_quad(canvas: np.ndarray, pts, color, radius_frac: float,
+                       lineType: int = cv2.LINE_AA) -> None:
+    """Fill a 4-corner polygon with rounded corners.
+
+    Uses erode→dilate on a temp mask to round corners.
+    radius_frac: 0..0.45 fraction of shortest edge.
+    Falls back to fillConvexPoly when radius too small or ROI empty.
+    """
+    pts_i = np.array(pts, dtype=np.int32)
+    bx, by, bw, bh = cv2.boundingRect(pts_i)
+    if bw <= 0 or bh <= 0:
+        return
+    shortest = float(min(
+        np.linalg.norm(pts_i[1].astype(float) - pts_i[0].astype(float)),
+        np.linalg.norm(pts_i[2].astype(float) - pts_i[1].astype(float)),
+        np.linalg.norm(pts_i[3].astype(float) - pts_i[2].astype(float)),
+        np.linalg.norm(pts_i[0].astype(float) - pts_i[3].astype(float)),
+    ))
+    r = max(0, int(shortest * radius_frac))
+    if r < 2:
+        cv2.fillConvexPoly(canvas, pts_i, color, lineType=lineType)
+        return
+    H_c, W_c = canvas.shape[:2]
+    pad = r + 2
+    rx0 = max(0, bx - pad);  ry0 = max(0, by - pad)
+    rx1 = min(W_c, bx + bw + pad);  ry1 = min(H_c, by + bh + pad)
+    rw, rh = rx1 - rx0, ry1 - ry0
+    if rw <= 0 or rh <= 0:
+        return
+    mask = np.zeros((rh, rw), dtype=np.uint8)
+    pts_local = (pts_i - np.array([rx0, ry0])).astype(np.int32)
+    cv2.fillConvexPoly(mask, pts_local, 255, lineType=lineType)
+    ks = r * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    mask_rounded = cv2.dilate(cv2.erode(mask, kernel), kernel)
+    color_arr = np.array(color[:3], dtype=np.float32)
+    a = mask_rounded.astype(np.float32) / 255.0
+    roi = canvas[ry0:ry1, rx0:rx1].astype(np.float32)
+    a3 = a[:, :, np.newaxis]
+    canvas[ry0:ry1, rx0:rx1] = np.clip(
+        roi * (1.0 - a3) + color_arr * a3, 0, 255
+    ).astype(np.uint8)
+
+
 class PunchTarget(Target):
     """3-D neon cube with fist icon, or a textured 3-D cube when an image
-    is supplied. Left = green, right = red (if untextured).
+    is supplied.  Default color chosen from per-lane neon palette.
     """
+
+    # Per-lane neon palette (BGR).
+    # Lane 0, 1 (left pair) = blue; lane 2, 3 (right pair) = orange.
+    LANE_COLORS: dict = {
+        0: (230,  80,  30),   # blue  (BGR: high-B)
+        1: (230,  80,  30),   # blue
+        2: (  0, 140, 255),   # orange (BGR: high-R)
+        3: (  0, 140, 255),   # orange
+    }
 
     # Cube half-size in world units.  Previously 0.22 when punch ran in a
     # 2-lane layout; now trimmed to 0.154 (≈70% of the old size) so the
@@ -2100,7 +2222,7 @@ class PunchTarget(Target):
     CUBE_HALF = 0.154
     # Corner rounding for the default neon cubes (fraction of the shortest
     # projected face-edge; 0 = sharp corners, ~0.45 = pill-shaped).
-    CORNER_RADIUS: float = 0.18
+    CORNER_RADIUS: float = 0.08
     # Populated by RhythmVisualizer before render.
     TEXTURE_LEFT:  tuple | None = None
     TEXTURE_RIGHT: tuple | None = None
@@ -2129,6 +2251,15 @@ class PunchTarget(Target):
     # exact ``hit_frame`` (= UI beat-stick).  See ``check_hit`` for the
     # state machine that turns this into "vanish exactly on the beat".
     HIT_ARRIVAL_OFFSET: int = 2
+
+    def __init__(self, spawn_frame: int, hit_frame: int, lane: int,
+                 is_left: bool):
+        super().__init__(spawn_frame, hit_frame, lane, is_left)
+        # Override base color with lane-specific palette.
+        # Falls back to base (green/red) if lane index out of range.
+        lane_col = self.LANE_COLORS.get(lane)
+        if lane_col is not None:
+            self.color = lane_col
 
     def depth(self, cur_frame: int) -> float:
         """Override base depth so cube reaches panel HIT_ARRIVAL_OFFSET
@@ -2223,18 +2354,16 @@ class PunchTarget(Target):
                 or pts[:, 1].max() < 0 or pts[:, 1].min() >= H):
             return canvas
 
-        # Brightness model — rule §2 (NOT Lambert).
+        # Brightness model — rule §2 v2: stronger top/front contrast.
         base = tuple(int(c) for c in self.color)
-        top_col   = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
-        side_col  = tuple(int(c * 0.50) for c in base)
+        top_col   = tuple(int(min(255, c * 1.15 + 255 * 0.15)) for c in base)
+        side_col  = tuple(int(c * 0.45) for c in base)
         depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
 
-        # Rule §5 Quy tắc 4: glow vẽ TRƯỚC mọi face solid.
-        # Use convex hull of projected corners as the silhouette so the
-        # boundingRect tightly hugs the visible block (avoids glow
-        # padding around invisible back vertices).
-        hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.int32)
-        _draw_block_glow_roi(canvas, hull, top_col, depth_gain, z_norm)
+        # Rule §5: glow only from the TOP face (brightest face).
+        # Drawn BEFORE solid faces so it sits behind them as a halo.
+        top_face_glow = pts[[0, 1, 5, 4]]  # FLT FRT BRT BLT
+        _draw_block_glow_roi(canvas, top_face_glow, top_col, depth_gain, z_norm)
 
         # Custom-asset paths — keep proven texture/mesh renderers.
         # The new ROI glow above already drew the halo; these renderers
@@ -2262,31 +2391,41 @@ class PunchTarget(Target):
         # Apply depth_gain per rule §2 (top brightest, front=side*1.15,
         # side darkest).
         top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)
-        front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)
+        front_scaled = tuple(int(min(255, c * depth_gain * 1.30)) for c in side_col)
         side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)
 
         # Rule §3: perspective-correct side selection.
         block_screen_cx = float(pts[:, 0].mean())
         cam_cx = float(getattr(cam, 'cx_pix', W / 2.0))
 
-        # Rule §4 painter's order: side → front → top.
-        if block_screen_cx < cam_cx - 2:
+        # Rule §3 v2: ALWAYS render 1 side face — no dead zone at center.
+        # Side face is typically very thin (perspective) — skip rounding to
+        # avoid erosion artifacts on narrow polygons.
+        if block_screen_cx < cam_cx:
             cv2.fillConvexPoly(canvas, right_face, side_scaled, lineType=cv2.LINE_AA)
-        elif block_screen_cx > cam_cx + 2:
+        else:
             cv2.fillConvexPoly(canvas, left_face, side_scaled, lineType=cv2.LINE_AA)
-        cv2.fillConvexPoly(canvas, front_face, front_scaled, lineType=cv2.LINE_AA)
-        cv2.fillConvexPoly(canvas, top_face, top_scaled, lineType=cv2.LINE_AA)
+        _fill_rounded_quad(canvas, front_face, front_scaled, self.CORNER_RADIUS)
+        _fill_rounded_quad(canvas, top_face, top_scaled, self.CORNER_RADIUS)
 
-        # Fist icon on the TOP face.  Size scales with on-screen top edge.
-        top_w = int(max(
-            np.linalg.norm(top_face[1] - top_face[0]),
-            np.linalg.norm(top_face[2] - top_face[3]),
+        # Fist icon on the FRONT face (Fix #7 — faces camera directly).
+        front_w = int(max(
+            np.linalg.norm(front_face[1].astype(float) - front_face[0].astype(float)),
+            np.linalg.norm(front_face[2].astype(float) - front_face[3].astype(float)),
         ))
-        if top_w >= 22:
-            cx_top = int(top_face[:, 0].mean())
-            cy_top = int(top_face[:, 1].mean())
-            _draw_fist_icon(canvas, cx_top, cy_top,
-                            int(top_w * 0.58), CLR_WHITE)
+        front_h = int(max(
+            np.linalg.norm(front_face[2].astype(float) - front_face[1].astype(float)),
+            np.linalg.norm(front_face[3].astype(float) - front_face[0].astype(float)),
+        ))
+        if front_w >= 12:
+            cx_front = int(front_face[:, 0].mean())
+            cy_front = int(front_face[:, 1].mean())
+            if front_w >= 18:
+                icon_size = int(min(front_w, front_h) * 0.62)
+                _draw_fist_icon_v2(canvas, cx_front, cy_front, icon_size, CLR_WHITE)
+            else:
+                _draw_fist_icon_simple_v2(canvas, cx_front, cy_front,
+                                          int(front_w * 0.70), CLR_WHITE)
         return canvas
 
 
@@ -3672,7 +3811,7 @@ class RelaxTarget(Target):
         if tex is not None:
             self._draw_textured_quad(canvas, wall_poly, tex)
         else:
-            cv2.fillConvexPoly(canvas, wall_poly, CLR_WALL_PINK)
+            cv2.fillConvexPoly(canvas, wall_poly, CLR_WALL_PINK, lineType=cv2.LINE_AA)
             stripe_col = (15, 5, 25)
             for i in range(1, 24):
                 x = int(x_l + (x_r - x_l) * i / 24.0)
@@ -3794,7 +3933,7 @@ class RelaxTarget(Target):
         # --- TOP face: trapezoid from (front-top line) to (back-top line)
         top_poly = np.array([(x_l, y_t), (x_r, y_t),
                              (x_rb, y_tb), (x_lb, y_tb)], np.int32)
-        cv2.fillPoly(canvas, [top_poly], top_col)
+        cv2.fillPoly(canvas, [top_poly], top_col, lineType=cv2.LINE_AA)
 
         # Dark diagonal ribs that trace from the front edge back to
         # the vanishing point.  Drawn BEFORE the front face so the
@@ -3811,7 +3950,7 @@ class RelaxTarget(Target):
         # grooves wrapping from one face to the other.
         r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
         front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
-        cv2.fillPoly(canvas, [front_pts], front_col)
+        cv2.fillPoly(canvas, [front_pts], front_col, lineType=cv2.LINE_AA)
 
         # Vertical BLACK stripes on the front face at the SAME x-
         # positions as the top ribs (each front stripe is the
@@ -3867,12 +4006,12 @@ class RelaxTarget(Target):
         # ── TOP face (hidden / far side) — dark fill only, no ribs ───────
         top_poly = np.array([(x_l, y_t), (x_r, y_t),
                              (x_rb, y_tb), (x_lb, y_tb)], np.int32)
-        cv2.fillPoly(canvas, [top_poly], top_col)
+        cv2.fillPoly(canvas, [top_poly], top_col, lineType=cv2.LINE_AA)
 
         # ── BOTTOM face — trapezoid visible from below ────────────────────
         bot_poly = np.array([(x_l, y_b), (x_r, y_b),
                              (x_rb, y_bb), (x_lb, y_bb)], np.int32)
-        cv2.fillPoly(canvas, [bot_poly], bot_col)
+        cv2.fillPoly(canvas, [bot_poly], bot_col, lineType=cv2.LINE_AA)
 
         # Diagonal ribs on the bottom face, converging to vanishing point.
         # Each rib runs from the front-bottom edge backward — same x-coords
@@ -3884,7 +4023,7 @@ class RelaxTarget(Target):
         # ── FRONT face (rounded rectangle) ───────────────────────────────
         r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
         front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
-        cv2.fillPoly(canvas, [front_pts], front_col)
+        cv2.fillPoly(canvas, [front_pts], front_col, lineType=cv2.LINE_AA)
 
         # Vertical black stripes clipped to rounded silhouette.
         mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
@@ -3937,7 +4076,7 @@ class WallTarget(Target):
             np.array([(x_l, y_b), (x_r, y_b), (x_rb, y_bb), (x_lb, y_bb)], np.int32),
             np.array([(x_l, y_t), (x_r, y_t), (x_rb, y_tb), (x_lb, y_tb)], np.int32),
         ):
-            cv2.fillPoly(canvas, [poly_pts], (90, 30, 110))
+            cv2.fillPoly(canvas, [poly_pts], (90, 30, 110), lineType=cv2.LINE_AA)
 
         # front face with diagonal laser stripes
         front_poly = np.array([(x_l, y_t), (x_r, y_t),
@@ -3945,7 +4084,7 @@ class WallTarget(Target):
         mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [front_poly], 255)
         sub_region = np.zeros_like(canvas)
-        cv2.fillPoly(sub_region, [front_poly], (80, 20, 120))
+        cv2.fillPoly(sub_region, [front_poly], (80, 20, 120), lineType=cv2.LINE_AA)
         # draw diagonal stripes
         stripe_spacing = max(4, int(18 * s))
         xs_min = min(x_l, x_lb)
@@ -4064,7 +4203,7 @@ class SideRailRenderer:
         self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
         self._chev_depth   = float(max(0.1, chevron_depth))
         self._chev_density = int(max(2, min(20, chevron_density)))
-        self._pillar_count = max(4, min(32, int(pillar_count)))
+        self._pillar_count = max(4, min(100, int(pillar_count)))
         self._pillar_highlight_count = max(
             1, min(self._pillar_count, int(pillar_highlight_count))
         )
@@ -4266,8 +4405,7 @@ class SideRailRenderer:
             roi = canvas[y0:y1, x0:x1]
             roi[mask > 0] = warped[mask > 0]
         else:
-            cv2.fillPoly(canvas, [poly], bgr)
-        if glow and self._tex is None:
+            cv2.fillPoly(canvas, [poly], bgr, lineType=cv2.LINE_AA)
             col_arr = np.array([bgr[0], bgr[1], bgr[2]], dtype=np.float32)
             _draw_neon_edges(canvas, [poly], col_arr, 1)
 
@@ -4485,7 +4623,7 @@ class SideRailRenderer:
                 top_poly = np.array(top_pts, dtype=np.int32)
                 top_color = np.clip(face_color * 0.62, 0, 255).astype(np.float32)
                 bgr_top = (int(top_color[0]), int(top_color[1]), int(top_color[2]))
-                cv2.fillConvexPoly(canvas, top_poly, bgr_top)
+                cv2.fillConvexPoly(canvas, top_poly, bgr_top, lineType=cv2.LINE_AA)
                 if is_head:
                     _draw_neon_edges(canvas, [top_poly], face_color, 1)
 

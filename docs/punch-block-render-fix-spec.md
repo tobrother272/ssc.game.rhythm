@@ -1052,3 +1052,450 @@ for sx, sy, sb in self._star_field:
 ```
 
 Tôi đã chốt mọi quyết định. Bạn implement theo migration plan trên — bắt đầu từ Phase 1 (5 phút quick win) rồi từng phase một, test visual sau mỗi phase. Nếu phase nào ra kết quả không như spec mong đợi → ping tôi điều chỉnh.
+
+---
+
+# 🚨 ICON FIST V3 — CRITICAL REWRITE (current icon SAI HOÀN TOÀN concept)
+
+## Phát hiện sau khi user gửi screenshot hệ thống vs reference
+
+**Vấn đề chí mạng**: Code `_draw_fist_icon` hiện tại vẽ thành **TAY MỞ XÒE** chứ KHÔNG phải nắm đấm:
+- 4 knuckles được vẽ là 4 rectangle vertical CHĨA LÊN từ top palm → trông như 4 ngón tay duỗi
+- Concept hoàn toàn sai vs "punch" (đấm)
+
+Reference image rõ ràng là **closed fist** quay về camera:
+- 4 knuckles = 4 dome bumps trên TOP edge của fist body
+- Bên dưới có 3 finger grooves (đường rãnh dọc) → ngón tay cuộn lại
+- Thumb wrapped HORIZONTAL ở giữa fist (không phải bên trái)
+
+## So sánh visual specifications
+
+| Spec | Current (sai) | Target v3 (mẫu) |
+|---|---|---|
+| Concept | Open palm "STOP" | Closed fist "PUNCH" |
+| Knuckle direction | Vertical bars chĩa LÊN | Dome bumps trên top edge |
+| Finger representation | Không có (knuckles = ngón) | 3 vertical grooves dưới knuckles |
+| Thumb position | Bên TRÁI palm | Vắt NGANG giữa fist |
+| Thumb shape | Rectangle dọc | Bar ngang có taper bên phải |
+| Icon size vs face | 58% | **75%** |
+| Icon color | Trắng đặc | **Trắng fill + đen outline** |
+| Outline thickness | Không | ~5% size (bold) |
+| Detail level | Flat shapes | Outline + grooves + thumb wrap |
+
+## Spec helper FINAL — `_draw_fist_icon_v3`
+
+```python
+def _draw_fist_icon_v3(canvas: np.ndarray, cx: int, cy: int, size: int,
+                       outline_color=(20, 20, 20),
+                       fill_color=(245, 245, 245)) -> None:
+    """Closed fist icon — match reference image (knuckles + grooves + thumb wrap).
+
+    Layout viewed from front:
+      ╭──╮╭──╮╭──╮╭──╮     ← 4 knuckle bumps (top)
+      │              │     ← fist body
+      │  ┃   ┃   ┃   │     ← 3 finger grooves
+      │  ╭─────╮     │     ← thumb wrap (horizontal)
+      │  ╰─────╯     │
+      ╰──────────────╯     ← bottom rounded
+
+    Args:
+        size: tổng chiều rộng icon (px). Skip nếu < 8.
+        outline_color: BGR cho outline + grooves (default near-black)
+        fill_color: BGR cho fill bên trong (default near-white)
+    """
+    if size < 8:
+        return
+    s = size
+
+    # ── Outline polygon vertices (relative to center, normalized to size) ──
+    knuckle_top  = -0.42
+    knuckle_base = -0.28
+    knuckle_xs   = [-0.30, -0.10, 0.10, 0.30]
+    knuckle_w    = 0.14
+
+    pts_norm = []
+    pts_norm.append((-0.40, -0.20))   # top-left fist body
+
+    for kx in knuckle_xs:
+        x_l = kx - knuckle_w / 2
+        x_r = kx + knuckle_w / 2
+        # Dome: left-base → top-mid → right-base (3 verts)
+        pts_norm.append((x_l, knuckle_base))
+        pts_norm.append((kx,  knuckle_top))
+        pts_norm.append((x_r, knuckle_base))
+
+    pts_norm.append((0.40, -0.20))    # top-right
+    pts_norm.append((0.44, 0.10))     # right-mid
+    pts_norm.append((0.40, 0.38))     # bottom-right rounded
+    pts_norm.append((0.20, 0.44))     # bottom-right curve
+    pts_norm.append((-0.20, 0.44))    # bottom-left curve
+    pts_norm.append((-0.40, 0.38))    # bottom-left rounded
+    pts_norm.append((-0.44, 0.10))    # left-mid
+
+    # Convert to absolute pixel coords
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts_norm],
+        dtype=np.int32,
+    )
+
+    # ── 1) Fill body ────────────────────────────────────────
+    cv2.fillPoly(canvas, [abs_pts], fill_color, lineType=cv2.LINE_AA)
+
+    # ── 2) Bold outline ─────────────────────────────────────
+    outline_thickness = max(2, int(s * 0.055))
+    cv2.polylines(canvas, [abs_pts], isClosed=True, color=outline_color,
+                  thickness=outline_thickness, lineType=cv2.LINE_AA)
+
+    # ── 3) Finger grooves (3 vertical lines under knuckles) ─
+    groove_thickness = max(1, int(s * 0.045))
+    groove_y0 = int(cy + (-0.18) * s)
+    groove_y1 = int(cy + (0.05) * s)
+    for gx_norm in [-0.20, 0.00, 0.20]:
+        gx = int(cx + gx_norm * s)
+        cv2.line(canvas, (gx, groove_y0), (gx, groove_y1),
+                 outline_color, groove_thickness, lineType=cv2.LINE_AA)
+
+    # ── 4) Thumb wrap (horizontal bar with taper on right) ──
+    thumb_y       =  0.18
+    thumb_half_h  =  0.07
+    thumb_x_l     = -0.22
+    thumb_x_r_top =  0.22
+    thumb_x_r_bot =  0.18    # taper inward at bottom
+
+    thumb_pts = np.array([
+        (cx + int(thumb_x_l * s),     cy + int((thumb_y - thumb_half_h) * s)),
+        (cx + int(thumb_x_r_top * s), cy + int((thumb_y - thumb_half_h) * s)),
+        (cx + int(thumb_x_r_bot * s), cy + int((thumb_y + thumb_half_h) * s)),
+        (cx + int(thumb_x_l * s),     cy + int((thumb_y + thumb_half_h) * s)),
+    ], dtype=np.int32)
+
+    # Thumb fill (slightly brighter than body) + outline
+    cv2.fillPoly(canvas, [thumb_pts], fill_color, lineType=cv2.LINE_AA)
+    cv2.polylines(canvas, [thumb_pts], isClosed=True, color=outline_color,
+                  thickness=outline_thickness, lineType=cv2.LINE_AA)
+
+
+def _draw_fist_icon_simple_v3(canvas, cx, cy, size,
+                               outline_color=(20, 20, 20),
+                               fill_color=(245, 245, 245)):
+    """Simplified fist for far/small blocks — keep concept, drop details."""
+    if size < 6:
+        return
+    s = size
+    # Just 4 dome bumps + body (no grooves, no thumb)
+    pts_norm = [
+        (-0.40, -0.15),
+        (-0.30, -0.30), (-0.20, -0.40), (-0.10, -0.30),
+        ( 0.00, -0.40),
+        ( 0.10, -0.30), ( 0.20, -0.40), ( 0.30, -0.30),
+        ( 0.40, -0.15),
+        ( 0.40,  0.40),
+        (-0.40,  0.40),
+    ]
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts_norm],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(canvas, [abs_pts], fill_color, lineType=cv2.LINE_AA)
+    cv2.polylines(canvas, [abs_pts], isClosed=True, color=outline_color,
+                  thickness=max(1, int(s * 0.06)), lineType=cv2.LINE_AA)
+```
+
+## Cách integrate vào PunchTarget.draw
+
+Replace toàn bộ block icon ở line 2280-2289:
+
+```python
+# DELETE
+top_w = int(max(
+    np.linalg.norm(top_face[1] - top_face[0]),
+    np.linalg.norm(top_face[2] - top_face[3]),
+))
+if top_w >= 22:
+    cx_top = int(top_face[:, 0].mean())
+    cy_top = int(top_face[:, 1].mean())
+    _draw_fist_icon(canvas, cx_top, cy_top,
+                    int(top_w * 0.58), CLR_WHITE)
+return canvas
+
+# REPLACE BY
+# Icon on FRONT face (matches reference v3, đấm về camera)
+front_edges = [
+    np.linalg.norm(front_face[1] - front_face[0]),   # top
+    np.linalg.norm(front_face[2] - front_face[3]),   # bottom
+    np.linalg.norm(front_face[0] - front_face[3]),   # left
+    np.linalg.norm(front_face[1] - front_face[2]),   # right
+]
+front_min_dim = int(min(front_edges))   # smaller of width/height
+icon_size = int(front_min_dim * 0.75)   # 75% of smaller face dimension
+
+if icon_size >= 12:
+    cx_front = int(front_face[:, 0].mean())
+    cy_front = int(front_face[:, 1].mean())
+    if icon_size >= 22:
+        _draw_fist_icon_v3(canvas, cx_front, cy_front, icon_size,
+                           outline_color=(20, 20, 20),
+                           fill_color=(245, 245, 245))
+    else:
+        _draw_fist_icon_simple_v3(canvas, cx_front, cy_front, icon_size,
+                                   outline_color=(20, 20, 20),
+                                   fill_color=(245, 245, 245))
+return canvas
+```
+
+## Lý do icon trắng-đen thay vì trắng đặc
+
+Reference dùng **outline đen + fill trắng** vì:
+1. **Contrast cực mạnh** trên block màu sáng (xanh dương / vàng / xanh lá)
+2. **Detail rõ** — finger grooves, thumb wrap đều cần outline để đọc được
+3. **Không bị merge** vào block khi block sáng (vd block vàng + icon trắng → khó đọc)
+4. **Universal** — works trên mọi tier color khác nhau
+
+Code hiện vẽ trắng đặc → trên block xanh dương đọc tạm OK, nhưng trên block vàng / cyan / pink sẽ mất contrast.
+
+## Acceptance v3
+
+```
+✓ Icon trông rõ ràng là CLOSED FIST (không phải tay xòe)
+✓ Có 4 knuckle bumps trên top
+✓ Có 3 finger grooves vertical bên dưới knuckles
+✓ Có thumb wrap horizontal ở middle
+✓ Outline đen ~5% size, fill trắng/off-white
+✓ Icon size 75% smaller face dim (was 58%)
+✓ Render rõ trên mọi block color (blue/yellow/green/red/cyan/pink)
+✓ Block xa (icon_size 12-21px): simplified version (knuckles + body, no grooves/thumb)
+✓ Block cực xa (icon_size < 12): no icon
+```
+
+## Update Migration plan
+
+Phase 4 (Fist icon v2) → REPLACE bằng **Phase 4 v3**:
+- Implement `_draw_fist_icon_v3` + `_draw_fist_icon_simple_v3`
+- Replace integrate trong PunchTarget.draw (FRONT face, threshold 12/22, color outline+fill)
+- Test trên 4 lane colors khác nhau verify contrast OK
+
+Effort: 1.5-2 giờ (tăng nhẹ vs v2 vì có outline + fill + grooves + thumb).
+Risk: Thấp — isolated trong icon function.
+
+---
+
+# 🚨 COLOR ANALYSIS V3 — Fix #2 REVISED (block không 3D, sáng tối không rõ)
+
+## Phát hiện sau khi user complain "màu xấu, không 3D, sáng tối không rõ"
+
+### BUG NGHIÊM TRỌNG — Front face derives sai từ side_col
+
+`rhythm.py:2229` và `2265`:
+```python
+side_col     = tuple(int(c * 0.50) for c in base)              # 50% base
+front_scaled = tuple(int(min(255, c * depth_gain * 1.15))      # ← BUG
+                     for c in side_col)                         # front = side * 1.15 = base * 0.575
+```
+
+**Hậu quả**: Front face — mặt camera nhìn thẳng vào, chiếm 60-70% pixel block — chỉ là **57.5% base brightness**. Block trông dim, mất sức sống.
+
+→ Đây là root cause "block xấu, không 3D, không vibrant".
+
+## Brightness ratio analysis
+
+Với base xanh dương `(255, 60, 50)` BGR:
+
+| Face | Code current → output | Brightness ratio | Reference cần đạt |
+|---|---|---|---|
+| **Top**   | `base*0.90 + 255*0.10` → `(250, 79, 75)`   | 95% | **130%** (highlight rõ) |
+| **Front** | `base*0.575` → `(147, 35, 29)` ⚠️           | **57.5%** | **100%** (canonical) |
+| **Side**  | `base*0.50` → `(128, 30, 25)`              | 50% | **45%** (OK) |
+
+**Ratio current**: top:front:side = 1.9 : 1.15 : 1 (front quá tối).
+**Ratio reference**: top:front:side = **2.9 : 2.2 : 1** (front dominant + top highlight rõ).
+
+## Fix #2a — Front = base CANONICAL (FIX BUG)
+
+```python
+# rhythm.py:2227-2230 — REPLACE
+base = tuple(int(c) for c in self.color)
+
+# Top: highlight + ngả trắng
+top_col = tuple(
+    int(min(255, c * 1.20 + 255 * 0.18))
+    for c in base
+)
+
+# Front: CANONICAL — đây là màu user expect thấy
+front_col_raw = tuple(int(c) for c in base)
+
+# Side: shadow ~45%
+side_col = tuple(int(c * 0.45) for c in base)
+
+depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
+```
+
+```python
+# rhythm.py:2264-2266 — REPLACE
+top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)
+front_scaled = tuple(int(min(255, c * depth_gain)) for c in front_col_raw)   # was side_col * 1.15 — BUG
+side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)
+```
+
+**Verification với base blue `(255, 60, 50)`**:
+- Top: `(255, 117, 105)` — vibrant blue + slight white tint
+- Front: `(255, 60, 50)` — **CANONICAL blue đậm sắc** (was muddy 147,35,29)
+- Side: `(115, 27, 22)` — shadow rõ rệt
+
+→ Block sẽ có 3 face contrast **2.9 : 2.2 : 1** match reference.
+
+## Fix #2b — Gradient mỗi face (block không còn flat)
+
+**Vấn đề**: `cv2.fillConvexPoly` chỉ fill solid 1 màu → mỗi face flat → mất cảm giác lighting.
+
+**Solution**: Vẽ gradient nhẹ mỗi face theo hướng phù hợp:
+
+```python
+def _fill_face_with_gradient(canvas: np.ndarray, pts: np.ndarray,
+                              color_bright: tuple, color_dim: tuple,
+                              gradient_dir: str = "top_to_bottom") -> None:
+    """Fill polygon với linear gradient subtle.
+
+    gradient_dir options:
+      - "top_to_bottom": cho FRONT face — sáng top edge, tối bottom edge
+      - "front_to_back": cho TOP face — sáng front edge, tối back edge
+      - "left_to_right": cho SIDE face — tùy hướng
+
+    Gradient dim factor mặc định ~0.85 (không quá tối, giữ readability).
+    """
+    pts = np.array(pts, dtype=np.int32)
+    bx, by, bw, bh = cv2.boundingRect(pts)
+    pad = 2
+    H, W = canvas.shape[:2]
+    rx0, ry0 = max(0, bx - pad), max(0, by - pad)
+    rx1, ry1 = min(W, bx + bw + pad), min(H, by + bh + pad)
+    rw, rh = rx1 - rx0, ry1 - ry0
+    if rw <= 0 or rh <= 0:
+        return
+
+    # Mask cho polygon
+    mask = np.zeros((rh, rw), dtype=np.uint8)
+    pts_local = pts - np.array([rx0, ry0])
+    cv2.fillConvexPoly(mask, pts_local, 255, lineType=cv2.LINE_AA)
+
+    # Gradient layer
+    bright = np.array(color_bright, dtype=np.float32)
+    dim = np.array(color_dim, dtype=np.float32)
+
+    if gradient_dir == "left_to_right":
+        t = np.linspace(0, 1, rw, dtype=np.float32).reshape(1, -1, 1)
+    else:   # top_to_bottom hoặc front_to_back (đều theo Y)
+        t = np.linspace(0, 1, rh, dtype=np.float32).reshape(-1, 1, 1)
+
+    color_grad = bright * (1 - t) + dim * t   # broadcasting → (rh, rw, 3)
+    color_grad = np.broadcast_to(color_grad, (rh, rw, 3))
+
+    # Composite onto canvas
+    a = mask.astype(np.float32) / 255.0
+    a3 = np.dstack([a, a, a])
+    roi = canvas[ry0:ry1, rx0:rx1].astype(np.float32)
+    canvas[ry0:ry1, rx0:rx1] = (
+        roi * (1 - a3) + color_grad * a3
+    ).clip(0, 255).astype(np.uint8)
+```
+
+**Apply trong PunchTarget.draw — replace 3 calls fillConvexPoly**:
+
+```python
+# REPLACE block 2274-2278:
+
+# Side face với gradient front_to_back
+side_bright = tuple(int(min(255, c * 1.10)) for c in side_scaled)
+side_dim    = tuple(int(c * 0.85) for c in side_scaled)
+
+if block_screen_cx < cam_cx:
+    _fill_face_with_gradient(canvas, right_face, side_bright, side_dim, "front_to_back")
+else:
+    _fill_face_with_gradient(canvas, left_face,  side_bright, side_dim, "front_to_back")
+
+# Front face với gradient top_to_bottom (light from above)
+front_bright = front_scaled
+front_dim    = tuple(int(c * 0.88) for c in front_scaled)
+_fill_face_with_gradient(canvas, front_face, front_bright, front_dim, "top_to_bottom")
+
+# Top face với gradient front_to_back
+top_bright = top_scaled
+top_dim    = tuple(int(c * 0.82) for c in top_scaled)
+_fill_face_with_gradient(canvas, top_face, top_bright, top_dim, "front_to_back")
+```
+
+## Fix #2c — Rim lighting trên edges
+
+**Vấn đề**: Edges giao 3 face hiện là hard transition → block trông "carved" không "lit".
+
+**Solution**: Vẽ 1-2px line sáng tại 3 edges chính (top-front, top-side, front-side):
+
+```python
+# Sau khi đã vẽ 3 face với gradient, thêm rim:
+RIM_BRIGHT = tuple(int(min(255, c * 1.45 + 30)) for c in base)
+RIM_THICKNESS = max(1, int(top_w * 0.025))
+
+# Edge top-front (FLT → FRT) = pts[0] → pts[1]
+cv2.line(canvas, tuple(pts[0]), tuple(pts[1]), RIM_BRIGHT,
+         RIM_THICKNESS, lineType=cv2.LINE_AA)
+
+# Edge top-side: depends on which side face
+if block_screen_cx < cam_cx:
+    # Vẽ right_face → edge top-right giao là FRT → BRT (pts[1] → pts[5])
+    cv2.line(canvas, tuple(pts[1]), tuple(pts[5]), RIM_BRIGHT,
+             RIM_THICKNESS, lineType=cv2.LINE_AA)
+    # Edge front-side = FRT → FRb (pts[1] → pts[2]) — optional weaker rim
+    rim_dim = tuple(int(c * 0.7) for c in RIM_BRIGHT)
+    cv2.line(canvas, tuple(pts[1]), tuple(pts[2]), rim_dim,
+             max(1, RIM_THICKNESS - 1), lineType=cv2.LINE_AA)
+else:
+    cv2.line(canvas, tuple(pts[0]), tuple(pts[4]), RIM_BRIGHT,
+             RIM_THICKNESS, lineType=cv2.LINE_AA)
+    rim_dim = tuple(int(c * 0.7) for c in RIM_BRIGHT)
+    cv2.line(canvas, tuple(pts[0]), tuple(pts[3]), rim_dim,
+             max(1, RIM_THICKNESS - 1), lineType=cv2.LINE_AA)
+```
+
+## Visual diff before vs after
+
+```
+BEFORE (current)              AFTER (v3 với 3 fix)
+─────────────────────         ────────────────────────
+flat blue rectangle           3D cube với rõ:
+top hơi sáng                  ✓ Top: vibrant + ngả trắng (gradient front→back)
+front DIM (57.5% base) ⚠️    ✓ Front: CANONICAL color (gradient top→bottom)
+side dark                     ✓ Side: dark shadow (gradient front→back)
+edges hard                    ✓ Rim light trên 3 edges giao
+no lighting feel              ✓ Cảm giác "neon block phát sáng" rõ rệt
+```
+
+## Test cases v3
+
+```
+✓ Block xanh dương: front sáng đậm sắc, top ngả trắng, side dark navy
+✓ Block vàng: front saturated yellow, top hơi cream, side dark olive
+✓ Block xanh lá: front emerald, top mint highlight, side dark forest
+✓ Block đỏ/hồng: clip white ở top OK (neon aesthetic), front canonical red
+✓ Gradient mỗi face visible nhưng subtle (không "graphic design")
+✓ Rim light trên top-front edge nổi bật, top-side edge subtle
+✓ Side-by-side với reference image: 3D pop ≥ 90% similarity
+✓ Block xa (z_norm > 0.7): gradient + rim vẫn visible (giảm intensity OK)
+```
+
+## Performance estimate
+
+- Fix #2a: 0% impact (chỉ đổi formula)
+- Fix #2b: +5-10% block render time (gradient = 1 ROI alloc + linspace + broadcast)
+- Fix #2c: +1-2% (3 calls cv2.line LINE_AA)
+
+→ Tổng +6-12% block render. Acceptable cho visual lift lớn.
+
+## Migration plan UPDATE — Fix #2 v3 chi tiết
+
+| Sub-fix | Effort | Impact | Recommend |
+|---|---|---|---|
+| **2a** Front canonical (bỏ bug `side_col * 1.15`) | 5 phút | ⭐⭐⭐⭐ HUGE | **MUST DO FIRST** |
+| **2b** Gradient mỗi face (helper mới) | 1-1.5 giờ | ⭐⭐⭐ | DO NEXT |
+| **2c** Rim lighting edges | 30 phút | ⭐⭐ | DO LAST (polish) |
+
+**Recommend tuần này**: Làm 2a TRƯỚC tiên (chỉ 5 phút sửa formula → block đã pop hơn rất nhiều). 2b và 2c là polish có thể delay.

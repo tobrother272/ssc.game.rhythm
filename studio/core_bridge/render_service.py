@@ -494,10 +494,10 @@ class RenderService(QObject):
             # ----------------------------------------------------------------
             if job.is_preview:
                 command.extend([
-                    "-W", "960",
-                    "-H", "540",
-                    "--fps", "24",
-                    "--bloom", "0",
+                    "-W", "1280",
+                    "-H", "720",
+                    "--fps", "30",
+                    "--bloom", "1",
                 ])
 
             # Log the full command so the user can copy-paste it for
