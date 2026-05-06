@@ -1071,11 +1071,11 @@ class _ComboSection(QGroupBox):
         style_form.setSpacing(6)
 
         self._border_sp = QDoubleSpinBox()
-        self._border_sp.setRange(0.0, 10.0)
-        self._border_sp.setSingleStep(0.5)
+        self._border_sp.setRange(0.0, 30.0)
+        self._border_sp.setSingleStep(1.0)
         self._border_sp.setDecimals(1)
-        self._border_sp.setValue(float(config.get("combo_border_thickness", 2.0) or 2.0))
-        self._border_sp.setToolTip("Text border thickness (0 = none)")
+        self._border_sp.setValue(float(config.get("combo_border_thickness", 8.0) or 8.0))
+        self._border_sp.setToolTip("Neon border thickness (0 = none)")
         self._border_sp.valueChanged.connect(self.changed)
         style_form.addRow("Border thickness", self._border_sp)
 
@@ -1084,7 +1084,7 @@ class _ComboSection(QGroupBox):
         self._glow_sp.setSingleStep(5)
         self._glow_sp.setSuffix(" %")
         self._glow_sp.setValue(
-            int(round(float(config.get("combo_glow_strength", 30.0) or 30.0)))
+            int(round(float(config.get("combo_glow_strength", 85.0) or 85.0)))
         )
         self._glow_sp.setToolTip("Glow intensity (0 = off)")
         self._glow_sp.valueChanged.connect(self.changed)
@@ -1099,13 +1099,15 @@ class _ComboSection(QGroupBox):
         tier_form.setSpacing(6)
 
         _tier_defaults = [
-            (30, "Great"),
-            (60, "Superb"),
-            (90, "Perfect"),
-            (120, "Godlike"),
+            (30, "Great",   "#22c55e"),
+            (60, "Superb",  "#3b82f6"),
+            (90, "Perfect", "#a855f7"),
+            (120, "Godlike","#f59e0b"),
         ]
+        self._tier_colors: list[str] = []
+        self._tier_color_btns: list[QPushButton] = []
         self._tier_widgets: list[tuple[QSpinBox, QLineEdit]] = []
-        for i, (def_thresh, def_label) in enumerate(_tier_defaults, 1):
+        for i, (def_thresh, def_label, def_color) in enumerate(_tier_defaults, 1):
             thresh_sp = QSpinBox()
             thresh_sp.setRange(0, 9999)
             thresh_sp.setValue(int(config.get(f"combo_tier{i}_threshold", def_thresh) or def_thresh))
@@ -1117,12 +1119,22 @@ class _ComboSection(QGroupBox):
             label_edit.setPlaceholderText(f"e.g. {def_label}")
             label_edit.textChanged.connect(self.changed)
 
+            tier_col = str(config.get(f"combo_tier{i}_color", def_color) or def_color)
+            self._tier_colors.append(tier_col)
+            color_btn = QPushButton(tier_col.upper())
+            color_btn.setFixedWidth(74)
+            _idx = i - 1
+            color_btn.clicked.connect(lambda _chk, idx=_idx: self._pick_tier_color(idx))
+            self._tier_color_btns.append(color_btn)
+            self._refresh_tier_color_btn(_idx)
+
             row_w = QWidget()
             row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(6)
+            row_l.setSpacing(4)
             row_l.addWidget(thresh_sp, 1)
             row_l.addWidget(label_edit, 2)
+            row_l.addWidget(color_btn, 0)
             tier_form.addRow(f"Tier {i} ≥", row_w)
             self._tier_widgets.append((thresh_sp, label_edit))
 
@@ -1149,6 +1161,25 @@ class _ComboSection(QGroupBox):
         if color:
             self._color = color
             self._refresh_color_btn()
+            self.changed.emit()
+
+    def _refresh_tier_color_btn(self, idx: int) -> None:
+        col = self._tier_colors[idx]
+        c = QColor(col)
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = "#000000" if lum > 128 else "#ffffff"
+        btn = self._tier_color_btns[idx]
+        btn.setStyleSheet(
+            f"background-color:{col};color:{fg};border:1px solid #555;"
+            "padding:1px 4px;"
+        )
+        btn.setText(col.upper())
+
+    def _pick_tier_color(self, idx: int) -> None:
+        color = _pick_color(self._tier_colors[idx], f"Tier {idx + 1} color", self)
+        if color:
+            self._tier_colors[idx] = color
+            self._refresh_tier_color_btn(idx)
             self.changed.emit()
 
     def _on_audio_toggle(self) -> None:
@@ -1207,8 +1238,12 @@ class _ComboSection(QGroupBox):
             "combo_h": self._combo_h,
             "combo_border_thickness": self._border_sp.value(),
             "combo_glow_strength": float(self._glow_sp.value()),
+            "combo_number_font_scale": 0.0,
+            "combo_label_font_scale": 0.0,
+            "combo_tier_font_scale": 0.0,
         }
         for i, (thresh_sp, label_edit) in enumerate(self._tier_widgets, 1):
             cfg[f"combo_tier{i}_threshold"] = thresh_sp.value()
             cfg[f"combo_tier{i}_label"] = label_edit.text().strip() or f"Tier{i}"
+            cfg[f"combo_tier{i}_color"] = self._tier_colors[i - 1]
         return cfg

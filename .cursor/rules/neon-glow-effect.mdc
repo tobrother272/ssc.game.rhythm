@@ -1,0 +1,94 @@
+---
+description: Standard approach for rendering neon glow effects on text and shapes
+alwaysApply: true
+---
+
+# Neon Glow Effect — Standard Rendering Pattern
+
+Khi tạo glow/neon effect cho bất kỳ element nào (text, badge, border, shape), PHẢI tuân theo pattern sau.
+
+## Nguyên tắc cốt lõi
+
+**Glow source TÁCH BIỆT khỏi content render.** Không bao giờ blur trực tiếp content buffer.
+
+## Architecture: 2 Layer tách biệt
+
+### Layer 1 — Glow Source (chỉ dùng để blur)
+
+- Vẽ lên buffer riêng (`glow_src`), KHÔNG phải content buffer.
+- Dùng **thick outline** (viền dày) hoặc **thick text stroke** — KHÔNG dùng filled shape.
+- Dùng `_lighten_bgr(color, 0.3)` cho màu glow source.
+- ❌ KHÔNG fill toàn bộ hình (sẽ làm interior sáng, mất hiệu ứng "neon viền").
+- ❌ KHÔNG blur trực tiếp content (sẽ ra "rim border" thay vì "soft halo").
+
+```python
+glow_src = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+light_color = self._lighten_bgr(color_bgr, 0.3)
+# Thick outline (NOT filled)
+self._draw_rounded_rect_outline(glow_src, rect, radius, light_color, thick_border)
+# Thick text stroke
+cv2.putText(glow_src, text, pos, font, scale, light_color, thickness + 8, cv2.LINE_AA)
+```
+
+### Layer 2 — Content (render sắc nét, KHÔNG blur)
+
+Render trực tiếp lên `content_buf`:
+1. **Drop shadow** (đen, offset xuống-phải, thickness lớn)
+2. **Black outline stroke** (viền đen dày bao quanh)
+3. **Color fill** (màu chính, thickness bình thường)
+4. Optionally: border outline mỏng bằng `_lighten_bgr` color
+
+```python
+content_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+# Shadow
+cv2.putText(content_buf, text, (x + shadow_off, y + shadow_off), font, scale, (0,0,0), th+4)
+# Black stroke
+cv2.putText(content_buf, text, (x, y), font, scale, (0,0,0), th+3)
+# Color fill
+cv2.putText(content_buf, text, (x, y), font, scale, color_bgr, th)
+```
+
+## Blur Strategy — Wide Soft Halo
+
+Multi-pass Gaussian blur với kernel sizes ĐỦ LỚN để glow lan rộng, không ôm sát viền:
+
+```python
+glow_buf = np.zeros_like(glow_src)
+for ksize, weight in ((151, 0.20), (101, 0.28), (71, 0.32), (41, 0.20)):
+    blurred = cv2.GaussianBlur(glow_src, (ksize|1, ksize|1), 0)
+    glow_buf = cv2.addWeighted(glow_buf, 1.0, blurred, weight * glow_norm, 0)
+# Final diffusion pass — remove any residual "ring" artifact
+glow_buf = cv2.GaussianBlur(glow_buf, (41, 41), 0)
+```
+
+**Kernel sizing rules:**
+- Smallest kernel ≥ 41 (để không ra rim-border)
+- Largest kernel ≥ 101 (cho far-field fade)
+- Luôn có final diffusion pass (31-51) để xóa hard ring
+
+## Combine & Composite
+
+```python
+combined = cv2.add(glow_buf, content_buf)  # glow behind, content on top
+# Rotate / transform nếu cần
+self._blit_additive_alpha(canvas, combined, x0, y0, alpha)
+```
+
+## Buffer Padding
+
+Pad buffer ĐỦ RỘNG để glow không bị cắt:
+
+```python
+pad = max(50, int(max(width, height) * 1.4))
+```
+
+## Checklist khi implement glow
+
+- [ ] Glow source = thick outline/stroke (KHÔNG filled)
+- [ ] Glow blur trên buffer RIÊNG, không blur content
+- [ ] Multi-pass blur: smallest kernel ≥ 41, largest ≥ 101
+- [ ] Final diffusion pass sau multi-pass
+- [ ] Content render: shadow → black stroke → color fill (thứ tự bắt buộc)
+- [ ] Combine: `cv2.add(glow_buf, content_buf)` — glow nằm sau
+- [ ] Padding buffer ≥ 1.4× element size
+- [ ] Interior badge/shape giữ TỐI (không fill glow vào trong)

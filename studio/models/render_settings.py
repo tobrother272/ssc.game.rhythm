@@ -157,10 +157,10 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     combo_audio_milestone_file: Optional[str] = None
     combo_x: float = Field(default=0.85, ge=0.0, le=1.0)
     combo_y: float = Field(default=0.08, ge=0.0, le=1.0)
-    combo_w: float = Field(default=0.13, ge=0.05, le=0.5)
-    combo_h: float = Field(default=0.18, ge=0.03, le=0.3)
-    combo_border_thickness: float = Field(default=2.0, ge=0.0, le=10.0)
-    combo_glow_strength: float = Field(default=30.0, ge=0.0, le=100.0)
+    combo_w: float = Field(default=0.065, ge=0.02, le=1.0)
+    combo_h: float = Field(default=0.09, ge=0.02, le=1.0)
+    combo_border_thickness: float = Field(default=8.0, ge=0.0, le=30.0)
+    combo_glow_strength: float = Field(default=85.0, ge=0.0, le=100.0)
     # Tier milestones — threshold = 0 to disable tier
     combo_tier1_threshold: int = Field(default=30, ge=0, le=9999)
     combo_tier1_label: str = "Great"
@@ -170,6 +170,15 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     combo_tier3_label: str = "Perfect"
     combo_tier4_threshold: int = Field(default=120, ge=0, le=9999)
     combo_tier4_label: str = "Godlike"
+    # ── per-tier colors (hex) ────────────────────────────────────────────────
+    combo_tier1_color: str = "#22c55e"
+    combo_tier2_color: str = "#3b82f6"
+    combo_tier3_color: str = "#a855f7"
+    combo_tier4_color: str = "#f59e0b"
+    # ── font scale overrides (0.0 = auto-fit) ───────────────────────────────
+    combo_number_font_scale: float = Field(default=0.0, ge=0.0, le=10.0)
+    combo_label_font_scale: float = Field(default=0.0, ge=0.0, le=5.0)
+    combo_tier_font_scale: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
 class PunchSettings(BaseRenderSettings):

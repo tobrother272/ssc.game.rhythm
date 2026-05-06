@@ -3373,13 +3373,18 @@ class TimelinePanel(QWidget):
                 "combo_audio_milestone_mode": "default",
                 "combo_audio_milestone_file": "",
                 "combo_x": 0.85, "combo_y": 0.08,
-                "combo_w": 0.13, "combo_h": 0.18,
-                "combo_border_thickness": 2.0,
-                "combo_glow_strength": 30.0,
+                "combo_w": 0.065, "combo_h": 0.09,
+                "combo_border_thickness": 8.0,
+                "combo_glow_strength": 85.0,
                 "combo_tier1_threshold": 30,  "combo_tier1_label": "Great",
                 "combo_tier2_threshold": 60,  "combo_tier2_label": "Superb",
                 "combo_tier3_threshold": 90,  "combo_tier3_label": "Perfect",
                 "combo_tier4_threshold": 120, "combo_tier4_label": "Godlike",
+                "combo_tier1_color": "#22c55e", "combo_tier2_color": "#3b82f6",
+                "combo_tier3_color": "#a855f7", "combo_tier4_color": "#f59e0b",
+                "combo_number_font_scale": 0.0,
+                "combo_label_font_scale": 0.0,
+                "combo_tier_font_scale": 0.0,
             }
         return {}
 

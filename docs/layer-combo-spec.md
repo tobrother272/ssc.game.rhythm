@@ -1133,6 +1133,352 @@ Verify: tier transition lại từ đầu.
 
 ---
 
+## Visual style guide — Match reference image
+
+### Reference
+
+```
+   ┌──────────────────────────┐
+   │            40            │  ← Number  (large, bold white)
+   │           COMBO          │  ← COMBO label (small, white)
+   │    ┌──────────────┐      │
+   │    │    GREAT     │      │  ← Tier pill (green bg, white text, glow)
+   │    └──────────────┘      │
+   └──────────────────────────┘
+```
+
+### Diff với current implementation
+
+Code hiện tại (`ComboHUD._draw_tier_badge` ở rhythm.py ~dòng 5023-5108) render badge style **tilted -8° + dark fill + neon border + heavy glow**. Mẫu user yêu cầu **straight (no tilt) + solid color fill + clean white text + outer glow**.
+
+3 thay đổi visual cần làm:
+
+| Aspect | Current | Match reference |
+|---|---|---|
+| Tilt | `-8°` | `0°` (straight) |
+| Pill background | Dark `(18,18,18)` + colored border | **Solid colored fill** (no dark BG, color = tier color) |
+| Text style | Per-tier color text + heavy glow | **Solid white text**, light shadow only |
+| Glow | Heavy multi-pass blur on border | Single subtle outer glow halo |
+
+### 7 fields mới
+
+Để user customize 3 parts riêng + tier colors:
+
+```
+combo_number_font_scale   : float  default 0.0   (0 = auto-fit theo bbox; > 0 = override)
+combo_label_font_scale    : float  default 0.0   (auto-fit)
+combo_tier_font_scale     : float  default 0.0   (auto-fit theo badge_h)
+
+combo_tier1_color         : hex    default "#22c55e"   (green, "Great")
+combo_tier2_color         : hex    default "#3b82f6"   (cyan-blue, "Superb")
+combo_tier3_color         : hex    default "#a855f7"   (purple, "Perfect")
+combo_tier4_color         : hex    default "#f59e0b"   (gold, "Godlike")
+```
+
+→ Tổng spec layer combo: **26 + 7 = 33 fields**.
+
+### Render logic mới
+
+#### Part 1: Number
+
+```python
+# Font: combo_font_family (existing) — đề xuất "triplex" cho bold serif feel
+font_face = self._get_font()    # default duplex; reference look = triplex
+target_h = int(bh * 0.62) if self._number_fs <= 0 else None   # auto vs override
+if self._number_fs > 0:
+    num_fs = float(self._number_fs)
+else:
+    # auto-fit
+    (ref_nw, ref_nh), _ = cv2.getTextSize(txt_num, font_face, 1.0, 4)
+    num_fs = max(0.3, target_h / max(1, ref_nh))
+
+# Color: combo_color (default white)
+# Border thickness: combo_border_thickness (default 2.0) — vẽ outline đen trước
+# Glow: combo_glow_strength (default 30) — bao quanh number
+self._draw_glow_text(canvas, text=txt_num, ..., color_bgr=self._color_bgr)
+```
+
+#### Part 2: "COMBO" label
+
+```python
+# Same font as number (combo_font_family)
+# Smaller scale (auto-fit ~0.18 × bh, hoặc override qua combo_label_font_scale)
+target_lbl_h = int(bh * 0.18) if self._label_fs <= 0 else None
+if self._label_fs > 0:
+    lbl_fs = float(self._label_fs)
+else:
+    (ref_lw, ref_lh), _ = cv2.getTextSize(self._label, font_face, 1.0, 1)
+    lbl_fs = max(0.2, target_lbl_h / max(1, ref_lh))
+
+# Color: dim white (80% của combo_color)
+lbl_color = tuple(int(c * 0.85) for c in self._color_bgr)
+self._draw_glow_text(canvas, text=self._label, ..., color_bgr=lbl_color, alpha=...)
+```
+
+#### Part 3: Tier badge (pill) — **rewrite `_draw_tier_badge`**
+
+```python
+def _draw_tier_badge(
+    self,
+    canvas, text, cx, cy, badge_w, badge_h,
+    color_bgr,           # tier color (vd green for tier 1)
+    alpha=1.0,
+):
+    """Solid-color pill badge với clean white text — match reference."""
+    if alpha <= 1e-4 or badge_w < 8 or badge_h < 8:
+        return
+    
+    pad = max(8, int(badge_h * 0.5))   # outer glow padding
+    buf_w = badge_w + 2 * pad
+    buf_h = badge_h + 2 * pad
+    rx0, ry0 = pad, pad
+    rx1, ry1 = pad + badge_w, pad + badge_h
+    rcx = (rx0 + rx1) // 2
+    rcy = (ry0 + ry1) // 2
+    rr = max(8, badge_h // 2)   # rounded corners ~50% height = full pill
+    
+    # Buffer
+    badge_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+    
+    # 1) Outer glow halo (subtle, single pass)
+    if self._glow_strength > 0:
+        glow_buf = np.zeros_like(badge_buf)
+        self._draw_rounded_rect(glow_buf, (rx0, ry0), (rx1, ry1),
+                                color_bgr, rr, -1)
+        ksize = max(7, int(badge_h * 0.4)) | 1
+        glow_buf = cv2.GaussianBlur(glow_buf, (ksize, ksize), 0)
+        glow_norm = self._glow_strength / 100.0
+        badge_buf = cv2.addWeighted(badge_buf, 1.0, glow_buf, 0.6 * glow_norm, 0)
+    
+    # 2) Pill SOLID FILL (tier color, no dark BG)
+    self._draw_rounded_rect(badge_buf, (rx0, ry0), (rx1, ry1),
+                            color_bgr, rr, -1)
+    
+    # 3) Optional dark border (~1-2px) cho contrast với background
+    border_color = tuple(int(c * 0.4) for c in color_bgr)
+    self._draw_rounded_rect(badge_buf, (rx0, ry0), (rx1, ry1),
+                            border_color, rr, 2)
+    
+    # 4) Tier label text — uppercase, bold, white
+    txt_upper = text.upper()
+    font_b = cv2.FONT_HERSHEY_DUPLEX   # hoặc TRIPLEX cho bold hơn
+    if self._tier_fs > 0:
+        tfs = float(self._tier_fs)
+    else:
+        # Auto-fit: text height ~58% badge height
+        target_th = int(badge_h * 0.58)
+        target_tw = int(badge_w * 0.85)   # 85% width with margin
+        (ref_w, ref_h), _ = cv2.getTextSize(txt_upper, font_b, 1.0, 2)
+        tfs = max(0.3, min(target_th / max(1, ref_h),
+                          target_tw / max(1, ref_w)))
+    (tw, th), _ = cv2.getTextSize(txt_upper, font_b, tfs, 2)
+    tx = rcx - tw // 2
+    ty = rcy + th // 2
+    
+    # Subtle shadow (light depth)
+    cv2.putText(badge_buf, txt_upper, (tx + 1, ty + 1), font_b, tfs,
+                (0, 0, 0), 2, cv2.LINE_AA)
+    
+    # Main text — white
+    cv2.putText(badge_buf, txt_upper, (tx, ty), font_b, tfs,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Composite onto canvas (NO TILT — straight)
+    x0 = cx - buf_w // 2
+    y0 = cy - buf_h // 2
+    self._blit_with_alpha(canvas, badge_buf, x0, y0, alpha)
+
+
+def _blit_with_alpha(self, canvas, src, x0, y0, alpha):
+    """Composite src onto canvas at (x0, y0) with alpha blend."""
+    # Same compositing logic as existing code, but no tilt rotation
+    H_c, W_c = canvas.shape[:2]
+    h_s, w_s = src.shape[:2]
+    sx0 = max(0, -x0)
+    sy0 = max(0, -y0)
+    sx1 = w_s - max(0, x0 + w_s - W_c)
+    sy1 = h_s - max(0, y0 + h_s - H_c)
+    dx0 = max(0, x0)
+    dy0 = max(0, y0)
+    dx1 = min(W_c, x0 + w_s)
+    dy1 = min(H_c, y0 + h_s)
+    if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+        return
+    
+    c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+    src_s = src[sy0:sy1, sx0:sx1].astype(np.float32)
+    
+    # Mask: pixels có content (non-zero) = visible
+    mask = np.clip(src_s.max(axis=2, keepdims=True) / 80.0, 0, 1) * alpha
+    c_roi = c_roi * (1 - mask) + src_s * mask
+    canvas[dy0:dy1, dx0:dx1] = np.clip(c_roi, 0, 255).astype(np.uint8)
+```
+
+### Tier color resolution (sửa `_TIER_COLORS_BGR`)
+
+Code cũ có hardcoded `_TIER_COLORS_BGR` dict. Sửa thành **dynamic from config**:
+
+```python
+def _resolve_tier_color(self, tier_idx: int) -> tuple:
+    """Return BGR tuple cho tier color, đọc từ config."""
+    if tier_idx == 4:
+        return _hex_to_bgr(self._tier4_color, default=(11, 158, 245))   # gold
+    if tier_idx == 3:
+        return _hex_to_bgr(self._tier3_color, default=(247, 85, 168))   # purple
+    if tier_idx == 2:
+        return _hex_to_bgr(self._tier2_color, default=(246, 130, 59))   # cyan-blue
+    if tier_idx == 1:
+        return _hex_to_bgr(self._tier1_color, default=(94, 197, 34))    # green
+    return self._color_bgr   # fallback
+```
+
+(Lưu ý BGR order: hex `#22c55e` (green) → BGR `(94, 197, 34)`.)
+
+### Config defaults summary
+
+```python
+combo_tier1_color = "#22c55e"   # green   (BGR 94, 197, 34)
+combo_tier2_color = "#3b82f6"   # blue    (BGR 246, 130, 59)
+combo_tier3_color = "#a855f7"   # purple  (BGR 247, 85, 168)
+combo_tier4_color = "#f59e0b"   # gold    (BGR 11, 158, 245)
+```
+
+Inspector cho phép user pick custom color từng tier.
+
+### Recommended fonts cho match mẫu
+
+- Number: `triplex` (cv2.FONT_HERSHEY_TRIPLEX) — bold serif, đậm hơn duplex
+- COMBO label: `simplex` (sans-serif clean)
+- Tier badge text: `duplex` (sans-serif bold)
+
+→ User có thể đổi qua `combo_font_family` (single field áp cho tất cả) hoặc V2 thêm 3 font_family riêng. V1 dùng 1 font shared.
+
+### UI Section update
+
+```
+[Style groupbox]
+  Border thickness     [spinbox 2.0]
+  Glow strength        [spinbox 30 %]
+  Number font scale    [spinbox 0.0]   tooltip "0 = auto-fit"
+  Label font scale     [spinbox 0.0]   tooltip "0 = auto-fit"
+  Tier font scale      [spinbox 0.0]   tooltip "0 = auto-fit"
+
+[Tier milestones groupbox]
+  Tier 1 ≥ [30]   Label [Great]    Color [#22c55e button]
+  Tier 2 ≥ [60]   Label [Superb]   Color [#3b82f6 button]
+  Tier 3 ≥ [90]   Label [Perfect]  Color [#a855f7 button]
+  Tier 4 ≥ [120]  Label [Godlike]  Color [#f59e0b button]
+```
+
+3 row tier giờ có 3 cột: threshold + label text + color picker.
+
+### Pydantic schema additions
+
+```python
+combo_number_font_scale: float = Field(default=0.0, ge=0.0, le=10.0)
+combo_label_font_scale: float = Field(default=0.0, ge=0.0, le=5.0)
+combo_tier_font_scale: float = Field(default=0.0, ge=0.0, le=5.0)
+combo_tier1_color: str = "#22c55e"
+combo_tier2_color: str = "#3b82f6"
+combo_tier3_color: str = "#a855f7"
+combo_tier4_color: str = "#f59e0b"
+```
+
+### `_VISUAL_FIELDS_BY_KIND["combo"]` thêm 7 keys
+
+```python
+"combo_number_font_scale",
+"combo_label_font_scale",
+"combo_tier_font_scale",
+"combo_tier1_color",
+"combo_tier2_color",
+"combo_tier3_color",
+"combo_tier4_color",
+```
+
+### Constructor updates
+
+```python
+def __init__(
+    self,
+    cam,
+    *,
+    # ... existing params ...
+    number_font_scale: float = 0.0,
+    label_font_scale: float = 0.0,
+    tier_font_scale: float = 0.0,
+    tier1_color: str = "#22c55e",
+    tier2_color: str = "#3b82f6",
+    tier3_color: str = "#a855f7",
+    tier4_color: str = "#f59e0b",
+):
+    # ...
+    self._number_fs = max(0.0, float(number_font_scale))
+    self._label_fs = max(0.0, float(label_font_scale))
+    self._tier_fs = max(0.0, float(tier_font_scale))
+    self._tier1_color = str(tier1_color)
+    self._tier2_color = str(tier2_color)
+    self._tier3_color = str(tier3_color)
+    self._tier4_color = str(tier4_color)
+```
+
+### Test cases bổ sung
+
+**Test 25**: Match reference visual
+```
+Setup: defaults — number=auto, label=auto, tier=auto, tier1_color=#22c55e.
+Action: trigger combo 31, screenshot frame.
+Verify side-by-side với reference image:
+  - Number "31" white bold ở top
+  - "COMBO" white nhỏ dưới
+  - Pill green chứa "GREAT" trắng (NO TILT, solid green)
+  - Glow halo subtle quanh pill
+```
+
+**Test 26**: Per-tier color
+```
+Setup: tier1_color=#FF0000 (red), combo=35.
+Verify: tier badge "Great" với background đỏ.
+```
+
+**Test 27**: Override font_scale
+```
+Setup: number_font_scale=4.0 (large override), bbox bình thường.
+Verify: số combo render rất to (vượt qua bbox). User accept overflow.
+Setup: number_font_scale=0.0 (auto).
+Verify: số fit gọn trong bbox.
+```
+
+**Test 28**: Tier badge size
+```
+Setup: tier_font_scale=0.0 (auto-fit ~58% badge_h).
+Verify: text "GREAT" fit gọn trong pill.
+Setup: tier_font_scale=2.0 (large override).
+Verify: text quá lớn, có thể tràn pill (acceptable cho user override).
+```
+
+### Migration từ implementation hiện tại
+
+Code hiện đang dùng `_TIER_COLORS_BGR` hardcoded dict + tilt -8° + dark bg + neon border. Sau apply spec:
+
+1. Xóa `_TIER_COLORS_BGR` class constant.
+2. Thêm 4 instance attrs `_tier{N}_color`.
+3. Thêm method `_resolve_tier_color(tier_idx)` đọc từ config.
+4. Rewrite `_draw_tier_badge`: bỏ `tilt_deg`, bỏ `bg_buf`, dùng `_blit_with_alpha` (no rotate).
+5. Pill fill = solid tier color, text = solid white, glow = single-pass outer halo.
+
+### Acceptance bổ sung
+
+```
+✓ Visual match reference image (no tilt, solid green pill, clean white text)
+✓ 3 font_scale fields work (number, label, tier — auto khi = 0)
+✓ 4 tier color fields configurable qua Inspector color picker
+✓ Default tier colors: #22c55e, #3b82f6, #a855f7, #f59e0b (Tailwind palette)
+✓ Pill render straight (no tilt) by default; tilt là hardcoded 0 (V2 expose nếu cần)
+```
+
+---
+
 ## Open questions
 
 (1) **Signal payload size**: FloorWallOverlay `changing`/`committed` hiện 12 floats. Thêm combo bbox → 16 floats. Có nên refactor sang `Signal(dict)` hoặc tách signal riêng cho combo (`combo_box_changing`, `combo_box_committed`)? Tôi đề xuất **tách signal riêng** cho clarity.
@@ -1154,3 +1500,1278 @@ Verify: tier transition lại từ đầu.
 (9) **Combo break event**: hiện chỉ có miss. Có sự kiện nào khác break combo không? (vd timing too late). Game logic existing.
 
 (10) **Replace existing layer-combo-spec**: spec này thay thế version trước (11 fields). Có cần lưu version cũ làm history hay xóa? Đề xuất xóa để clean.
+
+---
+
+## NEON GLOW STYLE — Match reference image v2 (FINAL TARGET)
+
+> **Bối cảnh**: User cung cấp 2 ảnh so sánh — hình 1 (output hiện tại) và hình 2 (style mong muốn). 2 hình KHÁC NHAU 1 TRỜI 1 VỰC. Section này là spec định nghĩa lại để render đúng 100% như hình 2.
+
+### So sánh side-by-side
+
+| Element | Hình 1 (HIỆN TẠI) | Hình 2 (TARGET) |
+|---|---|---|
+| **Số combo** | "36" — bold trắng, size MEDIUM | "40" — bold trắng, size **EXTRA LARGE** (~1.6× hiện tại) |
+| **Label "COMBO"** | Letter spacing thường, sát số | Letter spacing **WIDE** (giãn rộng), nhỏ, đặt giữa số và badge |
+| **Badge shape** | Pill (oval, fully rounded) | **Rectangle với corner radius nhỏ** (~16-20px) — KHÔNG phải pill |
+| **Badge size** | Nhỏ — vừa fit chữ | **LỚN** — padding rộng cả ngang lẫn dọc |
+| **Badge fill** | Solid green flat | **Solid green** + cảm giác sáng hơn ở giữa |
+| **Badge border** | Không có / mỏng | **Border neon dày** ~6-10px, màu xanh sáng cực gắt |
+| **Glow / halo** | Không / nhẹ | **Halo neon CỰC MẠNH** — multi-pass blur, xanh lá phát sáng ra ngoài 20-40px |
+| **Text trong badge** | "GREAT" trắng, regular | "GREAT" **trắng đậm, bold heavy**, không tilt |
+| **Tilt** | Không | Không (giữ thẳng) |
+| **Tổng thể** | UI flat, đơn giản | **Neon sign aesthetic** — như biển hiệu LED phát sáng |
+
+### 4 điểm phải fix CHÍNH
+
+#### Fix 1: Badge SHAPE — chuyển từ pill sang rounded rectangle
+
+```python
+# HIỆN TẠI (sai)
+rr = max(8, badge_h // 2)   # full pill (radius = nửa chiều cao)
+
+# TARGET (đúng)
+rr = max(12, int(badge_h * 0.18))   # rounded rect, radius ~18% chiều cao
+# Ví dụ badge_h=80 → rr=14-16px (KHÔNG phải 40)
+```
+
+#### Fix 2: NEON BORDER — viền dày màu sáng
+
+```python
+# Border thickness scale theo badge size
+border_thickness = max(4, int(badge_h * 0.08))   # ~6-10px cho badge_h=80-120
+
+# Border color = tier color SÁNG HƠN fill (lighten +30%)
+def _lighten_bgr(bgr, factor=0.3):
+    """Pha trắng vào màu để tạo neon highlight."""
+    b, g, r = bgr
+    return (
+        int(min(255, b + (255 - b) * factor)),
+        int(min(255, g + (255 - g) * factor)),
+        int(min(255, r + (255 - r) * factor)),
+    )
+
+fill_color = color_bgr                         # vd green #22c55e BGR
+border_color = _lighten_bgr(color_bgr, 0.35)   # green sáng hơn, gần neon white-green
+```
+
+#### Fix 3: HALO GLOW — multi-pass blur cực mạnh
+
+```python
+def _draw_neon_halo(self, canvas, badge_rect, color_bgr, intensity=1.0):
+    """Vẽ halo neon ngoài badge bằng multi-pass gaussian blur.
+
+    intensity 0..1 — controlled bởi self.combo_glow_strength / 100.
+    """
+    x, y, w, h = badge_rect
+    H, W = canvas.shape[:2]
+
+    # Mask trắng cho vùng badge (slightly larger)
+    pad = int(min(w, h) * 0.15)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.rectangle(
+        mask,
+        (max(0, x - pad), max(0, y - pad)),
+        (min(W, x + w + pad), min(H, y + h + pad)),
+        255,
+        -1,
+    )
+
+    # Multi-pass blur — mỗi pass blur radius lớn hơn, alpha thấp hơn
+    glow_canvas = np.zeros_like(canvas)
+    glow_color = np.array(color_bgr, dtype=np.float32)
+    passes = [
+        # (blur_radius, alpha_multiplier)
+        (int(min(w, h) * 0.20), 0.55),
+        (int(min(w, h) * 0.40), 0.40),
+        (int(min(w, h) * 0.70), 0.25),
+        (int(min(w, h) * 1.10), 0.15),
+    ]
+    for blur_r, alpha_m in passes:
+        if blur_r % 2 == 0:
+            blur_r += 1
+        blur_r = max(3, blur_r)
+        blurred_mask = cv2.GaussianBlur(mask, (blur_r, blur_r), 0)
+        # Multiply mask normalized → alpha layer per pixel
+        alpha = (blurred_mask.astype(np.float32) / 255.0) * alpha_m * intensity
+        # Blend glow color in
+        for c in range(3):
+            glow_canvas[:, :, c] = np.clip(
+                glow_canvas[:, :, c] + alpha * glow_color[c],
+                0,
+                255,
+            ).astype(np.uint8)
+
+    # Composite glow onto canvas (additive — neon nổi bật trên dark BG)
+    canvas[:] = cv2.addWeighted(canvas, 1.0, glow_canvas, 1.0, 0)
+```
+
+#### Fix 4: SỐ COMBO PHẢI TO HƠN nhiều
+
+```python
+# HIỆN TẠI: number_font_scale auto-fit theo bbox height
+# user_scale = self.combo_number_font_scale or auto
+
+# TARGET: scale up ~1.6×
+NUMBER_SIZE_BOOST = 1.6
+
+if self.combo_number_font_scale > 0:
+    number_scale = self.combo_number_font_scale
+else:
+    # Auto-fit nhưng aggressive hơn — chiếm ~60-70% chiều cao bbox
+    number_scale = self._auto_number_scale(bbox_h) * NUMBER_SIZE_BOOST
+```
+
+### Code FULL refactor `_draw_tier_badge`
+
+```python
+def _draw_tier_badge(
+    self,
+    canvas: np.ndarray,
+    text: str,
+    cx: int,
+    cy: int,
+    badge_w: int,
+    badge_h: int,
+    color_bgr: tuple[int, int, int],
+    alpha: float = 1.0,
+) -> None:
+    """Vẽ neon-glow tier badge — match reference image v2.
+
+    Layers (back → front):
+      1. Outer halo glow (multi-pass gaussian blur)
+      2. Solid pill/rect FILL (tier color)
+      3. Bright neon BORDER (lightened tier color, thick)
+      4. Bold WHITE text (uppercase, no tilt)
+    """
+    if badge_w <= 0 or badge_h <= 0 or alpha <= 0:
+        return
+
+    # Geometry
+    x = cx - badge_w // 2
+    y = cy - badge_h // 2
+    rr = max(12, int(badge_h * 0.18))   # rounded rect (KHÔNG pill)
+    border_th = max(4, int(badge_h * 0.08))
+
+    # Colors
+    fill_color = color_bgr
+    border_color = self._lighten_bgr(color_bgr, 0.35)
+    text_color = (255, 255, 255)
+
+    # Working canvas (RGBA-style via separate alpha tracking)
+    glow_intensity = (self.combo_glow_strength / 100.0) * alpha
+
+    # ── Step 1: Outer halo glow ──────────────────────────────
+    self._draw_neon_halo(
+        canvas,
+        badge_rect=(x, y, badge_w, badge_h),
+        color_bgr=color_bgr,
+        intensity=glow_intensity,
+    )
+
+    # ── Step 2: Solid fill rounded rect ──────────────────────
+    self._draw_rounded_rect_filled(
+        canvas, (x, y, badge_w, badge_h), rr, fill_color, alpha=alpha,
+    )
+
+    # ── Step 3: Neon border (thick, lightened) ───────────────
+    self._draw_rounded_rect_outline(
+        canvas, (x, y, badge_w, badge_h), rr,
+        border_color, thickness=border_th, alpha=alpha,
+    )
+
+    # ── Step 4: White bold text — no tilt ────────────────────
+    if self.combo_tier_font_scale > 0:
+        font_scale = self.combo_tier_font_scale
+    else:
+        # Auto-fit: text ~50% chiều cao badge
+        font_scale = self._auto_text_scale(text, badge_w, badge_h, ratio=0.5)
+
+    font = cv2.FONT_HERSHEY_TRIPLEX   # bold heavy
+    th = max(2, int(badge_h * 0.05))   # text stroke thickness
+
+    (tw, th_text), baseline = cv2.getTextSize(text, font, font_scale, th)
+    text_x = cx - tw // 2
+    text_y = cy + th_text // 2
+
+    # Subtle text shadow (1px offset, dark)
+    cv2.putText(
+        canvas, text, (text_x + 1, text_y + 1), font, font_scale,
+        (0, 0, 0), th + 1, cv2.LINE_AA,
+    )
+    # Main white text
+    cv2.putText(
+        canvas, text, (text_x, text_y), font, font_scale,
+        text_color, th, cv2.LINE_AA,
+    )
+```
+
+### Helper methods cần thêm
+
+```python
+@staticmethod
+def _lighten_bgr(bgr: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    """Trộn trắng vào BGR color để tạo neon highlight."""
+    b, g, r = bgr
+    return (
+        int(min(255, b + (255 - b) * factor)),
+        int(min(255, g + (255 - g) * factor)),
+        int(min(255, r + (255 - r) * factor)),
+    )
+
+def _draw_rounded_rect_filled(
+    self, canvas, rect, radius, color_bgr, alpha=1.0
+):
+    """Vẽ rounded rect đặc."""
+    x, y, w, h = rect
+    overlay = canvas.copy()
+    # 4 corner circles + 2 rectangles cross-pattern
+    cv2.rectangle(overlay, (x + radius, y), (x + w - radius, y + h), color_bgr, -1)
+    cv2.rectangle(overlay, (x, y + radius), (x + w, y + h - radius), color_bgr, -1)
+    cv2.circle(overlay, (x + radius, y + radius), radius, color_bgr, -1)
+    cv2.circle(overlay, (x + w - radius, y + radius), radius, color_bgr, -1)
+    cv2.circle(overlay, (x + radius, y + h - radius), radius, color_bgr, -1)
+    cv2.circle(overlay, (x + w - radius, y + h - radius), radius, color_bgr, -1)
+    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+
+def _draw_rounded_rect_outline(
+    self, canvas, rect, radius, color_bgr, thickness, alpha=1.0
+):
+    """Vẽ rounded rect outline (4 cạnh + 4 cung)."""
+    x, y, w, h = rect
+    overlay = canvas.copy()
+    # 4 thẳng
+    cv2.line(overlay, (x + radius, y), (x + w - radius, y), color_bgr, thickness, cv2.LINE_AA)
+    cv2.line(overlay, (x + radius, y + h), (x + w - radius, y + h), color_bgr, thickness, cv2.LINE_AA)
+    cv2.line(overlay, (x, y + radius), (x, y + h - radius), color_bgr, thickness, cv2.LINE_AA)
+    cv2.line(overlay, (x + w, y + radius), (x + w, y + h - radius), color_bgr, thickness, cv2.LINE_AA)
+    # 4 cung
+    cv2.ellipse(overlay, (x + radius, y + radius), (radius, radius), 180, 0, 90, color_bgr, thickness, cv2.LINE_AA)
+    cv2.ellipse(overlay, (x + w - radius, y + radius), (radius, radius), 270, 0, 90, color_bgr, thickness, cv2.LINE_AA)
+    cv2.ellipse(overlay, (x + radius, y + h - radius), (radius, radius), 90, 0, 90, color_bgr, thickness, cv2.LINE_AA)
+    cv2.ellipse(overlay, (x + w - radius, y + h - radius), (radius, radius), 0, 0, 90, color_bgr, thickness, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+
+def _auto_text_scale(self, text: str, max_w: int, max_h: int, ratio: float = 0.5) -> float:
+    """Tìm font_scale lớn nhất để text fit trong (max_w, max_h) với chiều cao ~ratio×max_h."""
+    target_h = max_h * ratio
+    # Binary search font scale
+    lo, hi = 0.3, 5.0
+    for _ in range(20):
+        mid = (lo + hi) / 2
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_TRIPLEX, mid, max(2, int(max_h * 0.05)))
+        if th < target_h and tw < max_w * 0.85:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+```
+
+### Số combo — refactor render
+
+```python
+def _draw_number(self, canvas, number_str, cx, cy, max_w, max_h, color_bgr, alpha):
+    """Render số combo CỰC TO bold trắng."""
+    if self.combo_number_font_scale > 0:
+        scale = self.combo_number_font_scale
+    else:
+        # Auto: chiếm ~70% chiều cao layer bbox
+        scale = self._auto_text_scale(number_str, max_w, max_h, ratio=0.70) * 1.0
+
+    font = cv2.FONT_HERSHEY_DUPLEX   # bold clean
+    th = max(3, int(max_h * 0.06))
+
+    (tw, th_text), _ = cv2.getTextSize(number_str, font, scale, th)
+    x = cx - tw // 2
+    y = cy + th_text // 2
+
+    # Subtle glow on number (less than badge)
+    if self.combo_glow_strength > 0:
+        glow_intensity = self.combo_glow_strength / 100.0 * 0.3 * alpha
+        # Single soft blur pass
+        ... (similar to _draw_neon_halo nhưng intensity nhẹ hơn)
+
+    # Shadow + main text
+    cv2.putText(canvas, number_str, (x + 2, y + 2), font, scale, (0, 0, 0), th + 1, cv2.LINE_AA)
+    cv2.putText(canvas, number_str, (x, y), font, scale, color_bgr, th, cv2.LINE_AA)
+```
+
+### Label "COMBO" — letter-spacing wide
+
+```python
+def _draw_label(self, canvas, label, cx, cy, max_w, max_h, color_bgr, alpha):
+    """Render label 'COMBO' với letter-spacing rộng."""
+    text = label.upper()
+
+    if self.combo_label_font_scale > 0:
+        scale = self.combo_label_font_scale
+    else:
+        scale = self._auto_text_scale(text, max_w, max_h, ratio=0.4)
+
+    font = cv2.FONT_HERSHEY_DUPLEX
+    th = max(1, int(max_h * 0.04))
+
+    # Letter-spacing wide: render từng ký tự với khoảng cách rộng
+    spacing_factor = 1.4   # 40% gap giữa chars
+
+    char_widths = []
+    for ch in text:
+        (cw, _), _ = cv2.getTextSize(ch, font, scale, th)
+        char_widths.append(cw)
+
+    total_w = sum(char_widths) * spacing_factor
+    start_x = cx - int(total_w // 2)
+
+    cur_x = start_x
+    for ch, cw in zip(text, char_widths):
+        (_, th_text), _ = cv2.getTextSize(ch, font, scale, th)
+        y = cy + th_text // 2
+        cv2.putText(canvas, ch, (cur_x, y), font, scale, color_bgr, th, cv2.LINE_AA)
+        cur_x += int(cw * spacing_factor)
+```
+
+### Layout vertical — 3 phần stack
+
+```
+┌─────────────────────────┐
+│                         │
+│         4   0           │   ← Số combo (60-70% bbox height)
+│                         │
+│      C O M B O          │   ← Label letter-spaced (12-15% bbox height)
+│   ┌───────────────┐     │
+│   │  ★ GREAT ★    │     │   ← Tier badge với neon glow (20-25%)
+│   └───────────────┘     │
+└─────────────────────────┘
+```
+
+Vertical split (% of total layer bbox height):
+- Top padding: 5%
+- Number block: 55%
+- Label block: 12%
+- Spacing: 3%
+- Badge block: 20%
+- Bottom padding: 5%
+
+### Default field values cập nhật
+
+```python
+# Update defaults trong BaseRenderSettings
+combo_glow_strength: int = Field(default=80, ge=0, le=100)   # was 30 → 80 (neon mạnh)
+combo_border_thickness: int = Field(default=8, ge=0, le=30)  # was 2 → 8 (border dày)
+combo_number_font_scale: float = Field(default=0.0, ge=0.0)   # 0 = auto-boost
+combo_label_font_scale: float = Field(default=0.0, ge=0.0)
+combo_tier_font_scale: float = Field(default=0.0, ge=0.0)
+
+combo_tier1_color: str = "#22c55e"
+combo_tier2_color: str = "#3b82f6"
+combo_tier3_color: str = "#a855f7"
+combo_tier4_color: str = "#f59e0b"
+```
+
+### Performance note
+
+Multi-pass gaussian blur 4 lần × full canvas mỗi frame = expensive. Optimize:
+1. **Cache blur result** khi badge_rect không đổi (chỉ re-blur khi tier_idx đổi hoặc bbox đổi).
+2. **Dùng ROI** thay vì full canvas — blur chỉ trong vùng `[x-pad×2, y-pad×2, w+pad×4, h+pad×4]`.
+3. **Downscale** trước khi blur, upscale lại — giảm pixel count đáng kể.
+
+```python
+def _draw_neon_halo_optimized(self, canvas, badge_rect, color_bgr, intensity):
+    x, y, w, h = badge_rect
+    H, W = canvas.shape[:2]
+    pad = int(min(w, h) * 1.2)   # halo extends 1.2× badge size
+
+    rx0 = max(0, x - pad)
+    ry0 = max(0, y - pad)
+    rx1 = min(W, x + w + pad)
+    ry1 = min(H, y + h + pad)
+
+    # ROI work
+    roi = canvas[ry0:ry1, rx0:rx1].copy()
+    rh, rw = roi.shape[:2]
+
+    # Mask cho badge trong ROI coords
+    bx, by = x - rx0, y - ry0
+    mask = np.zeros((rh, rw), dtype=np.uint8)
+    cv2.rectangle(mask, (bx, by), (bx + w, by + h), 255, -1)
+
+    # Downscale 4×
+    small_mask = cv2.resize(mask, (rw // 4, rh // 4))
+    glow_small = np.zeros((rh // 4, rw // 4, 3), dtype=np.float32)
+
+    for blur_r, alpha_m in [(7, 0.55), (15, 0.4), (29, 0.25), (51, 0.15)]:
+        blurred = cv2.GaussianBlur(small_mask, (blur_r, blur_r), 0)
+        a = (blurred.astype(np.float32) / 255.0) * alpha_m * intensity
+        for c in range(3):
+            glow_small[:, :, c] = np.clip(glow_small[:, :, c] + a * color_bgr[c], 0, 255)
+
+    # Upscale back
+    glow = cv2.resize(glow_small, (rw, rh)).astype(np.uint8)
+
+    # Additive blend onto canvas ROI
+    canvas[ry0:ry1, rx0:rx1] = cv2.add(canvas[ry0:ry1, rx0:rx1], glow)
+```
+
+Ước lượng ~3-5ms/frame với optimize, vs 15-25ms/frame với full canvas blur — chấp nhận được cho 60fps target.
+
+### Test cases bổ sung — visual match
+
+```
+✓ Test 29: Render combo=40 tier=GREAT → screenshot match hình mẫu pixel-by-pixel ±10%
+✓ Test 30: Glow strength=0 → không có halo, badge flat (legacy mode)
+✓ Test 31: Glow strength=100 → halo cực mạnh, sáng cả vùng xung quanh
+✓ Test 32: Border thickness=0 → no border, chỉ solid fill
+✓ Test 33: Border thickness=20 → border cực dày, fill area bị thu nhỏ
+✓ Test 34: Tier label dài "ULTRA GODLIKE" → auto font_scale shrink để fit
+✓ Test 35: Performance — render 60fps trên 1080p với glow_strength=100, KHÔNG dropped frames
+```
+
+### Migration từ implementation hiện tại
+
+Bước 1: Add 7 helper methods mới (`_lighten_bgr`, `_draw_rounded_rect_filled`, `_draw_rounded_rect_outline`, `_auto_text_scale`, `_draw_neon_halo`, `_draw_neon_halo_optimized`, `_draw_label` với letter-spacing).
+
+Bước 2: Replace toàn bộ `_draw_tier_badge` bằng version mới (no tilt, rounded rect, multi-pass glow).
+
+Bước 3: Replace `_draw_number` để dùng NUMBER_SIZE_BOOST=1.6.
+
+Bước 4: Replace `_draw_label` để dùng letter-spacing wide.
+
+Bước 5: Update default values trong Pydantic schema (`combo_glow_strength=80`, `combo_border_thickness=8`).
+
+Bước 6: Test với combo=40 tier=GREAT, so sánh với hình mẫu, tinh chỉnh các magic number cho đến khi pixel-match.
+
+### Acceptance — final visual lock
+
+```
+✓ Badge KHÔNG còn pill → rounded rect với corner radius ~18% chiều cao
+✓ Badge có border NEON dày 6-10px màu sáng hơn fill ~35%
+✓ Badge có HALO glow sáng rực ra ngoài 20-40px (multi-pass blur)
+✓ Số combo TO HƠN 1.6× so với current implementation
+✓ Label "COMBO" có letter-spacing wide (1.4× normal)
+✓ Text "GREAT" trắng đậm bold heavy (FONT_HERSHEY_TRIPLEX), no tilt
+✓ Render 60fps không drop frame trên 1080p
+✓ Mỗi tier 1 màu riêng từ field, default Tailwind palette
+✓ Visual A/B compare với hình mẫu — match ≥90% perceptual similarity
+```
+
+> ⚠️ **Section trên (v2) SUPERSEDED bởi v3 bên dưới.** Giữ lại làm history reference. Implementation thực tế phải theo v3.
+
+---
+
+## NEON GLOW STYLE v3 — FINAL SPEC (skew + PIL TTF + auto tier text color)
+
+> **Confirmed by user**:
+> 1. Italic angle = **7° fixed**
+> 2. Tier text color = **darker variant của tier color (auto, không expose field)**
+> 3. Load font ngoài qua **PIL/Pillow TTF** — thêm field `combo_font_path`
+> 4. Transform = **SKEW (parallelogram)**, không phải rotate
+
+### Dependencies bổ sung
+
+```
+Pillow >= 9.0   # PIL.Image, PIL.ImageDraw, PIL.ImageFont
+```
+
+Đã có trong project. Không cần thêm.
+
+### Fields cập nhật (tổng hợp)
+
+| Field | Type | Default | Mô tả |
+|---|---|---|---|
+| `combo_font_path` | `str` | `""` | Path tới TTF/OTF file. Empty → fallback sang built-in cv2 font. |
+| `combo_italic_skew_deg` | `float` | `7.0` | Góc skew (KHÔNG phải rotate). Range 0-30°. |
+| `combo_number_letter_spacing` | `float` | `0.0` | Extra spacing giữa các chữ số (px). Mặc định 0. |
+| `combo_label_letter_spacing` | `float` | `0.5` | Letter-spacing cho COMBO (×em). 0.5 = 50% width 1 char. |
+| `combo_tier_letter_spacing` | `float` | `0.0` | Letter-spacing cho tier text. |
+| `combo_glow_strength` | `int` | `90` | Halo intensity 0-100. Mặc định cao (matching ref). |
+| `combo_border_thickness` | `int` | `7` | Border badge (px). |
+| `combo_badge_corner_radius` | `int` | `12` | Corner radius badge (px). 0-50. |
+| `combo_badge_padding_x` | `float` | `0.20` | Padding ngang text trong badge (×text_w). |
+| `combo_badge_padding_y` | `float` | `0.18` | Padding dọc (×text_h). |
+| `combo_tier_text_darken` | `float` | `0.55` | Mức darken tier text vs fill (0-1). 0.55 = 45% as bright. |
+
+`combo_tier_text_color` **KHÔNG expose** — auto compute từ tier color × darken factor.
+
+### Constants chốt visual
+
+```python
+# Tỉ lệ layout vertical (% bbox height)
+LAYOUT_TOP_PAD       = 0.05
+LAYOUT_NUMBER_RATIO  = 0.55   # Số "40"
+LAYOUT_LABEL_GAP     = 0.02
+LAYOUT_LABEL_RATIO   = 0.10   # "COMBO"
+LAYOUT_BADGE_GAP     = 0.04
+LAYOUT_BADGE_RATIO   = 0.20   # "GREAT"
+LAYOUT_BOTTOM_PAD    = 0.04
+
+# Italic skew
+ITALIC_SKEW_RAD = math.radians(7.0)   # = ~0.122 rad
+SKEW_MATRIX_2x3 = np.array([[1, math.tan(ITALIC_SKEW_RAD), 0],
+                            [0, 1, 0]], dtype=np.float32)
+
+# Color computation
+NEON_BORDER_LIGHTEN = 0.40   # border = lighten(tier_color, 0.40)
+NEON_FILL_DARKEN    = 0.10   # fill   = darken(tier_color, 0.10) — slightly darker than border
+TIER_TEXT_DARKEN    = 0.55   # text   = darken(tier_color, 0.55)
+
+# Glow halo
+HALO_PASSES = [
+    # (blur_radius_ratio, alpha_multiplier)
+    (0.20, 0.65),
+    (0.45, 0.50),
+    (0.80, 0.32),
+    (1.30, 0.18),
+    (2.00, 0.10),   # extra outer aura
+]
+
+# Number style
+NUMBER_HALO_BLUR_R   = 9     # px
+NUMBER_HALO_ALPHA    = 0.30
+NUMBER_OUTLINE_PX    = 2
+
+# Letter spacing
+LABEL_LETTER_SPACING_EM = 0.50   # 50% extra gap between chars
+```
+
+### PIL font rendering helper
+
+```python
+from PIL import Image, ImageDraw, ImageFont
+
+class PILFontRenderer:
+    """Render text với TTF font qua PIL, return BGR numpy array với alpha mask."""
+
+    _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+    @classmethod
+    def _get_font(cls, path: str, size_px: int) -> ImageFont.FreeTypeFont | None:
+        if not path:
+            return None
+        key = (path, size_px)
+        if key in cls._font_cache:
+            return cls._font_cache[key]
+        try:
+            font = ImageFont.truetype(path, size_px)
+        except (OSError, IOError):
+            return None
+        cls._font_cache[key] = font
+        return font
+
+    @classmethod
+    def render_text(
+        cls,
+        text: str,
+        font_path: str,
+        font_size_px: int,
+        color_bgr: tuple[int, int, int],
+        letter_spacing_px: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Render text → (BGR image, alpha mask). Return None nếu font load fail.
+
+        Returned image là tight-cropped quanh text. Caller responsible for placement.
+        """
+        font = cls._get_font(font_path, font_size_px)
+        if font is None:
+            return None
+
+        # Measure
+        if letter_spacing_px == 0:
+            bbox = font.getbbox(text)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            ascent = -bbox[1]
+        else:
+            char_widths = []
+            max_top = 0
+            max_bottom = 0
+            for ch in text:
+                cb = font.getbbox(ch)
+                char_widths.append((cb[2] - cb[0], cb[0]))
+                max_top = max(max_top, -cb[1])
+                max_bottom = max(max_bottom, cb[3])
+            tw = sum(cw for cw, _ in char_widths) + letter_spacing_px * (len(text) - 1)
+            th = max_top + max_bottom
+            ascent = max_top
+
+        pad = 4
+        canvas_w = tw + pad * 2
+        canvas_h = th + pad * 2
+
+        img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+
+        if letter_spacing_px == 0:
+            draw.text((pad, pad), text, font=font, fill=(*rgb, 255))
+        else:
+            cur_x = pad
+            for ch, (cw, lsb) in zip(text, char_widths):
+                draw.text((cur_x, pad), ch, font=font, fill=(*rgb, 255))
+                cur_x += cw + letter_spacing_px
+
+        arr = np.array(img)   # RGBA H×W×4
+        bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+        alpha = arr[:, :, 3]
+        return bgr, alpha
+```
+
+### Skew transformation helper
+
+```python
+def apply_skew_to_image(
+    img_bgr: np.ndarray,
+    alpha: np.ndarray,
+    skew_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply horizontal skew (italic effect) to image + alpha.
+
+    Skew formula: x' = x + tan(angle) * (y - y_center)
+                  y' = y
+    Top dịch trái, bottom dịch phải (italic standard).
+    """
+    if abs(skew_deg) < 0.01:
+        return img_bgr, alpha
+
+    h, w = img_bgr.shape[:2]
+    skew_rad = math.radians(skew_deg)
+    shift = math.tan(skew_rad) * h
+
+    # New canvas wider để chứa skew
+    new_w = int(w + abs(shift)) + 2
+
+    # Affine matrix: x' = x + tan(angle) * (h - y)
+    # → top (y=0) dịch +shift, bottom (y=h) dịch 0
+    M = np.array([
+        [1, math.tan(skew_rad), 0],
+        [0, 1, 0],
+    ], dtype=np.float32)
+
+    # Adjust translation để fit new canvas
+    if skew_rad > 0:
+        # Top dịch trái nếu tan > 0 và y nghĩa ngược → cần offset
+        M[0, 2] = 0
+    else:
+        M[0, 2] = abs(shift)
+
+    skewed_bgr = cv2.warpAffine(
+        img_bgr, M, (new_w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    skewed_alpha = cv2.warpAffine(
+        alpha, M, (new_w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return skewed_bgr, skewed_alpha
+
+
+def alpha_blit(
+    canvas: np.ndarray,
+    img_bgr: np.ndarray,
+    alpha: np.ndarray,
+    x: int,
+    y: int,
+    global_alpha: float = 1.0,
+) -> None:
+    """Blit BGR + alpha mask onto canvas tại (x, y) — left-top corner."""
+    H, W = canvas.shape[:2]
+    h, w = img_bgr.shape[:2]
+
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(W, x + w)
+    y1 = min(H, y + h)
+
+    if x0 >= x1 or y0 >= y1:
+        return
+
+    sx0 = x0 - x
+    sy0 = y0 - y
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+
+    src = img_bgr[sy0:sy1, sx0:sx1].astype(np.float32)
+    a = (alpha[sy0:sy1, sx0:sx1].astype(np.float32) / 255.0) * global_alpha
+    a3 = np.dstack([a, a, a])
+
+    canvas[y0:y1, x0:x1] = (
+        canvas[y0:y1, x0:x1].astype(np.float32) * (1 - a3) + src * a3
+    ).astype(np.uint8)
+```
+
+### Color helpers
+
+```python
+@staticmethod
+def _lighten_bgr(bgr: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    """Mix BGR with white. factor 0..1."""
+    b, g, r = bgr
+    return (
+        int(min(255, b + (255 - b) * factor)),
+        int(min(255, g + (255 - g) * factor)),
+        int(min(255, r + (255 - r) * factor)),
+    )
+
+@staticmethod
+def _darken_bgr(bgr: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    """Multiply BGR by (1 - factor). factor 0..1."""
+    b, g, r = bgr
+    k = 1.0 - factor
+    return (int(b * k), int(g * k), int(r * k))
+
+@staticmethod
+def _hex_to_bgr(hex_str: str) -> tuple[int, int, int]:
+    s = hex_str.lstrip("#")
+    r = int(s[0:2], 16)
+    g = int(s[2:4], 16)
+    b = int(s[4:6], 16)
+    return (b, g, r)
+
+def _resolve_tier_color(self, tier_idx: int) -> tuple[int, int, int]:
+    """Get tier color BGR by index 0-3."""
+    hex_colors = [
+        self.combo_tier1_color,
+        self.combo_tier2_color,
+        self.combo_tier3_color,
+        self.combo_tier4_color,
+    ]
+    return self._hex_to_bgr(hex_colors[tier_idx])
+```
+
+### Number render — italic skew + soft white halo
+
+```python
+def _draw_number(
+    self,
+    canvas: np.ndarray,
+    number_str: str,
+    bbox: tuple[int, int, int, int],   # (cx, cy, max_w, max_h)
+    alpha: float,
+) -> None:
+    """Render số combo italic skew với soft white halo."""
+    cx, cy, max_w, max_h = bbox
+
+    # Determine font size — auto fit với boost
+    if self.combo_number_font_scale > 0:
+        font_size_px = int(max_h * self.combo_number_font_scale)
+    else:
+        font_size_px = int(max_h * 0.85)   # 85% bbox height
+
+    color_bgr = (245, 245, 240)   # off-white kem
+
+    # Try PIL TTF render
+    pil_result = None
+    if self.combo_font_path:
+        pil_result = PILFontRenderer.render_text(
+            number_str, self.combo_font_path, font_size_px,
+            color_bgr=color_bgr,
+            letter_spacing_px=int(self.combo_number_letter_spacing),
+        )
+
+    if pil_result is None:
+        # Fallback cv2 — không có italic native, dùng FONT_HERSHEY_DUPLEX
+        bgr, mask = self._cv2_text_to_bgr_alpha(
+            number_str, cv2.FONT_HERSHEY_DUPLEX,
+            scale=font_size_px / 30.0,
+            color=color_bgr,
+            thickness=max(2, font_size_px // 25),
+        )
+    else:
+        bgr, mask = pil_result
+
+    # Apply 7° italic skew
+    bgr, mask = apply_skew_to_image(bgr, mask, self.combo_italic_skew_deg)
+
+    # Soft white halo
+    if self.combo_glow_strength > 0:
+        halo_intensity = (self.combo_glow_strength / 100.0) * 0.35 * alpha
+        self._add_text_halo(canvas, bgr, mask, cx, cy, color_bgr, halo_intensity)
+
+    # Outline đen mỏng
+    outline_mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    outline_only = cv2.subtract(outline_mask, mask)
+    outline_bgr = np.zeros_like(bgr)
+    self._blit_centered(canvas, outline_bgr, outline_only, cx, cy, alpha * 0.7)
+
+    # Main text
+    self._blit_centered(canvas, bgr, mask, cx, cy, alpha)
+
+
+def _add_text_halo(
+    self, canvas, bgr, mask, cx, cy, color_bgr, intensity,
+):
+    """Soft glow xung quanh text bằng blur mask."""
+    glow_mask = cv2.GaussianBlur(mask, (25, 25), 0)
+    glow_bgr = np.full_like(bgr, color_bgr, dtype=np.uint8)
+    self._blit_centered(canvas, glow_bgr, (glow_mask * intensity).astype(np.uint8), cx, cy, 1.0)
+
+
+def _blit_centered(self, canvas, img_bgr, alpha, cx, cy, global_alpha):
+    h, w = img_bgr.shape[:2]
+    x = cx - w // 2
+    y = cy - h // 2
+    alpha_blit(canvas, img_bgr, alpha, x, y, global_alpha)
+```
+
+### Label "COMBO" render — wide letter-spacing italic
+
+```python
+def _draw_label(self, canvas, label_text, bbox, alpha):
+    cx, cy, max_w, max_h = bbox
+    text = label_text.upper()
+
+    if self.combo_label_font_scale > 0:
+        font_size_px = int(max_h * self.combo_label_font_scale)
+    else:
+        font_size_px = int(max_h * 0.80)
+
+    color_bgr = (208, 208, 208)   # gray-white
+
+    # Letter-spacing px
+    ls_px = int(font_size_px * self.combo_label_letter_spacing)
+
+    pil_result = None
+    if self.combo_font_path:
+        pil_result = PILFontRenderer.render_text(
+            text, self.combo_font_path, font_size_px,
+            color_bgr=color_bgr, letter_spacing_px=ls_px,
+        )
+
+    if pil_result is None:
+        # Fallback: render từng char với cv2 + manual spacing
+        bgr, mask = self._cv2_text_with_spacing(
+            text, cv2.FONT_HERSHEY_DUPLEX,
+            scale=font_size_px / 30.0,
+            color=color_bgr,
+            thickness=max(1, font_size_px // 30),
+            spacing_px=ls_px,
+        )
+    else:
+        bgr, mask = pil_result
+
+    bgr, mask = apply_skew_to_image(bgr, mask, self.combo_italic_skew_deg)
+
+    self._blit_centered(canvas, bgr, mask, cx, cy, alpha)
+```
+
+### Tier badge render — neon glow + skew + auto-darker text
+
+```python
+def _draw_tier_badge(
+    self,
+    canvas: np.ndarray,
+    text: str,
+    bbox: tuple[int, int, int, int],   # (cx, cy, max_w, max_h)
+    tier_color_bgr: tuple[int, int, int],
+    alpha: float,
+) -> None:
+    """Vẽ neon green badge với skew + glow + darker text — match ref v3."""
+    cx, cy, max_w, max_h = bbox
+    if max_w <= 0 or max_h <= 0 or alpha <= 0:
+        return
+
+    # ── Color computation ─────────────────────────────────
+    fill_color   = self._darken_bgr(tier_color_bgr, NEON_FILL_DARKEN)    # ~10% darker
+    border_color = self._lighten_bgr(tier_color_bgr, NEON_BORDER_LIGHTEN)  # ~40% lighter neon
+    text_color   = self._darken_bgr(tier_color_bgr, self.combo_tier_text_darken)  # ~55% darker
+
+    # ── Sizing badge dựa vào text ──────────────────────────
+    text_target_h = int(max_h * 0.65)
+    if self.combo_tier_font_scale > 0:
+        text_target_h = int(max_h * self.combo_tier_font_scale)
+
+    # PIL render text trước (để biết kích thước)
+    text_render = None
+    if self.combo_font_path:
+        text_render = PILFontRenderer.render_text(
+            text.upper(), self.combo_font_path, text_target_h,
+            color_bgr=text_color,
+            letter_spacing_px=int(self.combo_tier_letter_spacing),
+        )
+
+    if text_render is None:
+        text_bgr, text_mask = self._cv2_text_to_bgr_alpha(
+            text.upper(), cv2.FONT_HERSHEY_TRIPLEX,
+            scale=text_target_h / 25.0,
+            color=text_color,
+            thickness=max(2, text_target_h // 12),
+        )
+    else:
+        text_bgr, text_mask = text_render
+
+    text_h, text_w = text_bgr.shape[:2]
+
+    # Badge size = text + padding
+    badge_w = int(text_w * (1 + 2 * self.combo_badge_padding_x))
+    badge_h = int(text_h * (1 + 2 * self.combo_badge_padding_y))
+
+    # Position badge centered tại (cx, cy)
+    badge_x = cx - badge_w // 2
+    badge_y = cy - badge_h // 2
+
+    # ── Render badge VÀO MỘT layer riêng để skew toàn bộ ────
+    pad_for_glow = int(max(badge_w, badge_h) * 0.4)
+    layer_w = badge_w + pad_for_glow * 2
+    layer_h = badge_h + pad_for_glow * 2
+
+    layer_bgr = np.zeros((layer_h, layer_w, 3), dtype=np.uint8)
+    layer_alpha = np.zeros((layer_h, layer_w), dtype=np.uint8)
+
+    # Coordinates trong layer
+    bx = pad_for_glow
+    by = pad_for_glow
+
+    # 1) Glow halo (multi-pass) — vẽ vào layer trước
+    self._draw_neon_halo_into_layer(
+        layer_bgr, layer_alpha,
+        rect=(bx, by, badge_w, badge_h),
+        color_bgr=tier_color_bgr,
+        radius=self.combo_badge_corner_radius,
+        intensity=(self.combo_glow_strength / 100.0),
+    )
+
+    # 2) Solid fill rounded rect
+    self._draw_rounded_rect_filled_layer(
+        layer_bgr, layer_alpha,
+        rect=(bx, by, badge_w, badge_h),
+        radius=self.combo_badge_corner_radius,
+        color_bgr=fill_color,
+    )
+
+    # 3) Neon border thick
+    self._draw_rounded_rect_outline_layer(
+        layer_bgr, layer_alpha,
+        rect=(bx, by, badge_w, badge_h),
+        radius=self.combo_badge_corner_radius,
+        color_bgr=border_color,
+        thickness=self.combo_border_thickness,
+    )
+
+    # 4) Text vào giữa badge
+    text_x = bx + (badge_w - text_w) // 2
+    text_y = by + (badge_h - text_h) // 2
+    alpha_blit(layer_bgr, text_bgr, text_mask, text_x, text_y, 1.0)
+    # Update layer_alpha với text alpha
+    layer_alpha[text_y:text_y+text_h, text_x:text_x+text_w] = np.maximum(
+        layer_alpha[text_y:text_y+text_h, text_x:text_x+text_w],
+        text_mask,
+    )
+
+    # ── Apply skew TOÀN BỘ layer ────────────────────────────
+    layer_bgr, layer_alpha = apply_skew_to_image(
+        layer_bgr, layer_alpha, self.combo_italic_skew_deg,
+    )
+
+    # ── Blit layer lên canvas tại tâm (cx, cy) ─────────────
+    skewed_h, skewed_w = layer_bgr.shape[:2]
+    final_x = cx - skewed_w // 2
+    final_y = cy - skewed_h // 2
+    alpha_blit(canvas, layer_bgr, layer_alpha, final_x, final_y, alpha)
+```
+
+### Multi-pass halo glow vào layer
+
+```python
+def _draw_neon_halo_into_layer(
+    self, layer_bgr, layer_alpha, rect, color_bgr, radius, intensity,
+):
+    """Vẽ multi-pass blur glow vào layer (additive)."""
+    x, y, w, h = rect
+    H, W = layer_bgr.shape[:2]
+
+    # Tạo solid mask cho rounded rect
+    base_mask = np.zeros((H, W), dtype=np.uint8)
+    self._fill_rounded_rect_into_mask(base_mask, rect, radius, 255)
+
+    glow_color = np.array(color_bgr, dtype=np.float32)
+    accum = np.zeros((H, W, 3), dtype=np.float32)
+
+    min_dim = min(w, h)
+    for blur_ratio, alpha_m in HALO_PASSES:
+        kr = max(3, int(min_dim * blur_ratio))
+        if kr % 2 == 0:
+            kr += 1
+        blurred = cv2.GaussianBlur(base_mask, (kr, kr), 0)
+        a = (blurred.astype(np.float32) / 255.0) * alpha_m * intensity
+        for c in range(3):
+            accum[:, :, c] += a * glow_color[c]
+
+    accum = np.clip(accum, 0, 255).astype(np.uint8)
+    # Additive blend onto layer
+    layer_bgr[:] = cv2.add(layer_bgr, accum)
+
+    # Update alpha — glow areas có alpha
+    glow_alpha = (cv2.GaussianBlur(base_mask, (51, 51), 0).astype(np.float32) * intensity * 0.8).clip(0, 255).astype(np.uint8)
+    layer_alpha[:] = np.maximum(layer_alpha, glow_alpha)
+
+
+def _fill_rounded_rect_into_mask(self, mask, rect, radius, value):
+    x, y, w, h = rect
+    r = max(0, min(radius, min(w, h) // 2))
+    cv2.rectangle(mask, (x + r, y), (x + w - r, y + h), value, -1)
+    cv2.rectangle(mask, (x, y + r), (x + w, y + h - r), value, -1)
+    if r > 0:
+        cv2.circle(mask, (x + r, y + r), r, value, -1)
+        cv2.circle(mask, (x + w - r, y + r), r, value, -1)
+        cv2.circle(mask, (x + r, y + h - r), r, value, -1)
+        cv2.circle(mask, (x + w - r, y + h - r), r, value, -1)
+
+
+def _draw_rounded_rect_filled_layer(self, layer_bgr, layer_alpha, rect, radius, color_bgr):
+    H, W = layer_bgr.shape[:2]
+    fill_mask = np.zeros((H, W), dtype=np.uint8)
+    self._fill_rounded_rect_into_mask(fill_mask, rect, radius, 255)
+    color_layer = np.full_like(layer_bgr, color_bgr)
+    a = (fill_mask.astype(np.float32) / 255.0)
+    a3 = np.dstack([a, a, a])
+    layer_bgr[:] = (layer_bgr.astype(np.float32) * (1 - a3) + color_layer.astype(np.float32) * a3).astype(np.uint8)
+    layer_alpha[:] = np.maximum(layer_alpha, fill_mask)
+
+
+def _draw_rounded_rect_outline_layer(self, layer_bgr, layer_alpha, rect, radius, color_bgr, thickness):
+    H, W = layer_bgr.shape[:2]
+    outer_mask = np.zeros((H, W), dtype=np.uint8)
+    inner_mask = np.zeros((H, W), dtype=np.uint8)
+    self._fill_rounded_rect_into_mask(outer_mask, rect, radius, 255)
+    inner_rect = (rect[0] + thickness, rect[1] + thickness, rect[2] - 2 * thickness, rect[3] - 2 * thickness)
+    inner_r = max(0, radius - thickness)
+    if inner_rect[2] > 0 and inner_rect[3] > 0:
+        self._fill_rounded_rect_into_mask(inner_mask, inner_rect, inner_r, 255)
+    border_mask = cv2.subtract(outer_mask, inner_mask)
+    color_layer = np.full_like(layer_bgr, color_bgr)
+    a = (border_mask.astype(np.float32) / 255.0)
+    a3 = np.dstack([a, a, a])
+    layer_bgr[:] = (layer_bgr.astype(np.float32) * (1 - a3) + color_layer.astype(np.float32) * a3).astype(np.uint8)
+    layer_alpha[:] = np.maximum(layer_alpha, border_mask)
+```
+
+### Render method tổng — `_draw_combo_layer`
+
+```python
+def _draw_combo_layer(self, canvas, layer_state, alpha=1.0):
+    """Entry point — vẽ toàn bộ combo layer.
+
+    layer_state cung cấp:
+      - combo_count: int
+      - tier_idx: int (0-3 hoặc -1 nếu chưa đạt tier)
+      - tier_label: str
+      - bbox: (x, y, w, h) trong canvas coords
+    """
+    bx, by, bw, bh = layer_state.bbox
+
+    # Tier color
+    if layer_state.tier_idx < 0:
+        tier_color = self._hex_to_bgr(self.combo_tier1_color)   # default
+    else:
+        tier_color = self._resolve_tier_color(layer_state.tier_idx)
+
+    # Vertical layout
+    cur_y = by + int(bh * LAYOUT_TOP_PAD)
+
+    # 1) Number
+    num_h = int(bh * LAYOUT_NUMBER_RATIO)
+    num_cy = cur_y + num_h // 2
+    num_cx = bx + bw // 2
+    self._draw_number(
+        canvas, str(layer_state.combo_count),
+        bbox=(num_cx, num_cy, bw, num_h),
+        alpha=alpha,
+    )
+    cur_y += num_h + int(bh * LAYOUT_LABEL_GAP)
+
+    # 2) Label "COMBO"
+    label_h = int(bh * LAYOUT_LABEL_RATIO)
+    label_cy = cur_y + label_h // 2
+    label_cx = bx + bw // 2
+    self._draw_label(
+        canvas, self.combo_label,
+        bbox=(label_cx, label_cy, bw, label_h),
+        alpha=alpha,
+    )
+    cur_y += label_h + int(bh * LAYOUT_BADGE_GAP)
+
+    # 3) Tier badge (chỉ vẽ nếu đạt tier)
+    if layer_state.tier_idx >= 0 and layer_state.tier_label:
+        badge_h = int(bh * LAYOUT_BADGE_RATIO)
+        badge_cy = cur_y + badge_h // 2
+        badge_cx = bx + bw // 2
+        self._draw_tier_badge(
+            canvas, layer_state.tier_label,
+            bbox=(badge_cx, badge_cy, bw, badge_h),
+            tier_color_bgr=tier_color,
+            alpha=alpha,
+        )
+```
+
+### Pydantic schema additions (consolidated)
+
+```python
+# Trong BaseRenderSettings (studio/models/render_settings.py)
+
+# Existing 26 fields giữ nguyên, REPLACE/ADD những field sau:
+combo_glow_strength: int = Field(default=90, ge=0, le=100)
+combo_border_thickness: int = Field(default=7, ge=0, le=30)
+combo_badge_corner_radius: int = Field(default=12, ge=0, le=50)
+combo_badge_padding_x: float = Field(default=0.20, ge=0.0, le=1.0)
+combo_badge_padding_y: float = Field(default=0.18, ge=0.0, le=1.0)
+
+# Italic + font external
+combo_font_path: str = Field(default="")
+combo_italic_skew_deg: float = Field(default=7.0, ge=0.0, le=30.0)
+
+# Letter spacing
+combo_number_letter_spacing: float = Field(default=0.0, ge=-10.0, le=20.0)
+combo_label_letter_spacing: float = Field(default=0.5, ge=0.0, le=2.0)
+combo_tier_letter_spacing: float = Field(default=0.0, ge=-10.0, le=20.0)
+
+# Auto-darker tier text
+combo_tier_text_darken: float = Field(default=0.55, ge=0.0, le=1.0)
+```
+
+**TỔNG = 26 + 7 (vẫn 4 tier color + 3 font_scale từ v2) + 4 mới (font_path, italic_skew, padding_x, padding_y, corner_radius) — ~37 fields.**
+
+### UI Inspector — sections cập nhật
+
+```
+┌─ Combo Layer ─────────────────────────────┐
+│ ▼ Position                                │
+│   X: [____]  Y: [____]                    │
+│   W: [____]  H: [____]                    │
+│                                           │
+│ ▼ Style                                   │
+│   Color:        [████]                    │
+│   Border thick: [ 7  ]                    │
+│   Glow:         [ 90 ]                    │
+│   Italic skew:  [ 7° ]                    │ ← NEW
+│                                           │
+│ ▼ Font                                    │
+│   ⓘ Empty = built-in cv2 font             │
+│   Font file:    [/path/to/font.ttf] [📁]  │ ← NEW
+│   Number scale: [auto / 0.0 ]             │
+│   Label scale:  [auto / 0.0 ]             │
+│   Tier scale:   [auto / 0.0 ]             │
+│   Number ls:    [ 0.0 ]                   │ ← NEW
+│   Label ls:     [ 0.5 ]                   │ ← NEW
+│   Tier ls:      [ 0.0 ]                   │ ← NEW
+│                                           │
+│ ▼ Badge                                   │
+│   Corner radius: [ 12 ]                   │ ← NEW
+│   Padding X:     [0.20]                   │ ← NEW
+│   Padding Y:     [0.18]                   │ ← NEW
+│   Text darken:   [0.55]                   │ ← NEW (auto darker)
+│                                           │
+│ ▼ Tier System                             │
+│   Label: [____________]   (combo_label)   │
+│   Tier 1: ≥ [ 30] [_Great__]  [████ ]     │
+│   Tier 2: ≥ [ 60] [_Superb_]  [████ ]     │
+│   Tier 3: ≥ [ 90] [_Perfect] [████ ]      │
+│   Tier 4: ≥ [120] [_Godlike] [████ ]      │
+│                                           │
+│ ▼ Animation / Audio                       │
+│   ... (giữ nguyên)                        │
+└───────────────────────────────────────────┘
+```
+
+### Recommended TTF fonts để bundle
+
+User upload font hoặc tool ship sẵn 1-2 font default trong `assets/fonts/`:
+
+| Font | Use case | License | URL |
+|---|---|---|---|
+| **Saira Condensed** | Condensed bold italic — match ref tốt nhất | OFL | Google Fonts |
+| **Bebas Neue** | All caps display — alt cho number | OFL | Google Fonts |
+| **Anton** | Heavy condensed — alt cho tier label | OFL | Google Fonts |
+| **Russo One** | Bold geometric — alt | OFL | Google Fonts |
+
+Default `combo_font_path` = `""` → fallback cv2. User có thể browse pick file qua Inspector button `[📁]`.
+
+### Visual reference checklist
+
+So sánh output với hình ref:
+```
+✓ Số "40":
+  - Italic skew 7° ✓
+  - Font condensed bold (Saira/Bebas) qua TTF ✓
+  - Color off-white (#F5F5F0) ✓
+  - Soft white halo blur ✓
+  - Outline đen 2px ✓
+
+✓ "COMBO" label:
+  - Italic skew 7° (đồng bộ số) ✓
+  - Letter-spacing wide (0.5em) ✓
+  - Color gray (#D0D0D0) ✓
+  - KHÔNG có glow ✓
+  - Size ~10% bbox h ✓
+
+✓ "GREAT" badge:
+  - Skew 7° toàn bộ badge (parallelogram) ✓
+  - Rounded rect corner_radius=12px (KHÔNG pill) ✓
+  - Border neon thick=7px, color=lighten(tier, 0.40) ✓
+  - Fill = darken(tier, 0.10) ✓
+  - Text color = darken(tier, 0.55) → green đậm hơn ✓
+  - Multi-pass halo glow 5 layers, intensity 0.90 ✓
+  - Text font condensed bold qua TTF ✓
+  - Padding 20% ngang × 18% dọc quanh text ✓
+```
+
+### Test cases v3
+
+```
+✓ Test 36: Render combo=40 tier=GREAT với font Saira Condensed → so sánh hình ref pixel diff <8%
+✓ Test 37: Skew 0° → render thẳng đứng (legacy mode)
+✓ Test 38: Skew 7° → toàn bộ 3 element nghiêng đồng bộ (số + label + badge)
+✓ Test 39: Font path invalid → fallback cv2 font, không crash
+✓ Test 40: Font path valid OTF → render đúng OTF
+✓ Test 41: Tier color đỏ #DC2626 → text auto = darken(0.55) = #631111 (dark red), readable
+✓ Test 42: Tier color vàng #F59E0B → text = #6E4705 (dark amber)
+✓ Test 43: Performance — full render với glow=100, font TTF, skew, multi-pass blur — vẫn 60fps
+✓ Test 44: Letter-spacing label = 0 → các chữ COMBO sát nhau (tight)
+✓ Test 45: Letter-spacing label = 1.5 → các chữ COMBO cực rộng
+```
+
+### Migration plan implementation
+
+**Phase 1 — Helpers (low risk, isolated):**
+1. Add `PILFontRenderer` class (font cache + render_text)
+2. Add `apply_skew_to_image()` standalone function
+3. Add `alpha_blit()` standalone function
+4. Add color helpers `_lighten_bgr`, `_darken_bgr`, `_hex_to_bgr`
+
+**Phase 2 — ComboHUD refactor:**
+5. Replace `_draw_number` với new version (PIL + skew + halo)
+6. Replace `_draw_label` với new version (letter-spacing wide)
+7. Replace `_draw_tier_badge` với new version (layer + skew + multi-pass glow)
+8. Add `_draw_neon_halo_into_layer`, `_fill_rounded_rect_into_mask`, `_draw_rounded_rect_filled_layer`, `_draw_rounded_rect_outline_layer`
+9. Replace top-level `_draw_combo_layer` với new orchestration
+
+**Phase 3 — Schema + UI:**
+10. Update Pydantic BaseRenderSettings (~11 fields mới/changed)
+11. Update Inspector panel UI (4 section: Style/Font/Badge/Tier)
+12. Add font file picker button [📁] gọi QFileDialog filter `*.ttf;;*.otf`
+
+**Phase 4 — Bundle assets (optional):**
+13. Tạo `assets/fonts/` directory
+14. Ship 2 default font: `SairaCondensed-BoldItalic.ttf`, `BebasNeue-Regular.ttf`
+15. Default `combo_font_path` có thể trỏ tới bundled font qua `bundle_paths.py`
+
+**Phase 5 — Testing:**
+16. Unit tests cho PIL renderer, skew, color helpers
+17. Visual regression test — render reference scenarios, compare với golden images
+18. Performance test 60fps với worst-case (max glow + TTF + skew)
+
+### Acceptance criteria v3
+
+```
+✓ Render output match hình ref user (40 COMBO GREAT) ≥92% perceptual similarity (SSIM)
+✓ 3 element (số + label + badge) ĐỀU SKEW 7° đồng bộ — không có element nào thẳng
+✓ Tier text color tự động darker hơn fill — KHÔNG cần user pick
+✓ Font TTF render qua PIL hoạt động với .ttf và .otf
+✓ Fallback cv2 font khi font_path empty hoặc invalid
+✓ 60fps trên 1080p với full feature (glow=100, TTF, skew, multi-pass)
+✓ Inspector có 4 field mới: font_path picker, italic_skew, badge corner_radius, badge padding x/y
+✓ KHÔNG break existing 26 fields (backward compat) — defaults match hình ref
+```

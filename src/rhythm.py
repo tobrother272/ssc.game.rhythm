@@ -4753,13 +4753,20 @@ class ComboHUD:
         font_family: str = "duplex",
         fade_after_break_sec: float = 0.5,
         anim: str = "pop",
-        bbox: tuple[float, float, float, float] = (0.85, 0.08, 0.13, 0.18),
+        bbox: tuple[float, float, float, float] = (0.85, 0.08, 0.065, 0.09),
         border_thickness: float = 2.0,
         glow_strength: float = 30.0,
         tier1_threshold: int = 30,  tier1_label: str = "Great",
         tier2_threshold: int = 60,  tier2_label: str = "Superb",
         tier3_threshold: int = 90,  tier3_label: str = "Perfect",
         tier4_threshold: int = 120, tier4_label: str = "Godlike",
+        tier1_color: str = "#22c55e",
+        tier2_color: str = "#3b82f6",
+        tier3_color: str = "#a855f7",
+        tier4_color: str = "#f59e0b",
+        number_font_scale: float = 0.0,
+        label_font_scale: float = 0.0,
+        tier_font_scale: float = 0.0,
         fps: float = 30.0,
     ):
         self.cam = cam
@@ -4786,6 +4793,14 @@ class ComboHUD:
         self._tier3_label = str(tier3_label)
         self._tier4_threshold = max(0, int(tier4_threshold))
         self._tier4_label = str(tier4_label)
+        self._tier1_color = str(tier1_color)
+        self._tier2_color = str(tier2_color)
+        self._tier3_color = str(tier3_color)
+        self._tier4_color = str(tier4_color)
+        # ── font scale overrides (0 = auto-fit) ─────────────────────────────
+        self._number_fs = max(0.0, float(number_font_scale))
+        self._label_fs = max(0.0, float(label_font_scale))
+        self._tier_fs = max(0.0, float(tier_font_scale))
         # ── internal state ───────────────────────────────────────────────────
         self._break_frame: int = -999_999
         self._last_combo: int = 0
@@ -4960,13 +4975,6 @@ class ComboHUD:
 
     # ── tier helpers ─────────────────────────────────────────────────────────
 
-    _TIER_COLORS_BGR: dict[int, tuple] = {
-        1: (80,  220,  80),   # green
-        2: (200, 200,  50),   # cyan-yellow
-        3: (40,  180, 255),   # gold/orange
-        4: (200,  60, 200),   # magenta
-    }
-
     def _resolve_tier_index(self, combo: int) -> int:
         if self._tier4_threshold > 0 and combo >= self._tier4_threshold:
             return 4
@@ -4978,6 +4986,17 @@ class ComboHUD:
             return 1
         return 0
 
+    def _resolve_tier_color(self, tier_idx: int) -> tuple:
+        if tier_idx == 1:
+            return _hex_to_bgr(self._tier1_color, default=(94, 197, 34))
+        if tier_idx == 2:
+            return _hex_to_bgr(self._tier2_color, default=(246, 130, 59))
+        if tier_idx == 3:
+            return _hex_to_bgr(self._tier3_color, default=(247, 85, 168))
+        if tier_idx == 4:
+            return _hex_to_bgr(self._tier4_color, default=(11, 158, 245))
+        return self._color_bgr
+
     def _tier_info(self, tier_idx: int) -> tuple[str, tuple]:
         labels = {
             1: self._tier1_label,
@@ -4985,10 +5004,7 @@ class ComboHUD:
             3: self._tier3_label,
             4: self._tier4_label,
         }
-        return (
-            labels.get(tier_idx, self._label),
-            self._TIER_COLORS_BGR.get(tier_idx, self._color_bgr),
-        )
+        return labels.get(tier_idx, self._label), self._resolve_tier_color(tier_idx)
 
     # ── badge renderer ───────────────────────────────────────────────────────
 
@@ -5020,6 +5036,187 @@ class ComboHUD:
             cv2.ellipse(img, (x1+r, y2-r), (r, r),  90, 0, 90, color, t, cv2.LINE_AA)
             cv2.ellipse(img, (x2-r, y2-r), (r, r),   0, 0, 90, color, t, cv2.LINE_AA)
 
+    # ── neon v2 helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lighten_bgr(bgr: tuple, factor: float) -> tuple:
+        """Blend white into BGR to create a lighter/neon highlight."""
+        b, g, r = bgr
+        return (
+            int(min(255, b + (255 - b) * factor)),
+            int(min(255, g + (255 - g) * factor)),
+            int(min(255, r + (255 - r) * factor)),
+        )
+
+    @staticmethod
+    def _draw_rounded_rect_filled(
+        canvas: np.ndarray,
+        rect: tuple,
+        radius: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+    ) -> None:
+        x, y, w, h = rect
+        r = max(1, min(radius, w // 2, h // 2))
+        if alpha >= 0.999:
+            cv2.rectangle(canvas, (x + r, y), (x + w - r, y + h), color_bgr, -1)
+            cv2.rectangle(canvas, (x, y + r), (x + w, y + h - r), color_bgr, -1)
+            for cx_, cy_ in ((x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)):
+                cv2.circle(canvas, (cx_, cy_), r, color_bgr, -1)
+        else:
+            ovl = canvas.copy()
+            cv2.rectangle(ovl, (x + r, y), (x + w - r, y + h), color_bgr, -1)
+            cv2.rectangle(ovl, (x, y + r), (x + w, y + h - r), color_bgr, -1)
+            for cx_, cy_ in ((x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)):
+                cv2.circle(ovl, (cx_, cy_), r, color_bgr, -1)
+            cv2.addWeighted(ovl, alpha, canvas, 1 - alpha, 0, canvas)
+
+    @staticmethod
+    def _draw_rounded_rect_outline(
+        canvas: np.ndarray,
+        rect: tuple,
+        radius: int,
+        color_bgr: tuple,
+        thickness: int,
+        alpha: float = 1.0,
+    ) -> None:
+        x, y, w, h = rect
+        r = max(1, min(radius, w // 2, h // 2))
+        t = max(1, thickness)
+        if alpha < 0.999:
+            ovl = canvas.copy()
+            tgt = ovl
+        else:
+            tgt = canvas
+        cv2.line(tgt, (x+r, y),   (x+w-r, y),   color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x+r, y+h), (x+w-r, y+h), color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x, y+r),   (x, y+h-r),   color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x+w, y+r), (x+w, y+h-r), color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+r,   y+r),   (r, r), 180, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+w-r, y+r),   (r, r), 270, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+r,   y+h-r), (r, r),  90, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+w-r, y+h-r), (r, r),   0, 0, 90, color_bgr, t, cv2.LINE_AA)
+        if alpha < 0.999:
+            cv2.addWeighted(ovl, alpha, canvas, 1 - alpha, 0, canvas)
+
+    def _auto_text_scale(self, text: str, max_w: int, max_h: int,
+                         ratio: float = 0.5, font=None) -> float:
+        """Height-primary scaling: font fills max_h×ratio, then clamp if width overflows."""
+        if font is None:
+            font = cv2.FONT_HERSHEY_TRIPLEX
+        target_h = max(1, int(max_h * ratio))
+        # Step 1: find scale that makes text_height == target_h (ignore width).
+        lo, hi = 0.1, 20.0
+        for _ in range(24):
+            mid = (lo + hi) / 2.0
+            th_arg = max(1, int(mid * 2))
+            (_, th), _ = cv2.getTextSize(text, font, mid, th_arg)
+            if th < target_h:
+                lo = mid
+            else:
+                hi = mid
+        fs = lo
+        # Step 2: clamp by width only if it overflows.
+        if max_w > 0:
+            th_arg = max(1, int(fs * 2))
+            (tw, _), _ = cv2.getTextSize(text, font, fs, th_arg)
+            if tw > max_w:
+                fs *= (max_w / tw)
+        return max(0.2, fs)
+
+    def _draw_neon_halo(
+        self,
+        canvas: np.ndarray,
+        badge_rect: tuple,
+        color_bgr: tuple,
+        intensity: float,
+    ) -> None:
+        """ROI-based optimized multi-pass neon halo (additive blend)."""
+        if intensity <= 1e-3:
+            return
+        x, y, w, h = badge_rect
+        H, W = canvas.shape[:2]
+        pad = int(min(w, h) * 1.2)
+        rx0 = max(0, x - pad);  ry0 = max(0, y - pad)
+        rx1 = min(W, x + w + pad); ry1 = min(H, y + h + pad)
+        if rx1 <= rx0 or ry1 <= ry0:
+            return
+        rw, rh = rx1 - rx0, ry1 - ry0
+
+        # mask in ROI coords
+        bx, by = x - rx0, y - ry0
+        mask = np.zeros((rh, rw), dtype=np.uint8)
+        cv2.rectangle(mask, (max(0, bx), max(0, by)),
+                      (min(rw, bx + w), min(rh, by + h)), 255, -1)
+
+        # downscale 4× for speed
+        sw, sh = max(1, rw // 4), max(1, rh // 4)
+        small_mask = cv2.resize(mask, (sw, sh))
+        glow_small = np.zeros((sh, sw, 3), dtype=np.float32)
+        col = np.array(color_bgr, dtype=np.float32)
+
+        for blur_r, a_m in [(7, 0.55), (15, 0.40), (29, 0.25), (51, 0.15)]:
+            blur_r = max(3, blur_r | 1)
+            blurred = cv2.GaussianBlur(small_mask, (blur_r, blur_r), 0)
+            a = (blurred.astype(np.float32) / 255.0) * a_m * intensity
+            for c in range(3):
+                glow_small[:, :, c] = np.clip(glow_small[:, :, c] + a * col[c], 0, 255)
+
+        glow = cv2.resize(glow_small.astype(np.uint8), (rw, rh))
+        canvas[ry0:ry1, rx0:rx1] = cv2.add(canvas[ry0:ry1, rx0:rx1], glow)
+
+    @staticmethod
+    def _blit_additive_alpha(
+        canvas: np.ndarray,
+        src: np.ndarray,
+        x0: int,
+        y0: int,
+        alpha: float,
+    ) -> None:
+        """Additive composite: canvas += src * alpha, masked by non-zero pixels."""
+        if alpha <= 1e-4:
+            return
+        H_c, W_c = canvas.shape[:2]
+        h_s, w_s = src.shape[:2]
+        sx0 = max(0, -x0);  sy0 = max(0, -y0)
+        sx1 = w_s - max(0, x0 + w_s - W_c)
+        sy1 = h_s - max(0, y0 + h_s - H_c)
+        dx0 = max(0, x0);   dy0 = max(0, y0)
+        dx1 = min(W_c, x0 + w_s)
+        dy1 = min(H_c, y0 + h_s)
+        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+            return
+        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+        src_s = src[sy0:sy1, sx0:sx1].astype(np.float32) * alpha
+        canvas[dy0:dy1, dx0:dx1] = np.clip(c_roi + src_s, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _blit_opaque(
+        canvas: np.ndarray,
+        src: np.ndarray,
+        x0: int,
+        y0: int,
+        alpha: float,
+    ) -> None:
+        """Opaque paste: where src is non-zero, blend src over canvas (not additive)."""
+        if alpha <= 1e-4:
+            return
+        H_c, W_c = canvas.shape[:2]
+        h_s, w_s = src.shape[:2]
+        sx0 = max(0, -x0);  sy0 = max(0, -y0)
+        sx1 = w_s - max(0, x0 + w_s - W_c)
+        sy1 = h_s - max(0, y0 + h_s - H_c)
+        dx0 = max(0, x0);   dy0 = max(0, y0)
+        dx1 = min(W_c, x0 + w_s)
+        dy1 = min(H_c, y0 + h_s)
+        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+            return
+        src_roi = src[sy0:sy1, sx0:sx1]
+        mask = (src_roi.max(axis=2) > 0).astype(np.float32)[:, :, np.newaxis] * alpha
+        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+        blended = src_roi.astype(np.float32) * mask + c_roi * (1.0 - mask)
+        canvas[dy0:dy1, dx0:dx1] = np.clip(blended, 0, 255).astype(np.uint8)
+
     def _draw_tier_badge(
         self,
         canvas: np.ndarray,
@@ -5028,84 +5225,129 @@ class ComboHUD:
         badge_w: int, badge_h: int,
         color_bgr: tuple,
         alpha: float = 1.0,
-        tilt_deg: float = -8.0,
+        font_scale: float | None = None,
     ) -> None:
-        """Neon badge with dark rounded-rect bg, glowing border, bold tilted text."""
-        if alpha <= 1e-4 or badge_w < 8 or badge_h < 8:
+        """Tier badge: outline frame + inner label, both with neon glow, tilted 15°.
+        No solid background fill — interior stays transparent.
+        Pass `font_scale` to keep text/box ratio consistent with caller.
+        """
+        if alpha <= 1e-4 or badge_w <= 0 or badge_h <= 0:
             return
 
-        pad = int(max(badge_w, badge_h) * 0.55)
+        # Buffer with generous room for wide glow halo + rotation.
+        pad = max(50, int(max(badge_w, badge_h) * 1.4))
         buf_w = badge_w + 2 * pad
         buf_h = badge_h + 2 * pad
         rx0, ry0 = pad, pad
-        rx1, ry1 = pad + badge_w, pad + badge_h
-        rcx = (rx0 + rx1) // 2
-        rcy = (ry0 + ry1) // 2
-        rr = max(4, badge_h // 3)
-        border_t = max(2, badge_h // 10)
+        rcx = pad + badge_w // 2
+        rcy = pad + badge_h // 2
+        rr = 0
+        border_th = max(4, int(round(self._border_thickness * 2)))
 
-        # dark background buffer
-        bg_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
-        self._draw_rounded_rect(bg_buf, (rx0, ry0), (rx1, ry1), (18, 18, 18), rr, -1)
-
-        # content buffer: glow border + text
-        content_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
-        for ksize, w in ((23, 0.35), (13, 0.55), (7, 0.75)):
-            tmp = np.zeros_like(content_buf)
-            self._draw_rounded_rect(tmp, (rx0, ry0), (rx1, ry1), color_bgr, rr, border_t)
-            tmp_blur = cv2.GaussianBlur(tmp, (ksize | 1, ksize | 1), 0)
-            content_buf = np.clip(
-                content_buf.astype(np.float32) + tmp_blur.astype(np.float32) * w,
-                0, 255,
-            ).astype(np.uint8)
-        self._draw_rounded_rect(content_buf, (rx0, ry0), (rx1, ry1), color_bgr, rr, border_t)
-
-        # bold text
+        # ── Resolve text metrics ──
+        txt_upper = text.upper()
         font_b = cv2.FONT_HERSHEY_TRIPLEX
-        th_tgt = int(badge_h * 0.58)
-        tw_tgt = badge_w - 2 * max(4, int(badge_w * 0.10))
-        (rw, rh), _ = cv2.getTextSize(text, font_b, 1.0, 2)
-        tfs = max(0.3, min(th_tgt / max(1, rh), tw_tgt / max(1, rw)))
-        (tw, th), _ = cv2.getTextSize(text, font_b, tfs, 2)
-        tx, ty = rcx - tw // 2, rcy + th // 2
+        if font_scale is not None and font_scale > 0:
+            tfs = float(font_scale)
+        elif self._tier_fs > 0:
+            tfs = float(self._tier_fs)
+        else:
+            tfs = self._auto_text_scale(txt_upper, badge_w, badge_h, ratio=0.50)
+        th_arg = max(2, int(tfs * 3))
+        (tw, th_text), _ = cv2.getTextSize(txt_upper, font_b, tfs, th_arg)
+        tx = rcx - tw // 2
+        ty = rcy + th_text // 2
 
-        for off in (8, 4):
-            tmp = np.zeros_like(content_buf)
-            cv2.putText(tmp, text, (tx, ty), font_b, tfs, color_bgr, 2 + off, cv2.LINE_AA)
-            tmp = cv2.GaussianBlur(tmp, (9, 9), 0)
-            content_buf = np.clip(content_buf.astype(np.float32) + tmp.astype(np.float32),
-                                  0, 255).astype(np.uint8)
-        cv2.putText(content_buf, text, (tx, ty), font_b, tfs, (255, 255, 255), 2, cv2.LINE_AA)
+        # ── 1) GLOW SOURCE: thick OUTLINE + thick text (no interior fill) ──
+        glow_src = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        light_color = self._lighten_bgr(color_bgr, 0.3)
+        # Thick border outline as glow source (NOT filled)
+        glow_border_th = border_th + max(6, int(badge_h * 0.06))
+        self._draw_rounded_rect_outline(
+            glow_src, (rx0, ry0, badge_w, badge_h),
+            rr, light_color, glow_border_th, alpha=1.0,
+        )
+        # Thick text stroke as additional glow source
+        cv2.putText(glow_src, txt_upper, (tx, ty),
+                    font_b, tfs, light_color, th_arg + 8, cv2.LINE_AA)
 
-        # rotate
-        ctr = (buf_w / 2.0, buf_h / 2.0)
-        M = cv2.getRotationMatrix2D(ctr, tilt_deg, 1.0)
-        rot_bg = cv2.warpAffine(bg_buf, M, (buf_w, buf_h))
-        rot_ct = cv2.warpAffine(content_buf, M, (buf_w, buf_h))
+        # Multi-pass blur: large kernels → wide soft halo fading into dark.
+        glow_norm = max(0.0, min(1.0, self._glow_strength / 100.0))
+        glow_buf = np.zeros_like(glow_src)
+        if glow_norm > 1e-3:
+            for ksize, w in ((151, 0.20), (101, 0.28), (71, 0.32), (41, 0.20)):
+                blurred = cv2.GaussianBlur(glow_src, (ksize | 1, ksize | 1), 0)
+                glow_buf = cv2.addWeighted(glow_buf, 1.0, blurred, w * glow_norm, 0)
+            glow_buf = cv2.GaussianBlur(glow_buf, (41, 41), 0)
 
-        # composite onto canvas
-        x0 = cx - buf_w // 2;  y0 = cy - buf_h // 2
-        x1 = x0 + buf_w;       y1 = y0 + buf_h
-        sx0 = max(0, -x0);     sy0 = max(0, -y0)
-        sx1 = buf_w - max(0, x1 - canvas.shape[1])
-        sy1 = buf_h - max(0, y1 - canvas.shape[0])
-        dx0 = max(0, x0);      dy0 = max(0, y0)
-        dx1 = min(canvas.shape[1], x1)
-        dy1 = min(canvas.shape[0], y1)
-        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
-            return
+        # ── 2) CONTENT: crisp border + 3D text (shadow → black stroke → color fill) ──
+        content_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        # Border outline
+        if border_th > 0:
+            self._draw_rounded_rect_outline(
+                content_buf, (rx0, ry0, badge_w, badge_h),
+                rr, light_color, border_th, alpha=1.0,
+            )
+        # Drop shadow (black, offset down-right)
+        shadow_off = max(2, int(tfs * 1.8))
+        cv2.putText(content_buf, txt_upper,
+                    (tx + shadow_off, ty + shadow_off),
+                    font_b, tfs, (0, 0, 0), th_arg + 4, cv2.LINE_AA)
+        # Black outline stroke
+        black_stroke = th_arg + max(2, int(tfs * 1.5))
+        cv2.putText(content_buf, txt_upper, (tx, ty),
+                    font_b, tfs, (0, 0, 0), black_stroke, cv2.LINE_AA)
+        # Main colored fill
+        cv2.putText(content_buf, txt_upper, (tx, ty),
+                    font_b, tfs, color_bgr, th_arg, cv2.LINE_AA)
 
-        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
-        bg_s  = rot_bg[sy0:sy1, sx0:sx1].astype(np.float32)
-        ct_s  = rot_ct[sy0:sy1, sx0:sx1].astype(np.float32)
+        # ── 3) Build content mask (tracks where content was painted, including black) ──
+        content_mask = np.zeros((buf_h, buf_w), dtype=np.uint8)
+        # Mark text regions (shadow + stroke cover area)
+        cv2.putText(content_mask, txt_upper,
+                    (tx + shadow_off, ty + shadow_off),
+                    font_b, tfs, 255, th_arg + 4, cv2.LINE_AA)
+        cv2.putText(content_mask, txt_upper, (tx, ty),
+                    font_b, tfs, 255, black_stroke, cv2.LINE_AA)
+        # Mark border region
+        if border_th > 0:
+            mask_3ch = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+            self._draw_rounded_rect_outline(
+                mask_3ch, (rx0, ry0, badge_w, badge_h),
+                rr, (255, 255, 255), border_th, alpha=1.0,
+            )
+            content_mask = np.maximum(content_mask, mask_3ch[:, :, 0])
 
-        bg_mask = np.clip(bg_s.max(axis=2, keepdims=True) / 18.0, 0, 1) * (0.78 * alpha)
-        c_roi = c_roi * (1 - bg_mask) + bg_s * bg_mask
+        # ── 4) Rotate all buffers 7.5° CCW ──
+        M = cv2.getRotationMatrix2D((buf_w / 2.0, buf_h / 2.0), 7.5, 1.0)
+        rot_glow = cv2.warpAffine(glow_buf, M, (buf_w, buf_h),
+                                  flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        rot_content = cv2.warpAffine(content_buf, M, (buf_w, buf_h),
+                                     flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        rot_mask = cv2.warpAffine(content_mask, M, (buf_w, buf_h),
+                                  flags=cv2.INTER_LINEAR, borderValue=0)
 
-        ct_mask = np.clip(ct_s.max(axis=2, keepdims=True) / 25.0, 0, 1) * alpha
-        c_roi = c_roi * (1 - ct_mask) + ct_s * ct_mask
+        # ── 5) Pass 1: Additive blit glow onto canvas (soft neon halo) ──
+        self._blit_additive_alpha(canvas, rot_glow,
+                                  cx - buf_w // 2, cy - buf_h // 2, alpha)
 
-        canvas[dy0:dy1, dx0:dx1] = np.clip(c_roi, 0, 255).astype(np.uint8)
+        # ── 6) Pass 2: Opaque paste content where mask > 0 (black stays black) ──
+        ox, oy = cx - buf_w // 2, cy - buf_h // 2
+        H_c, W_c = canvas.shape[:2]
+        sx0 = max(0, -ox);  sy0 = max(0, -oy)
+        sx1 = buf_w - max(0, ox + buf_w - W_c)
+        sy1 = buf_h - max(0, oy + buf_h - H_c)
+        dx0 = max(0, ox);   dy0 = max(0, oy)
+        dx1 = min(W_c, ox + buf_w)
+        dy1 = min(H_c, oy + buf_h)
+        if dx1 > dx0 and dy1 > dy0 and sx1 > sx0 and sy1 > sy0:
+            m_roi = rot_mask[sy0:sy1, sx0:sx1].astype(np.float32) / 255.0 * alpha
+            m_3 = m_roi[:, :, np.newaxis]
+            c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+            s_roi = rot_content[sy0:sy1, sx0:sx1].astype(np.float32)
+            canvas[dy0:dy1, dx0:dx1] = np.clip(
+                s_roi * m_3 + c_roi * (1.0 - m_3), 0, 255,
+            ).astype(np.uint8)
 
     def draw(self, canvas: np.ndarray, cur_frame: int) -> np.ndarray:
         W, H = self.cam.W, self.cam.H
@@ -5138,63 +5380,186 @@ class ComboHUD:
                 final_alpha = fade_alpha * anim_a
                 dx, dy = self._shake_offset(cur_frame)
 
-                _pad_x = max(2, int(bw * 0.05))
-                _pad_y = max(2, int(bh * 0.04))
+                # Vertical layout — pure proportional, drag bbox = scale all parts:
+                #   number zone   : 0%   → 35%   (height 35%)
+                #   gap           : 35%  → 40%   (5%)
+                #   label zone    : 40%  → 45%   (height 5%)
+                #   gap           : 45%  → 57.5% (12.5%)
+                #   tier box zone : 57.5% → 100% (height 42.5%)
+                _num_zone_h   = int(bh * 0.35)
+                _lbl_zone_h   = int(bh * 0.05)
+                _badge_zone_h = int(bh * 0.425)
+                _num_zone_top   = by
+                _lbl_zone_top   = by + int(bh * 0.40)
+                _badge_zone_top = by + int(bh * 0.575)
+                num_max_w = bw - max(4, int(bw * 0.06))
 
-                # ── combo number — bold (TRIPLEX), fits ~62% bbox height ──
-                bold_font = cv2.FONT_HERSHEY_TRIPLEX
-                target_num_h = int(bh * 0.62)
-                target_num_w = bw - 2 * _pad_x
-                (ref_nw, ref_nh), _ = cv2.getTextSize(txt_num, bold_font, 1.0, 4)
-                if ref_nh > 0 and ref_nw > 0:
-                    num_fs = max(0.3, min(target_num_h / ref_nh,
-                                         target_num_w / ref_nw)) * scale
+                # ── number — glow (separate source) + shadow + black stroke + white fill ──
+                num_font = self._get_font()
+                if self._number_fs > 0:
+                    num_fs = float(self._number_fs) * scale
                 else:
-                    num_fs = max(0.3, bh * 0.006 * scale)
+                    num_fs = self._auto_text_scale(
+                        txt_num, num_max_w, _num_zone_h, 1.0, font=num_font,
+                    ) * scale
+                num_th = max(1, int(num_fs * 1.5))
 
-                (nw, nh), _ = cv2.getTextSize(txt_num, bold_font, num_fs, 4)
-                nx = bx + (bw - nw) // 2 + dx
-                ny = by + int(bh * 0.65) + dy
-                self._draw_glow_text(
-                    canvas, text=txt_num, x=nx, y=ny,
-                    font_face=bold_font, font_scale=num_fs, thickness=4,
-                    color_bgr=self._color_bgr, alpha=final_alpha,
-                )
+                (nw, nth), _ = cv2.getTextSize(txt_num, num_font, num_fs, num_th)
+                num_cx = bx + bw // 2 + dx
+                num_cy_base = _num_zone_top + (_num_zone_h + nth) // 2 + dy
+                num_x0 = num_cx - nw // 2
 
-                # ── "COMBO" label — small, always visible ─────────────────
+                # Pass 1: Glow — thick text as source, multi-pass blur, additive
+                glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0)) * final_alpha
+                if glow_norm > 1e-3:
+                    glow_buf = np.zeros_like(canvas)
+                    light_c = self._lighten_bgr(self._color_bgr, 0.3)
+                    cv2.putText(glow_buf, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, light_c, num_th + 8, cv2.LINE_AA)
+                    blurred = np.zeros_like(canvas)
+                    for ksize, w in ((101, 0.22), (61, 0.30), (31, 0.25)):
+                        b = cv2.GaussianBlur(glow_buf, (ksize | 1, ksize | 1), 0)
+                        blurred = cv2.addWeighted(blurred, 1.0, b, w * glow_norm, 0)
+                    blurred = cv2.GaussianBlur(blurred, (21, 21), 0)
+                    canvas[:] = cv2.add(canvas, blurred)
+
+                # Pass 2: Content — shadow → black stroke → colored outline → white fill
+                num_shadow_off = max(2, int(num_fs * 1.8))
+                num_black_stroke = num_th + max(2, int(num_fs * 1.5))
+                num_outline = num_th + max(1, int(num_fs * 0.8))
+
+                if final_alpha >= 0.999:
+                    cv2.putText(canvas, txt_num,
+                                (num_x0 + num_shadow_off, num_cy_base + num_shadow_off),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke + 2, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, self._color_bgr,
+                                num_outline, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (255, 255, 255),
+                                num_th, cv2.LINE_AA)
+                else:
+                    ovl_n = canvas.copy()
+                    cv2.putText(ovl_n, txt_num,
+                                (num_x0 + num_shadow_off, num_cy_base + num_shadow_off),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke + 2, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, self._color_bgr,
+                                num_outline, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (255, 255, 255),
+                                num_th, cv2.LINE_AA)
+                    cv2.addWeighted(ovl_n, final_alpha, canvas, 1 - final_alpha, 0, canvas)
+
+                # ── label "COMBO" — glow + shadow + black stroke + colored outline + white fill ──
+                lbl_text = self._label.upper()
                 lbl_font = self._get_font()
-                target_lbl_h = int(bh * 0.15)
-                target_lbl_w = bw - 2 * _pad_x
-                (ref_lw, ref_lh), _ = cv2.getTextSize(self._label, lbl_font, 1.0, 1)
-                if ref_lh > 0 and ref_lw > 0:
-                    lbl_fs = max(0.2, min(target_lbl_h / ref_lh,
-                                         target_lbl_w / ref_lw))
-                else:
-                    lbl_fs = 0.4
-                (lw, lh), _ = cv2.getTextSize(self._label, lbl_font, lbl_fs, 1)
-                lx = bx + (bw - lw) // 2 + dx
-                ly = by + int(bh * 0.84) + dy
-                lbl_color = tuple(int(c * 0.80) for c in self._color_bgr)
-                self._draw_glow_text(
-                    canvas, text=self._label, x=lx, y=ly,
-                    font_face=lbl_font, font_scale=lbl_fs, thickness=1,
-                    color_bgr=lbl_color, alpha=final_alpha,
-                )
+                lbl_th = max(1, int(num_fs * 0.3))
+                lbl_cx = bx + bw // 2 + dx
 
-                # ── tier neon badge — below bbox, tilted ──────────────────
+                if self._label_fs > 0:
+                    lbl_fs = float(self._label_fs)
+                else:
+                    lbl_fs = self._auto_text_scale(
+                        lbl_text, int(bw * 0.60), _lbl_zone_h, 0.90, font=lbl_font,
+                    )
+
+                # letter-spacing 1.4×
+                spacing = 1.40
+                char_ws = []
+                for ch in lbl_text:
+                    (cw, _), _ = cv2.getTextSize(ch, lbl_font, lbl_fs, lbl_th)
+                    char_ws.append(cw)
+                total_lbl_w = int(sum(cw * spacing for cw in char_ws))
+                start_x = lbl_cx - total_lbl_w // 2
+                (_, lbl_ch), _ = cv2.getTextSize("A", lbl_font, lbl_fs, lbl_th)
+                lbl_baseline = _lbl_zone_top + (_lbl_zone_h + lbl_ch) // 2 + dy
+
+                # Pass 1: Glow for label (subtle, smaller than number)
+                if glow_norm > 1e-3:
+                    lbl_glow = np.zeros_like(canvas)
+                    light_c = self._lighten_bgr(self._color_bgr, 0.3)
+                    cur_x = start_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(lbl_glow, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, light_c, lbl_th + 6, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    lbl_glow = cv2.GaussianBlur(lbl_glow, (51 | 1, 51 | 1), 0)
+                    lbl_glow = (lbl_glow.astype(np.float32) * glow_norm * 0.6).clip(0, 255).astype(np.uint8)
+                    canvas[:] = cv2.add(canvas, lbl_glow)
+
+                # Pass 2: Content — shadow → black stroke → colored outline → white fill
+                lbl_shadow_off = max(1, int(lbl_fs * 1.8))
+                lbl_black_stroke = lbl_th + max(1, int(lbl_fs * 1.5))
+                lbl_color_stroke = lbl_th + max(1, int(lbl_fs * 0.8))
+
+                def _draw_label_pass(target):
+                    cur_x = start_x
+                    saved_x = cur_x
+                    # 1) shadow
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch,
+                                    (cur_x + lbl_shadow_off, lbl_baseline + lbl_shadow_off),
+                                    lbl_font, lbl_fs, (0, 0, 0),
+                                    lbl_black_stroke + 2, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 2) black stroke
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, (0, 0, 0),
+                                    lbl_black_stroke, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 3) colored outline
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, self._color_bgr,
+                                    lbl_color_stroke, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 4) white fill
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, (255, 255, 255),
+                                    lbl_th, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+
+                if final_alpha >= 0.999:
+                    _draw_label_pass(canvas)
+                else:
+                    ovl_l = canvas.copy()
+                    _draw_label_pass(ovl_l)
+                    cv2.addWeighted(ovl_l, final_alpha, canvas, 1 - final_alpha, 0, canvas)
+
+                # ── tier neon badge — fills tier box zone (35% bh × 80% bw) ────
                 if tier_idx > 0:
                     tier_text, tier_color = self._tier_info(tier_idx)
-                    b_w = int(bw * 0.92)
-                    b_h = int(bh * 0.35)
+                    b_w = max(40, int(bw * 0.85))
+                    b_h = max(20, int(_badge_zone_h * 0.75))
                     b_cx = bx + bw // 2 + dx
-                    b_cy = by + bh + b_h // 2 + _pad_y * 2 + dy
+                    b_cy = _badge_zone_top + _badge_zone_h // 2 + dy
+                    if self._tier_fs > 0:
+                        tier_fs_val = float(self._tier_fs)
+                    else:
+                        tier_fs_val = self._auto_text_scale(
+                            tier_text.upper(), int(b_w * 0.75), b_h, ratio=0.65,
+                        )
                     self._draw_tier_badge(
                         canvas, tier_text,
                         cx=b_cx, cy=b_cy,
                         badge_w=b_w, badge_h=b_h,
                         color_bgr=tier_color,
                         alpha=final_alpha,
-                        tilt_deg=-8.0,
+                        font_scale=tier_fs_val,
                     )
 
         return canvas
@@ -6851,6 +7216,13 @@ class RhythmVisualizer:
             tier3_label=str(getattr(self, "COMBO_TIER3_LABEL", "Perfect")),
             tier4_threshold=int(getattr(self, "COMBO_TIER4_THRESHOLD", 120)),
             tier4_label=str(getattr(self, "COMBO_TIER4_LABEL", "Godlike")),
+            tier1_color=str(getattr(self, "COMBO_TIER1_COLOR", "#22c55e")),
+            tier2_color=str(getattr(self, "COMBO_TIER2_COLOR", "#3b82f6")),
+            tier3_color=str(getattr(self, "COMBO_TIER3_COLOR", "#a855f7")),
+            tier4_color=str(getattr(self, "COMBO_TIER4_COLOR", "#f59e0b")),
+            number_font_scale=float(getattr(self, "COMBO_NUMBER_FONT_SCALE", 0.0)),
+            label_font_scale=float(getattr(self, "COMBO_LABEL_FONT_SCALE", 0.0)),
+            tier_font_scale=float(getattr(self, "COMBO_TIER_FONT_SCALE", 0.0)),
             fps=float(getattr(self, "FPS", 30.0)),
         )
         countdown_hud = None
@@ -8226,6 +8598,20 @@ def parse_arguments():
                    help='Combo count for Tier 4 label (0=disabled, default 120).')
     p.add_argument('--combo_tier4_label', type=str, default='Godlike',
                    help='Tier 4 label text (default Godlike).')
+    p.add_argument('--combo_tier1_color', type=str, default='#22c55e',
+                   help='Tier 1 badge color (hex, default #22c55e green).')
+    p.add_argument('--combo_tier2_color', type=str, default='#3b82f6',
+                   help='Tier 2 badge color (hex, default #3b82f6 blue).')
+    p.add_argument('--combo_tier3_color', type=str, default='#a855f7',
+                   help='Tier 3 badge color (hex, default #a855f7 purple).')
+    p.add_argument('--combo_tier4_color', type=str, default='#f59e0b',
+                   help='Tier 4 badge color (hex, default #f59e0b gold).')
+    p.add_argument('--combo_number_font_scale', type=float, default=0.0,
+                   help='Override combo number font scale (0=auto-fit).')
+    p.add_argument('--combo_label_font_scale', type=float, default=0.0,
+                   help='Override combo label font scale (0=auto-fit).')
+    p.add_argument('--combo_tier_font_scale', type=float, default=0.0,
+                   help='Override tier badge font scale (0=auto-fit).')
     p.add_argument('--start_gate_enabled', type=int, default=0, metavar='0|1',
                    help='Show the start gate at the far end of floor.')
     p.add_argument('--start_gate_type', type=str, default='color',
@@ -8468,6 +8854,13 @@ if __name__ == '__main__':
     viz.COMBO_TIER3_LABEL = str(args.combo_tier3_label or "Perfect")
     viz.COMBO_TIER4_THRESHOLD = max(0, int(args.combo_tier4_threshold))
     viz.COMBO_TIER4_LABEL = str(args.combo_tier4_label or "Godlike")
+    viz.COMBO_TIER1_COLOR = str(args.combo_tier1_color or "#22c55e")
+    viz.COMBO_TIER2_COLOR = str(args.combo_tier2_color or "#3b82f6")
+    viz.COMBO_TIER3_COLOR = str(args.combo_tier3_color or "#a855f7")
+    viz.COMBO_TIER4_COLOR = str(args.combo_tier4_color or "#f59e0b")
+    viz.COMBO_NUMBER_FONT_SCALE = max(0.0, float(args.combo_number_font_scale))
+    viz.COMBO_LABEL_FONT_SCALE = max(0.0, float(args.combo_label_font_scale))
+    viz.COMBO_TIER_FONT_SCALE = max(0.0, float(args.combo_tier_font_scale))
     viz.START_GATE_ENABLED = bool(int(args.start_gate_enabled))
     viz.START_GATE_TYPE = str(args.start_gate_type or "color")
     viz.START_GATE_COLOR = str(args.start_gate_color or "#1a1a1a")

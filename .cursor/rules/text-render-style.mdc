@@ -1,0 +1,79 @@
+---
+description: Standard text rendering style with black outline and drop shadow for video overlay
+alwaysApply: true
+---
+
+# Text Render Style — Black Outline + Drop Shadow
+
+Bất kỳ text nào vẽ lên video (layer overlay, HUD, badge, label) PHẢI có **viền đen** và **drop shadow** để text luôn rõ ràng trên mọi nền.
+
+## Thứ tự render (bắt buộc)
+
+Vẽ theo đúng thứ tự sau, layer sau đè lên layer trước:
+
+1. **Drop shadow** — màu đen `(0,0,0)`, offset xuống-phải, thickness lớn hơn stroke
+2. **Black outline stroke** — màu đen `(0,0,0)`, thickness vừa phải quanh text
+3. **Color fill** — màu chính của text, thickness base
+
+```python
+# 1) Drop shadow
+shadow_off = max(2, int(font_scale * 1.8))
+cv2.putText(buf, text, (x + shadow_off, y + shadow_off),
+            font, font_scale, (0, 0, 0), thickness + 4, cv2.LINE_AA)
+
+# 2) Black outline
+black_stroke = thickness + max(2, int(font_scale * 1.5))
+cv2.putText(buf, text, (x, y),
+            font, font_scale, (0, 0, 0), black_stroke, cv2.LINE_AA)
+
+# 3) Color fill
+cv2.putText(buf, text, (x, y),
+            font, font_scale, color_bgr, thickness, cv2.LINE_AA)
+```
+
+## Tỷ lệ sizing
+
+| Parameter | Formula | Mô tả |
+|-----------|---------|--------|
+| `shadow_off` | `max(2, int(fs * 1.8))` | Khoảng cách shadow (pixels) |
+| Shadow thickness | `th + 4` | Dày hơn outline để tạo depth |
+| `black_stroke` | `th + max(2, int(fs * 1.5))` | Viền đen quanh text |
+| Color thickness | `th` (base) | Fill chính của text |
+
+## Compositing khi có glow
+
+Nếu text có glow effect phía sau, PHẢI dùng **2-pass compositing**:
+
+1. Pass 1: Additive blit glow lên canvas (halo mềm)
+2. Pass 2: Opaque paste content (text + viền đen) dùng mask → viền đen đè lên glow
+
+```python
+# Pass 1 — glow additive
+self._blit_additive_alpha(canvas, rotated_glow, x0, y0, alpha)
+
+# Pass 2 — content opaque (mask-based)
+mask_float = rot_mask.astype(np.float32) / 255.0 * alpha
+m_3 = mask_float[:, :, np.newaxis]
+canvas_roi = canvas[dy:dy2, dx:dx2].astype(np.float32)
+content_roi = rot_content[sy:sy2, sx:sx2].astype(np.float32)
+canvas[dy:dy2, dx:dx2] = np.clip(
+    content_roi * m_3 + canvas_roi * (1.0 - m_3), 0, 255
+).astype(np.uint8)
+```
+
+**Lý do**: Additive blend khiến pixel đen (0,0,0) trở thành transparent. Phải dùng opaque paste với mask để viền đen thực sự ĐEN.
+
+## Cấm tuyệt đối
+
+- ❌ Vẽ text không có viền đen (sẽ không đọc được trên nền sáng)
+- ❌ Chỉ dùng additive blend cho text có viền đen (viền sẽ biến mất)
+- ❌ Shadow offset = 0 (mất hiệu ứng depth)
+- ❌ Black stroke thickness < font_scale (viền quá mỏng, không thấy)
+
+## Checklist
+
+- [ ] Text có shadow (đen, offset > 0, thick)
+- [ ] Text có viền đen (stroke dày hơn fill)
+- [ ] Color fill vẽ cuối cùng (đè lên shadow + stroke)
+- [ ] Nếu có glow: dùng 2-pass (additive glow + opaque content)
+- [ ] Test trên cả nền tối và nền sáng — text phải rõ ràng

@@ -2711,6 +2711,13 @@ class MainWindow(QMainWindow):
             "combo_tier3_label": str(_get("combo_tier3_label", "Perfect") or "Perfect"),
             "combo_tier4_threshold": int(_get("combo_tier4_threshold", 120) or 120),
             "combo_tier4_label": str(_get("combo_tier4_label", "Godlike") or "Godlike"),
+            "combo_tier1_color": str(_get("combo_tier1_color", "#22c55e") or "#22c55e"),
+            "combo_tier2_color": str(_get("combo_tier2_color", "#3b82f6") or "#3b82f6"),
+            "combo_tier3_color": str(_get("combo_tier3_color", "#a855f7") or "#a855f7"),
+            "combo_tier4_color": str(_get("combo_tier4_color", "#f59e0b") or "#f59e0b"),
+            "combo_number_font_scale": float(_get("combo_number_font_scale", 0.0) or 0.0),
+            "combo_label_font_scale": float(_get("combo_label_font_scale", 0.0) or 0.0),
+            "combo_tier_font_scale": float(_get("combo_tier_font_scale", 0.0) or 0.0),
             "floor_hit_frac":       _get("floor_hit_frac", None),
             "horizon_frac":         _get("horizon_frac", None),
             "floor_spread_frac":    _get("floor_spread_frac", None),
@@ -2986,6 +2993,13 @@ class MainWindow(QMainWindow):
             combo_tier3_label = str(rs.get("combo_tier3_label", "Perfect") or "Perfect")
             combo_tier4_threshold = int(rs.get("combo_tier4_threshold", 120) or 120)
             combo_tier4_label = str(rs.get("combo_tier4_label", "Godlike") or "Godlike")
+            combo_tier1_color = str(rs.get("combo_tier1_color", "#22c55e") or "#22c55e")
+            combo_tier2_color = str(rs.get("combo_tier2_color", "#3b82f6") or "#3b82f6")
+            combo_tier3_color = str(rs.get("combo_tier3_color", "#a855f7") or "#a855f7")
+            combo_tier4_color = str(rs.get("combo_tier4_color", "#f59e0b") or "#f59e0b")
+            combo_number_font_scale = float(rs.get("combo_number_font_scale", 0.0) or 0.0)
+            combo_label_font_scale = float(rs.get("combo_label_font_scale", 0.0) or 0.0)
+            combo_tier_font_scale = float(rs.get("combo_tier_font_scale", 0.0) or 0.0)
             _vpd_raw = rs.get("viewport_panel_depth")
             viewport_panel_depth_live = (
                 max(0.05, float(_vpd_raw)) if _vpd_raw is not None else None
@@ -3104,6 +3118,13 @@ class MainWindow(QMainWindow):
                     combo_tier3_label=combo_tier3_label,
                     combo_tier4_threshold=combo_tier4_threshold,
                     combo_tier4_label=combo_tier4_label,
+                    combo_tier1_color=combo_tier1_color,
+                    combo_tier2_color=combo_tier2_color,
+                    combo_tier3_color=combo_tier3_color,
+                    combo_tier4_color=combo_tier4_color,
+                    combo_number_font_scale=combo_number_font_scale,
+                    combo_label_font_scale=combo_label_font_scale,
+                    combo_tier_font_scale=combo_tier_font_scale,
                     viewport_panel_depth=viewport_panel_depth_live,
                     max_per_lane=max_per_lane,
                 )

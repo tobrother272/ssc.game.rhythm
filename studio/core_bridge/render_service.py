@@ -781,6 +781,13 @@ class RenderService(QObject):
         "combo_tier3_label",
         "combo_tier4_threshold",
         "combo_tier4_label",
+        "combo_tier1_color",
+        "combo_tier2_color",
+        "combo_tier3_color",
+        "combo_tier4_color",
+        "combo_number_font_scale",
+        "combo_label_font_scale",
+        "combo_tier_font_scale",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any

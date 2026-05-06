@@ -290,6 +290,13 @@ class LiveFrameRenderer:
         combo_tier3_label: str = "Perfect",
         combo_tier4_threshold: int = 120,
         combo_tier4_label: str = "Godlike",
+        combo_tier1_color: str = "#22c55e",
+        combo_tier2_color: str = "#3b82f6",
+        combo_tier3_color: str = "#a855f7",
+        combo_tier4_color: str = "#f59e0b",
+        combo_number_font_scale: float = 0.0,
+        combo_label_font_scale: float = 0.0,
+        combo_tier_font_scale: float = 0.0,
         floor_hit_frac: Optional[float] = None,
         horizon_frac: Optional[float] = None,
         floor_spread_frac: Optional[float] = None,
@@ -413,11 +420,11 @@ class LiveFrameRenderer:
         self._combo_audio_volume = max(0.0, min(1.0, float(combo_audio_volume)))
         self._combo_audio_milestone_mode = str(combo_audio_milestone_mode or "default")
         self._combo_audio_milestone_file = combo_audio_milestone_file or None
-        self._combo_x = max(0.0, min(1.0, float(combo_x)))
-        self._combo_y = max(0.0, min(1.0, float(combo_y)))
-        self._combo_w = max(0.05, min(0.5, float(combo_w)))
-        self._combo_h = max(0.03, min(0.3, float(combo_h)))
-        self._combo_border_thickness = max(0.0, min(10.0, float(combo_border_thickness)))
+        self._combo_x = max(0.0, min(0.98, float(combo_x)))
+        self._combo_y = max(0.0, min(0.98, float(combo_y)))
+        self._combo_w = max(0.02, float(combo_w))
+        self._combo_h = max(0.02, float(combo_h))
+        self._combo_border_thickness = max(0.0, min(30.0, float(combo_border_thickness)))
         self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
         self._combo_tier1_threshold = max(0, int(combo_tier1_threshold))
         self._combo_tier1_label = str(combo_tier1_label)
@@ -427,6 +434,13 @@ class LiveFrameRenderer:
         self._combo_tier3_label = str(combo_tier3_label)
         self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
         self._combo_tier4_label = str(combo_tier4_label)
+        self._combo_tier1_color = str(combo_tier1_color)
+        self._combo_tier2_color = str(combo_tier2_color)
+        self._combo_tier3_color = str(combo_tier3_color)
+        self._combo_tier4_color = str(combo_tier4_color)
+        self._combo_number_font_scale = max(0.0, float(combo_number_font_scale))
+        self._combo_label_font_scale = max(0.0, float(combo_label_font_scale))
+        self._combo_tier_font_scale = max(0.0, float(combo_tier_font_scale))
         self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
         self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
         self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
@@ -686,6 +700,13 @@ class LiveFrameRenderer:
         combo_tier3_label: Optional[str] = None,
         combo_tier4_threshold: Optional[int] = None,
         combo_tier4_label: Optional[str] = None,
+        combo_tier1_color: Optional[str] = None,
+        combo_tier2_color: Optional[str] = None,
+        combo_tier3_color: Optional[str] = None,
+        combo_tier4_color: Optional[str] = None,
+        combo_number_font_scale: Optional[float] = None,
+        combo_label_font_scale: Optional[float] = None,
+        combo_tier_font_scale: Optional[float] = None,
         viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
@@ -908,15 +929,15 @@ class LiveFrameRenderer:
         if combo_anim is not None:
             self._combo_anim = ComboHUD._normalize_anim(combo_anim)
         if combo_x is not None:
-            self._combo_x = max(0.0, min(1.0, float(combo_x)))
+            self._combo_x = max(0.0, min(0.98, float(combo_x)))
         if combo_y is not None:
-            self._combo_y = max(0.0, min(1.0, float(combo_y)))
+            self._combo_y = max(0.0, min(0.98, float(combo_y)))
         if combo_w is not None:
-            self._combo_w = max(0.05, min(0.5, float(combo_w)))
+            self._combo_w = max(0.02, float(combo_w))
         if combo_h is not None:
-            self._combo_h = max(0.03, min(0.3, float(combo_h)))
+            self._combo_h = max(0.02, float(combo_h))
         if combo_border_thickness is not None:
-            self._combo_border_thickness = max(0.0, min(10.0, float(combo_border_thickness)))
+            self._combo_border_thickness = max(0.0, min(30.0, float(combo_border_thickness)))
         if combo_glow_strength is not None:
             self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
         if combo_tier1_threshold is not None:
@@ -935,6 +956,20 @@ class LiveFrameRenderer:
             self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
         if combo_tier4_label is not None:
             self._combo_tier4_label = str(combo_tier4_label)
+        if combo_tier1_color is not None:
+            self._combo_tier1_color = str(combo_tier1_color)
+        if combo_tier2_color is not None:
+            self._combo_tier2_color = str(combo_tier2_color)
+        if combo_tier3_color is not None:
+            self._combo_tier3_color = str(combo_tier3_color)
+        if combo_tier4_color is not None:
+            self._combo_tier4_color = str(combo_tier4_color)
+        if combo_number_font_scale is not None:
+            self._combo_number_font_scale = max(0.0, float(combo_number_font_scale))
+        if combo_label_font_scale is not None:
+            self._combo_label_font_scale = max(0.0, float(combo_label_font_scale))
+        if combo_tier_font_scale is not None:
+            self._combo_tier_font_scale = max(0.0, float(combo_tier_font_scale))
         if viewport_panel_depth is not None:
             self._viewport_panel_depth = max(0.05, float(viewport_panel_depth))
         if max_per_lane is not None:
@@ -962,10 +997,10 @@ class LiveFrameRenderer:
         self, *, x: float, y: float, w: float, h: float
     ) -> None:
         """Hot-update combo bbox without full scene rebuild."""
-        self._combo_x = max(0.0, min(1.0, float(x)))
-        self._combo_y = max(0.0, min(1.0, float(y)))
-        self._combo_w = max(0.05, min(0.5, float(w)))
-        self._combo_h = max(0.03, min(0.3, float(h)))
+        self._combo_x = max(0.0, min(0.98, float(x)))
+        self._combo_y = max(0.0, min(0.98, float(y)))
+        self._combo_w = max(0.02, float(w))
+        self._combo_h = max(0.02, float(h))
         if self._combo is not None:
             self._combo.set_bbox(
                 self._combo_x, self._combo_y, self._combo_w, self._combo_h
@@ -1332,6 +1367,13 @@ class LiveFrameRenderer:
             tier3_label=self._combo_tier3_label,
             tier4_threshold=self._combo_tier4_threshold,
             tier4_label=self._combo_tier4_label,
+            tier1_color=self._combo_tier1_color,
+            tier2_color=self._combo_tier2_color,
+            tier3_color=self._combo_tier3_color,
+            tier4_color=self._combo_tier4_color,
+            number_font_scale=self._combo_number_font_scale,
+            label_font_scale=self._combo_label_font_scale,
+            tier_font_scale=self._combo_tier_font_scale,
             fps=float(self._fps),
         )
         self._countdown_hud = None
