@@ -2145,13 +2145,14 @@ class PreviewPanel(QWidget):
 
         # FPS selector for live preview.  Options kept deliberately small
         # (6 / 12 / 24 / 30) — higher means more CPU per second on the
-        # render thread.  Default 24 matches what users consider "smooth".
+        # render thread.  Default 12 keeps preview responsive on heavy
+        # scenes (multi-tile dance, glow effects) while still readable.
         self.fps_combo = QComboBox()
         self.fps_combo.setToolTip("Live preview frame-rate (higher = smoother but more CPU)")
         self.fps_combo.setFixedWidth(72)
         for fps_val in (6, 12, 24, 30):
             self.fps_combo.addItem(f"{fps_val} fps", fps_val)
-        self.fps_combo.setCurrentIndex(2)  # default 24 fps
+        self.fps_combo.setCurrentIndex(1)  # default 12 fps
         self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
 
         control_row.addWidget(self.play_button)

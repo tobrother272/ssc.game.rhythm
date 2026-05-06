@@ -1323,7 +1323,11 @@ class TunnelRenderer:
             mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
             cv2.fillPoly(mask, [poly], 255)
             x, y0, w, h = cv2.boundingRect(poly)
-            if w > 0 and h > 0:
+            H_c, W_c = canvas.shape[:2]
+            rx0, ry0 = max(0, x), max(0, y0)
+            rx1, ry1 = min(W_c, x + w), min(H_c, y0 + h)
+            rw, rh = rx1 - rx0, ry1 - ry0
+            if rw > 0 and rh > 0:
                 gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
                 gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
                 top = np.array([82.0, 82.0, 82.0], dtype=np.float32)
@@ -1334,7 +1338,7 @@ class TunnelRenderer:
                 grad = np.clip(grad, 0, 255).astype(np.uint8)
 
                 fill_layer = np.zeros_like(canvas)
-                fill_layer[y0:y0 + h, x:x + w] = grad
+                fill_layer[ry0:ry1, rx0:rx1] = grad[ry0 - y0:ry1 - y0, rx0 - x:rx1 - x]
                 alpha = 0.78
                 roi = mask > 0
                 canvas[roi] = (
@@ -2858,16 +2862,42 @@ class DanceTarget(Target):
         # Side/front face: medium-dark (~50% of top)
         side_col = tuple(int(c * 0.50) for c in base)
 
-        # ── 0) Strong glow: large spread illuminating floor ──────────────────
-        glow_src = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillConvexPoly(glow_src, pts, 255, lineType=cv2.LINE_AA)
-        glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in top_col],
-                            dtype=np.float32)
-        for k, w in ((101, 0.28), (61, 0.35), (31, 0.30), (15, 0.20)):
-            gb = cv2.GaussianBlur(glow_src, (k | 1, k | 1), 0)
-            a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (w * depth_gain)
-            canvas[:] = np.clip(canvas.astype(np.float32) + glow_bgr * a3,
-                                0, 255).astype(np.uint8)
+        # ── 0) Strong glow on tile-bbox ROI (near tiles only) ────────────────
+        # Performance budget: glow is the most expensive stage by far.
+        # We restrict it aggressively so multi-tile dance scenes stay
+        # preview-friendly:
+        #   • Tiles with `z_norm > 0.30` (i.e. anything past the front
+        #     ~30% of the tunnel) skip glow entirely.  Their depth_gain
+        #     is already attenuating them and the halo would be lost in
+        #     the tunnel haze anyway.
+        #   • Near tiles use a single `cv2.boxFilter` pass on the tile
+        #     bounding box + padding.  boxFilter runs on integral-image
+        #     in O(n) regardless of kernel size, ~5–10× faster than
+        #     GaussianBlur at k=71.  The slight rectangular bias of one
+        #     box pass is hidden by the additive composite + alpha
+        #     fall-off; at typical tile sizes it reads as a soft halo.
+        if z_norm <= 0.30:
+            kernel = 35
+            weight = 0.95
+            pad = kernel // 2 + 4
+            bx, by_, bw, bh = cv2.boundingRect(pts)
+            rx0 = max(0, bx - pad)
+            ry0 = max(0, by_ - pad)
+            rx1 = min(W, bx + bw + pad)
+            ry1 = min(H, by_ + bh + pad)
+            rw, rh = rx1 - rx0, ry1 - ry0
+            if rw > 0 and rh > 0:
+                pts_local = pts - np.array([rx0, ry0], dtype=np.int32)
+                glow_src = np.zeros((rh, rw), dtype=np.uint8)
+                cv2.fillConvexPoly(glow_src, pts_local, 255, lineType=cv2.LINE_AA)
+                gb = cv2.boxFilter(glow_src, -1, (kernel, kernel),
+                                   normalize=True, borderType=cv2.BORDER_CONSTANT)
+                glow_bgr = np.array(
+                    [min(255, c * depth_gain * 1.2) for c in top_col],
+                    dtype=np.float32)
+                a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (weight * depth_gain)
+                roi_f = canvas[ry0:ry1, rx0:rx1].astype(np.float32) + glow_bgr * a3
+                canvas[ry0:ry1, rx0:rx1] = np.clip(roi_f, 0, 255).astype(np.uint8)
 
         # ── 1) 3D extrusion geometry ─────────────────────────────────────────
         fl, fr, br, bl = pts[0], pts[1], pts[2], pts[3]
@@ -2935,13 +2965,39 @@ class DanceTarget(Target):
         ang = math.degrees(math.atan2(fwd[1], fwd[0]))
         fw_u = fwd / (np.linalg.norm(fwd) + 1e-6)
 
-        # Draw icon into a separate mask, then blur/blend as a soft shadow.
-        icon_mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+        # ROI-only icon: bound mask + blur to tile bbox + blur padding so
+        # we don't pay full-canvas cost per tile per frame.  Also collapse
+        # the original two sequential blends (shadow then core) into a
+        # single multiplicative blend — equivalent darkening
+        # (1 - (1-a)(1-b)) at half the float32 churn.
+        H_c, W_c = canvas.shape[:2]
+        k = max(5, int(min(tile_len, front_w) * 0.18)) | 1
+        pad = k // 2 + 2
+        bx, by_, bw, bh = cv2.boundingRect(pts)
+        rx0 = max(0, bx - pad)
+        ry0 = max(0, by_ - pad)
+        rx1 = min(W_c, bx + bw + pad)
+        ry1 = min(H_c, by_ + bh + pad)
+        rw, rh = rx1 - rx0, ry1 - ry0
+        if rw <= 0 or rh <= 0:
+            return
+        # Clamp blur kernel to ROI dims so the box filter never receives
+        # a kernel larger than the image (cv2 throws "Unknown C++
+        # exception" in this build for that case).  k must stay odd.
+        k_max = min(rw, rh)
+        if k_max < 3:
+            return
+        if k > k_max:
+            k = k_max if (k_max % 2) == 1 else (k_max - 1)
+            if k < 3:
+                return
+
+        icon_mask = np.zeros((rh, rw), dtype=np.uint8)
 
         # Heel ellipse: centered slightly backward from tile center.
         heel_off = tile_len * 0.10
-        heel_cx = int(cx - fw_u[0] * heel_off)
-        heel_cy = int(cy - fw_u[1] * heel_off)
+        heel_cx = int(cx - fw_u[0] * heel_off) - rx0
+        heel_cy = int(cy - fw_u[1] * heel_off) - ry0
         heel_rx = max(3, int(tile_len * 0.22))   # along fwd
         heel_ry = max(3, int(front_w * 0.20))    # across fwd
         cv2.ellipse(icon_mask, (heel_cx, heel_cy),
@@ -2949,24 +3005,29 @@ class DanceTarget(Target):
 
         # Toe pad: smaller ellipse forward of the heel, with a visible gap.
         toe_off = tile_len * 0.22
-        toe_cx = int(cx + fw_u[0] * toe_off)
-        toe_cy = int(cy + fw_u[1] * toe_off)
+        toe_cx = int(cx + fw_u[0] * toe_off) - rx0
+        toe_cy = int(cy + fw_u[1] * toe_off) - ry0
         toe_rx = max(2, int(tile_len * 0.10))
         toe_ry = max(2, int(front_w * 0.15))
         cv2.ellipse(icon_mask, (toe_cx, toe_cy),
                     (toe_rx, toe_ry), ang, 0, 360, 255, -1, cv2.LINE_AA)
 
-        # Soft shadow pass (blurry, reference-like)
-        k = max(5, int(min(tile_len, front_w) * 0.18)) | 1
-        blur = cv2.GaussianBlur(icon_mask, (k, k), 0)
-        a = (blur.astype(np.float32) / 255.0) * (0.55 + 0.20 * depth_gain)
-        a3 = a[:, :, None]
-        canvas[:] = np.clip(canvas.astype(np.float32) * (1.0 - a3), 0, 255).astype(np.uint8)
-
-        # Core footprint to keep the icon readable after blur.
+        # Use cv2.boxFilter instead of GaussianBlur: the build of OpenCV
+        # in production raises "Unknown C++ exception from OpenCV code"
+        # at GaussianBlur for some ROI/kernel combos that we couldn't
+        # narrow down.  boxFilter is integral-image based, robust across
+        # all sizes, and visually equivalent for a soft icon shadow.
+        blur = cv2.boxFilter(icon_mask, -1, (k, k), normalize=True)
+        shadow_a = (blur.astype(np.float32) / 255.0) * (0.55 + 0.20 * depth_gain)
         core_a = (icon_mask.astype(np.float32) / 255.0) * (0.22 + 0.10 * depth_gain)
-        core3 = core_a[:, :, None]
-        canvas[:] = np.clip(canvas.astype(np.float32) * (1.0 - core3), 0, 255).astype(np.uint8)
+        # Combined multiplicative darkening alpha — matches sequential
+        # canvas *= (1-shadow_a); canvas *= (1-core_a) exactly.
+        keep = (1.0 - shadow_a) * (1.0 - core_a)
+        keep3 = keep[:, :, None]
+        roi = canvas[ry0:ry1, rx0:rx1]
+        canvas[ry0:ry1, rx0:rx1] = np.clip(
+            roi.astype(np.float32) * keep3, 0, 255
+        ).astype(np.uint8)
 
 
 def _rounded_rect_points(x1: int, y1: int, x2: int, y2: int,
@@ -4667,7 +4728,10 @@ class ViewportFrame:
             mask = np.zeros((H, W), dtype=np.uint8)
             cv2.fillConvexPoly(mask, pts, 255)
             x, y0, w, h = cv2.boundingRect(pts)
-            if w > 0 and h > 0:
+            rx0, ry0 = max(0, x), max(0, y0)
+            rx1, ry1 = min(W, x + w), min(H, y0 + h)
+            rw, rh = rx1 - rx0, ry1 - ry0
+            if rw > 0 and rh > 0:
                 gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
                 gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
                 top = np.array([92.0, 92.0, 92.0], dtype=np.float32)
@@ -4678,7 +4742,7 @@ class ViewportFrame:
                 grad = np.clip(grad, 0, 255).astype(np.uint8)
 
                 fill_layer = np.zeros_like(canvas)
-                fill_layer[y0:y0 + h, x:x + w] = grad
+                fill_layer[ry0:ry1, rx0:rx1] = grad[ry0 - y0:ry1 - y0, rx0 - x:rx1 - x]
                 idx = mask > 0
                 if idx.any():
                     fill_alpha = 0.74 if active else 0.58
