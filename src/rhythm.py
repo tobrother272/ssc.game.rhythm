@@ -2014,6 +2014,47 @@ def draw_cube_3d(canvas: np.ndarray, cam: PerspectiveCamera,
     return {'cx': nx, 'cy': ny, 'size': nw, 'pts': pts_2d}
 
 
+def _draw_block_glow_roi(canvas: np.ndarray, pts: np.ndarray,
+                         color_bgr: tuple, depth_gain: float, z_norm: float,
+                         *, kernel: int = 35, weight: float = 0.95) -> None:
+    """ROI-only additive halo glow around a projected block silhouette.
+
+    Implements `.cursor/rules/3d-block-rendering.mdc` §5:
+      • Quy tắc 1: skip glow when ``z_norm > 0.30`` (far tile, depth_gain
+        already attenuates and halo lost in tunnel haze).
+      • Quy tắc 2: bound alloc + blur to ``cv2.boundingRect(pts) +
+        kernel/2 + 4`` padding — never alloc full canvas (~30× cheaper).
+      • Quy tắc 3: ``cv2.boxFilter`` (integral image, O(n), robust at
+        all sizes) — NEVER ``cv2.GaussianBlur`` (Unknown C++ exception
+        in OpenCV 4.13 build for some ROI/kernel combos).
+
+    Caller is responsible for invoking this BEFORE drawing solid faces
+    (Quy tắc 4: glow → side → front → top).
+    """
+    if z_norm > 0.30:
+        return
+    H, W = canvas.shape[:2]
+    pad = kernel // 2 + 4
+    bx, by_, bw, bh = cv2.boundingRect(pts)
+    rx0 = max(0, bx - pad)
+    ry0 = max(0, by_ - pad)
+    rx1 = min(W, bx + bw + pad)
+    ry1 = min(H, by_ + bh + pad)
+    rw, rh = rx1 - rx0, ry1 - ry0
+    if rw <= 0 or rh <= 0:
+        return
+    pts_local = pts - np.array([rx0, ry0], dtype=np.int32)
+    glow_src = np.zeros((rh, rw), dtype=np.uint8)
+    cv2.fillConvexPoly(glow_src, pts_local, 255, lineType=cv2.LINE_AA)
+    gb = cv2.boxFilter(glow_src, -1, (kernel, kernel),
+                       normalize=True, borderType=cv2.BORDER_CONSTANT)
+    glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in color_bgr],
+                        dtype=np.float32)
+    a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (weight * depth_gain)
+    roi_f = canvas[ry0:ry1, rx0:rx1].astype(np.float32) + glow_bgr * a3
+    canvas[ry0:ry1, rx0:rx1] = np.clip(roi_f, 0, 255).astype(np.uint8)
+
+
 def _draw_fist_icon(canvas: np.ndarray, cx: int, cy: int, size: int,
                     color=CLR_WHITE):
     """Stylized closed-fist icon (knuckles + palm) centered at (cx,cy).
@@ -2135,6 +2176,19 @@ class PunchTarget(Target):
         return False
 
     def draw(self, canvas, cam, cur_frame):
+        """Render per .cursor/rules/3d-block-rendering.mdc.
+
+        Pipeline (all paths share the rule §5 glow):
+          1. Project 8 cube corners → onscreen check.
+          2. Glow ROI+boxFilter (rule §5) using projected silhouette as
+             the bbox source — gated by ``z_norm > 0.30``.
+          3. Mesh/Texture path: hand the box geometry to the existing
+             renderer (kept for user-supplied custom assets).
+          4. Default neon path: 3 flat faces (top/front/one side) with
+             brightness ratios from rule §2, painter's order side →
+             front → top, perspective-correct side selection (§3).
+          5. Fist icon centered on the TOP face.
+        """
         if self.state != 'flying':
             return canvas
         z_norm = self.depth(cur_frame)   # 1 at spawn, 0 at hit
@@ -2144,9 +2198,49 @@ class PunchTarget(Target):
         wz = self.Z_VIS_NEAR + z_norm * (self.Z_VIS_FAR - self.Z_VIS_NEAR)
         wy = self.WY_SPAWN + (self.WY_HIT - self.WY_SPAWN) * (1.0 - z_norm)
 
+        # 8 cube corners.  Conventions (matches PerspectiveCamera):
+        #   +X right, +Y down (so wy < cube_center → top face), +Z away.
+        # Indices: [F=front (z-), B=back (z+); L/R; T=top (y-), b=bottom (y+)].
+        HX = HY = HZ = self.CUBE_HALF
+        corners_w = [
+            (wx - HX, wy - HY, wz - HZ),  # 0 FLT
+            (wx + HX, wy - HY, wz - HZ),  # 1 FRT
+            (wx + HX, wy + HY, wz - HZ),  # 2 FRb
+            (wx - HX, wy + HY, wz - HZ),  # 3 FLb
+            (wx - HX, wy - HY, wz + HZ),  # 4 BLT
+            (wx + HX, wy - HY, wz + HZ),  # 5 BRT
+            (wx + HX, wy + HY, wz + HZ),  # 6 BRb
+            (wx - HX, wy + HY, wz + HZ),  # 7 BLb
+        ]
+        proj = [cam.project(*p) for p in corners_w]
+        if any(p is None for p in proj):
+            return canvas
+        pts = np.array(
+            [(int(round(p[0])), int(round(p[1]))) for p in proj],
+            dtype=np.int32)
+        H, W = canvas.shape[:2]
+        if (pts[:, 0].max() < 0 or pts[:, 0].min() >= W
+                or pts[:, 1].max() < 0 or pts[:, 1].min() >= H):
+            return canvas
+
+        # Brightness model — rule §2 (NOT Lambert).
+        base = tuple(int(c) for c in self.color)
+        top_col   = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
+        side_col  = tuple(int(c * 0.50) for c in base)
+        depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
+
+        # Rule §5 Quy tắc 4: glow vẽ TRƯỚC mọi face solid.
+        # Use convex hull of projected corners as the silhouette so the
+        # boundingRect tightly hugs the visible block (avoids glow
+        # padding around invisible back vertices).
+        hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.int32)
+        _draw_block_glow_roi(canvas, hull, top_col, depth_gain, z_norm)
+
+        # Custom-asset paths — keep proven texture/mesh renderers.
+        # The new ROI glow above already drew the halo; these renderers
+        # have no internal glow of their own (verified) so no double-glow.
         mesh = self.MESH_LEFT if self.is_left else self.MESH_RIGHT
         tex  = self.TEXTURE_LEFT if self.is_left else self.TEXTURE_RIGHT
-
         if mesh is not None:
             draw_mesh_3d(canvas, cam, mesh, (wx, wy, wz), self.CUBE_HALF,
                          base_color=self.color,
@@ -2157,17 +2251,42 @@ class PunchTarget(Target):
                                   tex[0], tex[1], rim=None)
             return canvas
 
-        # Perfect dice: uniform half on all axes, yaw = 0 (axis-aligned).
-        # 3 faces emerge naturally from perspective at hit zone:
-        #   • FRONT — always visible
-        #   • TOP   — WY_HIT > CUBE_HALF → cube fully below eye line → camera looks down
-        #   • SIDE  — lane is off-centre → camera sees inner face
-        cube_info = draw_cube_3d(canvas, cam, (wx, wy, wz), self.CUBE_HALF,
-                                 color=self.color, yaw=0.0,
-                                 corner_radius=self.CORNER_RADIUS)
-        if cube_info is not None and cube_info['size'] >= 22:
-            _draw_fist_icon(canvas, cube_info['cx'], cube_info['cy'],
-                            int(cube_info['size'] * 0.58), CLR_WHITE)
+        # ===== Default neon path: 3 flat faces per rule §1-§4 =====
+        # Face vertex orderings (CCW when viewed from outside the cube,
+        # which is what cv2.fillConvexPoly expects for clean filling):
+        top_face   = pts[[0, 1, 5, 4]]   # FLT FRT BRT BLT
+        front_face = pts[[3, 0, 1, 2]]   # FLb FLT FRT FRb
+        left_face  = pts[[3, 7, 4, 0]]   # FLb BLb BLT FLT
+        right_face = pts[[2, 1, 5, 6]]   # FRb FRT BRT BRb
+
+        # Apply depth_gain per rule §2 (top brightest, front=side*1.15,
+        # side darkest).
+        top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)
+        front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)
+        side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)
+
+        # Rule §3: perspective-correct side selection.
+        block_screen_cx = float(pts[:, 0].mean())
+        cam_cx = float(getattr(cam, 'cx_pix', W / 2.0))
+
+        # Rule §4 painter's order: side → front → top.
+        if block_screen_cx < cam_cx - 2:
+            cv2.fillConvexPoly(canvas, right_face, side_scaled, lineType=cv2.LINE_AA)
+        elif block_screen_cx > cam_cx + 2:
+            cv2.fillConvexPoly(canvas, left_face, side_scaled, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(canvas, front_face, front_scaled, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(canvas, top_face, top_scaled, lineType=cv2.LINE_AA)
+
+        # Fist icon on the TOP face.  Size scales with on-screen top edge.
+        top_w = int(max(
+            np.linalg.norm(top_face[1] - top_face[0]),
+            np.linalg.norm(top_face[2] - top_face[3]),
+        ))
+        if top_w >= 22:
+            cx_top = int(top_face[:, 0].mean())
+            cy_top = int(top_face[:, 1].mean())
+            _draw_fist_icon(canvas, cx_top, cy_top,
+                            int(top_w * 0.58), CLR_WHITE)
         return canvas
 
 
@@ -2862,42 +2981,8 @@ class DanceTarget(Target):
         # Side/front face: medium-dark (~50% of top)
         side_col = tuple(int(c * 0.50) for c in base)
 
-        # ── 0) Strong glow on tile-bbox ROI (near tiles only) ────────────────
-        # Performance budget: glow is the most expensive stage by far.
-        # We restrict it aggressively so multi-tile dance scenes stay
-        # preview-friendly:
-        #   • Tiles with `z_norm > 0.30` (i.e. anything past the front
-        #     ~30% of the tunnel) skip glow entirely.  Their depth_gain
-        #     is already attenuating them and the halo would be lost in
-        #     the tunnel haze anyway.
-        #   • Near tiles use a single `cv2.boxFilter` pass on the tile
-        #     bounding box + padding.  boxFilter runs on integral-image
-        #     in O(n) regardless of kernel size, ~5–10× faster than
-        #     GaussianBlur at k=71.  The slight rectangular bias of one
-        #     box pass is hidden by the additive composite + alpha
-        #     fall-off; at typical tile sizes it reads as a soft halo.
-        if z_norm <= 0.30:
-            kernel = 35
-            weight = 0.95
-            pad = kernel // 2 + 4
-            bx, by_, bw, bh = cv2.boundingRect(pts)
-            rx0 = max(0, bx - pad)
-            ry0 = max(0, by_ - pad)
-            rx1 = min(W, bx + bw + pad)
-            ry1 = min(H, by_ + bh + pad)
-            rw, rh = rx1 - rx0, ry1 - ry0
-            if rw > 0 and rh > 0:
-                pts_local = pts - np.array([rx0, ry0], dtype=np.int32)
-                glow_src = np.zeros((rh, rw), dtype=np.uint8)
-                cv2.fillConvexPoly(glow_src, pts_local, 255, lineType=cv2.LINE_AA)
-                gb = cv2.boxFilter(glow_src, -1, (kernel, kernel),
-                                   normalize=True, borderType=cv2.BORDER_CONSTANT)
-                glow_bgr = np.array(
-                    [min(255, c * depth_gain * 1.2) for c in top_col],
-                    dtype=np.float32)
-                a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (weight * depth_gain)
-                roi_f = canvas[ry0:ry1, rx0:rx1].astype(np.float32) + glow_bgr * a3
-                canvas[ry0:ry1, rx0:rx1] = np.clip(roi_f, 0, 255).astype(np.uint8)
+        # ── 0) ROI-only halo glow per rule §5 (gate, ROI, boxFilter) ─────────
+        _draw_block_glow_roi(canvas, pts, top_col, depth_gain, z_norm)
 
         # ── 1) 3D extrusion geometry ─────────────────────────────────────────
         fl, fr, br, bl = pts[0], pts[1], pts[2], pts[3]
