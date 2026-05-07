@@ -28,6 +28,7 @@ _update_staging/
 
 *.sh
 *.mp3
+*.mp4
 # PyInstaller
 *.spec.bak
 
