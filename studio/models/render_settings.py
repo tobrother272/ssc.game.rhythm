@@ -92,6 +92,7 @@ class BaseRenderSettings(SideRailMixin, BaseModel):
     # the flag.
     beat_min_gap: int = 4
     bloom: bool = True
+    use_moderngl: bool = True
     floor_panels: bool = True
     floor_panel_color: Optional[str] = None    # hex e.g. "#4af0c8"; None = default grey
     floor_panel_opacity: float = 1.0           # 0.0 (transparent) … 1.0 (solid)

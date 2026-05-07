@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from math import atan2 as _math_atan2, cos as _math_cos, sin as _math_sin
 from pathlib import Path
 from typing import Optional
 
@@ -1274,6 +1275,13 @@ class LiveFrameRenderer:
         if self._wall_floor_gap_frac is not None:
             cam_kwargs["wall_floor_gap_frac"] = self._wall_floor_gap_frac
         self._cam = PerspectiveCamera(self._width, self._height, **cam_kwargs)
+
+        # ModernGL GPU renderer for PunchTarget — deferred to first render_at()
+        # because OpenGL contexts have thread affinity on Windows: _build_scene
+        # runs in a background QThread but render_at is called from the main thread.
+        if not hasattr(self, '_mgl_renderer'):
+            self._mgl_renderer = None
+        self._mgl_ready = False
         self._background_layer = SegmentBackgroundLayer(
             self._width,
             self._height,
@@ -1610,9 +1618,11 @@ class LiveFrameRenderer:
                         0.0, LineTarget.HORIZONTAL_WY,
                         cam.Z_NEAR + 0.01,
                     )
-                    y = int(proj[1]) if proj else int(cam.air_y(0.02, 0.55))
+                    y = int(proj[1]) if proj else int(cam.cy_pix)
                 else:
-                    y = int(cam.air_y(0.02, 0.55))
+                    # PunchTarget blocks fly at camera level (wy=0); burst
+                    # at horizon = block actual screen position.
+                    y = int(cam.cy_pix)
                 count = 50
                 self._viewport.trigger(1.0)
             elif isinstance(tg, DanceTarget):
@@ -1636,6 +1646,17 @@ class LiveFrameRenderer:
             return self._background_layer.frame(0)
         return np.full((self._height, self._width, 3),
                        CLR_BG, dtype=np.uint8)
+
+    def _init_mgl(self) -> None:
+        """Lazily init ModernGL on first render (must run on the GL thread)."""
+        self._mgl_ready = True
+        if self._mgl_renderer is None:
+            try:
+                from mgl_renderer import MGLPunchRenderer
+                self._mgl_renderer = MGLPunchRenderer.get()
+            except Exception:
+                self._mgl_renderer = None
+        self._vp_matrix = self._cam.view_proj_matrix() if self._mgl_renderer else None
 
     def _compose_frame(self, fi: int) -> np.ndarray:
         """Render one frame at index ``fi``.
@@ -1667,8 +1688,74 @@ class LiveFrameRenderer:
             _bass = float(self._audio.bass_arr[fi]) if fi < len(self._audio.bass_arr) else 0.0
             self._side_rail.draw(canvas, fi, bass_val=_bass, hit=self._hit_this_frame)
         # 2. targets (back to front so close cubes occlude far ones)
-        for tg in self._game.alive_sorted(fi):
-            canvas = tg.draw(canvas, self._cam, fi)
+        # Use ModernGL GPU path for PunchTarget when available.
+        if not self._mgl_ready:
+            self._init_mgl()
+        if self._mgl_renderer is not None:
+            from mgl_renderer import PunchBlockInstance, composite_alpha_with_halo
+            _punch_insts = []
+            _lane_step = abs(self._cam.lane_world_x(1) - self._cam.lane_world_x(0)) if self._cam.n_lanes > 1 else 0.5
+            _tile_hw = _lane_step * 0.80 * 0.5
+            _ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W if PunchTarget.BLOCK_HALF_W > 0 else 1.0
+            _yaw_factor = 0.5
+            _max_yaw = max(
+                abs(_math_atan2(self._cam.lane_world_x(_l), abs(self._cam.FLOOR_WORLD_Y)) * _yaw_factor)
+                for _l in range(self._cam.n_lanes)
+            )
+            _shrink = 1.0 / (abs(_math_cos(_max_yaw)) + _ratio_DW * abs(_math_sin(_max_yaw)))
+            _block_hw = _tile_hw * _shrink
+            _block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W) if PunchTarget.BLOCK_HALF_W > 0 else _block_hw
+            _block_hd = _block_hw * _ratio_DW
+            _wy_const = 0.0  # camera eye level → no top/bottom face visible
+            for tg in self._game.alive_sorted(fi):
+                # LineTarget inherits PunchTarget but renders a chain of
+                # cubes via its own draw() — must NOT be batched into the
+                # single-cube GPU path or the chain disappears and the
+                # head reads as a plain punch block.
+                if (isinstance(tg, PunchTarget)
+                        and not isinstance(tg, LineTarget)
+                        and tg.state == 'flying'):
+                    if (PunchTarget.MESH_LEFT is not None or
+                            PunchTarget.MESH_RIGHT is not None or
+                            PunchTarget.TEXTURE_LEFT is not None or
+                            PunchTarget.TEXTURE_RIGHT is not None):
+                        continue
+                    _zn = tg.depth(fi)
+                    if _zn <= 0.0:
+                        continue
+                    _wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+                    _wx = self._cam.lane_world_x(tg.lane)
+                    _wy = _wy_const
+                    _yaw = _math_atan2(_wx, abs(self._cam.FLOOR_WORLD_Y)) * _yaw_factor
+                    b, g, r = tg.color
+                    _punch_insts.append(PunchBlockInstance(
+                        position=(_wx, _wy, _wz),
+                        scale=(_block_hw, _block_hh, _block_hd),
+                        color=(r / 255.0, g / 255.0, b / 255.0),
+                        z_norm=_zn,
+                        yaw=_yaw,
+                    ))
+            if _punch_insts:
+                _gl_bgr, _gl_alpha = self._mgl_renderer.render(
+                    _punch_insts, self._vp_matrix,
+                    (0.0, 0.0, 0.0), self._width, self._height)
+                canvas = composite_alpha_with_halo(canvas, _gl_bgr, _gl_alpha)
+            for tg in self._game.alive_sorted(fi):
+                # Skip plain PunchTarget that was already drawn via the GPU
+                # path above.  LineTarget falls through to its own CPU
+                # draw() (chain rendering); MESH/TEXTURE-overridden punch
+                # also falls through (GPU path skipped them above).
+                if (isinstance(tg, PunchTarget)
+                        and not isinstance(tg, LineTarget)):
+                    if (PunchTarget.MESH_LEFT is None and
+                            PunchTarget.MESH_RIGHT is None and
+                            PunchTarget.TEXTURE_LEFT is None and
+                            PunchTarget.TEXTURE_RIGHT is None):
+                        continue
+                canvas = tg.draw(canvas, self._cam, fi)
+        else:
+            for tg in self._game.alive_sorted(fi):
+                canvas = tg.draw(canvas, self._cam, fi)
         # 3. particle update + draw.  Bursts for hits at this frame
         # were already triggered inside ``render_at``'s fast-forward
         # loop (see ``_apply_hits``); here we only DRAW the current

@@ -654,6 +654,7 @@ class RenderService(QObject):
         "rail_dot_count",
         "rail_dot_lines",
         "rail_dot_size_px",
+        "use_moderngl",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -669,6 +670,7 @@ class RenderService(QObject):
         "density",
         "speed",
         "max_per_lane",
+        "use_moderngl",
         "floor_panels",
         "floor_panel_color",
         "floor_panel_opacity",

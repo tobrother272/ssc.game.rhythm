@@ -448,7 +448,7 @@ class PerspectiveCamera:
                  n_lanes: int = N_LANES,
                  horizon_frac: float = 0.45,
                  hit_zone_frac: float = 0.86,
-                 floor_spread_frac: float = 0.70,
+                 floor_spread_frac: float = 0.175,
                  far_spread_frac: float | None = None,
                  wall_floor_gap_frac: float | None = None,
                  fov_deg: float = 55.0):
@@ -525,6 +525,46 @@ class PerspectiveCamera:
         sx = self.cx_pix + self.fx * wx / wz
         sy = self.cy_pix + self.fy * wy / wz
         return (sx, sy, 1.0 / wz)
+
+    def view_proj_matrix(self) -> "np.ndarray":
+        """Build a 4x4 OpenGL view-projection matrix matching project() pinhole.
+
+        Convention: camera at origin, +X right, +Y down, +Z away.
+        OpenGL clip space: +X right, +Y up, -Z into screen.
+        We embed a Y-flip + Z-flip into the projection to reconcile.
+        The matrix is column-major (transposed) for GL upload.
+        """
+        W = float(self.W)
+        H = float(self.H)
+        fx = float(self.fx)
+        fy = float(self.fy)
+        cx = float(self.cx_pix)
+        cy = float(self.cy_pix)
+
+        z_near = 0.1
+        z_far = 120.0
+
+        # OpenGL NDC projection from pinhole intrinsics:
+        #   x_ndc = (2*fx/W)*x/z + (1 - 2*cx/W)
+        #   y_ndc = -(2*fy/H)*y/z + (2*cy/H - 1)   (Y-flip: our +Y down → GL +Y up)
+        #   z_ndc = standard depth mapping
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = 2.0 * fx / W
+        proj[0, 2] = 1.0 - 2.0 * cx / W
+        proj[1, 1] = -2.0 * fy / H           # negative for Y-flip
+        proj[1, 2] = 2.0 * cy / H - 1.0
+        proj[2, 2] = -(z_far + z_near) / (z_far - z_near)
+        proj[2, 3] = -2.0 * z_far * z_near / (z_far - z_near)
+        proj[3, 2] = -1.0
+
+        # View: identity (camera at world origin looking +Z).
+        # GL convention is -Z into screen, so flip Z in view.
+        view = np.eye(4, dtype=np.float32)
+        view[2, 2] = -1.0
+
+        # Column-major for GL: transpose the product.
+        vp = proj @ view
+        return vp.T.astype(np.float32)
 
     def lane_world_x(self, lane) -> float:
         """World-X for a (possibly fractional) lane index.
@@ -2220,6 +2260,12 @@ class PunchTarget(Target):
     # cubes stay visually comfortable in the 4-lane layout and don't
     # crowd adjacent lanes.
     CUBE_HALF = 0.154
+    # Block dimensions — width is computed dynamically from lane tile width at
+    # render time (see `_block_hw` in render loop). H and D follow these ratios
+    # so the block proportions stay constant regardless of lane spacing.
+    BLOCK_HALF_W: float = 0.20    # X half-width (base reference, overridden at render)
+    BLOCK_HALF_H: float = 0.18    # Y half-height (ratio H/W = 0.90)
+    BLOCK_HALF_D: float = 0.14    # Z depth (ratio D/W = 0.70)
     # Corner rounding for the default neon cubes (fraction of the shortest
     # projected face-edge; 0 = sharp corners, ~0.45 = pill-shaped).
     CORNER_RADIUS: float = 0.08
@@ -2239,7 +2285,7 @@ class PunchTarget(Target):
     # panels meet the floor grid) and detonates THERE — instead of zooming
     # past Z_NEAR and exploding centimetres from the lens.
     Z_VIS_FAR:  float = 28.0
-    Z_VIS_NEAR: float = 2.5
+    Z_VIS_NEAR: float = 3.2
     # Trajectory descends from horizon (eye level) to WY_HIT (cube fully
     # below eye → top face visible, sits inside the bottom hit panel).
     WY_SPAWN: float = 0.0
@@ -8085,6 +8131,26 @@ class RhythmVisualizer:
                                       creationflags=_creation_flags)
             _vwriter = None
 
+        # ── ModernGL renderer setup (GPU batched PunchTarget) ──────────
+        _use_mgl = False
+        _mgl_renderer = None
+        _vp_matrix = None
+        _PunchBlockInstance = None
+        _composite_alpha = None
+        if getattr(args, 'use_moderngl', 1):
+            try:
+                from mgl_renderer import MGLPunchRenderer, PunchBlockInstance as _PBI
+                from mgl_renderer import composite_alpha_with_halo as _ca
+                _mgl_renderer = MGLPunchRenderer.get()
+                _vp_matrix = cam.view_proj_matrix()
+                _PunchBlockInstance = _PBI
+                _composite_alpha = _ca
+                _use_mgl = True
+                print("[MGL] ModernGL GPU renderer active for PunchTarget blocks.")
+            except Exception as _mgl_err:
+                print(f"[MGL] GPU renderer unavailable, using cv2 fallback: {_mgl_err}")
+                _use_mgl = False
+
         for fi in range(total_frames):
             pct = int(fi / total_frames * 100)
             if pct // 10 > last_pct:
@@ -8114,8 +8180,72 @@ class RhythmVisualizer:
                 side_rail.draw(canvas, fi, bass_val=_bass_val, hit=_hit_this)
 
             # 2. targets (back to front)
-            for tg in game.alive_sorted(fi):
-                canvas = tg.draw(canvas, cam, fi)
+            # ModernGL batched path for PunchTarget (GPU accelerated)
+            if _use_mgl and _mgl_renderer is not None:
+                _punch_instances = []
+                # Block width derived from lane tile width so blocks scale with
+                # floor. Shrink further so rotated block (yaw) stays within
+                # lane bounds and never spills into adjacent lanes.
+                _lane_step = abs(cam.lane_world_x(1) - cam.lane_world_x(0)) if cam.n_lanes > 1 else 0.5
+                _tile_hw = _lane_step * 0.80 * 0.5
+                _ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W if PunchTarget.BLOCK_HALF_W > 0 else 1.0
+                _yaw_factor = 0.5
+                _max_yaw = max(
+                    abs(math.atan2(cam.lane_world_x(_l), abs(cam.FLOOR_WORLD_Y)) * _yaw_factor)
+                    for _l in range(cam.n_lanes)
+                )
+                _shrink = 1.0 / (abs(math.cos(_max_yaw)) + _ratio_DW * abs(math.sin(_max_yaw)))
+                _block_hw = _tile_hw * _shrink
+                _block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W) if PunchTarget.BLOCK_HALF_W > 0 else _block_hw
+                _block_hd = _block_hw * _ratio_DW
+                _wy_const = 0.0  # camera eye level → no top/bottom face visible
+                for tg in game.alive_sorted(fi):
+                    # LineTarget inherits PunchTarget but renders a chain
+                    # of cubes via its own draw() — must NOT be batched
+                    # into the single-cube GPU path or the chain
+                    # disappears and the head reads as a plain punch.
+                    if (isinstance(tg, PunchTarget)
+                            and not isinstance(tg, LineTarget)
+                            and tg.state == 'flying'):
+                        if (PunchTarget.MESH_LEFT is not None or
+                                PunchTarget.MESH_RIGHT is not None or
+                                PunchTarget.TEXTURE_LEFT is not None or
+                                PunchTarget.TEXTURE_RIGHT is not None):
+                            continue
+                        _zn = tg.depth(fi)
+                        if _zn <= 0.0:
+                            continue
+                        _wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+                        _wx = cam.lane_world_x(tg.lane)
+                        _wy = _wy_const
+                        _yaw = math.atan2(_wx, abs(cam.FLOOR_WORLD_Y)) * _yaw_factor
+                        b, g, r = tg.color
+                        _punch_instances.append(_PunchBlockInstance(
+                            position=(_wx, _wy, _wz),
+                            scale=(_block_hw, _block_hh, _block_hd),
+                            color=(r / 255.0, g / 255.0, b / 255.0),
+                            z_norm=_zn,
+                            yaw=_yaw,
+                        ))
+                if _punch_instances:
+                    _gl_bgr, _gl_alpha = _mgl_renderer.render(
+                        _punch_instances, _vp_matrix,
+                        (0.0, 0.0, 0.0), self.WIDTH, self.HEIGHT)
+                    canvas = _composite_alpha(canvas, _gl_bgr, _gl_alpha)
+                # Non-punch targets + punch targets with mesh/texture +
+                # LineTarget (always uses its own CPU chain renderer).
+                for tg in game.alive_sorted(fi):
+                    if (isinstance(tg, PunchTarget)
+                            and not isinstance(tg, LineTarget)):
+                        if (PunchTarget.MESH_LEFT is None and
+                                PunchTarget.MESH_RIGHT is None and
+                                PunchTarget.TEXTURE_LEFT is None and
+                                PunchTarget.TEXTURE_RIGHT is None):
+                            continue
+                    canvas = tg.draw(canvas, cam, fi)
+            else:
+                for tg in game.alive_sorted(fi):
+                    canvas = tg.draw(canvas, cam, fi)
 
             # 4. process hits → VFX (particles only, no flash/slash)
             for tg in hits:
@@ -8150,9 +8280,12 @@ class RhythmVisualizer:
                         _proj = cam.project(0.0,
                                             LineTarget.HORIZONTAL_WY,
                                             cam.Z_NEAR + 0.01)
-                        y = int(_proj[1]) if _proj else int(cam.air_y(0.02, 0.55))
+                        y = int(_proj[1]) if _proj else int(cam.cy_pix)
                     else:
-                        y = int(cam.air_y(0.02, 0.55))
+                        # PunchTarget blocks now fly at camera level (wy=0),
+                        # converging on horizon line. Burst at horizon = block
+                        # actual screen position (no longer at floor height).
+                        y = int(cam.cy_pix)
                     count = 50
                     viewport.trigger(1.0)
                 elif isinstance(tg, DanceTarget):
@@ -8452,11 +8585,14 @@ def parse_arguments():
                          'zooms in only near hit zone (matches reference). '
                          '"inv" = 1/z mapping → linear on-screen growth. '
                          'Default: linear'))
-    p.add_argument('--cube_radius',    type=float, default=0.18,
+    p.add_argument('--cube_radius',    type=float, default=0.08,
                    help=('Corner rounding of the default neon cubes, '
                          'as a fraction of the shortest projected face '
                          'edge.  0 = perfectly sharp, 0.15-0.25 = soft '
-                         'bevel, 0.45 = nearly circular.  Default: 0.18'))
+                         'bevel, 0.45 = nearly circular.  Default: 0.08'))
+    p.add_argument('--use_moderngl', type=int, default=1, metavar='0|1',
+                   help='Use ModernGL GPU renderer for PunchTarget blocks. '
+                        'Falls back to cv2 software path if GPU unavailable. Default 1.')
     p.add_argument('-i', '--input',    type=str,   required=True)
     p.add_argument('-o', '--output',   type=str,   required=True)
     p.add_argument('-d', '--duration', type=float, default=None)

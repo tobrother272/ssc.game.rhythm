@@ -2,7 +2,7 @@
 
 ## Mục tiêu
 
-Migrate **PunchTarget block rendering** từ `cv2.fillConvexPoly` software 2D fake-3D sang **ModernGL GPU 3D rendering thật** với:
+Migrate **PunchTarget block rendering** từ `cv2.fillConvexPoly` + `_fill_rounded_quad` software 2D fake-3D sang **ModernGL GPU 3D rendering thật** với:
 - Custom GLSL shader cho neon aesthetic (match reference image)
 - Hardware Z-buffer (auto painter order, không còn dead-zone bug)
 - 8× MSAA anti-aliasing (smooth edges)
@@ -11,6 +11,28 @@ Migrate **PunchTarget block rendering** từ `cv2.fillConvexPoly` software 2D fa
 - **GIỮ NGUYÊN** mọi module khác (tunnel, rails, particles, HUD vẫn cv2)
 
 > **Strategy**: Hybrid render pipeline — ModernGL chỉ xử lý PunchTarget cube + glow, output texture composite vào cv2 canvas. Migration partial, low risk, có thể revert.
+
+---
+
+## Trạng thái hiện tại (cv2 path — đã implement)
+
+Các fix đã áp dụng trong `src/rhythm.py` cho cv2 path hiện tại:
+
+| # | Feature | Giá trị hiện tại |
+|---|---|---|
+| 1 | **LANE_COLORS** | 2 màu: lane 0,1 = blue `(230,80,30)` BGR; lane 2,3 = orange `(0,140,255)` BGR |
+| 2 | **CORNER_RADIUS** | `0.08` (subtle rounding, chỉ áp cho front + top face) |
+| 3 | **Side face** | Plain `cv2.fillConvexPoly` — KHÔNG rounded (quá mỏng → artifact nếu round) |
+| 4 | **Brightness model** | `top_col = c*1.15 + 255*0.15`; `side_col = c*0.45`; `front = side*1.30*depth_gain` |
+| 5 | **Glow source** | Chỉ từ **top face** (`pts[[0,1,5,4]]`), không phải full silhouette |
+| 6 | **Fist icon** | `_draw_fist_icon_v2` bold polygon trên **FRONT face**; `_draw_fist_icon_simple_v2` cho block xa |
+| 7 | **Icon threshold** | `front_w >= 18` → full icon; `front_w >= 12` → simplified; `< 12` → no icon |
+| 8 | **Bloom defaults** | `gpu_glow(sigma=24.0, gain=0.75)` |
+| 9 | **Preview quality** | 1280×720 @30fps, bloom=1 |
+| 10 | **Side face selection** | ALWAYS 1 side face — no ±2px dead zone (`block_cx < cam_cx` → right; else → left) |
+| 11 | **Rail pillar count** | Default 40 (was 16), max 100 |
+
+GL migration cần **replicate chính xác** các hành vi trên trong GLSL shader.
 
 ---
 
@@ -215,10 +237,11 @@ in vec2 in_uv;           // UV for icon mapping (front face uses 0..1)
 in float in_face_id;     // 0=front, 1=back, 2=top, 3=bottom, 4=left, 5=right
 
 // Per-instance
-in vec3 in_inst_position;   // World position of cube center
+in vec3 in_inst_position;   // World position of cube center (wx is corrected — Fix 1)
 in float in_inst_half;       // Cube half-size (CUBE_HALF in code)
 in vec4 in_inst_color;       // Base color (RGBA, A = depth_gain or alpha)
 in float in_inst_z_norm;     // Depth progress 0..1 (1 = far spawn, 0 = hit)
+in float in_inst_yaw;        // Yaw rotation around Y axis (radians) — Fix 2 billboard
 
 uniform mat4 u_view_proj;    // View-projection matrix from camera
 
@@ -230,10 +253,25 @@ out float v_z_norm;
 out float v_face_id;
 
 void main() {
-    vec3 world_pos = in_position * in_inst_half * 2.0 + in_inst_position;
+    // ── Fix 2: Yaw rotation around Y axis (lane-aware billboard) ──
+    float c = cos(in_inst_yaw);
+    float s = sin(in_inst_yaw);
+    mat3 rot_y = mat3(
+        c,    0.0,  -s,
+        0.0,  1.0,  0.0,
+        s,    0.0,  c
+    );
+
+    // Local scaled vertex → rotated → translated to world
+    vec3 local_scaled = in_position * in_inst_half * 2.0;
+    vec3 rotated = rot_y * local_scaled;
+    vec3 world_pos = rotated + in_inst_position;
+
     gl_Position = u_view_proj * vec4(world_pos, 1.0);
 
-    v_normal = in_normal;
+    // IMPORTANT: rotate normal vector cùng cube cho lighting đúng
+    v_normal = rot_y * in_normal;
+
     v_uv = in_uv;
     v_world_pos = world_pos;
     v_base_color = in_inst_color;
@@ -259,7 +297,7 @@ in float v_face_id;
 uniform vec3 u_camera_pos;       // Camera world position
 uniform vec3 u_light_dir;        // Main light direction (normalized)
 uniform sampler2D u_icon_tex;    // Fist icon texture (RGBA, alpha = mask)
-uniform float u_corner_radius;   // 0..0.45 fraction of edge
+uniform float u_corner_radius;   // 0..0.45 fraction of edge (current: 0.08)
 
 out vec4 fragColor;
 
@@ -273,74 +311,57 @@ void main() {
     vec3 base = v_base_color.rgb;
     vec3 N = normalize(v_normal);
     vec3 V = normalize(u_camera_pos - v_world_pos);
-    vec3 L = normalize(u_light_dir);
 
-    // ── Lighting model — stylized neon (NOT pure Lambert) ──
-    // Top face: bright + slight white
-    // Front face: canonical color + subtle gradient top→bottom
-    // Side face: dark shadow
+    // ── Brightness model v2 — matches cv2 path exactly ──────────────
+    // top_col   = clamp(base * 1.15 + 0.15)   → brightest, white tint
+    // side_col  = base * 0.45                  → darkest
+    // front_col = side_col * 1.30 * depth_gain → mid-tone
+    //
+    // NOTE: "top" = face_id 2 (normal -Y); "front" = face_id 0 (normal -Z);
+    //       "side" = face_id 4 or 5 (normal ±X).
 
-    float ndotl = max(dot(N, -L), 0.0);
-
-    // Brightness factor based on face_id
-    float top_factor   = 1.20;   // top sáng + white tint
-    float front_factor = 1.00;   // canonical
-    float side_factor  = 0.45;   // shadow
-
-    float face_factor;
-    vec3 white_tint = vec3(0.0);
-
-    if (v_face_id == 2.0) {           // top
-        face_factor = top_factor;
-        white_tint = vec3(0.18);     // ngả trắng
-    } else if (v_face_id == 0.0 || v_face_id == 1.0) {  // front/back
-        face_factor = front_factor;
-    } else {                          // left/right (side)
-        face_factor = side_factor;
-    }
-
-    // Subtle gradient mỗi face (UV-based)
-    float gradient_factor = 1.0;
-    if (v_face_id == 0.0) {           // front: top→bottom
-        gradient_factor = mix(1.0, 0.85, v_uv.y);
-    } else if (v_face_id == 2.0) {    // top: front→back
-        gradient_factor = mix(1.0, 0.80, v_uv.y);
-    } else if (v_face_id == 4.0 || v_face_id == 5.0) {   // side: front→back
-        gradient_factor = mix(1.10, 0.85, v_uv.y);
-    }
-
-    vec3 face_color = base * face_factor + white_tint;
-    face_color *= gradient_factor;
-
-    // Depth gain — gần camera sáng hơn xa
+    vec3 top_col   = clamp(base * 1.15 + 0.15, 0.0, 1.0);
+    vec3 side_col  = base * 0.45;
     float depth_gain = 0.70 + 0.30 * (1.0 - v_z_norm);
-    face_color *= depth_gain;
 
-    // ── Rim lighting on edges (Fresnel-like) ──
+    vec3 face_color;
+
+    if (v_face_id == 2.0) {
+        // TOP face — brightest
+        face_color = top_col * depth_gain;
+    } else if (v_face_id == 0.0) {
+        // FRONT face — mid (side_col * 1.30 * depth_gain)
+        face_color = side_col * 1.30 * depth_gain;
+    } else {
+        // SIDE faces (left/right) — darkest
+        face_color = side_col * depth_gain;
+    }
+
+    // ── Rim lighting on edges (Fresnel-like, subtle) ──
     float rim = 1.0 - max(dot(N, V), 0.0);
-    rim = pow(rim, 2.0);
-    vec3 rim_color = base * 1.50 + vec3(0.15);
-    face_color += rim_color * rim * 0.35;
+    rim = pow(rim, 2.5);
+    vec3 rim_color = base * 1.20 + vec3(0.10);
+    face_color += rim_color * rim * 0.25;
 
-    // ── Icon overlay (front face only) ──
+    // ── Icon overlay (FRONT face only, face_id == 0) ──
     if (v_face_id == 0.0) {
-        // Map UV to centered region [0.15..0.85] for 70% icon size
-        vec2 icon_uv = (v_uv - 0.15) / 0.70;
+        // Map UV to centered region [0.19..0.81] for ~62% icon size
+        vec2 icon_uv = (v_uv - 0.19) / 0.62;
         if (icon_uv.x >= 0.0 && icon_uv.x <= 1.0 &&
             icon_uv.y >= 0.0 && icon_uv.y <= 1.0) {
             vec4 icon = texture(u_icon_tex, icon_uv);
-            // Icon: black outline (RGB low, A high) + white fill (RGB high)
             face_color = mix(face_color, icon.rgb, icon.a);
         }
     }
 
-    // ── Rounded corners via SDF (per-face) ──
-    if (u_corner_radius > 0.001) {
-        // UV-space SDF — corners at (0,0), (1,0), (0,1), (1,1)
-        vec2 p = v_uv * 2.0 - 1.0;   // -1..1
+    // ── Rounded corners via SDF ──
+    // Only apply to FRONT (face_id 0) and TOP (face_id 2) faces.
+    // Side faces skip rounding (too thin in perspective → artifacts).
+    if (u_corner_radius > 0.001 && (v_face_id == 0.0 || v_face_id == 2.0)) {
+        vec2 p = v_uv * 2.0 - 1.0;
         float d = sd_rounded_box(p, vec2(1.0), u_corner_radius);
         if (d > 0.0) {
-            discard;   // pixel ngoài rounded shape → transparent
+            discard;
         }
     }
 
@@ -505,13 +526,14 @@ from .geometry import generate_cube_with_face_ids, generate_fist_icon_texture
 
 class PunchBlockInstance:
     """Per-block instance data for batched rendering."""
-    __slots__ = ('position', 'half', 'color', 'z_norm')
+    __slots__ = ('position', 'half', 'color', 'z_norm', 'yaw')
 
-    def __init__(self, position, half, color, z_norm):
-        self.position = position   # (x, y, z) world
+    def __init__(self, position, half, color, z_norm, yaw=0.0):
+        self.position = position   # (x, y, z) world — wx is corrected (Fix 1)
         self.half = half           # CUBE_HALF
         self.color = color         # (r, g, b, a) 0..1 floats
         self.z_norm = z_norm       # 0..1
+        self.yaw = yaw             # rotation around Y axis (radians, Fix 2)
 
 
 class MGLPunchRenderer:
@@ -544,8 +566,9 @@ class MGLPunchRenderer:
         self.n_indices = len(indices)
 
         # Per-instance VBO (allocated dynamically based on max blocks)
+        # 9 floats per instance: pos(3) + half(1) + color(4) + z_norm(1) + yaw(1) = 36 bytes
         self.MAX_INSTANCES = 64
-        self.vbo_instance = ctx.buffer(reserve=self.MAX_INSTANCES * 32)   # 8 floats × 4 bytes
+        self.vbo_instance = ctx.buffer(reserve=self.MAX_INSTANCES * 36)   # was 32
 
         # VAO
         self.vao = ctx.vertex_array(
@@ -555,9 +578,9 @@ class MGLPunchRenderer:
                 (self.vbo_normals,  '3f',   'in_normal'),
                 (self.vbo_uvs,      '2f',   'in_uv'),
                 (self.vbo_face_ids, '1f',   'in_face_id'),
-                (self.vbo_instance, '3f 1f 4f 1f /i',
+                (self.vbo_instance, '3f 1f 4f 1f 1f /i',   # was '3f 1f 4f 1f /i'
                  'in_inst_position', 'in_inst_half',
-                 'in_inst_color', 'in_inst_z_norm'),
+                 'in_inst_color', 'in_inst_z_norm', 'in_inst_yaw'),
             ],
             self.ibo,
         )
@@ -568,8 +591,8 @@ class MGLPunchRenderer:
         self.tex_icon.use(location=0)
         self.prog['u_icon_tex'] = 0
 
-        # Default uniforms
-        self.prog['u_corner_radius'] = 0.18
+        # Default uniforms — match cv2 path current values
+        self.prog['u_corner_radius'] = 0.08   # subtle rounding (was 0.18)
         self.prog['u_light_dir'] = (0.2, -0.5, 1.0)
 
     @classmethod
@@ -598,12 +621,12 @@ class MGLPunchRenderer:
         if len(blocks) > self.MAX_INSTANCES:
             # Resize instance VBO
             self.MAX_INSTANCES = max(self.MAX_INSTANCES * 2, len(blocks))
-            self.vbo_instance.orphan(self.MAX_INSTANCES * 32)
+            self.vbo_instance.orphan(self.MAX_INSTANCES * 36)   # 9 floats × 4 bytes
 
-        # Upload instance data
-        instance_data = np.empty(len(blocks) * 8, dtype=np.float32)
+        # Upload instance data — 9 floats per instance (was 8, +yaw)
+        instance_data = np.empty(len(blocks) * 9, dtype=np.float32)
         for i, b in enumerate(blocks):
-            base = i * 8
+            base = i * 9
             instance_data[base + 0] = b.position[0]
             instance_data[base + 1] = b.position[1]
             instance_data[base + 2] = b.position[2]
@@ -612,6 +635,7 @@ class MGLPunchRenderer:
             instance_data[base + 5] = b.color[1]
             instance_data[base + 6] = b.color[2]
             instance_data[base + 7] = b.z_norm
+            instance_data[base + 8] = b.yaw            # ← NEW (Fix 2)
         self.vbo_instance.write(instance_data.tobytes())
 
         # Get framebuffer
@@ -765,19 +789,37 @@ for tg in game.alive_sorted(fi):
             continue
 
         z_norm = tg.depth(fi)
-        wx = cam.lane_world_x(tg.lane)
+
+        # ── FIX 1 (Trajectory match floor lane) ──
+        # Block screen X anchored to floor lane interp (cam.lane_x), then
+        # back-compute world X so cam.project() reproduces sx_center.
+        # See docs/block-trajectory-fix-spec.md (Option A).
+        sx_center = cam.lane_x(tg.lane, z_norm)
         wz = tg.Z_VIS_NEAR + z_norm * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
         wy = tg.WY_SPAWN + (tg.WY_HIT - tg.WY_SPAWN) * (1.0 - z_norm)
+        wx = (sx_center - cam.cx_pix) * wz / cam.fx
 
-        # Color BGR → RGB float
+        # ── FIX 2 (Yaw billboard rotation) ──
+        # Cube xoay quanh trục Y theo độ lệch lane → front face quay về camera.
+        # YAW_FACTOR = 0.75 = nghiêng 75% (giữ chút side face cho 3D pop).
+        # See docs/block-trajectory-fix-spec.md (Phần 2).
+        import math
+        YAW_FACTOR = 0.75
+        yaw = -math.atan2(wx, wz) * YAW_FACTOR
+
+        # Color from LANE_COLORS (2-color palette):
+        #   lane 0,1 → blue  BGR(230, 80, 30)
+        #   lane 2,3 → orange BGR(0, 140, 255)
+        # Convert BGR → RGB float for GL
         b, g, r = tg.color
         color_rgb = (r / 255.0, g / 255.0, b / 255.0, 1.0)
 
         punch_blocks.append(PunchBlockInstance(
-            position=(wx, wy, wz),
+            position=(wx, wy, wz),    # wx is corrected (Fix 1)
             half=tg.CUBE_HALF,
             color=color_rgb,
             z_norm=z_norm,
+            yaw=yaw,                  # NEW field (Fix 2)
         ))
 
 if punch_blocks:
@@ -1066,18 +1108,23 @@ near=0.1, far=100. Nếu cube tại z=0.05 (closer than near) → clip plane c�
 ## Acceptance criteria
 
 ```
-✓ ModernGL render 1 cube → output match cv2 cv2 reference vị trí ±2px
+✓ ModernGL render 1 cube → output match cv2 reference vị trí ±2px
 ✓ View-proj matrix produce identical screen coords vs cam.project() ≤ 1px error
 ✓ Render 8 cubes simultaneously trong 1 pass → output match cv2 individual renders
 ✓ Performance: 6 cubes/frame ≤ 5ms (vs cv2 ~30ms) — 6× speedup
-✓ Visual: block 3D rõ rệt, có gradient + rim light + rounded corners
-✓ Fist icon visible trên front face với contrast tốt trên mọi color
+✓ Visual: block 3D rõ rệt — top sáng ngả trắng, front mid-tone, side tối
+✓ Brightness: top = base*1.15+0.15, front = side*1.30*depth_gain, side = base*0.45
+✓ Glow: only from TOP face polygon — NOT full silhouette
+✓ Rounded corners: SDF discard only on FRONT + TOP faces (radius=0.08); side = sharp
+✓ Fist icon bold silhouette trên FRONT face; simplified version cho block xa (front_w 12-18px)
+✓ 2-color palette: lane 0,1 = blue; lane 2,3 = orange
 ✓ MSAA 8× → edges smooth, no jagged steps
 ✓ PyInstaller frozen exe load shaders OK, render output identical với dev mode
 ✓ GPU memory không leak qua 100 renders (heap stable)
 ✓ Toggle flag --use_moderngl_punch hoạt động cả 2 chiều
 ✓ Mesh/texture path KHÔNG bị ảnh hưởng (vẫn cv2 software rasterize)
 ✓ Other targets (Dance/Line/Relax) KHÔNG bị ảnh hưởng
+✓ Bloom defaults: sigma=24, gain=0.75 (stronger halo)
 ```
 
 ---
