@@ -1,0 +1,146 @@
+---
+description: Quy tắc quỹ đạo bay và hướng nghiêng của PunchTarget blocks trong ModernGL renderer
+alwaysApply: true
+---
+
+# Block Flight Trajectory & Yaw — Nguyên tắc tuyệt đối
+
+## 1. Quỹ đạo bay: ĐƯỜNG THẲNG song song với floor lanes
+
+Blocks bay theo **đường thẳng** trên screen, **song song** với cạnh floor lane tương ứng.
+
+### Công thức positioning (cho cả `live_renderer.py` và `rhythm.py`):
+
+```python
+# Hoist ngoài vòng lặp — block size proportional to lane tile width,
+# shrunk so that AFTER yaw rotation, block stays within lane bounds.
+_lane_step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+_tile_hw = _lane_step * 0.80 * 0.5
+_ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W
+_yaw_factor = 0.5
+_max_yaw = max(abs(math.atan2(cam.lane_world_x(l), abs(cam.FLOOR_WORLD_Y)) * _yaw_factor) for l in range(cam.n_lanes))
+_shrink = 1.0 / (abs(math.cos(_max_yaw)) + _ratio_DW * abs(math.sin(_max_yaw)))
+_block_hw = _tile_hw * _shrink
+_block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W)
+_block_hd = _block_hw * _ratio_DW
+_wy_const = 0.0                                   # camera y level → no top/bottom face visible
+
+# Trong vòng lặp — block placement
+_wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+_wx = cam.lane_world_x(tg.lane)                   # centered on lane (constant)
+_wy = _wy_const                                   # eye-level (constant, no descending)
+```
+
+### Tại sao:
+
+- **wx = `lane_world_x(lane)`** (constant per lane): block ở cùng world-X với floor tile centers → project qua 1/z pinhole → hội tụ về vanishing point → **đường thẳng trên screen, song song lane**.
+- **wy = `0.0` (camera y level)** (constant): block bay **HORIZONTAL** chính xác tại horizon line. Camera không nhìn lên/xuống → top/bottom face KHÔNG visible (chỉ thấy front + side). Block screen_y = `cy_pix` ở mọi depth.
+- **Block size dynamic** = `tile_hw * shrink`: scale theo lane tile, co thêm để sau khi xoay yaw không vượt qua lane bounds. Công thức: `shrink = 1 / (|cos(yaw_max)| + ratio_D * |sin(yaw_max)|)`.
+- Đảm bảo nguyên tắc tuyệt đối: **mỗi block CHỈ di chuyển trên lane của mình**, KHÔNG lấn sang lane khác sau khi xoay.
+
+### Tuyệt đối CẤM:
+
+- ❌ `cam.lane_x(lane, z_norm)` back-project → đường cong trên screen, KHÔNG thẳng
+- ❌ `lane_world_x * wz / Z_NEAR` → scale sai, bay ra ngoài
+- ❌ `wy` thay đổi theo z_norm (WY_SPAWN→WY_HIT) → block chếch xuống floor → user phản hồi "đừng chếch xuống"
+- ❌ `wy = FLOOR_WORLD_Y - block_hh` → bottom edge nằm trên floor, block "trượt" trên sàn thay vì bay ngang
+- ❌ `wy = AIR_WORLD_Y` (0.05) → camera nhìn xuống nhẹ, vẫn thấy TOP face → user phản hồi "ko hiện mặt trên"
+- ❌ `u_depth_extrude > 0` trong vertex shader → fake tilt làm side face thành parallelogram/diamond, top face artificial → cube không còn vuông đúng → fix: `u_depth_extrude = 0.0`
+- ❌ Dùng `tg.BLOCK_HALF_W` trực tiếp làm `scale.x` → block không scale theo lane khi `floor_spread_frac` đổi → bug "không tỉ lệ với floor"
+
+## 2. Yaw rotation: KHỚP với độ lệch hình học của lane (đã giảm 50%)
+
+Block xoay quanh Y axis bằng **góc lệch lane khỏi trục Y**, scaled bởi `_yaw_factor = 0.5`:
+
+```python
+_yaw_factor = 0.5  # giảm 50% để tránh outer lanes nghiêng quá nhiều
+_yaw = math.atan2(_wx, abs(cam.FLOOR_WORLD_Y)) * _yaw_factor
+```
+
+### Kết quả (với `floor_spread_frac = 0.175`):
+
+| Lane | wx | Yaw | Side visible |
+|------|------|---------|------|
+| 0 | -0.228 | -10.4° | Cạnh PHẢI |
+| 1 | -0.076 | -3.6°  | Cạnh PHẢI |
+| 2 | +0.076 | +3.6°  | Cạnh TRÁI |
+| 3 | +0.228 | +10.4° | Cạnh TRÁI |
+
+### Tại sao:
+
+- Constant per lane (không thay đổi khi block bay tới gần) → ổn định, không "lắc"
+- Outer lanes có yaw ~3× inner lanes → khớp tỷ lệ lệch hình học
+- `_yaw_factor = 0.5`: full geometric angle (×1.0) làm outer lanes nghiêng quá nhiều (~21°). Giảm 50% giữ side face vẫn visible nhưng block trông "thẳng" hơn.
+
+### Tuyệt đối CẤM:
+
+- ❌ `atan2(wx, wz)` → góc quá nhỏ (~3-9°), không khớp lane deviation
+- ❌ `-atan2(...)` → sai chiều (thấy cạnh sai)
+- ❌ `_yaw_factor > 1` → outer lanes nghiêng quá → user phản hồi "block lệch"
+
+## 3. Vertex Shader convention
+
+Rotation matrix trong `punch_block.vert`:
+
+```glsl
+mat3 rot_y = mat3(c, 0, s, 0, 1, 0, -s, 0, c);  // column-major
+vec3 rotated = rot_y * scaled;
+```
+
+Với convention này:
+- **Negative yaw** → right side face moves toward camera → RIGHT side visible
+- **Positive yaw** → left side face moves toward camera → LEFT side visible
+
+## 4. Tổng hợp code pattern chuẩn
+
+```python
+# Hoist ngoài vòng lặp:
+_lane_step = abs(cam.lane_world_x(1) - cam.lane_world_x(0)) if cam.n_lanes > 1 else 0.5
+_tile_hw = _lane_step * 0.80 * 0.5
+_ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W
+_yaw_factor = 0.5
+_max_yaw = max(abs(math.atan2(cam.lane_world_x(l), abs(cam.FLOOR_WORLD_Y)) * _yaw_factor) for l in range(cam.n_lanes))
+_shrink = 1.0 / (abs(math.cos(_max_yaw)) + _ratio_DW * abs(math.sin(_max_yaw)))
+_block_hw = _tile_hw * _shrink
+_block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W)
+_block_hd = _block_hw * _ratio_DW
+_wy_const = 0.0
+
+# Trong vòng lặp — CHỈ batch PunchTarget thuần (không phải LineTarget):
+for tg in game.alive_sorted(fi):
+    if (isinstance(tg, PunchTarget)
+            and not isinstance(tg, LineTarget)   # ← BẮT BUỘC
+            and tg.state == 'flying'):
+        _zn = tg.depth(fi)
+        if _zn <= 0.0:
+            continue
+        _wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+        _wx = cam.lane_world_x(tg.lane)
+        _wy = _wy_const
+        _yaw = math.atan2(_wx, abs(cam.FLOOR_WORLD_Y)) * _yaw_factor
+
+        PunchBlockInstance(
+            position=(_wx, _wy, _wz),
+            scale=(_block_hw, _block_hh, _block_hd),
+            color=(r/255.0, g/255.0, b/255.0),
+            z_norm=_zn,
+            yaw=_yaw,
+        )
+```
+
+## 5. LineTarget KHÔNG được batch vào GPU PunchTarget path
+
+`LineTarget(PunchTarget)` thừa kế `PunchTarget` nên `isinstance(tg, PunchTarget)` trả `True` cho cả LineTarget. Nhưng LineTarget vẽ **chuỗi N cubes** (chain) qua `LineTarget.draw()` (CPU path) với hình học, vị trí Y, shrink/zigzag riêng — KHÔNG phải single cube.
+
+### Bắt buộc:
+
+- ✅ Batch GPU loop: `isinstance(tg, PunchTarget) and not isinstance(tg, LineTarget)` → chỉ punch thuần lên GPU.
+- ✅ CPU draw loop sau đó: LineTarget LUÔN rơi xuống `tg.draw(canvas, cam, fi)` để render chain.
+- ❌ Nếu chỉ check `isinstance(tg, PunchTarget)`: LineTarget bị render như **1 cube đơn lẻ ở head depth**, mode `line` nhìn y hệt `punch` → bug "preview mode line vẫn thấy như punch".
+
+### Áp dụng đồng bộ ở 2 nơi:
+
+1. `src/rhythm.py` (`process_video`, final render loop).
+2. `src/live_renderer.py` (`render_at`, preview loop).
+
+Cả 2 file phải dùng cùng filter `not isinstance(tg, LineTarget)` để preview ≡ render.

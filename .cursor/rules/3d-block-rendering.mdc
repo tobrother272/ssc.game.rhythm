@@ -1,0 +1,173 @@
+---
+alwaysApply: true
+---
+
+# 3D Block Rendering — Nguyên lý vẽ khối
+
+Quy tắc bắt buộc khi vẽ bất kỳ block/cube/slab nào trên canvas (OpenCV). Áp dụng cho mọi hình dạng và kích thước — chỉ thay đổi shape/size, KHÔNG thay đổi nguyên lý màu sắc và phối cảnh.
+
+## 1. Cấu trúc 3 mặt nhìn thấy
+
+Mỗi block luôn có tối đa 3 mặt hiển thị:
+- **Top face** (mặt trên): sáng nhất, là mặt chính
+- **Front face** (mặt trước, hướng camera): tối hơn top
+- **Side face** (cạnh bên): tối nhất, chỉ hiển thị 1 bên dựa vào vị trí block
+
+## 2. Nguyên lý sáng tối (KHÔNG ĐƯỢC THAY ĐỔI)
+
+Cho `base` = màu gốc BGR của block:
+
+```python
+# Top face: sáng, saturated (90% base + 10% white)
+top_col = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
+
+# Side/front face: tối hơn (~50% base)
+side_col = tuple(int(c * 0.50) for c in base)
+
+# depth_gain điều chỉnh theo khoảng cách (xa = tối hơn)
+depth_gain = 0.70 + 0.30 * (1.0 - z_norm)  # range [0.70, 1.0]
+
+# Áp dụng depth_gain khi vẽ:
+top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)       # sáng nhất
+front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)  # trung bình
+side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)      # tối nhất
+```
+
+Tỉ lệ sáng: **top > front (×1.15) > side**
+
+## 3. Quy tắc hiển thị cạnh bên (perspective-correct)
+
+Dựa vào vị trí block trên screen so với vanishing point (camera center X):
+
+```python
+block_screen_cx = float(pts[:, 0].mean())
+cam_cx = getattr(cam, 'cx_pix', W / 2.0)
+
+if block_screen_cx < cam_cx - 2:
+    # Block ở BÊN TRÁI → viewer nhìn thấy cạnh PHẢI
+    # Vẽ right_face = [fr, br, br+ex, fr+ex]
+elif block_screen_cx > cam_cx + 2:
+    # Block ở BÊN PHẢI → viewer nhìn thấy cạnh TRÁI
+    # Vẽ left_face = [bl, fl, fl+ex, bl+ex]
+# Block ở giữa (±2px): chỉ vẽ front + top
+```
+
+**KHÔNG BAO GIỜ** vẽ cả 2 cạnh bên cùng lúc.
+
+## 4. Thứ tự vẽ (Painter's Algorithm)
+
+Luôn vẽ theo thứ tự xa → gần:
+1. **Side face** (xa nhất, bị che 1 phần)
+2. **Front face** (giữa)
+3. **Top face** (gần nhất, trên cùng)
+
+## 5. Glow effect (ánh sáng tỏa) — ROI-only, boxFilter
+
+Block phải có glow additive tỏa ra xung quanh (chiếu sáng sàn). 4 quy tắc BẮT BUỘC:
+
+### Quy tắc 1 — Gate theo độ sâu (chỉ glow tile gần camera)
+
+Tile xa đã bị `depth_gain` attenuate, halo lẫn vào tunnel haze nên không cần glow. Glow là stage tốn ÍT NHẤT GẤP 10× tổng các pass solid → bắt buộc skip cho tile xa:
+
+```python
+if z_norm > 0.30:
+    pass  # bỏ glow hoàn toàn — vẫn vẽ 3D faces bình thường
+else:
+    # vẽ glow theo Quy tắc 2-4
+```
+
+### Quy tắc 2 — Blur trên ROI, KHÔNG full canvas
+
+❌ TUYỆT ĐỐI KHÔNG `glow_src = np.zeros((H, W), ...)` rồi blur full canvas. Cost = O(canvas_size) làm preview tụt từ 30 fps → 1-2 fps khi có 4+ tile.
+
+✅ Bound mọi alloc + blur vào tile bbox + padding (~30× ít work hơn):
+
+```python
+kernel = 35                # halo radius ≈ kernel/2
+pad = kernel // 2 + 4
+bx, by, bw, bh = cv2.boundingRect(pts)
+rx0, ry0 = max(0, bx - pad), max(0, by - pad)
+rx1 = min(W, bx + bw + pad);  ry1 = min(H, by + bh + pad)
+rw, rh = rx1 - rx0, ry1 - ry0
+if rw <= 0 or rh <= 0:
+    return                                          # tile off canvas
+pts_local = pts - np.array([rx0, ry0], dtype=np.int32)
+glow_src = np.zeros((rh, rw), dtype=np.uint8)
+cv2.fillConvexPoly(glow_src, pts_local, 255, lineType=cv2.LINE_AA)
+```
+
+### Quy tắc 3 — Dùng `cv2.boxFilter`, KHÔNG `cv2.GaussianBlur`
+
+**Áp dụng cho TẤT CẢ blur pass trong code vẽ block** — không chỉ glow mà cả icon shadow, footprint, texture decoration, reflection, ... Bất kỳ chỗ nào đang gọi `cv2.GaussianBlur` trên buffer của block đều phải đổi sang `cv2.boxFilter`.
+
+`cv2.GaussianBlur` ném `Unknown C++ exception from OpenCV code` không reproduce được trong một số ROI/kernel combo ở OpenCV 4.13 build hiện tại — kill render giữa chừng (đã gặp ở `_draw_stomp_icon` trước đây). `cv2.boxFilter`:
+- Integral-image, O(n) không phụ thuộc kernel size → 5-10× nhanh hơn Gaussian ở k≥41
+- Robust 100% mọi size combo (an toàn khi tile bị clip cạnh canvas)
+- Halo hơi cứng biên hơn nhưng với additive alpha mờ thì khó nhận ra
+
+```python
+gb = cv2.boxFilter(glow_src, -1, (kernel, kernel),
+                   normalize=True, borderType=cv2.BORDER_CONSTANT)
+glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in top_col],
+                    dtype=np.float32)
+weight = 0.95
+a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (weight * depth_gain)
+roi_f = canvas[ry0:ry1, rx0:rx1].astype(np.float32) + glow_bgr * a3
+canvas[ry0:ry1, rx0:rx1] = np.clip(roi_f, 0, 255).astype(np.uint8)
+```
+
+### Quy tắc 4 — Glow vẽ TRƯỚC tất cả các mặt solid
+
+Additive composite từ dưới lên: glow → side → front → top. Faces solid đè lên giữa tile, glow chỉ "tỏa" ở viền ngoài.
+
+### Kernel sizing reference
+
+| Tile size trên screen (px) | Kernel | Halo radius |
+|---|---|---|
+| ~100 | 21-31 | ~10-15 |
+| ~300 | 35-51 | ~17-25 |
+| ~600+ | 51-71 | ~25-35 |
+
+Bắt đầu với `kernel=35`, tăng nếu halo mỏng, giảm nếu lan rộng quá.
+
+## 6. Extrusion (độ dày khối)
+
+```python
+fwd_n = (front_c - back_c) / (norm + 1e-6)
+extrude = max(6, int(norm * THICKNESS_RATIO))  # THICKNESS_RATIO tùy loại block
+ex = (fwd_n * extrude).astype(np.int32)
+```
+
+`THICKNESS_RATIO` có thể thay đổi theo loại block (mặc định 0.22).
+
+## 7. Cấm tuyệt đối
+
+- ❌ Vẽ cả left_face VÀ right_face cho cùng 1 block
+- ❌ Vẽ viền/rim bao quanh tất cả các mặt (phá vỡ 3D)
+- ❌ Thay đổi tỉ lệ sáng tối giữa các mặt (top 90%+10%white, side 50% base)
+- ❌ Vẽ seam line (đường viền đen) giữa các mặt
+- ❌ Đảo thứ tự vẽ (top phải luôn vẽ cuối cùng)
+- ❌ Glow blur trên FULL canvas (xem §5 quy tắc 2)
+- ❌ Dùng `cv2.GaussianBlur` cho BẤT KỲ blur pass nào trong code vẽ block (glow, icon, shadow, …) — xem §5 quy tắc 3
+- ❌ Glow cho tile xa `z_norm > 0.30` (xem §5 quy tắc 1)
+
+## 8. Được phép thay đổi
+
+- ✅ Hình dạng block (hình vuông, hình chữ nhật, hình thoi, bo góc...)
+- ✅ Kích thước (HALF_X, HALF_Z, THICKNESS_RATIO)
+- ✅ Màu base (self.color)
+- ✅ Glow kernel size + weight (theo bảng §5)
+- ✅ Glow z_norm threshold (mặc định 0.30; chỉnh nếu muốn nhiều/ít tile có glow hơn)
+- ✅ Bỏ glow hoàn toàn cho block không cần (vd block cảnh dressing)
+- ✅ Thêm icon/texture lên top face
+
+## 9. Checklist khi thêm/sửa block — 4 trụ cột
+
+Trước khi commit code vẽ block mới hoặc đổi block hiện có, verify đủ 4 mục:
+
+| # | Trụ cột | Verify ở §nào | Test nhanh |
+|---|---|---|---|
+| 1 | **Render & preview nhẹ** | §5 Q1 (gate z_norm), Q2 (ROI-only), Q3 (boxFilter) | 4 tile cùng frame ở 1080p ≤ 20 ms tổng glow |
+| 2 | **Có halo glow** đúng kích thước | §5 Q4 (vẽ trước faces) + sizing reference | Tile gần `z_norm ≤ 0.30` thấy halo ~17 px (kernel=35); tile xa không halo |
+| 3 | **Tránh bug render** | §5 Q3 (chỉ boxFilter) + §5 Q2 (off-canvas guard) | Sweep z_norm 0.0→1.0 × 4 lane → 0 crash |
+| 4 | **Đúng nguyên lý 3D** | §1 (3 mặt), §2 (top > front > side), §3 (1 cạnh bên), §4 (painter's order) | Block lệch trái thấy cạnh phải; lệch phải thấy cạnh trái; top sáng nhất; không có outline rim |

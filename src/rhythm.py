@@ -26,6 +26,7 @@ import time
 import sys
 import subprocess
 import shlex
+from pathlib import Path
 import ffmpeg
 
 # ── GPU acceleration (CuPy + cuFFT) ──────────────────────────────────────────
@@ -80,7 +81,7 @@ def _fft_blur_gpu(arr_gpu, sigma_y: float, sigma_x: float):
     return cp.real(cp.fft.ifft2(cp.fft.fft2(ch) * k_fft)).astype(cp.float32)
 
 
-def gpu_glow(canvas: np.ndarray, sigma: float = 18.0, gain: float = 0.55) -> np.ndarray:
+def gpu_glow(canvas: np.ndarray, sigma: float = 24.0, gain: float = 0.75) -> np.ndarray:
     """Additive bloom glow for whole frame (screen-space bloom)."""
     if not _CUPY:
         ks = max(3, int(6 * sigma + 1) | 1)
@@ -177,6 +178,46 @@ _RELAX_BOB_WINDOW_F     = 8       # ramp-in / ramp-out length (frames)
 _RELAX_BOB_HEIGHT_FRAC  = 0.08    # peak offset as a fraction of HEIGHT
 
 
+_MIDDLE_SHAKE_DURATION_F = 12      # frames after hit_frame (~400ms @30fps)
+_MIDDLE_SHAKE_PEAK_FRAC = 0.030    # 3.0% of min(W, H) at peak (~32px @1080p)
+
+
+def _relax_middle_shake_offset(
+    targets, cur_frame: int, width: int, height: int
+) -> tuple[int, int]:
+    """Screen-shake offset for `middle` block impact.
+
+    Full-canvas jitter triggered AT each `middle` RelaxTarget's
+    ``hit_frame`` (when the wall slams into the camera plane).  Amplitude
+    follows a punchy quartic decay (k**0.5 envelope: stays high for the
+    first half, then ramps off fast) over `_MIDDLE_SHAKE_DURATION_F`
+    frames.  Per-frame RNG is seeded by (hit_frame, cur_frame) so renders
+    are deterministic.
+    """
+    peak_px = max(2, int(min(width, height) * _MIDDLE_SHAKE_PEAK_FRAC))
+    amp = 0.0
+    seed = 0
+    for t in targets:
+        if not isinstance(t, RelaxTarget) or t.kind != 'middle':
+            continue
+        delta = cur_frame - t.hit_frame
+        if delta < 0 or delta >= _MIDDLE_SHAKE_DURATION_F:
+            continue
+        # Square-root envelope: k=1 → amp=1, k=0.5 → amp~0.71, holds
+        # impact longer than linear before falling off.
+        k_lin = 1.0 - delta / float(_MIDDLE_SHAKE_DURATION_F)
+        k = k_lin ** 0.5
+        if k > amp:
+            amp = k
+            seed = (int(t.hit_frame) & 0xFFFF) * 65537 + (int(cur_frame) & 0xFFFF)
+    if amp <= 0.0:
+        return 0, 0
+    rng = np.random.default_rng(seed)
+    jx = (float(rng.random()) - 0.5) * 2.0 * amp * peak_px
+    jy = (float(rng.random()) - 0.5) * 2.0 * amp * peak_px
+    return int(round(jx)), int(round(jy))
+
+
 def _relax_camera_dy(targets, cur_frame: int, height: int) -> int:
     """Compute the vertical canvas translation for relax-mode camera bob.
 
@@ -196,6 +237,8 @@ def _relax_camera_dy(targets, cur_frame: int, height: int) -> int:
     W = _RELAX_BOB_WINDOW_F
     for t in targets:
         if not isinstance(t, RelaxTarget):
+            continue
+        if t.kind == 'middle':
             continue
         dodge_f  = t.dodge_frame
         hold_end = t.dodge_end_frame    # end of the sustained pose
@@ -405,7 +448,9 @@ class PerspectiveCamera:
                  n_lanes: int = N_LANES,
                  horizon_frac: float = 0.45,
                  hit_zone_frac: float = 0.86,
-                 floor_spread_frac: float = 0.70,
+                 floor_spread_frac: float = 0.175,
+                 far_spread_frac: float | None = None,
+                 wall_floor_gap_frac: float | None = None,
                  fov_deg: float = 55.0):
         self.W = W
         self.H = H
@@ -441,15 +486,85 @@ class PerspectiveCamera:
             (self.y_hit - self.cy_pix) * self.Z_NEAR / self.fy)
         # Tunnel-wall x at bottom of frame (~0.52*W each side)
         self.WALL_WORLD_X = (self.W * 0.52) * self.Z_NEAR / self.fx
+        # Wall bottom Y in world space.
+        # When `wall_floor_gap_frac` is provided (including 0.0) the editor
+        # is taking over the wall-floor relationship:
+        #   gap_pixels   = wall_floor_gap_frac * H
+        #   wall_screen_y = y_hit - gap_pixels
+        #   WALL_BOTTOM_WORLD_Y = (wall_screen_y - cy_pix) * Z_NEAR / fy
+        # gap=0 ⇒ wall bottom on the floor; gap>0 ⇒ wall lifted above floor.
+        # When None ⇒ legacy behaviour (renderers fall back to default).
+        if wall_floor_gap_frac is not None:
+            gap_pix = float(wall_floor_gap_frac) * H
+            wall_screen_y = self.y_hit - gap_pix
+            self.WALL_BOTTOM_WORLD_Y: float | None = (
+                (wall_screen_y - self.cy_pix) * self.Z_NEAR / self.fy)
+        else:
+            self.WALL_BOTTOM_WORLD_Y = None
+
+        # Independent far-end spread: when set, the X projection is
+        # linearly interpolated between 1.0 (at Z_NEAR) and the
+        # far_spread/near_spread ratio (at Z_FAR).  This lets the user
+        # set how wide/narrow the tunnel appears at the horizon
+        # independently from the near (floor) width.
+        if far_spread_frac is not None and floor_spread_frac > 0:
+            self._x_stretch_far = float(far_spread_frac) / float(floor_spread_frac)
+        else:
+            self._x_stretch_far = None  # standard perspective, no stretch
 
     # ---------- 3D projection ----------
     def project(self, wx: float, wy: float, wz: float):
         """Project world point → (sx, sy, depth_scale). None if behind cam."""
         if wz <= 0.05:
             return None
+        # Apply depth-based x stretch when far_spread_frac was provided.
+        # t=0 at Z_NEAR (stretch=1.0) → t=1 at Z_FAR (stretch=_x_stretch_far).
+        if self._x_stretch_far is not None:
+            t = max(0.0, min(1.0, (wz - self.Z_NEAR) / (self.Z_FAR - self.Z_NEAR)))
+            wx = wx * (1.0 + t * (self._x_stretch_far - 1.0))
         sx = self.cx_pix + self.fx * wx / wz
         sy = self.cy_pix + self.fy * wy / wz
         return (sx, sy, 1.0 / wz)
+
+    def view_proj_matrix(self) -> "np.ndarray":
+        """Build a 4x4 OpenGL view-projection matrix matching project() pinhole.
+
+        Convention: camera at origin, +X right, +Y down, +Z away.
+        OpenGL clip space: +X right, +Y up, -Z into screen.
+        We embed a Y-flip + Z-flip into the projection to reconcile.
+        The matrix is column-major (transposed) for GL upload.
+        """
+        W = float(self.W)
+        H = float(self.H)
+        fx = float(self.fx)
+        fy = float(self.fy)
+        cx = float(self.cx_pix)
+        cy = float(self.cy_pix)
+
+        z_near = 0.1
+        z_far = 120.0
+
+        # OpenGL NDC projection from pinhole intrinsics:
+        #   x_ndc = (2*fx/W)*x/z + (1 - 2*cx/W)
+        #   y_ndc = -(2*fy/H)*y/z + (2*cy/H - 1)   (Y-flip: our +Y down → GL +Y up)
+        #   z_ndc = standard depth mapping
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = 2.0 * fx / W
+        proj[0, 2] = 1.0 - 2.0 * cx / W
+        proj[1, 1] = -2.0 * fy / H           # negative for Y-flip
+        proj[1, 2] = 2.0 * cy / H - 1.0
+        proj[2, 2] = -(z_far + z_near) / (z_far - z_near)
+        proj[2, 3] = -2.0 * z_far * z_near / (z_far - z_near)
+        proj[3, 2] = -1.0
+
+        # View: identity (camera at world origin looking +Z).
+        # GL convention is -Z into screen, so flip Z in view.
+        view = np.eye(4, dtype=np.float32)
+        view[2, 2] = -1.0
+
+        # Column-major for GL: transpose the product.
+        vp = proj @ view
+        return vp.T.astype(np.float32)
 
     def lane_world_x(self, lane) -> float:
         """World-X for a (possibly fractional) lane index.
@@ -526,113 +641,711 @@ class PerspectiveCamera:
         return self.cy_v - t * (self.cy_v - top)
 
 
+# ── SegmentBackgroundLayer ───────────────────────────────────────────────────
+class SegmentBackgroundLayer:
+    """Background fill layer drawn under all segment elements."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        bg_type: str = "solid",
+        color: str = "#000000",
+        image_path: str | None = None,
+        video_path: str | None = None,
+        fps: float = 30.0,
+    ) -> None:
+        self._w = int(width)
+        self._h = int(height)
+        self._fps = max(1e-6, float(fps))
+        t = str(bg_type or "solid").strip().lower()
+        self._type = t if t in {"solid", "image", "video"} else "solid"
+        self._solid_bgr = _hex_to_bgr(color, default=CLR_BG)
+        self._image: np.ndarray | None = None
+        self._cap: cv2.VideoCapture | None = None
+        self._video_fps = self._fps
+        self._video_frames = 0
+        self._last_src_idx = -1
+        self._last_frame: np.ndarray | None = None
+
+        if self._type == "image" and image_path:
+            try:
+                img = cv2.imread(str(image_path))
+                if img is not None:
+                    self._image = cv2.resize(
+                        img, (self._w, self._h), interpolation=cv2.INTER_AREA
+                    )
+            except Exception:
+                self._image = None
+        elif self._type == "video" and video_path:
+            try:
+                cap = cv2.VideoCapture(str(video_path))
+                if cap is not None and cap.isOpened():
+                    self._cap = cap
+                    vf = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if vf > 1e-3:
+                        self._video_fps = vf
+                    self._video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                else:
+                    if cap is not None:
+                        cap.release()
+            except Exception:
+                self._cap = None
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _solid_frame(self) -> np.ndarray:
+        return np.full((self._h, self._w, 3), self._solid_bgr, dtype=np.uint8)
+
+    def frame(self, frame_idx: int) -> np.ndarray:
+        if self._type == "image" and self._image is not None:
+            return self._image.copy()
+        if self._type == "video" and self._cap is not None:
+            src_idx = int(round((float(frame_idx) / self._fps) * self._video_fps))
+            if self._video_frames > 0:
+                src_idx = max(0, min(self._video_frames - 1, src_idx))
+            if src_idx != self._last_src_idx:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(src_idx))
+                ok, frm = self._cap.read()
+                if ok and frm is not None:
+                    if frm.shape[1] != self._w or frm.shape[0] != self._h:
+                        frm = cv2.resize(
+                            frm, (self._w, self._h), interpolation=cv2.INTER_LINEAR
+                        )
+                    self._last_frame = frm
+                    self._last_src_idx = src_idx
+            if self._last_frame is not None:
+                return self._last_frame.copy()
+        return self._solid_frame()
+
+
+class StartGate:
+    """Visual gate anchored to floor + side-rail inner edges."""
+
+    def __init__(
+        self,
+        cam: PerspectiveCamera,
+        view_w: int,
+        view_h: int,
+        *,
+        gate_type: str = "color",
+        color: str = "#1a1a1a",
+        border_color: str = "#ffffff",
+        border_thickness: float = 0.0,
+        image_path: str | None = None,
+        video_path: str | None = None,
+        rail_height: float = 0.14,
+        rail_offset_x: float = 0.08,
+        gate_height: float = 0.14,
+        fps: float = 30.0,
+    ) -> None:
+        self._cam = cam
+        self._view_w = int(view_w)
+        self._view_h = int(view_h)
+        self._rail_height = max(0.03, float(rail_height))
+        self._rail_offset_x = max(0.0, float(rail_offset_x))
+        self._gate_height = max(0.03, float(gate_height))
+        self._fps = max(1e-6, float(fps))
+        t = str(gate_type or "color").strip().lower()
+        self._type = t if t in {"color", "image", "video"} else "color"
+        self._solid_bgr = _hex_to_bgr(color, default=(26, 26, 26))
+        self._border_bgr = _hex_to_bgr(border_color, default=(255, 255, 255))
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+
+        self._orig_image: np.ndarray | None = None
+        self._image: np.ndarray | None = None
+        self._cap: cv2.VideoCapture | None = None
+        self._video_fps = self._fps
+        self._video_frames = 0
+        self._last_src_idx = -1
+        self._last_frame: np.ndarray | None = None
+
+        self._px = 0
+        self._py = 0
+        self._pw = 1
+        self._ph = 1
+        self._recompute_rect()
+
+        if self._type == "image" and image_path:
+            try:
+                img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    self._orig_image = img
+                    self._image = self._fit_to_rect(img)
+            except Exception:
+                self._orig_image = None
+                self._image = None
+        elif self._type == "video" and video_path:
+            try:
+                cap = cv2.VideoCapture(str(video_path))
+                if cap is not None and cap.isOpened():
+                    self._cap = cap
+                    vf = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if vf > 1e-3:
+                        self._video_fps = vf
+                    self._video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                else:
+                    if cap is not None:
+                        cap.release()
+            except Exception:
+                self._cap = None
+
+    def _set_rect_px(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        x0 = max(0, min(self._view_w - 1, int(x0)))
+        y0 = max(0, min(self._view_h - 1, int(y0)))
+        x1 = max(x0 + 1, min(self._view_w, int(x1)))
+        y1 = max(y0 + 1, min(self._view_h, int(y1)))
+        new_px = x0
+        new_py = y0
+        new_pw = max(1, x1 - x0)
+        new_ph = max(1, y1 - y0)
+        if (
+            new_px != self._px or new_py != self._py
+            or new_pw != self._pw or new_ph != self._ph
+        ):
+            self._px = new_px
+            self._py = new_py
+            self._pw = new_pw
+            self._ph = new_ph
+            self._last_frame = None
+            self._last_src_idx = -1
+            if self._orig_image is not None:
+                self._image = self._fit_to_rect(self._orig_image)
+
+    def _recompute_rect(self) -> None:
+        cam = self._cam
+        if cam.n_lanes >= 2:
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+        else:
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+        inner_x = outer_tile_x + self._rail_offset_x
+        wx_l = -inner_x
+        wx_r = inner_x
+        wz = cam.Z_FAR
+        wy_bot = cam.FLOOR_WORLD_Y
+        wy_top = cam.FLOOR_WORLD_Y - self._gate_height
+        p_lb = cam.project(wx_l, wy_bot, wz)
+        p_rb = cam.project(wx_r, wy_bot, wz)
+        p_lt = cam.project(wx_l, wy_top, wz)
+        p_rt = cam.project(wx_r, wy_top, wz)
+        if any(p is None for p in (p_lb, p_rb, p_lt, p_rt)):
+            # Fallback box if projection fails unexpectedly.
+            self._set_rect_px(
+                int(self._view_w * 0.30),
+                int(self._view_h * 0.18),
+                int(self._view_w * 0.70),
+                int(self._view_h * 0.40),
+            )
+            return
+        x0 = int(round(min(p_lb[0], p_lt[0])))
+        x1 = int(round(max(p_rb[0], p_rt[0])))
+        y0 = int(round(min(p_lt[1], p_rt[1])))
+        y1 = int(round(max(p_lb[1], p_rb[1])))
+        self._set_rect_px(x0, y0, x1, y1)
+
+    def update_layout(
+        self,
+        *,
+        cam: PerspectiveCamera | None = None,
+        rail_height: float | None = None,
+        rail_offset_x: float | None = None,
+        gate_height: float | None = None,
+    ) -> None:
+        if cam is not None:
+            self._cam = cam
+        if rail_height is not None:
+            self._rail_height = max(0.03, float(rail_height))
+        if rail_offset_x is not None:
+            self._rail_offset_x = max(0.0, float(rail_offset_x))
+        if gate_height is not None:
+            self._gate_height = max(0.03, float(gate_height))
+        self._recompute_rect()
+
+    def rect_fracs(self) -> tuple[float, float, float, float]:
+        return (
+            float(self._px) / float(max(1, self._view_w)),
+            float(self._py) / float(max(1, self._view_h)),
+            float(self._pw) / float(max(1, self._view_w)),
+            float(self._ph) / float(max(1, self._view_h)),
+        )
+
+    def set_style(
+        self,
+        *,
+        color: str | None = None,
+        border_color: str | None = None,
+        border_thickness: float | None = None,
+    ) -> None:
+        if color is not None:
+            self._solid_bgr = _hex_to_bgr(color, default=self._solid_bgr)
+        if border_color is not None:
+            self._border_bgr = _hex_to_bgr(border_color, default=self._border_bgr)
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _fit_to_rect(self, img: np.ndarray) -> np.ndarray:
+        interp = cv2.INTER_AREA
+        if img.shape[1] < self._pw or img.shape[0] < self._ph:
+            interp = cv2.INTER_LINEAR
+        return cv2.resize(img, (self._pw, self._ph), interpolation=interp)
+
+    def _read_video_frame(self, frame_idx: int) -> np.ndarray | None:
+        if self._cap is None:
+            return None
+        src_idx = int(round((float(frame_idx) / self._fps) * self._video_fps))
+        if self._video_frames > 0:
+            src_idx %= self._video_frames
+        if src_idx != self._last_src_idx:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(src_idx))
+            ok, frm = self._cap.read()
+            if ok and frm is not None:
+                if frm.shape[1] != self._pw or frm.shape[0] != self._ph:
+                    frm = cv2.resize(frm, (self._pw, self._ph), interpolation=cv2.INTER_LINEAR)
+                self._last_frame = frm
+                self._last_src_idx = src_idx
+        return self._last_frame
+
+    def draw(self, canvas: np.ndarray, frame_idx: int) -> None:
+        self._recompute_rect()
+        content: np.ndarray | None = None
+        if self._type == "image" and self._image is not None:
+            content = self._image
+        elif self._type == "video":
+            content = self._read_video_frame(frame_idx)
+        if content is None:
+            content = np.full((self._ph, self._pw, 3), self._solid_bgr, dtype=np.uint8)
+
+        x0, y0 = self._px, self._py
+        x1, y1 = x0 + self._pw, y0 + self._ph
+        cx0, cy0 = max(0, x0), max(0, y0)
+        cx1, cy1 = min(canvas.shape[1], x1), min(canvas.shape[0], y1)
+        if cx0 >= cx1 or cy0 >= cy1:
+            return
+        sx0 = cx0 - x0
+        sy0 = cy0 - y0
+        src = content[sy0:sy0 + (cy1 - cy0), sx0:sx0 + (cx1 - cx0)]
+
+        if src.ndim == 3 and src.shape[2] == 4:
+            alpha = src[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = src[:, :, :3].astype(np.float32)
+            dst = canvas[cy0:cy1, cx0:cx1].astype(np.float32)
+            canvas[cy0:cy1, cx0:cx1] = (rgb * alpha + dst * (1.0 - alpha)).astype(np.uint8)
+        else:
+            canvas[cy0:cy1, cx0:cx1] = src[:, :, :3]
+
+        if self._border_thickness > 1e-6:
+            bt = max(1, int(round(self._border_thickness)))
+            cv2.rectangle(
+                canvas,
+                (cx0, cy0),
+                (max(cx0, cx1 - 1), max(cy0, cy1 - 1)),
+                tuple(int(v) for v in self._border_bgr),
+                thickness=bt,
+                lineType=cv2.LINE_AA,
+            )
+
+
 # ── TunnelRenderer ────────────────────────────────────────────────────────────
 class TunnelRenderer:
     """Draws the receding 3D tunnel: floor grid + side walls with neon strips."""
 
     def __init__(self, cam: PerspectiveCamera, show_floor_panels: bool = True,
-                 lane_tiles: bool = False):
+                 lane_tiles: bool = False,
+                 floor_panel_color: str | None = None,
+                 floor_panel_opacity: float = 1.0,
+                 floor_panel_blink: bool = False,
+                 floor_panel_image: str | None = None,
+                 floor_full_static_image: bool = False,
+                 floor_layout: str = 'auto',
+                 floor_bg_color: str | None = None,
+                 floor_bg_opacity: float = 1.0,
+                 chevron_color: str = '#FFD700',
+                 chevron_scroll: bool = True,
+                 chevron_blink: bool = False,
+                 chevron_width_frac: float = 0.45,
+                 chevron_count: int = 6):
         """
         `lane_tiles`: when True, floor panels are drawn directly UNDER each
         lane (one column of tiles per lane, derived from `cam.lane_world_x`).
         Used by dance mode so the 4 lanes have visible "runway" tiles.
         When False (default), uses the original 2 columns flanking the
         center — matches the original punch-mode look.
+
+        `floor_panel_color`: optional hex string ("#RRGGBB") to override the
+        default grey neon color of floor tiles.
+        `floor_panel_blink`: when True tiles flash on/off each beat (derived
+        from a fixed half-second period so the preview matches the render).
+        `floor_panel_image`: optional image path; when set the image is
+        perspective-warped onto each tile instead of the flat grey fill.
+        `floor_full_static_image`: when True AND `floor_panel_image` is set,
+        the image is stretched (perspective-warped) onto the FULL floor
+        trapezoid as one static graphic — chevrons, tiles, BG color, blink
+        and opacity are all bypassed.  Has no effect when no image is loaded.
+        `floor_layout`: 'auto' (legacy lane_tiles / 2-column) or
+        'chevron_strip' (single centre column of >>>-arrow shapes).
+        `floor_bg_color`: hex "#RRGGBB" solid trapezoid drawn UNDER tiles;
+        None = transparent (default canvas black).
+        `chevron_*`: colour / animation / geometry of the chevron strip.
         """
         self.cam = cam
         self.show_floor_panels = show_floor_panels
         self.lane_tiles = lane_tiles
+        self.floor_panel_color = floor_panel_color
+        self.floor_panel_opacity = float(max(0.0, min(1.0, floor_panel_opacity)))
+        self.floor_panel_blink = floor_panel_blink
+        self.floor_layout = str(floor_layout)
+        self.floor_bg_color = floor_bg_color or None
+        self.floor_bg_opacity = float(max(0.0, min(1.0, floor_bg_opacity)))
+        self.chevron_color = str(chevron_color)
+        self.chevron_scroll = bool(chevron_scroll)
+        self.chevron_blink = bool(chevron_blink)
+        self.chevron_width_frac = float(max(0.1, min(2.0, chevron_width_frac)))
+        self.chevron_count = int(max(3, min(12, chevron_count)))
+        self.floor_full_static_image = bool(floor_full_static_image)
+        # Pre-load the tile image (BGR) so we don't re-read on every frame.
+        self._tile_img: "np.ndarray | None" = None
+        if floor_panel_image:
+            try:
+                img = cv2.imread(floor_panel_image)
+                if img is not None:
+                    self._tile_img = img
+            except Exception:
+                pass
+
+    def set_chevron_width_frac(self, value: float) -> None:
+        """Hot-update chevron strip width (overlay drag)."""
+        self.chevron_width_frac = float(max(0.05, min(0.95, value)))
 
     def draw(self, canvas: np.ndarray, frame: int) -> np.ndarray:
         """Dark 3D tunnel with floor panels receding toward the horizon.
 
         Uses the camera's 3D projection so floor tiles are true trapezoid
         perspective (not hand-faked), matching the CapCut reference.
+
+        Z-order (bottom to top):
+          1. Floor BG trapezoid (solid color, optional).
+          2. Floor tiles / chevron strip (show_floor_panels gate).
+          3. Horizon glow line (atmospherics).
         """
         cam = self.cam
 
-        if self.show_floor_panels:
-            # -- Floor panels (receding rows of grey tiles) ----------------
-            # `lane_tiles` mode: one tile column per lane (dance mode, 4
-            # lanes under the 4 viewport panels).  Legacy mode: two columns
-            # flanking center (punch mode).
-            tile_len  = 1.6                        # length along z
-            if self.lane_tiles and cam.n_lanes >= 2:
-                x_centers = tuple(cam.lane_world_x(i)
-                                  for i in range(cam.n_lanes))
-                # Tile half-width = 80% of lane spacing so adjacent rows
-                # almost touch but keep a visible neon seam between them.
-                step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
-                tile_w = max(0.25, step * 0.80)
-            else:
-                x_centers = (-0.95, +0.95)
-                tile_w    = 0.55
-            z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
-            scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
+        # ── Phase 0: Full static image short-circuit ───────────────────
+        # When enabled with an image loaded, render JUST the image stretched
+        # onto the whole floor trapezoid and skip every other floor effect.
+        if self.floor_full_static_image and self._tile_img is not None:
+            self._draw_floor_full_static(canvas)
+            y_hz = self._runway_horizon_y()
+            cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
+                     lineType=cv2.LINE_AA)
+            return canvas
 
+        # ── Phase A: Floor BG trapezoid (solid color under tiles) ──────
+        if self.floor_bg_color:
+            self._draw_floor_bg(canvas)
+
+        # ── Phase B: Floor tiles or chevron strip ───────────────────────
+        if self.show_floor_panels:
+            if self.floor_layout == 'chevron_strip':
+                self._draw_chevron_strip(canvas, frame)
+            else:
+                self._draw_floor_tiles_legacy(canvas, frame)
+
+        # ── Phase C: Faint horizon / runway glow line (atmospherics) ───
+        y_hz = self._runway_horizon_y()
+        cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
+                 lineType=cv2.LINE_AA)
+
+        return canvas
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _runway_horizon_y(self) -> int:
+        """Y of the runway far edge; keeps glow line aligned to floor."""
+        cam = self.cam
+        if cam.n_lanes >= 2:
+            outer_left = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left = outer_left - half_step
+        x_right = outer_right + half_step
+        p_l = cam.project(x_left, cam.FLOOR_WORLD_Y, cam.Z_FAR)
+        p_r = cam.project(x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR)
+        if p_l is None or p_r is None:
+            return int(cam.cy_pix + 2)
+        return int(round((float(p_l[1]) + float(p_r[1])) * 0.5))
+
+    def _draw_floor_bg(self, canvas: np.ndarray) -> None:
+        """Fill a (possibly translucent) trapezoid covering the full runway."""
+        cam = self.cam
+        bgr = _hex_to_bgr(self.floor_bg_color, default=(140, 26, 90))
+
+        if cam.n_lanes >= 2:
+            outer_left  = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step   = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left  = outer_left  - half_step
+        x_right = outer_right + half_step
+
+        corners_w = [
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_NEAR),
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_NEAR),
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR),
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_FAR),
+        ]
+        proj = [cam.project(*c) for c in corners_w]
+        if any(p is None for p in proj):
+            return
+        poly = np.array(
+            [(int(round(p[0])), int(round(p[1]))) for p in proj],
+            dtype=np.int32,
+        )
+        opacity = self.floor_bg_opacity
+        if opacity >= 1.0:
+            cv2.fillConvexPoly(canvas, poly, bgr, lineType=cv2.LINE_AA)
+        elif opacity > 0.0:
+            overlay = canvas.copy()
+            cv2.fillConvexPoly(overlay, poly, bgr, lineType=cv2.LINE_AA)
+            cv2.addWeighted(overlay, opacity, canvas, 1.0 - opacity, 0, canvas)
+
+    def _draw_floor_full_static(self, canvas: np.ndarray) -> None:
+        """Stretch ``self._tile_img`` to the full runway trapezoid (one shot)."""
+        cam = self.cam
+        if self._tile_img is None:
+            return
+
+        if cam.n_lanes >= 2:
+            outer_left  = cam.lane_world_x(0)
+            outer_right = cam.lane_world_x(cam.n_lanes - 1)
+            half_step   = abs(outer_right - outer_left) / max(1, cam.n_lanes - 1) * 0.5
+        else:
+            outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+        x_left  = outer_left  - half_step
+        x_right = outer_right + half_step
+
+        corners_w = [
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_NEAR),   # near-left
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_NEAR),   # near-right
+            (x_right, cam.FLOOR_WORLD_Y, cam.Z_FAR),    # far-right
+            (x_left,  cam.FLOOR_WORLD_Y, cam.Z_FAR),    # far-left
+        ]
+        proj = [cam.project(*c) for c in corners_w]
+        if any(p is None for p in proj):
+            return
+        dst_pts = np.array(
+            [(float(p[0]), float(p[1])) for p in proj],
+            dtype=np.float32,
+        )
+
+        ih, iw = self._tile_img.shape[:2]
+        # Source corners ordered to match dst: TL, TR, BR, BL.
+        # Image y=0 is "top" / far end of the floor; y=ih is "bottom" / near.
+        src_pts = np.array(
+            [[0,   ih], [iw, ih], [iw, 0], [0,  0]],
+            dtype=np.float32,
+        )
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(
+            self._tile_img, M, (canvas.shape[1], canvas.shape[0])
+        )
+        poly_int = dst_pts.astype(np.int32)
+        mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, poly_int, 255)
+        canvas[mask > 0] = warped[mask > 0]
+
+    def _draw_chevron_strip(self, canvas: np.ndarray, frame: int) -> None:
+        """Draw a single column of >>>-arrows down the centre of the runway."""
+        cam = self.cam
+
+        if self.chevron_blink and (frame // 15) % 2 == 1:
+            return
+
+        bgr = _hex_to_bgr(self.chevron_color, default=(0, 215, 255))
+
+        spacing = (cam.Z_FAR - cam.Z_NEAR) / max(1, self.chevron_count)
+        z_slots = [cam.Z_NEAR + i * spacing for i in range(self.chevron_count)]
+        scroll  = ((frame * 0.30) % spacing) if self.chevron_scroll else 0.0
+
+        if cam.n_lanes >= 2:
+            spread = abs(cam.lane_world_x(cam.n_lanes - 1) - cam.lane_world_x(0))
+        else:
+            spread = 1.9
+        half_w    = spread * self.chevron_width_frac * 0.5
+        arrow_len = 1.2
+
+        polys: list[tuple[float, "np.ndarray", float]] = []
+        for z_c in z_slots:
+            wz = z_c - scroll
+            if wz <= cam.Z_NEAR + 0.05:
+                continue
+            z_tip  = wz - arrow_len * 0.5
+            z_base = wz + arrow_len * 0.5
+            z_mid  = wz
+            # Clamp the near-end vertices so they never project outside
+            # (below) the floor-background trapezoid boundary at Z_NEAR.
+            _z_floor = cam.Z_NEAR + 0.05
+            z_tip_c       = max(_z_floor, z_tip)
+            z_tip_inner_c = max(_z_floor, z_tip + 0.45)
+            # 8-vertex notched chevron (outer ring CCW then inner ring CW)
+            corners_w = [
+                (-half_w,        cam.FLOOR_WORLD_Y, z_base),
+                (-half_w * 0.55, cam.FLOOR_WORLD_Y, z_mid),
+                (0.0,            cam.FLOOR_WORLD_Y, z_tip_c),
+                (+half_w * 0.55, cam.FLOOR_WORLD_Y, z_mid),
+                (+half_w,        cam.FLOOR_WORLD_Y, z_base),
+                (+half_w * 0.65, cam.FLOOR_WORLD_Y, z_base + 0.05),
+                (0.0,            cam.FLOOR_WORLD_Y, z_tip_inner_c),
+                (-half_w * 0.65, cam.FLOOR_WORLD_Y, z_base + 0.05),
+            ]
+            proj = [cam.project(*c) for c in corners_w]
+            if any(p is None for p in proj):
+                continue
+            depth_factor = max(0.15, min(1.0, 5.0 / wz))
+            pts = np.array(
+                [(int(round(p[0])), int(round(p[1]))) for p in proj],
+                dtype=np.int32,
+            )
+            polys.append((wz, pts, depth_factor))
+
+        polys.sort(key=lambda t: -t[0])   # far first
+
+        for _, pts, df in polys:
+            fill = tuple(int(c * (0.35 + 0.65 * df)) for c in bgr)
+            cv2.fillPoly(canvas, [pts], fill, lineType=cv2.LINE_AA)
+            rim = tuple(int(min(255, c * (0.55 + 0.85 * df))) for c in bgr)
+            cv2.polylines(canvas, [pts], True, rim, 1, lineType=cv2.LINE_AA)
+
+    def _draw_floor_tiles_legacy(self, canvas: np.ndarray, frame: int) -> None:
+        """Original floor-tile rendering (lane_tiles or 2-column). Pixel-identical."""
+        cam = self.cam
+
+        # -- Blink: hide tiles on odd half-seconds --------------------
+        if self.floor_panel_blink and (frame // 15) % 2 == 1:
+            return
+
+        # -- Floor panels (receding rows of grey tiles) ----------------
+        # `lane_tiles` mode: one tile column per lane (dance mode, 4
+        # lanes under the 4 viewport panels).  Legacy mode: two columns
+        # flanking center (punch mode).
+        tile_len  = 1.6                        # length along z
+        if self.lane_tiles and cam.n_lanes >= 2:
+            x_centers = tuple(cam.lane_world_x(i)
+                              for i in range(cam.n_lanes))
+            # Tile half-width = 80% of lane spacing so adjacent rows
+            # almost touch but keep a visible neon seam between them.
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+            tile_w = max(0.25, step * 0.80)
+        else:
+            x_centers = (-0.95, +0.95)
+            tile_w    = 0.55
+        z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
+        scroll    = (frame * 0.30) % (z_slots[1] - z_slots[0])
+
+        # Resolve the glow color: custom hex or neutral grey default.
+        if self.floor_panel_color:
+            try:
+                hx = self.floor_panel_color.lstrip("#")
+                r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+                floor_glow_color = np.array([b, g, r], dtype=np.float32)
+            except Exception:
+                floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
+        else:
             # Neutral grey neon for the floor panels (same hue as the tile
             # fill, just brighter) – keeps the ground reading as ground while
             # the punch cubes own the saturated green/red accent colors.
             floor_glow_color = np.array([170, 175, 180], dtype=np.float32)
 
-            floor_polys = []
-            for lane_i, xc in enumerate(x_centers):
-                for z_c in z_slots:
-                    wz = z_c - scroll
-                    if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
-                        continue
-                    corners = [
-                        (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                        (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
-                        (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                        (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
-                    ]
-                    proj = [cam.project(*c) for c in corners]
-                    if any(p is None for p in proj):
-                        continue
-                    depth_factor = max(0.08, min(1.0, 5.0 / wz))
-                    poly = np.array([(int(p[0]), int(p[1])) for p in proj],
-                                    dtype=np.int32)
-                    floor_polys.append((wz, poly, depth_factor, lane_i))
+        floor_polys = []
+        for lane_i, xc in enumerate(x_centers):
+            for z_c in z_slots:
+                wz = z_c - scroll
+                if wz < cam.Z_NEAR + 0.2:      # don't clip front edge
+                    continue
+                corners = [
+                    (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                    (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz - tile_len / 2),
+                    (xc + tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                    (xc - tile_w / 2, cam.FLOOR_WORLD_Y, wz + tile_len / 2),
+                ]
+                proj = [cam.project(*c) for c in corners]
+                if any(p is None for p in proj):
+                    continue
+                depth_factor = max(0.08, min(1.0, 5.0 / wz))
+                poly = np.array([(int(p[0]), int(p[1])) for p in proj],
+                                dtype=np.int32)
+                floor_polys.append((wz, poly, depth_factor, lane_i))
 
-            floor_polys.sort(key=lambda t: -t[0])  # far first
+        floor_polys.sort(key=lambda t: -t[0])  # far first
 
-            # Pass 1: dark grey fill for each tile (ground-panel feel).
+        # Pass 1: fill each tile — image-warp or flat color.
+        if self._tile_img is not None:
+            # Perspective-warp the source image onto each tile poly.
+            ih, iw = self._tile_img.shape[:2]
+            src_pts = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]],
+                               dtype=np.float32)
             for _, poly, df, _ in floor_polys:
-                base = int(45 * df)
-                cv2.fillPoly(canvas, [poly], (base, base + 2, base + 2),
-                             lineType=cv2.LINE_AA)
+                dst_pts = poly.astype(np.float32)
+                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                warped = cv2.warpPerspective(
+                    self._tile_img, M, (canvas.shape[1], canvas.shape[0])
+                )
+                # Blend warped image into canvas only inside tile poly.
+                mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(mask, [poly], 255)
+                alpha = min(1.0, 0.25 + 0.75 * df) * self.floor_panel_opacity
+                canvas[mask > 0] = cv2.addWeighted(
+                    canvas, 1.0 - alpha, warped, alpha, 0
+                )[mask > 0]
+        else:
+            for _, poly, df, _ in floor_polys:
+                if self.floor_panel_color:
+                    # Tint with custom color, scale by depth.
+                    fill = tuple(int(c * df * 0.4) for c in
+                                 (int(floor_glow_color[0]),
+                                  int(floor_glow_color[1]),
+                                  int(floor_glow_color[2])))
+                else:
+                    base = int(45 * df)
+                    fill = (base, base + 2, base + 2)
+                if self.floor_panel_opacity >= 1.0:
+                    cv2.fillPoly(canvas, [poly], fill, lineType=cv2.LINE_AA)
+                elif self.floor_panel_opacity > 0.0:
+                    overlay = canvas.copy()
+                    cv2.fillPoly(overlay, [poly], fill, lineType=cv2.LINE_AA)
+                    cv2.addWeighted(
+                        overlay,
+                        self.floor_panel_opacity,
+                        canvas,
+                        1.0 - self.floor_panel_opacity,
+                        0,
+                        canvas,
+                    )
 
-            # Pass 2: rim outline.  In `lane_tiles` mode we want the
-            # runway tiles to read as a QUIET grid so the bright DanceTarget
-            # stomp-pads pop on top; in legacy (punch) mode we keep the
-            # original neon glow that gives the tunnel its energetic feel.
-            if self.lane_tiles:
-                for _, poly, df, _ in floor_polys:
-                    c = int(60 + 60 * df)             # dim grey, 60..120
-                    cv2.polylines(canvas, [poly], True, (c, c, c), 1,
-                                  lineType=cv2.LINE_AA)
-            else:
-                for _, poly, df, _ in floor_polys:
-                    glow = floor_glow_color * (0.40 + 0.60 * df)
-                    thickness = max(1, int(round(1 + df * 1.2)))
-                    _draw_neon_edges(canvas, [poly], glow, thickness)
-
-        # -- Faint horizon / runway glow line (ambient neon) --
-        y_hz = int(cam.cy_pix + 2)
-        cv2.line(canvas, (0, y_hz), (cam.W, y_hz), (70, 60, 80), 1,
-                 lineType=cv2.LINE_AA)
-
-        # -- Dark wall edge hints (very subtle perspective lines) --
-        for side in (-1, +1):
-            pts = []
-            for z_n in [0, 0.35, 0.65, 0.85, 0.95]:
-                pts.append((int(cam.wall_x(side, z_n)),
-                            int(cam.floor_y(z_n))))
-            for a, b in zip(pts, pts[1:]):
-                cv2.line(canvas, a, b, (55, 45, 35), 1, lineType=cv2.LINE_AA)
-
-        return canvas
+        # Pass 2: rim outline.
+        if self.lane_tiles:
+            for _, poly, df, _ in floor_polys:
+                c = int((60 + 60 * df) * self.floor_panel_opacity)
+                cv2.polylines(canvas, [poly], True, (c, c, c), 1,
+                              lineType=cv2.LINE_AA)
+        else:
+            for _, poly, df, _ in floor_polys:
+                glow = floor_glow_color * (0.40 + 0.60 * df) * self.floor_panel_opacity
+                thickness = max(1, int(round(1 + df * 1.2)))
+                _draw_neon_edges(canvas, [poly], glow, thickness)
 
     def draw_hit_zone(self, canvas: np.ndarray) -> np.ndarray:
         cam = self.cam
@@ -646,11 +1359,36 @@ class TunnelRenderer:
             l_xb1 = int(cam.lane_x(i + 0.5, 0.12))
             poly = np.array([(l_x0, y), (l_x1, y),
                              (l_xb1, y_back), (l_xb0, y_back)], dtype=np.int32)
-            # translucent fill
-            overlay = canvas.copy()
-            cv2.fillPoly(overlay, [poly], (50, 40, 15))
-            canvas = cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0)
-            cv2.polylines(canvas, [poly], True, CLR_LANE_EDGE, 2, lineType=cv2.LINE_AA)
+            # Gradient fill (top brighter, bottom darker) + slight side vignette.
+            mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            x, y0, w, h = cv2.boundingRect(poly)
+            H_c, W_c = canvas.shape[:2]
+            rx0, ry0 = max(0, x), max(0, y0)
+            rx1, ry1 = min(W_c, x + w), min(H_c, y0 + h)
+            rw, rh = rx1 - rx0, ry1 - ry0
+            if rw > 0 and rh > 0:
+                gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+                gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
+                top = np.array([82.0, 82.0, 82.0], dtype=np.float32)
+                bot = np.array([42.0, 42.0, 42.0], dtype=np.float32)
+                grad = top * (1.0 - gy) + bot * gy
+                grad = np.repeat(grad, w, axis=1)
+                grad *= (1.0 - 0.18 * gx)  # darker toward left/right edges
+                grad = np.clip(grad, 0, 255).astype(np.uint8)
+
+                fill_layer = np.zeros_like(canvas)
+                fill_layer[ry0:ry1, rx0:rx1] = grad[ry0 - y0:ry1 - y0, rx0 - x:rx1 - x]
+                alpha = 0.78
+                roi = mask > 0
+                canvas[roi] = (
+                    canvas[roi].astype(np.float32) * (1.0 - alpha)
+                    + fill_layer[roi].astype(np.float32) * alpha
+                ).astype(np.uint8)
+
+            # Edge treatment: dark outer + light inner for depth.
+            cv2.polylines(canvas, [poly], True, (26, 26, 26), 2, lineType=cv2.LINE_AA)
+            cv2.polylines(canvas, [poly], True, (120, 120, 120), 1, lineType=cv2.LINE_AA)
         return canvas
 
 
@@ -1089,6 +1827,24 @@ def _round_poly(pts: np.ndarray, radius: float, steps: int = 6) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
+def _hex_to_bgr(hex_str: str,
+                default: tuple[int, int, int] = (255, 0, 255)
+                ) -> tuple[int, int, int]:
+    """Parse a '#RRGGBB' hex string and return (B, G, R) for OpenCV.
+
+    Returns *default* (magenta) on any parse failure so callers never crash
+    on bad user input.
+    """
+    try:
+        s = (hex_str or "").lstrip('#')
+        if len(s) != 6:
+            return default
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+        return (b, g, r)
+    except (ValueError, AttributeError):
+        return default
+
+
 def _draw_neon_edges(canvas: np.ndarray,
                      polys: list,
                      base_color: np.ndarray,
@@ -1298,6 +2054,47 @@ def draw_cube_3d(canvas: np.ndarray, cam: PerspectiveCamera,
     return {'cx': nx, 'cy': ny, 'size': nw, 'pts': pts_2d}
 
 
+def _draw_block_glow_roi(canvas: np.ndarray, pts: np.ndarray,
+                         color_bgr: tuple, depth_gain: float, z_norm: float,
+                         *, kernel: int = 35, weight: float = 0.95) -> None:
+    """ROI-only additive halo glow around a projected block silhouette.
+
+    Implements `.cursor/rules/3d-block-rendering.mdc` §5:
+      • Quy tắc 1: skip glow when ``z_norm > 0.30`` (far tile, depth_gain
+        already attenuates and halo lost in tunnel haze).
+      • Quy tắc 2: bound alloc + blur to ``cv2.boundingRect(pts) +
+        kernel/2 + 4`` padding — never alloc full canvas (~30× cheaper).
+      • Quy tắc 3: ``cv2.boxFilter`` (integral image, O(n), robust at
+        all sizes) — NEVER ``cv2.GaussianBlur`` (Unknown C++ exception
+        in OpenCV 4.13 build for some ROI/kernel combos).
+
+    Caller is responsible for invoking this BEFORE drawing solid faces
+    (Quy tắc 4: glow → side → front → top).
+    """
+    if z_norm > 0.30:
+        return
+    H, W = canvas.shape[:2]
+    pad = kernel // 2 + 4
+    bx, by_, bw, bh = cv2.boundingRect(pts)
+    rx0 = max(0, bx - pad)
+    ry0 = max(0, by_ - pad)
+    rx1 = min(W, bx + bw + pad)
+    ry1 = min(H, by_ + bh + pad)
+    rw, rh = rx1 - rx0, ry1 - ry0
+    if rw <= 0 or rh <= 0:
+        return
+    pts_local = pts - np.array([rx0, ry0], dtype=np.int32)
+    glow_src = np.zeros((rh, rw), dtype=np.uint8)
+    cv2.fillConvexPoly(glow_src, pts_local, 255, lineType=cv2.LINE_AA)
+    gb = cv2.boxFilter(glow_src, -1, (kernel, kernel),
+                       normalize=True, borderType=cv2.BORDER_CONSTANT)
+    glow_bgr = np.array([min(255, c * depth_gain * 1.2) for c in color_bgr],
+                        dtype=np.float32)
+    a3 = (gb[:, :, None].astype(np.float32) / 255.0) * (weight * depth_gain)
+    roi_f = canvas[ry0:ry1, rx0:rx1].astype(np.float32) + glow_bgr * a3
+    canvas[ry0:ry1, rx0:rx1] = np.clip(roi_f, 0, 255).astype(np.uint8)
+
+
 def _draw_fist_icon(canvas: np.ndarray, cx: int, cy: int, size: int,
                     color=CLR_WHITE):
     """Stylized closed-fist icon (knuckles + palm) centered at (cx,cy).
@@ -1331,19 +2128,147 @@ def _draw_fist_icon(canvas: np.ndarray, cx: int, cy: int, size: int,
                   color, -1, lineType=cv2.LINE_AA)
 
 
+def _draw_fist_icon_v2(canvas: np.ndarray, cx: int, cy: int, size: int,
+                       color=CLR_WHITE):
+    """Bold single-polygon fist silhouette on the FRONT face.
+
+    Layout: 4 knuckle bumps on top, palm body, thumb on left.
+    Matches reference image — one filled shape, no separate parts.
+    """
+    if size < 8:
+        return
+    s = float(size)
+    pts = []
+    # Palm top-left start
+    pts.append((-0.40, -0.10))
+    # 4 knuckle bumps
+    k_y_base = -0.20
+    k_y_top  = -0.42
+    k_xs     = [-0.30, -0.10, 0.10, 0.30]
+    k_hw     = 0.09
+    for kx in k_xs:
+        pts.append((kx - k_hw, k_y_base))
+        pts.append((kx - k_hw, k_y_top))
+        pts.append((kx + k_hw, k_y_top))
+        pts.append((kx + k_hw, k_y_base))
+    pts.append((0.40, -0.10))
+    pts.append((0.42,  0.20))
+    pts.append((0.36,  0.36))
+    pts.append((0.20,  0.42))
+    pts.append((-0.20, 0.42))
+    pts.append((-0.36, 0.36))
+    pts.append((-0.42, 0.20))
+    pts.append((-0.40, 0.05))
+    # Thumb
+    pts.append((-0.50,  0.00))
+    pts.append((-0.55, -0.10))
+    pts.append((-0.50, -0.18))
+    pts.append((-0.40, -0.15))
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(canvas, [abs_pts], color, lineType=cv2.LINE_AA)
+    # Finger grooves (3 dark lines between 4 knuckles)
+    groove = tuple(int(c * 0.55) for c in color)
+    for kx in (-0.20, 0.00, 0.20):
+        x = int(cx + kx * s)
+        y0_g = int(cy - 0.38 * s)
+        y1_g = int(cy - 0.06 * s)
+        cv2.line(canvas, (x, y0_g), (x, y1_g), groove,
+                 max(1, int(s * 0.04)), lineType=cv2.LINE_AA)
+
+
+def _draw_fist_icon_simple_v2(canvas: np.ndarray, cx: int, cy: int, size: int,
+                               color=CLR_WHITE):
+    """Simplified bold fist for far/small blocks — knuckle bumps + palm."""
+    if size < 6:
+        return
+    s = float(size)
+    pts = [
+        (-0.35, -0.28), (-0.22, -0.40), (-0.08, -0.28),
+        (0.08, -0.40),  (0.22, -0.28),  (0.36, -0.40),
+        (0.40,  0.30),  (-0.40, 0.30),
+    ]
+    abs_pts = np.array(
+        [(int(cx + p[0] * s), int(cy + p[1] * s)) for p in pts],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(canvas, [abs_pts], color, lineType=cv2.LINE_AA)
+
+
+def _fill_rounded_quad(canvas: np.ndarray, pts, color, radius_frac: float,
+                       lineType: int = cv2.LINE_AA) -> None:
+    """Fill a 4-corner polygon with rounded corners.
+
+    Uses erode→dilate on a temp mask to round corners.
+    radius_frac: 0..0.45 fraction of shortest edge.
+    Falls back to fillConvexPoly when radius too small or ROI empty.
+    """
+    pts_i = np.array(pts, dtype=np.int32)
+    bx, by, bw, bh = cv2.boundingRect(pts_i)
+    if bw <= 0 or bh <= 0:
+        return
+    shortest = float(min(
+        np.linalg.norm(pts_i[1].astype(float) - pts_i[0].astype(float)),
+        np.linalg.norm(pts_i[2].astype(float) - pts_i[1].astype(float)),
+        np.linalg.norm(pts_i[3].astype(float) - pts_i[2].astype(float)),
+        np.linalg.norm(pts_i[0].astype(float) - pts_i[3].astype(float)),
+    ))
+    r = max(0, int(shortest * radius_frac))
+    if r < 2:
+        cv2.fillConvexPoly(canvas, pts_i, color, lineType=lineType)
+        return
+    H_c, W_c = canvas.shape[:2]
+    pad = r + 2
+    rx0 = max(0, bx - pad);  ry0 = max(0, by - pad)
+    rx1 = min(W_c, bx + bw + pad);  ry1 = min(H_c, by + bh + pad)
+    rw, rh = rx1 - rx0, ry1 - ry0
+    if rw <= 0 or rh <= 0:
+        return
+    mask = np.zeros((rh, rw), dtype=np.uint8)
+    pts_local = (pts_i - np.array([rx0, ry0])).astype(np.int32)
+    cv2.fillConvexPoly(mask, pts_local, 255, lineType=lineType)
+    ks = r * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    mask_rounded = cv2.dilate(cv2.erode(mask, kernel), kernel)
+    color_arr = np.array(color[:3], dtype=np.float32)
+    a = mask_rounded.astype(np.float32) / 255.0
+    roi = canvas[ry0:ry1, rx0:rx1].astype(np.float32)
+    a3 = a[:, :, np.newaxis]
+    canvas[ry0:ry1, rx0:rx1] = np.clip(
+        roi * (1.0 - a3) + color_arr * a3, 0, 255
+    ).astype(np.uint8)
+
+
 class PunchTarget(Target):
     """3-D neon cube with fist icon, or a textured 3-D cube when an image
-    is supplied. Left = green, right = red (if untextured).
+    is supplied.  Default color chosen from per-lane neon palette.
     """
+
+    # Per-lane neon palette (BGR).
+    # Lane 0, 1 (left pair) = blue; lane 2, 3 (right pair) = orange.
+    LANE_COLORS: dict = {
+        0: (230,  80,  30),   # blue  (BGR: high-B)
+        1: (230,  80,  30),   # blue
+        2: (  0, 140, 255),   # orange (BGR: high-R)
+        3: (  0, 140, 255),   # orange
+    }
 
     # Cube half-size in world units.  Previously 0.22 when punch ran in a
     # 2-lane layout; now trimmed to 0.154 (≈70% of the old size) so the
     # cubes stay visually comfortable in the 4-lane layout and don't
     # crowd adjacent lanes.
     CUBE_HALF = 0.154
+    # Block dimensions — width is computed dynamically from lane tile width at
+    # render time (see `_block_hw` in render loop). H and D follow these ratios
+    # so the block proportions stay constant regardless of lane spacing.
+    BLOCK_HALF_W: float = 0.20    # X half-width (base reference, overridden at render)
+    BLOCK_HALF_H: float = 0.18    # Y half-height (ratio H/W = 0.90)
+    BLOCK_HALF_D: float = 0.14    # Z depth (ratio D/W = 0.70)
     # Corner rounding for the default neon cubes (fraction of the shortest
     # projected face-edge; 0 = sharp corners, ~0.45 = pill-shaped).
-    CORNER_RADIUS: float = 0.18
+    CORNER_RADIUS: float = 0.08
     # Populated by RhythmVisualizer before render.
     TEXTURE_LEFT:  tuple | None = None
     TEXTURE_RIGHT: tuple | None = None
@@ -1360,7 +2285,7 @@ class PunchTarget(Target):
     # panels meet the floor grid) and detonates THERE — instead of zooming
     # past Z_NEAR and exploding centimetres from the lens.
     Z_VIS_FAR:  float = 28.0
-    Z_VIS_NEAR: float = 2.5
+    Z_VIS_NEAR: float = 3.2
     # Trajectory descends from horizon (eye level) to WY_HIT (cube fully
     # below eye → top face visible, sits inside the bottom hit panel).
     WY_SPAWN: float = 0.0
@@ -1372,6 +2297,15 @@ class PunchTarget(Target):
     # exact ``hit_frame`` (= UI beat-stick).  See ``check_hit`` for the
     # state machine that turns this into "vanish exactly on the beat".
     HIT_ARRIVAL_OFFSET: int = 2
+
+    def __init__(self, spawn_frame: int, hit_frame: int, lane: int,
+                 is_left: bool):
+        super().__init__(spawn_frame, hit_frame, lane, is_left)
+        # Override base color with lane-specific palette.
+        # Falls back to base (green/red) if lane index out of range.
+        lane_col = self.LANE_COLORS.get(lane)
+        if lane_col is not None:
+            self.color = lane_col
 
     def depth(self, cur_frame: int) -> float:
         """Override base depth so cube reaches panel HIT_ARRIVAL_OFFSET
@@ -1419,6 +2353,19 @@ class PunchTarget(Target):
         return False
 
     def draw(self, canvas, cam, cur_frame):
+        """Render per .cursor/rules/3d-block-rendering.mdc.
+
+        Pipeline (all paths share the rule §5 glow):
+          1. Project 8 cube corners → onscreen check.
+          2. Glow ROI+boxFilter (rule §5) using projected silhouette as
+             the bbox source — gated by ``z_norm > 0.30``.
+          3. Mesh/Texture path: hand the box geometry to the existing
+             renderer (kept for user-supplied custom assets).
+          4. Default neon path: 3 flat faces (top/front/one side) with
+             brightness ratios from rule §2, painter's order side →
+             front → top, perspective-correct side selection (§3).
+          5. Fist icon centered on the TOP face.
+        """
         if self.state != 'flying':
             return canvas
         z_norm = self.depth(cur_frame)   # 1 at spawn, 0 at hit
@@ -1428,9 +2375,47 @@ class PunchTarget(Target):
         wz = self.Z_VIS_NEAR + z_norm * (self.Z_VIS_FAR - self.Z_VIS_NEAR)
         wy = self.WY_SPAWN + (self.WY_HIT - self.WY_SPAWN) * (1.0 - z_norm)
 
+        # 8 cube corners.  Conventions (matches PerspectiveCamera):
+        #   +X right, +Y down (so wy < cube_center → top face), +Z away.
+        # Indices: [F=front (z-), B=back (z+); L/R; T=top (y-), b=bottom (y+)].
+        HX = HY = HZ = self.CUBE_HALF
+        corners_w = [
+            (wx - HX, wy - HY, wz - HZ),  # 0 FLT
+            (wx + HX, wy - HY, wz - HZ),  # 1 FRT
+            (wx + HX, wy + HY, wz - HZ),  # 2 FRb
+            (wx - HX, wy + HY, wz - HZ),  # 3 FLb
+            (wx - HX, wy - HY, wz + HZ),  # 4 BLT
+            (wx + HX, wy - HY, wz + HZ),  # 5 BRT
+            (wx + HX, wy + HY, wz + HZ),  # 6 BRb
+            (wx - HX, wy + HY, wz + HZ),  # 7 BLb
+        ]
+        proj = [cam.project(*p) for p in corners_w]
+        if any(p is None for p in proj):
+            return canvas
+        pts = np.array(
+            [(int(round(p[0])), int(round(p[1]))) for p in proj],
+            dtype=np.int32)
+        H, W = canvas.shape[:2]
+        if (pts[:, 0].max() < 0 or pts[:, 0].min() >= W
+                or pts[:, 1].max() < 0 or pts[:, 1].min() >= H):
+            return canvas
+
+        # Brightness model — rule §2 v2: stronger top/front contrast.
+        base = tuple(int(c) for c in self.color)
+        top_col   = tuple(int(min(255, c * 1.15 + 255 * 0.15)) for c in base)
+        side_col  = tuple(int(c * 0.45) for c in base)
+        depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
+
+        # Rule §5: glow only from the TOP face (brightest face).
+        # Drawn BEFORE solid faces so it sits behind them as a halo.
+        top_face_glow = pts[[0, 1, 5, 4]]  # FLT FRT BRT BLT
+        _draw_block_glow_roi(canvas, top_face_glow, top_col, depth_gain, z_norm)
+
+        # Custom-asset paths — keep proven texture/mesh renderers.
+        # The new ROI glow above already drew the halo; these renderers
+        # have no internal glow of their own (verified) so no double-glow.
         mesh = self.MESH_LEFT if self.is_left else self.MESH_RIGHT
         tex  = self.TEXTURE_LEFT if self.is_left else self.TEXTURE_RIGHT
-
         if mesh is not None:
             draw_mesh_3d(canvas, cam, mesh, (wx, wy, wz), self.CUBE_HALF,
                          base_color=self.color,
@@ -1441,17 +2426,52 @@ class PunchTarget(Target):
                                   tex[0], tex[1], rim=None)
             return canvas
 
-        # Perfect dice: uniform half on all axes, yaw = 0 (axis-aligned).
-        # 3 faces emerge naturally from perspective at hit zone:
-        #   • FRONT — always visible
-        #   • TOP   — WY_HIT > CUBE_HALF → cube fully below eye line → camera looks down
-        #   • SIDE  — lane is off-centre → camera sees inner face
-        cube_info = draw_cube_3d(canvas, cam, (wx, wy, wz), self.CUBE_HALF,
-                                 color=self.color, yaw=0.0,
-                                 corner_radius=self.CORNER_RADIUS)
-        if cube_info is not None and cube_info['size'] >= 22:
-            _draw_fist_icon(canvas, cube_info['cx'], cube_info['cy'],
-                            int(cube_info['size'] * 0.58), CLR_WHITE)
+        # ===== Default neon path: 3 flat faces per rule §1-§4 =====
+        # Face vertex orderings (CCW when viewed from outside the cube,
+        # which is what cv2.fillConvexPoly expects for clean filling):
+        top_face   = pts[[0, 1, 5, 4]]   # FLT FRT BRT BLT
+        front_face = pts[[3, 0, 1, 2]]   # FLb FLT FRT FRb
+        left_face  = pts[[3, 7, 4, 0]]   # FLb BLb BLT FLT
+        right_face = pts[[2, 1, 5, 6]]   # FRb FRT BRT BRb
+
+        # Apply depth_gain per rule §2 (top brightest, front=side*1.15,
+        # side darkest).
+        top_scaled   = tuple(int(min(255, c * depth_gain)) for c in top_col)
+        front_scaled = tuple(int(min(255, c * depth_gain * 1.30)) for c in side_col)
+        side_scaled  = tuple(int(min(255, c * depth_gain)) for c in side_col)
+
+        # Rule §3: perspective-correct side selection.
+        block_screen_cx = float(pts[:, 0].mean())
+        cam_cx = float(getattr(cam, 'cx_pix', W / 2.0))
+
+        # Rule §3 v2: ALWAYS render 1 side face — no dead zone at center.
+        # Side face is typically very thin (perspective) — skip rounding to
+        # avoid erosion artifacts on narrow polygons.
+        if block_screen_cx < cam_cx:
+            cv2.fillConvexPoly(canvas, right_face, side_scaled, lineType=cv2.LINE_AA)
+        else:
+            cv2.fillConvexPoly(canvas, left_face, side_scaled, lineType=cv2.LINE_AA)
+        _fill_rounded_quad(canvas, front_face, front_scaled, self.CORNER_RADIUS)
+        _fill_rounded_quad(canvas, top_face, top_scaled, self.CORNER_RADIUS)
+
+        # Fist icon on the FRONT face (Fix #7 — faces camera directly).
+        front_w = int(max(
+            np.linalg.norm(front_face[1].astype(float) - front_face[0].astype(float)),
+            np.linalg.norm(front_face[2].astype(float) - front_face[3].astype(float)),
+        ))
+        front_h = int(max(
+            np.linalg.norm(front_face[2].astype(float) - front_face[1].astype(float)),
+            np.linalg.norm(front_face[3].astype(float) - front_face[0].astype(float)),
+        ))
+        if front_w >= 12:
+            cx_front = int(front_face[:, 0].mean())
+            cy_front = int(front_face[:, 1].mean())
+            if front_w >= 18:
+                icon_size = int(min(front_w, front_h) * 0.62)
+                _draw_fist_icon_v2(canvas, cx_front, cy_front, icon_size, CLR_WHITE)
+            else:
+                _draw_fist_icon_simple_v2(canvas, cx_front, cy_front,
+                                          int(front_w * 0.70), CLR_WHITE)
         return canvas
 
 
@@ -2138,80 +3158,55 @@ class DanceTarget(Target):
         if xs.max() < 0 or xs.min() >= W or ys.max() < 0 or ys.min() >= H:
             return
 
-        # Proximity gain: closer tiles glow brighter, far ones dim toward
-        # the tunnel floor so they don't fight the foreground for attention.
-        depth_gain = 0.35 + 0.65 * (1.0 - z_norm)
+        depth_gain = 0.70 + 0.30 * (1.0 - z_norm)
 
-        base = tuple(int(c) for c in self.color)          # lane BGR
-        # Neon "hot" version of the lane color (lerp toward white).
-        neon = tuple(int(min(255, c * 0.30 + 255 * 0.70)) for c in base)
-        # Dark outline version for the back of the rim.
-        dark = tuple(int(c * 0.35) for c in base)
+        base = tuple(int(c) for c in self.color)
+        # Top face: near-full saturation (90% base + 10% white for punch)
+        top_col = tuple(int(min(255, c * 0.90 + 255 * 0.10)) for c in base)
+        # Side/front face: medium-dark (~50% of top)
+        side_col = tuple(int(c * 0.50) for c in base)
 
-        # 1) Outer soft glow — two passes at different widths, alpha-blended
-        #    so the tile "bleeds" onto the surrounding tunnel floor.
-        glow_col = tuple(int(c * depth_gain) for c in neon)
-        for gw, base_a in ((14, 0.22), (7, 0.38)):
-            a = base_a * depth_gain
-            if a < 0.02:
-                continue
-            overlay = canvas.copy()
-            cv2.polylines(overlay, [pts], True, glow_col,
-                          gw, lineType=cv2.LINE_AA)
-            cv2.addWeighted(overlay, a, canvas, 1.0 - a, 0, dst=canvas)
+        # ── 0) ROI-only halo glow per rule §5 (gate, ROI, boxFilter) ─────────
+        _draw_block_glow_roi(canvas, pts, top_col, depth_gain, z_norm)
 
-        # 2) Main tile fill — translucent bright color so the tunnel floor
-        #    still shows a faint grid through the pad (reference look).
-        mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, pts, 255)
-        idx = mask > 0
-        if not idx.any():
-            return
-        fill_col = np.array(
-            [c * depth_gain for c in base], dtype=np.float32)
-        fill_a = 0.55 + 0.30 * depth_gain
-        canvas[idx] = (canvas[idx].astype(np.float32) * (1.0 - fill_a)
-                       + fill_col * fill_a).astype(np.uint8)
+        # ── 1) 3D extrusion geometry ─────────────────────────────────────────
+        fl, fr, br, bl = pts[0], pts[1], pts[2], pts[3]
+        front_c = np.array([(fl[0] + fr[0]) * 0.5, (fl[1] + fr[1]) * 0.5],
+                           dtype=np.float32)
+        back_c  = np.array([(bl[0] + br[0]) * 0.5, (bl[1] + br[1]) * 0.5],
+                           dtype=np.float32)
+        fwd_n   = (front_c - back_c) / (np.linalg.norm(front_c - back_c) + 1e-6)
+        extrude = max(6, int(np.linalg.norm(front_c - back_c) * 0.22))
+        ex = np.array([fwd_n[0] * extrude, fwd_n[1] * extrude]).astype(np.int32)
 
-        # 3) Inner "hot" highlight — a shrunken trapezoid biased toward the
-        #    FRONT edge (closer to camera) so the tile reads as a lit-up
-        #    pad instead of a flat sticker.
-        cx_px = float(pts[:, 0].mean())
-        cy_px = float(pts[:, 1].mean())
-        front_cx = (pts[0][0] + pts[1][0]) * 0.5
-        front_cy = (pts[0][1] + pts[1][1]) * 0.5
-        # Shift the shrink center 25% toward the front edge.
-        sc_x = cx_px * 0.75 + front_cx * 0.25
-        sc_y = cy_px * 0.75 + front_cy * 0.25
-        shrink = 0.65
-        inner = np.array([
-            (int(round(sc_x + (p[0] - sc_x) * shrink)),
-             int(round(sc_y + (p[1] - sc_y) * shrink)))
-            for p in pts
-        ], dtype=np.int32)
-        inner_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillConvexPoly(inner_mask, inner, 255)
-        idx2 = inner_mask > 0
-        if idx2.any():
-            hot = np.array(
-                [min(255, c * 0.40 + 255 * 0.55 * depth_gain) for c in base],
-                dtype=np.float32)
-            hot_a = 0.35 * depth_gain
-            canvas[idx2] = (canvas[idx2].astype(np.float32) * (1.0 - hot_a)
-                            + hot * hot_a).astype(np.uint8)
+        # Determine which side face is visible based on block position
+        # relative to vanishing point (camera center X)
+        block_screen_cx = float(pts[:, 0].mean())
+        cam_cx = getattr(cam, 'cx_pix', W / 2.0)
 
-        # 4) Crisp neon rim so the tile edges are unambiguous (the
-        #    reference video has a sharp bright border around each pad).
-        rim_col = tuple(int(min(255, c * 0.20 + 255 * 0.80 * depth_gain))
-                        for c in base)
-        rim_w = max(2, int(round(3 * depth_gain + 1)))
-        cv2.polylines(canvas, [pts], True, rim_col, rim_w,
-                      lineType=cv2.LINE_AA)
-        # Darker inner shadow line just below the neon rim — sells the
-        # "recessed into the floor" look.
-        cv2.polylines(canvas, [pts], True, dark, 1, lineType=cv2.LINE_AA)
+        # Front face quad (always visible)
+        front_face = np.array([fl, fr, fr + ex, fl + ex], dtype=np.int32)
 
-        # 5) Footprint / stomp icon in the middle of the tile.
+        side_scaled = tuple(int(min(255, c * depth_gain)) for c in side_col)
+        front_scaled = tuple(int(min(255, c * depth_gain * 1.15)) for c in side_col)
+
+        if block_screen_cx < cam_cx - 2:
+            # Block is LEFT of center → viewer sees RIGHT side face
+            right_face = np.array([fr, br, br + ex, fr + ex], dtype=np.int32)
+            cv2.fillConvexPoly(canvas, right_face, side_scaled, lineType=cv2.LINE_AA)
+        elif block_screen_cx > cam_cx + 2:
+            # Block is RIGHT of center → viewer sees LEFT side face
+            left_face = np.array([bl, fl, fl + ex, bl + ex], dtype=np.int32)
+            cv2.fillConvexPoly(canvas, left_face, side_scaled, lineType=cv2.LINE_AA)
+
+        # Front face (always visible, slightly brighter than sides)
+        cv2.fillConvexPoly(canvas, front_face, front_scaled, lineType=cv2.LINE_AA)
+
+        # ── 2) Top face: bright saturated fill ───────────────────────────────
+        top_scaled = tuple(int(min(255, c * depth_gain)) for c in top_col)
+        cv2.fillConvexPoly(canvas, pts, top_scaled, lineType=cv2.LINE_AA)
+
+        # ── 3) Footprint icon ────────────────────────────────────────────────
         self._draw_stomp_icon(canvas, pts, depth_gain)
 
     # ------------------------------------------------------------------
@@ -2240,27 +3235,69 @@ class DanceTarget(Target):
         ang = math.degrees(math.atan2(fwd[1], fwd[0]))
         fw_u = fwd / (np.linalg.norm(fwd) + 1e-6)
 
-        icon_col = (18, 18, 18)   # near-black → strong contrast vs. neon
+        # ROI-only icon: bound mask + blur to tile bbox + blur padding so
+        # we don't pay full-canvas cost per tile per frame.  Also collapse
+        # the original two sequential blends (shadow then core) into a
+        # single multiplicative blend — equivalent darkening
+        # (1 - (1-a)(1-b)) at half the float32 churn.
+        H_c, W_c = canvas.shape[:2]
+        k = max(5, int(min(tile_len, front_w) * 0.18)) | 1
+        pad = k // 2 + 2
+        bx, by_, bw, bh = cv2.boundingRect(pts)
+        rx0 = max(0, bx - pad)
+        ry0 = max(0, by_ - pad)
+        rx1 = min(W_c, bx + bw + pad)
+        ry1 = min(H_c, by_ + bh + pad)
+        rw, rh = rx1 - rx0, ry1 - ry0
+        if rw <= 0 or rh <= 0:
+            return
+        # Clamp blur kernel to ROI dims so the box filter never receives
+        # a kernel larger than the image (cv2 throws "Unknown C++
+        # exception" in this build for that case).  k must stay odd.
+        k_max = min(rw, rh)
+        if k_max < 3:
+            return
+        if k > k_max:
+            k = k_max if (k_max % 2) == 1 else (k_max - 1)
+            if k < 3:
+                return
+
+        icon_mask = np.zeros((rh, rw), dtype=np.uint8)
 
         # Heel ellipse: centered slightly backward from tile center.
         heel_off = tile_len * 0.10
-        heel_cx = int(cx - fw_u[0] * heel_off)
-        heel_cy = int(cy - fw_u[1] * heel_off)
+        heel_cx = int(cx - fw_u[0] * heel_off) - rx0
+        heel_cy = int(cy - fw_u[1] * heel_off) - ry0
         heel_rx = max(3, int(tile_len * 0.22))   # along fwd
         heel_ry = max(3, int(front_w * 0.20))    # across fwd
-        cv2.ellipse(canvas, (heel_cx, heel_cy),
-                    (heel_rx, heel_ry), ang, 0, 360,
-                    icon_col, -1, cv2.LINE_AA)
+        cv2.ellipse(icon_mask, (heel_cx, heel_cy),
+                    (heel_rx, heel_ry), ang, 0, 360, 255, -1, cv2.LINE_AA)
 
         # Toe pad: smaller ellipse forward of the heel, with a visible gap.
         toe_off = tile_len * 0.22
-        toe_cx = int(cx + fw_u[0] * toe_off)
-        toe_cy = int(cy + fw_u[1] * toe_off)
+        toe_cx = int(cx + fw_u[0] * toe_off) - rx0
+        toe_cy = int(cy + fw_u[1] * toe_off) - ry0
         toe_rx = max(2, int(tile_len * 0.10))
         toe_ry = max(2, int(front_w * 0.15))
-        cv2.ellipse(canvas, (toe_cx, toe_cy),
-                    (toe_rx, toe_ry), ang, 0, 360,
-                    icon_col, -1, cv2.LINE_AA)
+        cv2.ellipse(icon_mask, (toe_cx, toe_cy),
+                    (toe_rx, toe_ry), ang, 0, 360, 255, -1, cv2.LINE_AA)
+
+        # Use cv2.boxFilter instead of GaussianBlur: the build of OpenCV
+        # in production raises "Unknown C++ exception from OpenCV code"
+        # at GaussianBlur for some ROI/kernel combos that we couldn't
+        # narrow down.  boxFilter is integral-image based, robust across
+        # all sizes, and visually equivalent for a soft icon shadow.
+        blur = cv2.boxFilter(icon_mask, -1, (k, k), normalize=True)
+        shadow_a = (blur.astype(np.float32) / 255.0) * (0.55 + 0.20 * depth_gain)
+        core_a = (icon_mask.astype(np.float32) / 255.0) * (0.22 + 0.10 * depth_gain)
+        # Combined multiplicative darkening alpha — matches sequential
+        # canvas *= (1-shadow_a); canvas *= (1-core_a) exactly.
+        keep = (1.0 - shadow_a) * (1.0 - core_a)
+        keep3 = keep[:, :, None]
+        roi = canvas[ry0:ry1, rx0:rx1]
+        canvas[ry0:ry1, rx0:rx1] = np.clip(
+            roi.astype(np.float32) * keep3, 0, 255
+        ).astype(np.uint8)
 
 
 def _rounded_rect_points(x1: int, y1: int, x2: int, y2: int,
@@ -2319,6 +3356,8 @@ class RelaxTarget(Target):
     """
 
     HIT_DEPTH = 0.0
+    _tex_cache: dict[str, np.ndarray] = {}
+    _hole_mask_cache: dict[str, np.ndarray] = {}
 
     # Visual tuning ────────────────────────────────────────────────────
     LOW_HEIGHT_FRAC  = 0.07   # fraction of tunnel height (hit-plane)
@@ -2332,8 +3371,14 @@ class RelaxTarget(Target):
     # the horizon.
     HIGH_HORIZON_OFFSET_FRAC = 0.26   # bar centre above horizon @ z=0
     HIGH_HEIGHT_FRAC         = 0.35   # bar height           @ z=0
+    MIDDLE_HORIZON_OFFSET_FRAC = 0.20
+    HOLE_DEFAULT_WIDTH_FRAC = 0.18
+    HOLE_DEFAULT_HEIGHT_FRAC = 0.55
 
-    # Motion profile (two-phase piecewise) ────────────────────────────
+    # Motion profile (two-phase piecewise) — ALL kinds ───────────────
+    # ALL three kinds (LOW, HIGH, MIDDLE) share the same two-phase
+    # motion.  MIDDLE previously used a separate visual-linear profile
+    # but is now unified so dodge urgency is consistent across kinds.
     # The block's spawn→hit travel is split into TWO distinct phases
     # with different world-speeds, per user spec:
     #   "70% quãng đường đầu tiên chạy chậm từ từ.
@@ -2357,6 +3402,18 @@ class RelaxTarget(Target):
     # block exits the viewport decisively.
     PHASE_SPLIT_D     = 0.70   # fraction of z-distance in Phase 1
     PHASE_SPEED_RATIO = 12.0   # Phase-2 world-speed / Phase-1 speed
+
+    # Wait-state hold depth for LOW / HIGH ─────────────────────────────
+    # At z=1.0 (Z_FAR) the perspective envelope (1-z)^1.6 collapses to
+    # zero, so a slab/bar held there during ``wait_frames`` would be
+    # invisible (zero height + zero width).  We therefore hold LOW/HIGH
+    # at a slightly nearer "entry" depth so the block is visibly parked
+    # at the horizon while the countdown ticks.  The motion phase is
+    # linearly rescaled so it animates from WAIT_HOLD_Z → 0 instead of
+    # 1.0 → 0, preserving the "70% drift + 30% vút" feel without a
+    # visual jump at move_start.  MIDDLE keeps z_entry=1.0 because its
+    # world rect already matches the StartGate footprint at z=Z_FAR.
+    WAIT_HOLD_Z       = 0.80
 
     # Dodge timing ─────────────────────────────────────────────────────
     # DODGE_OFFSET_{LOW,HIGH}:  where the stickman fires its pose
@@ -2397,6 +3454,7 @@ class RelaxTarget(Target):
     DODGE_OFFSET_LOW  = +0.01   # fire just after z=0 — block is right at
                                 # the hit-zone edge before the jump starts
     DODGE_OFFSET_HIGH = +0.064
+    DODGE_OFFSET_MIDDLE = +0.0
     DODGE_HOLD_FRAC   = 0.04   # hold briefly then snap back to RELAX_STAND
 
     # Dodge timing ─────────────────────────────────────────────────────
@@ -2410,13 +3468,25 @@ class RelaxTarget(Target):
     # how the phase split is tuned.
 
     def __init__(self, spawn_frame: int, hit_frame: int,
-                 kind: str = 'low'):
+                 kind: str = 'low',
+                 wait_frames: int = 0):
         # Centre lane + is_left=False: lane index is irrelevant here
         # because the slab always spans the whole width, but Target's
         # base __init__ needs *something*, so we pass centre.
         super().__init__(spawn_frame, hit_frame, lane=0, is_left=False)
-        self.kind = 'high' if kind == 'high' else 'low'
+        if kind not in ('low', 'high', 'middle'):
+            kind = 'low'
+        self.kind = kind
         self.color = CLR_WALL_PINK
+        self.texture_path: str | None = None
+        self.hole_mask_path: str | None = None
+        self.wait_frames = max(0, int(wait_frames))
+        # Initial size of a `middle` wall is computed from these gate
+        # parameters so the wall fits inside the StartGate at z=Z_FAR
+        # (spawn point) and grows naturally via perspective as it
+        # approaches the camera.  Defaults match StartGate defaults.
+        self.gate_rail_offset_x: float = 0.08
+        self.gate_height: float = 0.14
 
     # ---------------- lifecycle ----------------
     #
@@ -2449,29 +3519,58 @@ class RelaxTarget(Target):
         D = cls.PHASE_SPLIT_D
         return D / (D + (1.0 - D) / cls.PHASE_SPEED_RATIO)
 
+    @property
+    def move_start_frame(self) -> int:
+        return self.spawn_frame + self.wait_frames
+
     def depth(self, cur_frame: int) -> float:
-        if cur_frame <= self.spawn_frame:
-            return 1.0
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
-        p_lin = (cur_frame - self.spawn_frame) / travel_f
+        move_start = self.move_start_frame
+        # Per-kind entry depth: MIDDLE holds at z=1.0 (its world rect is
+        # sized to fit the StartGate at Z_FAR); LOW/HIGH hold at
+        # WAIT_HOLD_Z so they have a non-zero projected size during the
+        # countdown wait and the motion phase animates smoothly from
+        # there to z=0 with no visual jump at move_start.
+        z_entry = 1.0 if self.kind == 'middle' else self.WAIT_HOLD_Z
+        if cur_frame <= move_start:
+            return z_entry
+        # Movement duration stays unchanged (configured travel), so it is
+        # measured from move_start -> hit_frame.
+        travel_f = max(1, self.hit_frame - move_start)
+        p_lin = (cur_frame - move_start) / travel_f
+
+        # MIDDLE: drive z linearly with time so the wall covers the FULL
+        # screen path from gate-bottom to floor-bottom every frame at the
+        # same rate.  The (1-z)^1.6 perspective envelope naturally yields
+        # "drift slow far / vút near" feel without the brittle phase-split
+        # math (which at low fps + high ratio collapses the vút into a
+        # single inter-frame snap, making the wall vanish mid-screen).
+        if self.kind == 'middle':
+            if p_lin <= 1.0:
+                z = 1.0 - p_lin
+            else:
+                z = -(p_lin - 1.0)
+            return max(-1.2, z)
+
+        # ── LOW / HIGH: two-phase "70% chậm + 30% vút" ──────────────────
+        # The phase math is computed in a normalised z-range [0, 1] then
+        # scaled by ``z_entry`` so the actual motion runs from
+        # WAIT_HOLD_Z → 0 (approach) → −∞ (clamped, pass-by).
         D = self.PHASE_SPLIT_D
         T = self._phase_split_t()
-        z_split = 1.0 - D                  # z at the Phase 1 → 2 hand-off
+        z_split = 1.0 - D                  # normalised z at Phase 1 → 2
         if p_lin <= T:
-            # Phase 1 (drift): z: 1.0 → z_split over t: [0, T]
-            z = 1.0 - D * (p_lin / T)
+            # Phase 1 (drift): z_norm: 1.0 → z_split over t: [0, T]
+            z_norm = 1.0 - D * (p_lin / T)
         elif p_lin <= 1.0:
-            # Phase 2 (vút): z: z_split → 0 over t: [T, 1]
-            z = z_split * (1.0 - (p_lin - T) / (1.0 - T))
+            # Phase 2 (vút): z_norm: z_split → 0 over t: [T, 1]
+            z_norm = z_split * (1.0 - (p_lin - T) / (1.0 - T))
         else:
             # Pass-by: carry Phase-2 velocity forward so the block
-            # exits the viewport at the same sharp speed.  Phase-2
-            # world-velocity in z-units per unit of normalised time
-            # is z_split / (1 - T).
+            # exits the viewport at the same sharp speed.
             v2 = z_split / (1.0 - T)
-            z = -v2 * (p_lin - 1.0)
+            z_norm = -v2 * (p_lin - 1.0)
         # Clamp so numerical blowup in (1-z)**k stays bounded.
-        return max(-1.2, z)
+        return max(-1.2, z_norm * z_entry)
 
     @property
     def dodge_frame(self) -> int:
@@ -2484,9 +3583,13 @@ class RelaxTarget(Target):
         where a jump must precede the slab but a duck is delayed
         until the bar is visibly passing above.
         """
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
-        offset_frac = (self.DODGE_OFFSET_LOW if self.kind == 'low'
-                       else self.DODGE_OFFSET_HIGH)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
+        if self.kind == 'low':
+            offset_frac = self.DODGE_OFFSET_LOW
+        elif self.kind == 'high':
+            offset_frac = self.DODGE_OFFSET_HIGH
+        else:
+            offset_frac = self.DODGE_OFFSET_MIDDLE
         return self.hit_frame + int(round(travel_f * offset_frac))
 
     @property
@@ -2498,7 +3601,7 @@ class RelaxTarget(Target):
         before the next beat's dodge_frame (on a typical 2 s cadence
         at travel=180 this leaves ≈0.5 s of recovery room).
         """
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
         return self.dodge_frame + int(round(travel_f * self.DODGE_HOLD_FRAC))
 
     def check_hit(self, cur_frame: int) -> bool:
@@ -2520,7 +3623,7 @@ class RelaxTarget(Target):
         # frame analytically from the Phase-2 world-velocity:
         #     v2 = z_split / (1 - T)
         #     Δframes = travel_f · 1.2 / v2
-        travel_f = max(1, self.hit_frame - self.spawn_frame)
+        travel_f = max(1, self.hit_frame - self.move_start_frame)
         T = self._phase_split_t()
         z_split = 1.0 - self.PHASE_SPLIT_D
         v2 = z_split / max(1e-6, 1.0 - T)
@@ -2529,24 +3632,36 @@ class RelaxTarget(Target):
 
     # ---------------- helpers ----------------
     def _span_x(self, cam: "PerspectiveCamera", z: float):
-        """Pink slab spans the full lane runway (outer lanes edge-to-edge).
+        """Horizontal extents of the pink slab at depth z.
 
-        We deliberately use the LANE boundaries — not the tunnel walls —
-        so the bar stays inside the visible runway even at z=0 where the
-        wall projection blows out past the screen edges.  A small extra
-        margin (half a lane step) keeps the slab reading as "spanning
-        everything" rather than ending exactly on the rails.
-
-        NOTE: we bypass `cam.lane_x()` because it applies
-        `int(round(lane))` and then uses the lane-bottom LUT whenever
-        the rounded index falls inside [0, n-1] — which, due to
-        Python's banker's rounding, collapses `-0.5 → 0` (no left
-        extrapolation) while `n-0.5 → n` correctly extrapolates to the
-        right.  That asymmetry skewed the slab visibly toward the
-        right edge.  Here we linearly extrapolate both bounds from
-        the lane-bottom step so the slab stays centered.
+        Both LOW and HIGH MUST match the rendered floor's x bounds at
+        the same depth so they read as "spanning the runway" cleanly:
+        TunnelRenderer._draw_floor_bg projects the world rect
+        [outer_lane ± half_step] × FLOOR_WORLD_Y via pinhole
+        `cam.project()`.  Using the legacy `(1-z)^1` converge here
+        tapers much slower than true 1/z and makes the slab/bar wider
+        than the runway at far/mid depths.  We therefore project the
+        SAME world x bounds the floor uses so the obstacle's left/right
+        edges glue to the runway edges all the way through travel.
+        Pass-by (z<0) falls back to legacy so the slab keeps sliding
+        off-screen (cam.project() rejects z_world <= 0).
         """
         n = max(1, cam.n_lanes)
+        if z >= 0.0:
+            if n >= 2:
+                outer_left  = cam.lane_world_x(0)
+                outer_right = cam.lane_world_x(n - 1)
+                half_step   = abs(outer_right - outer_left) / max(1, n - 1) * 0.5
+            else:
+                outer_left, outer_right, half_step = -0.95, +0.95, 0.5
+            xw_left  = outer_left  - half_step
+            xw_right = outer_right + half_step
+            wz = cam.z_from_norm(max(0.0, min(1.0, z)))
+            p_l = cam.project(xw_left,  cam.FLOOR_WORLD_Y, wz)
+            p_r = cam.project(xw_right, cam.FLOOR_WORLD_Y, wz)
+            if p_l is not None and p_r is not None:
+                return int(round(p_l[0])), int(round(p_r[0]))
+        # ── Pass-by fallback (legacy converge, slab leaving viewport) ──
         if n >= 2:
             step = (cam.lane_x_bottom[-1] - cam.lane_x_bottom[0]) / (n - 1)
         else:
@@ -2575,9 +3690,22 @@ class RelaxTarget(Target):
                as a huge slab pinned at the top of the screen.
         """
         if self.kind == 'low':
-            fy = cam.floor_y(z)
-            cy = cam.ceil_y(z)
-            tunnel_h = fy - cy
+            # Bottom edge MUST track the rendered floor (TunnelRenderer
+            # uses pinhole `cam.project()` — NOT the legacy `floor_y(z)`
+            # envelope, which mismatches by up to ~10% of viewport
+            # height at the horizon).  We project the FLOOR_WORLD_Y
+            # plane at the same world depth so the slab visually slides
+            # along the floor surface at every z.  Pass-by (z<0) falls
+            # back to the legacy formula so the slab keeps sliding off
+            # the bottom of the viewport (project() rejects z_world<=0).
+            fy_legacy = cam.floor_y(z)
+            cy_legacy = cam.ceil_y(z)
+            if z >= 0.0:
+                p_f = cam.project(0.0, cam.FLOOR_WORLD_Y, cam.z_from_norm(z))
+                fy = float(p_f[1]) if p_f is not None else fy_legacy
+            else:
+                fy = fy_legacy
+            tunnel_h = max(0.0, fy_legacy - cy_legacy)
             h = tunnel_h * self.LOW_HEIGHT_FRAC
             y_b = fy
             y_t = fy - h
@@ -2600,6 +3728,8 @@ class RelaxTarget(Target):
              cur_frame: int):
         if self.state != 'flying':
             return canvas
+        if self.kind == 'middle':
+            return self._draw_middle(canvas, cam, cur_frame)
         z = self.depth(cur_frame)
 
         # Front face
@@ -2623,6 +3753,179 @@ class RelaxTarget(Target):
                                x_l, x_r, y_t, y_b,
                                x_lb, x_rb, y_tb, y_bb)
 
+    @classmethod
+    def _load_texture(cls, path: str | None) -> np.ndarray | None:
+        if not path:
+            return None
+        key = str(path)
+        if key not in cls._tex_cache:
+            img = cv2.imread(key, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                if max(h, w) > 512:
+                    sc = 512.0 / float(max(h, w))
+                    img = cv2.resize(
+                        img,
+                        (max(1, int(round(w * sc))), max(1, int(round(h * sc)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                cls._tex_cache[key] = img
+            else:
+                cls._tex_cache[key] = None
+        return cls._tex_cache.get(key)
+
+    @classmethod
+    def _load_hole_mask(cls, path: str | None) -> np.ndarray | None:
+        if not path:
+            return None
+        key = str(path)
+        if key not in cls._hole_mask_cache:
+            img = cv2.imread(key, cv2.IMREAD_UNCHANGED)
+            if img is not None and len(img.shape) == 3 and img.shape[2] == 4:
+                cls._hole_mask_cache[key] = img
+            else:
+                cls._hole_mask_cache[key] = None
+        return cls._hole_mask_cache.get(key)
+
+    def _draw_textured_quad(self, canvas: np.ndarray, poly: np.ndarray, tex: np.ndarray) -> bool:
+        H, W = canvas.shape[:2]
+        x0, y0 = poly.min(axis=0)
+        x1, y1 = poly.max(axis=0) + 1
+        x0, y0 = max(0, int(x0)), max(0, int(y0))
+        x1, y1 = min(W, int(x1)), min(H, int(y1))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        bw, bh = x1 - x0, y1 - y0
+        poly_local = poly.astype(np.int32) - np.array([x0, y0], dtype=np.int32)
+        th, tw = tex.shape[:2]
+        src_pts = np.float32([[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]])
+        dst_pts = poly_local.astype(np.float32)
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(tex, M, (bw, bh))
+        mask = np.zeros((bh, bw), dtype=np.uint8)
+        cv2.fillPoly(mask, [poly_local], 255)
+        roi = canvas[y0:y1, x0:x1]
+        roi[mask > 0] = warped[mask > 0]
+        return True
+
+    def _draw_middle(self, canvas: np.ndarray, cam: "PerspectiveCamera", cur_frame: int):
+        z = self.depth(cur_frame)
+        if z < -1.0:
+            return canvas
+        base_canvas = canvas.copy()
+        H, _W = canvas.shape[:2]
+
+        # World rect MATCHES StartGate's footprint (see StartGate._recompute_rect):
+        # the wall projects to the exact gate rectangle at z=Z_FAR (spawn) and
+        # scales up via 1/z perspective as it approaches the camera.
+        if cam.n_lanes >= 2:
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+        else:
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+        inner_x = outer_tile_x + float(self.gate_rail_offset_x)
+        xw_left = -inner_x
+        xw_right = +inner_x
+        wz = cam.z_from_norm(max(0.0, min(1.0, z)))
+        p_l = cam.project(xw_left, cam.FLOOR_WORLD_Y, wz)
+        p_r = cam.project(xw_right, cam.FLOOR_WORLD_Y, wz)
+        if p_l is None or p_r is None:
+            return canvas
+        x_l = int(round(p_l[0]))
+        x_r = int(round(p_r[0]))
+        y_bot_f = float(p_l[1])  # exact floor y at this depth
+        if x_l > x_r:
+            x_l, x_r = x_r, x_l
+
+        # Height matches StartGate's gate_height (world units).
+        world_dh = max(0.03, float(self.gate_height))
+        p_top = cam.project(xw_left, cam.FLOOR_WORLD_Y - world_dh, wz)
+        if p_top is None:
+            return canvas
+        y_bot = int(round(y_bot_f))
+        y_top = int(round(float(p_top[1])))
+        y_top = max(0, min(H - 1, y_top))
+        y_bot = max(0, min(H - 1, y_bot))
+        if y_bot <= y_top:
+            return canvas
+        wall_poly = np.array(
+            [(x_l, y_top), (x_r, y_top), (x_r, y_bot), (x_l, y_bot)],
+            dtype=np.int32,
+        )
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            self._draw_textured_quad(canvas, wall_poly, tex)
+        else:
+            cv2.fillConvexPoly(canvas, wall_poly, CLR_WALL_PINK, lineType=cv2.LINE_AA)
+            stripe_col = (15, 5, 25)
+            for i in range(1, 24):
+                x = int(x_l + (x_r - x_l) * i / 24.0)
+                cv2.line(canvas, (x, y_top), (x, y_bot), stripe_col, 1, cv2.LINE_AA)
+        # Middle block now renders as a solid obstacle by default.
+        # Only apply cutout when user explicitly provides a mask path.
+        if self.hole_mask_path:
+            self._punch_hole(canvas, wall_poly, base_canvas)
+
+        # Screen-path definition for middle movement/fade:
+        # progress = distance from gate-bottom line to wall-bottom, normalised by
+        # total distance from gate-bottom line to floor-bottom line.
+        # Fade starts at 90% of that visual path.
+        FADE_START_PROGRESS = 0.90
+        p_far = cam.project(xw_left, cam.FLOOR_WORLD_Y, cam.z_from_norm(1.0))
+        p_hit = cam.project(xw_left, cam.FLOOR_WORLD_Y, cam.z_from_norm(0.0))
+        if z < 0.0:
+            # Pass-by (after hit_frame): wall is behind camera, hard cut.
+            canvas[:] = base_canvas
+        elif p_far is not None and p_hit is not None:
+            y_far = float(p_far[1])
+            y_hit = float(p_hit[1])
+            denom = max(1e-6, y_hit - y_far)
+            progress = (y_bot_f - y_far) / denom
+            progress = max(0.0, min(1.0, progress))
+            if progress >= FADE_START_PROGRESS:
+                if progress >= 1.0:
+                    canvas[:] = base_canvas
+                else:
+                    alpha = 1.0 - (progress - FADE_START_PROGRESS) / (1.0 - FADE_START_PROGRESS)
+                    alpha = max(0.0, min(1.0, alpha))
+                    cv2.addWeighted(canvas, alpha, base_canvas, 1.0 - alpha, 0, canvas)
+        return canvas
+
+    def _punch_hole(self, canvas: np.ndarray, wall_poly: np.ndarray,
+                    base_canvas: np.ndarray) -> None:
+        H, W = canvas.shape[:2]
+        cx = W // 2
+        cy = int((int(wall_poly[0][1]) + int(wall_poly[2][1])) * 0.5)
+        mask = self._load_hole_mask(self.hole_mask_path)
+        if mask is not None:
+            wall_h = max(1, int(wall_poly[2][1] - wall_poly[0][1]))
+            target_h = max(1, int(wall_h * 0.7))
+            mh, mw = mask.shape[:2]
+            target_w = max(1, int(target_h * mw / max(1, mh)))
+            resized = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            x0 = cx - target_w // 2
+            y0 = cy - target_h // 2
+            x1 = x0 + target_w
+            y1 = y0 + target_h
+            sx0 = max(0, -x0)
+            sy0 = max(0, -y0)
+            x0 = max(0, x0)
+            y0 = max(0, y0)
+            x1 = min(W, x1)
+            y1 = min(H, y1)
+            if x1 > x0 and y1 > y0:
+                crop = resized[sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)]
+                alpha = crop[:, :, 3].astype(np.float32) / 255.0
+                hole = 1.0 - alpha
+                roi = canvas[y0:y1, x0:x1].astype(np.float32)
+                base_roi = base_canvas[y0:y1, x0:x1].astype(np.float32)
+                out = roi * (1.0 - hole[..., None]) + base_roi * hole[..., None]
+                canvas[y0:y1, x0:x1] = out.astype(np.uint8)
+                return
+        # No fallback rectangular cutout: if mask is absent/invalid,
+        # keep the block fully filled.
+
     # -- per-kind rendering -------------------------------------------------
     def _draw_low(self, canvas, cam, z,
                   x_l, x_r, y_t, y_b,
@@ -2640,6 +3943,12 @@ class RelaxTarget(Target):
         tonal step between top and front faces plus a soft rim
         highlight tracing the rounded top edge.
         """
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            front_poly = np.array([(x_l, y_t), (x_r, y_t), (x_r, y_b), (x_l, y_b)], np.int32)
+            self._draw_textured_quad(canvas, front_poly, tex)
+            return canvas
+
         front_col    = CLR_WALL_PINK         # bright magenta
         top_col      = (140, 25, 190)        # warm pink for top face
         top_edge_col = (15, 5, 25)           # near-black: used for BOTH
@@ -2670,7 +3979,7 @@ class RelaxTarget(Target):
         # --- TOP face: trapezoid from (front-top line) to (back-top line)
         top_poly = np.array([(x_l, y_t), (x_r, y_t),
                              (x_rb, y_tb), (x_lb, y_tb)], np.int32)
-        cv2.fillPoly(canvas, [top_poly], top_col)
+        cv2.fillPoly(canvas, [top_poly], top_col, lineType=cv2.LINE_AA)
 
         # Dark diagonal ribs that trace from the front edge back to
         # the vanishing point.  Drawn BEFORE the front face so the
@@ -2687,7 +3996,7 @@ class RelaxTarget(Target):
         # grooves wrapping from one face to the other.
         r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
         front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
-        cv2.fillPoly(canvas, [front_pts], front_col)
+        cv2.fillPoly(canvas, [front_pts], front_col, lineType=cv2.LINE_AA)
 
         # Vertical BLACK stripes on the front face at the SAME x-
         # positions as the top ribs (each front stripe is the
@@ -2716,6 +4025,12 @@ class RelaxTarget(Target):
         design language to the ground slab (user: "thiết kế lại vật
         cản treo", obstacle-visual-style rule).
         """
+        tex = self._load_texture(self.texture_path)
+        if tex is not None:
+            front_poly = np.array([(x_l, y_t), (x_r, y_t), (x_r, y_b), (x_l, y_b)], np.int32)
+            self._draw_textured_quad(canvas, front_poly, tex)
+            return canvas
+
         front_col    = CLR_WALL_PINK          # bright magenta
         bot_col      = (140, 25, 190)         # warm purple — bottom face
         top_col      = (70, 25, 95)           # dark plum — hidden top face
@@ -2737,12 +4052,12 @@ class RelaxTarget(Target):
         # ── TOP face (hidden / far side) — dark fill only, no ribs ───────
         top_poly = np.array([(x_l, y_t), (x_r, y_t),
                              (x_rb, y_tb), (x_lb, y_tb)], np.int32)
-        cv2.fillPoly(canvas, [top_poly], top_col)
+        cv2.fillPoly(canvas, [top_poly], top_col, lineType=cv2.LINE_AA)
 
         # ── BOTTOM face — trapezoid visible from below ────────────────────
         bot_poly = np.array([(x_l, y_b), (x_r, y_b),
                              (x_rb, y_bb), (x_lb, y_bb)], np.int32)
-        cv2.fillPoly(canvas, [bot_poly], bot_col)
+        cv2.fillPoly(canvas, [bot_poly], bot_col, lineType=cv2.LINE_AA)
 
         # Diagonal ribs on the bottom face, converging to vanishing point.
         # Each rib runs from the front-bottom edge backward — same x-coords
@@ -2754,7 +4069,7 @@ class RelaxTarget(Target):
         # ── FRONT face (rounded rectangle) ───────────────────────────────
         r = max(3, int(min(x_r - x_l, y_b - y_t) * 0.22))
         front_pts = _rounded_rect_points(x_l, y_t, x_r, y_b, r, n=10)
-        cv2.fillPoly(canvas, [front_pts], front_col)
+        cv2.fillPoly(canvas, [front_pts], front_col, lineType=cv2.LINE_AA)
 
         # Vertical black stripes clipped to rounded silhouette.
         mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
@@ -2807,7 +4122,7 @@ class WallTarget(Target):
             np.array([(x_l, y_b), (x_r, y_b), (x_rb, y_bb), (x_lb, y_bb)], np.int32),
             np.array([(x_l, y_t), (x_r, y_t), (x_rb, y_tb), (x_lb, y_tb)], np.int32),
         ):
-            cv2.fillPoly(canvas, [poly_pts], (90, 30, 110))
+            cv2.fillPoly(canvas, [poly_pts], (90, 30, 110), lineType=cv2.LINE_AA)
 
         # front face with diagonal laser stripes
         front_poly = np.array([(x_l, y_t), (x_r, y_t),
@@ -2815,7 +4130,7 @@ class WallTarget(Target):
         mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [front_poly], 255)
         sub_region = np.zeros_like(canvas)
-        cv2.fillPoly(sub_region, [front_poly], (80, 20, 120))
+        cv2.fillPoly(sub_region, [front_poly], (80, 20, 120), lineType=cv2.LINE_AA)
         # draw diagonal stripes
         stripe_spacing = max(4, int(18 * s))
         xs_min = min(x_l, x_lb)
@@ -2873,6 +4188,560 @@ class Particle:
             (self.x - cs - sn, self.y - sn + cs),
         ], dtype=np.int32)
         cv2.fillPoly(canvas, [pts], col)
+
+
+class SideRailRenderer:
+    """Draws 3-D floating neon barriers alongside the runway.
+
+    Each barrier segment is a 3-D box that floats ABOVE the floor with a gap
+    on both X (away from lane tiles) and Y (lifted off the floor surface), so
+    it never overlaps the floor.  Three faces are rendered per segment:
+      - inner face  (faces the runway centre — brightest, neon glow)
+      - top face    (faces the camera slightly — dimmed ~70%, gives 3-D depth)
+      - front face  (nearest Z edge of each chunk — dimmed ~55%, chunky only)
+
+    Parameters
+    ----------
+    height      : box height in world-Y units (default 0.14)
+    offset_x    : X gap from outer tile edge to inner face (default 0.08)
+    pulse       : 'none' | 'beat' | 'rms'
+    """
+
+    _tex_cache: dict[object, np.ndarray] = {}
+
+    # Box proportions relative to height
+    _BOX_LIFT_FRAC  = 0.50   # gap below box = height * this  (Y clearance)
+    _BOX_DEPTH_FRAC = 0.55   # box X thickness = height * this
+
+    def __init__(
+        self,
+        cam: "PerspectiveCamera",
+        *,
+        color: str = "#FF60FF",
+        shape: str = "chunky",
+        height: float = 0.14,
+        offset_x: float = 0.08,
+        image_path: str | None = None,
+        texture_non_loop: bool = False,
+        pulse: str = "beat",
+        pulse_intensity: float = 0.6,
+        chevron_depth: float = 1.0,
+        chevron_density: int = 6,
+        pillar_count: int = 16,
+        pillar_highlight_count: int = 1,
+        pillar_radius: float = 1.0,
+        chase_mode: str = "time",
+        chase_speed_frames: int = 4,
+        dot_count: int = 24,
+        dot_lines: int = 1,
+        dot_size_px: int = 6,
+        dot_anim_mode: str = "audio",
+        dot_color_near: str = "#FF60FF",
+        dot_color_far: str = "#00FFFF",
+    ):
+        self._cam    = cam
+        self._shape  = shape.lower()
+        if self._shape in {"pillar", "dot"}:
+            image_path = None
+        self._texture_non_loop = bool(texture_non_loop)
+        self._height = max(0.03, float(height))
+        self._pulse  = pulse.lower()
+        self._pi     = float(np.clip(pulse_intensity, 0.0, 1.0))
+        self._chev_depth   = float(max(0.1, chevron_depth))
+        self._chev_density = int(max(2, min(20, chevron_density)))
+        self._pillar_count = max(4, min(100, int(pillar_count)))
+        self._pillar_highlight_count = max(
+            1, min(self._pillar_count, int(pillar_highlight_count))
+        )
+        self._pillar_radius = float(max(0.2, min(2.0, pillar_radius)))
+        self._chase_mode = str(chase_mode).lower()
+        if self._chase_mode not in ("time", "beat"):
+            self._chase_mode = "time"
+        self._chase_speed_frames = max(1, int(chase_speed_frames))
+        self._chase_step = 0
+        self._chase_frame_counter = 0
+        self._dot_count = max(8, min(64, int(dot_count)))
+        self._dot_lines = max(1, min(8, int(dot_lines)))
+        self._dot_size_px = max(2, min(20, int(dot_size_px)))
+        self._dot_anim_mode = str(dot_anim_mode).lower()
+        if self._dot_anim_mode not in ("audio", "twinkle", "wave"):
+            self._dot_anim_mode = "audio"
+        self._dot_near_bgr = np.array(
+            _hex_to_bgr(dot_color_near, default=(255, 96, 255)),
+            dtype=np.float32,
+        )
+        self._dot_far_bgr = np.array(
+            _hex_to_bgr(dot_color_far, default=(255, 255, 0)),
+            dtype=np.float32,
+        )
+
+        # Color
+        try:
+            h = color.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            self._base_bgr = np.array([b, g, r], dtype=np.float32)
+        except Exception:
+            self._base_bgr = np.array([255, 96, 255], dtype=np.float32)
+
+        # Texture (optional, applied to inner face).
+        # Downscale oversized inputs because rail faces are small on-screen;
+        # high-res sources only add warp cost with negligible visual gain.
+        self._tex: np.ndarray | None = None
+        if image_path:
+            cache_key = (image_path, "v2")
+            if cache_key not in SideRailRenderer._tex_cache:
+                img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                if img is not None:
+                    MAX_TEX_EDGE = 256
+                    h, w = img.shape[:2]
+                    longest = max(h, w)
+                    if longest > MAX_TEX_EDGE:
+                        scale = MAX_TEX_EDGE / float(longest)
+                        new_w = max(1, int(round(w * scale)))
+                        new_h = max(1, int(round(h * scale)))
+                        img = cv2.resize(
+                            img, (new_w, new_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    SideRailRenderer._tex_cache[cache_key] = img
+            self._tex = SideRailRenderer._tex_cache.get(cache_key)
+
+        # Outer edge of the outermost floor tile
+        # (mirrors TunnelRenderer: tile_w = max(0.25, step*0.80))
+        if cam.n_lanes >= 2:
+            step = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
+        else:
+            step = cam.LANE_WORLD_X * 2
+        tile_half_w  = max(0.25, step * 0.80) / 2.0
+        outer_tile_x = cam.LANE_WORLD_X + tile_half_w
+
+        # Box X boundaries (inner face / outer face)
+        gap          = max(0.0, float(offset_x))
+        box_depth    = self._height * self._BOX_DEPTH_FRAC
+        # right side
+        self._ri_r   =  outer_tile_x + gap              # inner face X (right)
+        self._ro_r   =  outer_tile_x + gap + box_depth  # outer face X (right)
+        # left side (mirrored)
+        self._ri_l   = -(outer_tile_x + gap)
+        self._ro_l   = -(outer_tile_x + gap + box_depth)
+
+        # Box Y boundaries.  When the camera carries an explicit wall-floor
+        # gap (driven by the editor's "Gap" handles → wall_floor_gap_frac),
+        # the rail bottom snaps to that exact world Y so dragging the
+        # handles visibly moves the rail's bottom edge towards/away from
+        # the floor sides.  Without an override we use the legacy default
+        # lift (height × _BOX_LIFT_FRAC) so existing setups look identical.
+        if getattr(cam, "WALL_BOTTOM_WORLD_Y", None) is not None:
+            self._bot_y = float(cam.WALL_BOTTOM_WORLD_Y)
+            self._top_y = self._bot_y - self._height
+        else:
+            lift         = self._height * self._BOX_LIFT_FRAC
+            self._bot_y  = cam.FLOOR_WORLD_Y - lift
+            self._top_y  = cam.FLOOR_WORLD_Y - lift - self._height
+
+        # Z grid
+        self._z_slices = np.linspace(cam.Z_NEAR, cam.Z_FAR, 32)
+        self._pillar_zs = np.linspace(cam.Z_FAR, cam.Z_NEAR, self._pillar_count)
+        spacing = (
+            abs(self._pillar_zs[1] - self._pillar_zs[0])
+            if self._pillar_count > 1 else 1.0
+        )
+        self._pillar_half_z = spacing * 0.20
+        self._dot_zs = np.linspace(cam.Z_NEAR, cam.Z_FAR, self._dot_count)
+        if self._dot_count > 1:
+            ts = np.linspace(0.0, 1.0, self._dot_count)[:, None]
+        else:
+            ts = np.array([[0.0]])
+        self._dot_base_colors = (
+            self._dot_near_bgr[None, :] * (1 - ts) + self._dot_far_bgr[None, :] * ts
+        )
+
+    # ------------------------------------------------------------------
+    def _effective_color(self, bass_val: float, hit: bool) -> np.ndarray:
+        if self._pulse == "none" or self._pi == 0:
+            return self._base_bgr
+        flash = (self._pi if hit else 0.0) if self._pulse == "beat" \
+                else float(bass_val) * self._pi
+        return np.clip(
+            self._base_bgr + flash * (255 - self._base_bgr), 0, 255
+        ).astype(np.float32)
+
+    def _advance_chase(self, hit: bool) -> None:
+        """Advance pillar highlight index according to chase mode."""
+        if self._chase_mode == "beat":
+            if hit:
+                self._chase_step = (self._chase_step + 1) % self._pillar_count
+            return
+        self._chase_frame_counter += 1
+        if self._chase_frame_counter >= self._chase_speed_frames:
+            self._chase_frame_counter = 0
+            self._chase_step = (self._chase_step + 1) % self._pillar_count
+
+    # ------------------------------------------------------------------
+    def draw(
+        self,
+        canvas: np.ndarray,
+        frame_idx: int,
+        bass_val: float = 0.0,
+        hit: bool = False,
+    ) -> np.ndarray:
+        color  = self._effective_color(bass_val, hit)
+        bgr_t  = (int(color[0]), int(color[1]), int(color[2]))
+        # Top face is slightly dimmer (shading cue)
+        dim    = np.clip(color * 0.65, 0, 255).astype(np.float32)
+        bgr_d  = (int(dim[0]),  int(dim[1]),  int(dim[2]))
+        # Front face even dimmer
+        dim2   = np.clip(color * 0.45, 0, 255).astype(np.float32)
+        bgr_d2 = (int(dim2[0]), int(dim2[1]), int(dim2[2]))
+
+        if self._shape == "pillar":
+            self._advance_chase(hit)
+
+        for wx_i, wx_o in (
+            (self._ri_r, self._ro_r),   # right rail
+            (self._ri_l, self._ro_l),   # left rail
+        ):
+            if self._shape == "dot":
+                self._draw_dots(canvas, wx_i, wx_o, color, frame_idx, bass_val)
+            elif self._shape == "pillar":
+                self._draw_pillar(canvas, wx_i, wx_o, color)
+            elif self._shape == "tube":
+                self._draw_tube(canvas, wx_i, wx_o, bgr_t, bgr_d, color)
+            elif self._shape == "chevron":
+                self._draw_chevrons(canvas, wx_i, wx_o, bgr_t, bgr_d,
+                                    color, frame_idx)
+            else:
+                self._draw_chunky(canvas, wx_i, wx_o, bgr_t, bgr_d,
+                                  bgr_d2, color)
+        return canvas
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _project_quad(self, corners4):
+        """Project 4 world points → int32 poly, or None if any behind cam."""
+        pts = [self._cam.project(x, y, z) for x, y, z in corners4]
+        if any(p is None for p in pts):
+            return None
+        return np.array([[int(p[0]), int(p[1])] for p in pts], dtype=np.int32)
+
+    def _fill_face(self, canvas, corners4, bgr, color, glow=True):
+        poly = self._project_quad(corners4)
+        if poly is None:
+            return
+        if self._tex is not None:
+            H, W = canvas.shape[:2]
+            # Bbox of poly clipped to canvas bounds
+            x0, y0 = poly.min(axis=0)
+            x1, y1 = poly.max(axis=0) + 1
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(W, int(x1)), min(H, int(y1))
+            if x1 <= x0 or y1 <= y0:
+                return
+            bw, bh = x1 - x0, y1 - y0
+            # Translate poly into bbox-local coords
+            poly_local = poly - np.array([x0, y0], dtype=np.int32)
+            # Warp output to bbox size only (NOT full canvas)
+            th, tw = self._tex.shape[:2]
+            src = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]])
+            M = cv2.getPerspectiveTransform(src, poly_local.astype(np.float32))
+            warped = cv2.warpPerspective(self._tex, M, (bw, bh))
+            # Mask in bbox-local space
+            mask = np.zeros((bh, bw), dtype=np.uint8)
+            cv2.fillPoly(mask, [poly_local], 255)
+            # Composite into canvas ROI (no full-canvas scan)
+            roi = canvas[y0:y1, x0:x1]
+            roi[mask > 0] = warped[mask > 0]
+        else:
+            cv2.fillPoly(canvas, [poly], bgr, lineType=cv2.LINE_AA)
+            col_arr = np.array([bgr[0], bgr[1], bgr[2]], dtype=np.float32)
+            _draw_neon_edges(canvas, [poly], col_arr, 1)
+
+    # ── chunky: floating 3-D box segments ────────────────────────────────
+    def _draw_chunky(self, canvas, wx_i, wx_o, bgr_t, bgr_d, bgr_d2, color):
+        zs   = self._z_slices
+        step = zs[1] - zs[0]
+        gap  = step * 0.38
+        bot, top = self._bot_y, self._top_y
+        for i in range(len(zs) - 1):
+            z0 = zs[i]   + gap * 0.5
+            z1 = zs[i+1] - gap * 0.5
+            # Inner face (bright, faces runway)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_i, top, z1),
+                (wx_i, bot, z1), (wx_i, bot, z0),
+            ], bgr_t, color, glow=True)
+            # Top face (slightly dim, faces camera)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
+            # Front face (nearest edge, most dim)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, bot, z0), (wx_i, bot, z0),
+            ], bgr_d2, color, glow=False)
+
+    # ── tube: continuous floating strip ──────────────────────────────────
+    def _draw_tube(self, canvas, wx_i, wx_o, bgr_t, bgr_d, color):
+        zs = self._z_slices
+        bot, top = self._bot_y, self._top_y
+        # Optional non-loop mode: map the texture ONCE across the full rail
+        # length, instead of re-warping per segment (which visually tiles).
+        if self._texture_non_loop and self._tex is not None:
+            z0 = self._cam.Z_NEAR + 0.05
+            z1 = self._cam.Z_FAR
+            self._fill_face(canvas, [
+                (wx_i, bot, z0), (wx_i, top, z0),
+                (wx_i, top, z1), (wx_i, bot, z1),
+            ], bgr_t, color, glow=True)
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
+            return
+        for i in range(len(zs) - 1):
+            z0, z1 = zs[i], zs[i + 1]
+            # Inner face: continuous strip facing runway.
+            self._fill_face(canvas, [
+                (wx_i, bot, z0), (wx_i, top, z0),
+                (wx_i, top, z1), (wx_i, bot, z1),
+            ], bgr_t, color, glow=True)
+            # Top face: depth cue, slightly dimmer.
+            self._fill_face(canvas, [
+                (wx_i, top, z0), (wx_o, top, z0),
+                (wx_o, top, z1), (wx_i, top, z1),
+            ], bgr_d, color, glow=False)
+
+    # ── chevron: glowing open-V neon lines on inner face (>>> style) ─────
+    def _draw_chevrons(self, canvas, wx_i, wx_o, bgr_t, bgr_d,
+                       color, frame_idx):
+        """Draw wall chevrons as glowing open-V neon outlines (no fill).
+
+        Each chevron is a simple 3-point open polyline:
+            (top, z_base) → (mid, z_tip) → (bot, z_base)
+        rendered with a Gaussian-blurred halo + bright core, identical in
+        look to the >>> neon arrows in the reference image.
+        """
+        cam    = self._cam
+        bot, top = self._bot_y, self._top_y
+        mid_y  = (bot + top) * 0.5
+        half_h = (bot - top) * 0.5          # positive (bot > top in world Y)
+
+        n_slots   = self._chev_density
+        spacing   = (cam.Z_FAR - cam.Z_NEAR) / n_slots
+        scroll    = (frame_idx * 0.30) % spacing
+        _z_safe   = cam.Z_NEAR + 0.05
+
+        # Base arrow_len for 120° opening at the near reference depth,
+        # then scaled by the user-facing chevron_depth multiplier.
+        _wz_ref   = cam.Z_NEAR + spacing
+        _fy_fx    = (cam.fy / cam.fx) if cam.fx > 0 else 1.0
+        _wx_safe  = max(0.1, abs(wx_i))
+        arrow_len = _fy_fx * half_h * _wz_ref / (_wx_safe * math.sqrt(3))
+        arrow_len = max(spacing * 0.06, min(spacing * 0.40, arrow_len))
+        arrow_len *= self._chev_depth   # user depth multiplier (>1 = more pointed)
+
+        polys: list[tuple[float, np.ndarray, float]] = []
+        for i in range(n_slots + 1):
+            wz = cam.Z_NEAR + i * spacing - scroll
+            if wz <= _z_safe:
+                continue
+            z_tip  = max(_z_safe, wz - arrow_len * 0.5)
+            z_base = wz + arrow_len * 0.5
+
+            # Open V: 3 world points on the inner face (X = wx_i)
+            corners_w = [
+                (wx_i, top,   z_base),   # top-far  (open end)
+                (wx_i, mid_y, z_tip),    # center tip (near end)
+                (wx_i, bot,   z_base),   # bot-far  (open end)
+            ]
+            proj = [cam.project(x, y, z) for x, y, z in corners_w]
+            if any(p is None for p in proj):
+                continue
+            depth_factor = max(0.15, min(1.0, 5.0 / wz))
+            pts = np.array(
+                [(int(round(p[0])), int(round(p[1]))) for p in proj],
+                dtype=np.int32,
+            )
+            polys.append((wz, pts, depth_factor))
+
+        polys.sort(key=lambda t: -t[0])   # far first → near last (on top)
+
+        H_cv, W_cv = canvas.shape[:2]
+        for _, pts, df in polys:
+            # Scale brightness by depth
+            scaled = np.clip(color * (0.35 + 0.65 * df), 0, 255).astype(np.float32)
+            glow_col = tuple(int(min(255.0, c * 1.2 + 20)) for c in scaled)
+            core_col = tuple(int(min(255.0, c * 0.55 + 130)) for c in scaled)
+            core_thick = max(2, int(round(1.5 + df * 2.5)))
+            wide = max(5, core_thick * 4)
+
+            # Bounding box for the blurred halo (crop to avoid full-frame blur)
+            xs, ys = pts[:, 0], pts[:, 1]
+            pad = wide + 8
+            x0 = max(0, int(xs.min()) - pad)
+            y0 = max(0, int(ys.min()) - pad)
+            x1 = min(W_cv, int(xs.max()) + pad + 1)
+            y1 = min(H_cv, int(ys.max()) + pad + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            crop = canvas[y0:y1, x0:x1]
+            shifted = pts - np.array([x0, y0], dtype=pts.dtype)
+
+            # Halo: blurred wide polyline blended via screen-mode (max)
+            overlay = np.zeros_like(crop)
+            cv2.polylines(overlay, [shifted], False, glow_col,
+                          wide, lineType=cv2.LINE_AA)
+            k = (wide * 2) | 1
+            overlay = cv2.GaussianBlur(overlay, (k, k), 0)
+            np.maximum(crop, overlay, out=crop)
+
+            # Bright core: thin crisp line drawn directly on canvas
+            cv2.polylines(canvas, [pts], False, core_col,
+                          core_thick, lineType=cv2.LINE_AA)
+
+    def _draw_pillar(self, canvas: np.ndarray, wx_i: float, wx_o: float,
+                     color: np.ndarray) -> np.ndarray:
+        """Draw cylindrical-looking pillar row with moving highlight span."""
+        cam = self._cam
+        bot, top = self._bot_y, self._top_y
+        head_idx = self._chase_step
+        span = max(1, min(self._pillar_count, self._pillar_highlight_count))
+        dim_color = np.clip(color * 0.25, 0, 255).astype(np.float32)
+
+        # Cylinder approximation: high-sided round prism around the Y axis.
+        # Keep radius slightly inside the rail box bounds.
+        x_c = (wx_i + wx_o) * 0.5
+        radius_x = max(0.01, abs(wx_o - wx_i) * 0.46)
+        radius_z = max(0.01, self._pillar_half_z * 0.96)
+        radius_x *= self._pillar_radius
+        radius_z *= self._pillar_radius
+        n_sides = 20
+        thetas = np.linspace(0.0, 2.0 * math.pi, n_sides + 1)
+
+        for i, z_c in enumerate(self._pillar_zs):
+            # Circular span: highlight N consecutive pillars moving as one group.
+            is_head = ((i - head_idx) % self._pillar_count) < span
+            face_color = color if is_head else dim_color
+
+            # Side facets
+            for s in range(n_sides):
+                t0 = float(thetas[s])
+                t1 = float(thetas[s + 1])
+                x0 = x_c + radius_x * math.cos(t0)
+                z0 = z_c + radius_z * math.sin(t0)
+                x1 = x_c + radius_x * math.cos(t1)
+                z1 = z_c + radius_z * math.sin(t1)
+
+                # Simple cylindrical shading: facets facing camera (-Z) are brighter.
+                tm = 0.5 * (t0 + t1)
+                facing = max(0.0, -math.sin(tm))
+                shade = 0.55 + 0.45 * facing
+                facet_color = np.clip(face_color * shade, 0, 255).astype(np.float32)
+                bgr_facet = (
+                    int(facet_color[0]),
+                    int(facet_color[1]),
+                    int(facet_color[2]),
+                )
+
+                self._fill_face(
+                    canvas,
+                    [(x0, top, z0), (x1, top, z1), (x1, bot, z1), (x0, bot, z0)],
+                    bgr_facet,
+                    color,
+                    glow=is_head and facing > 0.85,
+                )
+
+            # Top cap (helps the pillar read as a cylinder, not a flat strip).
+            top_pts = []
+            for s in range(n_sides):
+                tt = float(thetas[s])
+                p = cam.project(
+                    x_c + radius_x * math.cos(tt),
+                    top,
+                    z_c + radius_z * math.sin(tt),
+                )
+                if p is None:
+                    top_pts = []
+                    break
+                top_pts.append((int(p[0]), int(p[1])))
+            if len(top_pts) >= 3:
+                top_poly = np.array(top_pts, dtype=np.int32)
+                top_color = np.clip(face_color * 0.62, 0, 255).astype(np.float32)
+                bgr_top = (int(top_color[0]), int(top_color[1]), int(top_color[2]))
+                cv2.fillConvexPoly(canvas, top_poly, bgr_top, lineType=cv2.LINE_AA)
+                if is_head:
+                    _draw_neon_edges(canvas, [top_poly], face_color, 1)
+
+        return canvas
+
+    def _draw_dots(
+        self,
+        canvas: np.ndarray,
+        wx_i: float,
+        wx_o: float,
+        color: np.ndarray,
+        frame_idx: int,
+        bass_val: float,
+    ) -> np.ndarray:
+        """Draw glowing 2D dots projected on the rail inner edge."""
+        cam = self._cam
+        bot, top = self._bot_y, self._top_y
+
+        n = self._dot_count
+        base_size = self._dot_size_px
+        anim = self._dot_anim_mode
+
+        if anim == "audio":
+            mod_per_dot = np.full(n, 0.4 + 0.6 * float(bass_val), dtype=np.float32)
+        elif anim == "twinkle":
+            period = 30
+            phases = ((frame_idx + np.arange(n) * 7) % period) / float(period)
+            mod_per_dot = (
+                0.3 + 0.7 * (0.5 + 0.5 * np.sin(phases * 2 * np.pi))
+            ).astype(np.float32)
+        elif anim == "wave":
+            wave_phase = (np.arange(n) / max(1, n - 1) + frame_idx * 0.05) * 2 * np.pi
+            mod_per_dot = (
+                0.4 + 0.6 * (0.5 + 0.5 * np.sin(wave_phase))
+            ).astype(np.float32)
+        else:
+            mod_per_dot = np.ones(n, dtype=np.float32)
+
+        pulse_norm = max(1e-3, float(np.linalg.norm(self._base_bgr)))
+        pulse_factor = float(np.linalg.norm(color) / pulse_norm)
+
+        if self._dot_lines <= 1:
+            y_fracs = [0.5]
+        else:
+            # Split lines vertically on the wall (top -> bottom), not across rail width.
+            y_fracs = [j / (self._dot_lines - 1) for j in range(self._dot_lines)]
+
+        for i, wz in enumerate(self._dot_zs):
+            bgr_val = self._dot_base_colors[i] * mod_per_dot[i] * pulse_factor
+            bgr_val = np.clip(bgr_val, 0, 255)
+            col_tuple = (int(bgr_val[0]), int(bgr_val[1]), int(bgr_val[2]))
+            depth_factor = max(0.15, min(1.0, 5.0 / max(0.1, float(wz))))
+            radius = max(2, int(round(base_size * depth_factor)))
+            halo_col = tuple(int(c * 0.5) for c in col_tuple)
+
+            for frac in y_fracs:
+                wy = float(top + (bot - top) * frac)
+                proj = cam.project(float(wx_i), wy, float(wz))
+                if proj is None:
+                    continue
+                cx, cy = int(proj[0]), int(proj[1])
+                cv2.circle(canvas, (cx, cy), radius, col_tuple, -1, lineType=cv2.LINE_AA)
+                cv2.circle(
+                    canvas,
+                    (cx, cy),
+                    int(radius * 1.6),
+                    halo_col,
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
+
+        return canvas
 
 
 class ParticleSystem:
@@ -2973,52 +4842,54 @@ from stickman import StickmanHUD  # noqa: E402, F401
 
 # ── HUD: Viewport shake blocks (4 neon panels in front of the view) ─────────
 class ViewportFrame:
-    """Four neon-outlined blocks floating at eye-level.
+    """Four neon-outlined landing pads ON THE FLOOR at the hit zone.
 
-    Static decorative HUD that represents the player's "visor" / cockpit.
-    On each punch hit, all four blocks receive a brief random jitter that
-    decays over ~0.25s, selling the illusion of a real impact shaking the
-    camera/viewport.
+    Each panel sits flush on the floor plane at z = Z_NEAR (the hit
+    line), extending slightly backward toward the horizon.  Visually
+    represents the per-lane "drum pad" where flying targets land.
+
+    On each punch hit, all four pads receive a brief random jitter
+    that decays over ~0.25s, selling the illusion of a real impact
+    shake.  The jitter is purely visual — pad geometry stays anchored
+    on the floor between hits.
     """
 
     def __init__(self, cam: PerspectiveCamera,
                  neon_color: tuple[int, int, int] | None = None,
                  lane_aligned: bool = False,
-                 mode: str = 'punch'):
-        """`lane_aligned` is a legacy flag kept for API compat; both modes
-        now always use lane-aligned panels so the 4 bottom tiles are the
-        forward extension of the 4 lane rails (matches where targets
-        actually fly along).  Internally we branch on `mode` to pick the
-        right panel depth / width:
+                 mode: str = 'punch',
+                 panel_depth: float | None = None):
+        """`lane_aligned` is a legacy flag kept for API compat; ignored.
 
-        * ``mode='dance'`` — panel back-edge coincides with
-          ``DanceTarget`` front-edge at hit_frame, so the stomp tile
-          lands flush onto its panel.
-        * ``mode='punch'`` — panel back-edge = ``Z_NEAR`` (the hit
-          line), panel half-width = ``0.40 × lane_step_world`` so
-          adjacent panels leave a small neon seam.  This replaces the
-          old hardcoded "cockpit HUD" trapezoids whose pixel positions
-          didn't match the 3D lane projection and made flying cubes
-          appear to drift off their lane rails near the horizon.
+        Both modes now place panels ON the floor at hit zone:
+
+        * ``mode='dance'`` — panel front-edge = ``Z_NEAR``, depth =
+          tile depth (2 × DanceTarget.HALF_Z) so the stomp tile lands
+          FLUSH ON TOP of its panel.
+        * ``mode='punch'`` — panel front-edge = ``Z_NEAR``, half_width =
+          ``0.40 × lane_step_world``, depth = 0.6 world units.  Flying
+          cubes land at the panel front and burst there.
+
+        ``panel_depth`` overrides the mode-specific default when provided.
         """
         self.cam = cam
         W, H = cam.W, cam.H
         _ = lane_aligned  # retained for back-compat; ignored
 
         if mode == 'dance':
-            # Flush with DanceTarget front-edge — matches tile landing.
-            half_x = DanceTarget.HALF_X
-            z_back = max(cam.Z_NEAR - DanceTarget.HALF_Z, 0.1)
+            half_x       = DanceTarget.HALF_X
+            default_depth = 2.0 * DanceTarget.HALF_Z
         else:
-            # Punch: auto-size to 80% of lane step; z_back = Z_NEAR (hit).
             if cam.n_lanes > 1:
                 lane_step_world = abs(cam.lane_world_x(1) - cam.lane_world_x(0))
             else:
                 lane_step_world = 0.40
-            half_x = 0.40 * lane_step_world
-            z_back = cam.Z_NEAR
-        panels = self._build_lane_aligned_panels(half_x=half_x,
-                                                 z_back=z_back)
+            half_x        = 0.40 * lane_step_world
+            default_depth = 0.6
+        depth = float(panel_depth) if panel_depth is not None else default_depth
+        panels = self._build_lane_aligned_panels(
+            half_x=half_x, z_front=cam.Z_NEAR, panel_depth=depth,
+        )
         self.panels = panels
 
         # Shake state -------------------------------------------------------
@@ -3042,62 +4913,45 @@ class ViewportFrame:
     # ------------------------------------------------------------------
     def _build_lane_aligned_panels(self,
                                    half_x: float | None = None,
-                                   z_back: float | None = None,
-                                   y_target_frac: float = 0.985) -> list:
-        """Lane-aligned panels — each panel is lane *i*'s floor strip
-        projected forward toward the camera.
+                                   z_front: float | None = None,
+                                   panel_depth: float = 0.6) -> list:
+        """Lane-aligned landing pads on the floor — each panel is lane *i*'s
+        floor footprint at the hit zone.
+
+        The panels sit FLUSH on the floor plane (FLOOR_WORLD_Y), with their
+        front edge at z = Z_NEAR (= the Floor line in overlay) and back edge
+        at z = Z_NEAR + panel_depth.  This is opposite to the legacy "cockpit
+        visor" interpretation where panels extended FORWARD from Z_NEAR
+        toward the camera (z range [near 0, Z_NEAR]).
 
         Parameters
         ----------
         half_x : float | None
-            Panel half-width in world units.  ``None`` = ``DanceTarget.HALF_X``
-            (tile-flush).  Callers (e.g. punch mode) can pass a custom
-            value derived from lane step.
-        z_back : float | None
-            World depth of the panel's back edge (the edge nearer the
-            tunnel / hit zone).  ``None`` = ``Z_NEAR - DanceTarget.HALF_Z``
-            (coincides with dance tile's front-edge at hit_frame so the
-            tile lands flush onto the panel).  Punch mode passes
-            ``Z_NEAR`` so the panel back-edge = exactly the hit line —
-            flying cubes then visibly enter the panel along its rail.
-        y_target_frac : float
-            Fraction of screen height the panel's front (closest) edge
-            should project to.  Default 0.985 = just above the bottom.
-
-        Net result: panels are the true 3D forward-continuation of each
-        lane — both modes now share this geometry so targets flying in
-        from the horizon travel exactly down their panel's rail.
+            Panel half-width in world units.  ``None`` = ``DanceTarget.HALF_X``.
+        z_front : float | None
+            World depth of the panel's FRONT edge (closer to camera, lower
+            on screen).  ``None`` = ``Z_NEAR`` (panel front sits exactly at
+            the Floor line / hit zone).
+        panel_depth : float
+            World depth from front to back.  Default 0.6 — enough visual
+            depth without encroaching too far toward the horizon.
         """
-        cam = self.cam
-        hx  = DanceTarget.HALF_X if half_x is None else float(half_x)
-        if z_back is None:
-            z_back = max(cam.Z_NEAR - DanceTarget.HALF_Z, 0.1)
-        else:
-            z_back = max(float(z_back), 0.1)
-
-        # Solve z_front from the target bottom-of-screen y.  Floor plane Y
-        # projects as y = cy_pix + fy * FLOOR_WORLD_Y / z, so:
-        #   z = fy * FLOOR_WORLD_Y / (y_target - cy_pix)
-        y_target = cam.H * y_target_frac
-        denom    = y_target - cam.cy_pix
-        if denom > 1.0:
-            z_front = cam.fy * cam.FLOOR_WORLD_Y / denom
-        else:
-            z_front = max(z_back - 0.8, 0.1)
-        # Safety: keep z_front < z_back with a minimum gap so the
-        # trapezoid has real depth.
-        z_front = max(min(z_front, z_back - 0.05), 0.1)
+        cam    = self.cam
+        hx     = DanceTarget.HALF_X if half_x is None else float(half_x)
+        zf     = float(cam.Z_NEAR) if z_front is None else max(float(z_front), 0.1)
+        zb     = zf + max(0.1, float(panel_depth))
 
         panels = []
         for i in range(cam.n_lanes):
             wx = cam.lane_world_x(i)
-            # Corner order = (BL, BR, TR, TL) in screen coords →
-            # (front-left, front-right, back-right, back-left) in world.
+            # Corner order: (front-left, front-right, back-right, back-left)
+            # Front = closer to camera (lower y on screen, at hit zone)
+            # Back  = farther (higher y on screen, toward horizon)
             corners_w = (
-                (wx - hx, cam.FLOOR_WORLD_Y, z_front),  # BL (closer)
-                (wx + hx, cam.FLOOR_WORLD_Y, z_front),  # BR
-                (wx + hx, cam.FLOOR_WORLD_Y, z_back),   # TR (farther)
-                (wx - hx, cam.FLOOR_WORLD_Y, z_back),   # TL
+                (wx - hx, cam.FLOOR_WORLD_Y, zf),   # FL — at Floor line
+                (wx + hx, cam.FLOOR_WORLD_Y, zf),   # FR
+                (wx + hx, cam.FLOOR_WORLD_Y, zb),   # BR — into floor
+                (wx - hx, cam.FLOOR_WORLD_Y, zb),   # BL
             )
             proj = [cam.project(*p) for p in corners_w]
             if any(p is None for p in proj):
@@ -3138,13 +4992,33 @@ class ViewportFrame:
             offset = np.array([int(round(jx)), int(round(jy))], dtype=np.int32)
             pts = poly + offset
 
-            # Dark semi-transparent interior so tunnel floor shows through.
+            # Gradient interior (top brighter, bottom darker, side vignette)
+            # to match the sample style even in idle state.
             mask = np.zeros((H, W), dtype=np.uint8)
             cv2.fillConvexPoly(mask, pts, 255)
-            idx = mask > 0
-            if idx.any():
-                canvas[idx] = (canvas[idx].astype(np.float32) * 0.45
-                               ).astype(np.uint8)
+            x, y0, w, h = cv2.boundingRect(pts)
+            rx0, ry0 = max(0, x), max(0, y0)
+            rx1, ry1 = min(W, x + w), min(H, y0 + h)
+            rw, rh = rx1 - rx0, ry1 - ry0
+            if rw > 0 and rh > 0:
+                gy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+                gx = np.abs(np.linspace(-1.0, 1.0, w, dtype=np.float32))[None, :, None]
+                top = np.array([92.0, 92.0, 92.0], dtype=np.float32)
+                bot = np.array([40.0, 40.0, 40.0], dtype=np.float32)
+                grad = top * (1.0 - gy) + bot * gy
+                grad = np.repeat(grad, w, axis=1)
+                grad *= (1.0 - 0.16 * gx)
+                grad = np.clip(grad, 0, 255).astype(np.uint8)
+
+                fill_layer = np.zeros_like(canvas)
+                fill_layer[ry0:ry1, rx0:rx1] = grad[ry0 - y0:ry1 - y0, rx0 - x:rx1 - x]
+                idx = mask > 0
+                if idx.any():
+                    fill_alpha = 0.74 if active else 0.58
+                    canvas[idx] = (
+                        canvas[idx].astype(np.float32) * (1.0 - fill_alpha)
+                        + fill_layer[idx].astype(np.float32) * fill_alpha
+                    ).astype(np.uint8)
 
             if active:
                 # Neon glow — alpha modulated by amp so it fades with decay.
@@ -3160,9 +5034,10 @@ class ViewportFrame:
 
                 # Crisp neon border (color lerped from dim grey → amber).
                 mix = min(1.0, amp * 1.4)
+                # Keep border darker so panels blend better with background.
                 border_col = tuple(
                     int(self._idle_col[i] * (1 - mix)
-                        + self._neon_col[i] * mix)
+                        + (self._neon_col[i] * 0.58) * mix)
                     for i in range(3))
                 cv2.polylines(canvas, [pts], True, border_col, 2,
                               lineType=cv2.LINE_AA)
@@ -3188,16 +5063,20 @@ class ViewportFrame:
                          (ccx - tick_w, ccy), (ccx + tick_w, ccy),
                          acc_col, 2, cv2.LINE_AA)
             else:
-                # Idle: just a thin faint grey outline — no glow, no tick.
-                cv2.polylines(canvas, [pts], True, self._idle_col, 1,
-                              lineType=cv2.LINE_AA)
+                # Idle: darker dual-edge outline to avoid popping from background.
+                cv2.polylines(canvas, [pts], True, (16, 16, 16), 2, lineType=cv2.LINE_AA)
+                cv2.polylines(canvas, [pts], True, (78, 78, 78), 1, lineType=cv2.LINE_AA)
 
         return canvas
 
 
 # ── HUD: Combo + Rating (right panel) ────────────────────────────────────────
 class ComboHUD:
-    """Displays combo count and latest rating on the right side."""
+    """Displays combo count and latest rating on the right side.
+
+    Configurable via layer config (26 fields mirroring CountdownHUD pattern).
+    Rating badge (GOOD/GREAT/SUPERB/PERFECT) remains hardcoded per spec.
+    """
 
     RATINGS = ['GOOD', 'GREAT', 'SUPERB', 'PERFECT']
     RATING_COLORS = {
@@ -3208,98 +5087,1091 @@ class ComboHUD:
         'MISS':    (80, 80, 220),
     }
 
-    def __init__(self, cam: PerspectiveCamera):
+    _FONT_MAP: dict[str, int] = {
+        "simplex":        cv2.FONT_HERSHEY_SIMPLEX,
+        "plain":          cv2.FONT_HERSHEY_PLAIN,
+        "duplex":         cv2.FONT_HERSHEY_DUPLEX,
+        "complex":        cv2.FONT_HERSHEY_COMPLEX,
+        "triplex":        cv2.FONT_HERSHEY_TRIPLEX,
+        "complex_small":  cv2.FONT_HERSHEY_COMPLEX_SMALL,
+        "script_simplex": cv2.FONT_HERSHEY_SCRIPT_SIMPLEX,
+        "script_complex": cv2.FONT_HERSHEY_SCRIPT_COMPLEX,
+    }
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw == "flash":
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    def __init__(
+        self,
+        cam: "PerspectiveCamera",
+        *,
+        enabled: bool = True,
+        color: str = "#FFFFFF",
+        label: str = "COMBO",
+        font_family: str = "duplex",
+        fade_after_break_sec: float = 0.5,
+        anim: str = "pop",
+        bbox: tuple[float, float, float, float] = (0.85, 0.08, 0.065, 0.09),
+        border_thickness: float = 2.0,
+        glow_strength: float = 30.0,
+        tier1_threshold: int = 30,  tier1_label: str = "Great",
+        tier2_threshold: int = 60,  tier2_label: str = "Superb",
+        tier3_threshold: int = 90,  tier3_label: str = "Perfect",
+        tier4_threshold: int = 120, tier4_label: str = "Godlike",
+        tier1_color: str = "#22c55e",
+        tier2_color: str = "#3b82f6",
+        tier3_color: str = "#a855f7",
+        tier4_color: str = "#f59e0b",
+        number_font_scale: float = 0.0,
+        label_font_scale: float = 0.0,
+        tier_font_scale: float = 0.0,
+        fps: float = 30.0,
+    ):
         self.cam = cam
         self.combo = 0
         self.rating = ''
         self.rating_frame = -999
+        self._fps = max(1.0, float(fps))
+        # ── config ──────────────────────────────────────────────────────────
+        self._enabled = bool(enabled)
+        self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
+        self._label = str(label) or "COMBO"
+        self._font_family = str(font_family)
+        self._fade_break_sec = max(0.0, float(fade_after_break_sec))
+        self._anim_mode = self._normalize_anim(anim)
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+        self.set_bbox(*bbox)
+        # ── tiers ───────────────────────────────────────────────────────────
+        self._tier1_threshold = max(0, int(tier1_threshold))
+        self._tier1_label = str(tier1_label)
+        self._tier2_threshold = max(0, int(tier2_threshold))
+        self._tier2_label = str(tier2_label)
+        self._tier3_threshold = max(0, int(tier3_threshold))
+        self._tier3_label = str(tier3_label)
+        self._tier4_threshold = max(0, int(tier4_threshold))
+        self._tier4_label = str(tier4_label)
+        self._tier1_color = str(tier1_color)
+        self._tier2_color = str(tier2_color)
+        self._tier3_color = str(tier3_color)
+        self._tier4_color = str(tier4_color)
+        # ── font scale overrides (0 = auto-fit) ─────────────────────────────
+        self._number_fs = max(0.0, float(number_font_scale))
+        self._label_fs = max(0.0, float(label_font_scale))
+        self._tier_fs = max(0.0, float(tier_font_scale))
+        # ── internal state ───────────────────────────────────────────────────
+        self._break_frame: int = -999_999
+        self._last_combo: int = 0
+        self._last_change_frame: int = -999_999
 
-    def register_hit(self, cur_frame: int):
+    # ── getters ──────────────────────────────────────────────────────────────
+
+    def _get_font(self) -> int:
+        return self._FONT_MAP.get(self._font_family, cv2.FONT_HERSHEY_DUPLEX)
+
+    def _resolve_label(self, combo: int) -> str:
+        """Return tier label for combo count (check tier4 first → tier1)."""
+        if self._tier4_threshold > 0 and combo >= self._tier4_threshold:
+            return self._tier4_label
+        if self._tier3_threshold > 0 and combo >= self._tier3_threshold:
+            return self._tier3_label
+        if self._tier2_threshold > 0 and combo >= self._tier2_threshold:
+            return self._tier2_label
+        if self._tier1_threshold > 0 and combo >= self._tier1_threshold:
+            return self._tier1_label
+        return self._label
+
+    # ── hot-update API (mirrors CountdownHUD) ────────────────────────────────
+
+    def set_bbox(self, x: float, y: float, w: float, h: float) -> None:
+        x = max(0.0, min(0.98, float(x)))
+        y = max(0.0, min(0.98, float(y)))
+        w = max(0.02, min(1.0 - x, float(w)))
+        h = max(0.02, min(1.0 - y, float(h)))
+        self._box_x = x
+        self._box_y = y
+        self._box_w = w
+        self._box_h = h
+
+    def set_style(
+        self,
+        *,
+        color: str | None = None,
+        label: str | None = None,
+        font_family: str | None = None,
+        anim: str | None = None,
+        border_thickness: float | None = None,
+        glow_strength: float | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        """Hot-update style fields without resetting combo state."""
+        if color is not None:
+            self._color_bgr = _hex_to_bgr(color, default=self._color_bgr)
+        if label is not None:
+            self._label = str(label) or "COMBO"
+        if font_family is not None:
+            self._font_family = str(font_family)
+        if anim is not None:
+            self._anim_mode = self._normalize_anim(anim)
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        if glow_strength is not None:
+            self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+        if enabled is not None:
+            self._enabled = bool(enabled)
+
+    def set_tier(self, n: int, *, threshold: int | None = None, label: str | None = None) -> None:
+        """Hot-update tier n (1..4)."""
+        if n not in (1, 2, 3, 4):
+            return
+        if threshold is not None:
+            setattr(self, f"_tier{n}_threshold", max(0, int(threshold)))
+        if label is not None:
+            setattr(self, f"_tier{n}_label", str(label))
+
+    # ── game events ─────────────────────────────────────────────────────────
+
+    def register_hit(self, cur_frame: int) -> None:
+        prev = self._last_combo
         self.combo += 1
-        # Reference style: always show a simple "GOOD" pill (single rating).
+        if self.combo != prev:
+            self._last_change_frame = cur_frame
+        self._last_combo = self.combo
         self.rating = 'GOOD'
         self.rating_frame = cur_frame
 
-    def register_miss(self, cur_frame: int):
+    def register_miss(self, cur_frame: int) -> None:
+        if self.combo > 0:
+            self._break_frame = cur_frame
         self.combo = 0
+        self._last_combo = 0
         self.rating = 'MISS'
         self.rating_frame = cur_frame
 
-    def draw(self, canvas: np.ndarray, cur_frame: int):
-        W, H = self.cam.W, self.cam.H
+    # ── rendering ───────────────────────────────────────────────────────────
 
-        # combo number (top right)
-        if self.combo > 0:
-            txt = f"{self.combo}"
-            fs = 2.5 if W >= 1600 else 1.9
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, fs, 4)
-            x = W - tw - int(W * 0.03)
-            y = int(H * 0.13)
-            cv2.putText(canvas, txt, (x, y),
-                        cv2.FONT_HERSHEY_DUPLEX, fs, CLR_WHITE, 4,
-                        lineType=cv2.LINE_AA)
-            lbl = 'COMBO'
-            lfs = 0.9 if W >= 1600 else 0.65
-            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_DUPLEX, lfs, 2)
-            cv2.putText(canvas, lbl, (W - lw - int(W * 0.03), y + int(lh * 1.4)),
-                        cv2.FONT_HERSHEY_DUPLEX, lfs, (200, 200, 210), 2,
-                        lineType=cv2.LINE_AA)
+    def _draw_glow_text(
+        self,
+        canvas: np.ndarray,
+        *,
+        text: str,
+        x: int,
+        y: int,
+        font_face: int,
+        font_scale: float,
+        thickness: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+    ) -> None:
+        """Draw text with optional glow + border (mirrors CountdownHUD._draw_glow_text)."""
+        if alpha <= 1e-4:
+            return
+        alpha = float(max(0.0, min(1.0, alpha)))
 
-        # Rating pop-up as a CYAN/BLUE rounded-rect badge (ref style):
-        #     ┌───────────┐
-        #     │  GOOD     │   blue gradient, white text, thin border
-        #     └───────────┘
-        age = cur_frame - self.rating_frame
-        if 0 <= age < 14 and self.rating:
-            # scale pop-in (0→1.25) over 3 frames then settle to 1.0
-            if age < 3:
-                scale = 0.6 + age / 3.0 * 0.65
-            elif age < 6:
-                scale = 1.25 - (age - 3) / 3.0 * 0.25
+        glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0))
+        if glow_norm > 1e-4:
+            glow = np.zeros_like(canvas)
+            for thick_off, base_weight in ((10, 0.10), (6, 0.18), (3, 0.28)):
+                layer_g = np.zeros_like(canvas)
+                cv2.putText(layer_g, text, (x, y), font_face, font_scale,
+                            color_bgr, thickness + thick_off, cv2.LINE_AA)
+                glow = cv2.addWeighted(glow, 1.0, layer_g,
+                                       base_weight * glow_norm * alpha, 0)
+            ksize = max(1, int(font_scale * 8)) | 1
+            glow = cv2.GaussianBlur(glow, (ksize, ksize), 0)
+            canvas[:] = cv2.add(canvas, glow)
+
+        if self._border_thickness > 0.1:
+            bthick = max(1, int(self._border_thickness) + thickness)
+            cv2.putText(canvas, text, (x, y), font_face, font_scale,
+                        (0, 0, 0), bthick, cv2.LINE_AA)
+
+        a_color = tuple(int(c * alpha) for c in color_bgr)
+        cv2.putText(canvas, text, (x, y), font_face, font_scale,
+                    a_color, thickness, cv2.LINE_AA)
+
+    def _anim_scale_alpha(self, cur_frame: int) -> tuple[float, float]:
+        """Return (scale, alpha) for pop/flash/shake/fade_cross animations."""
+        age = cur_frame - self._last_change_frame
+        if age < 0:
+            return 1.0, 1.0
+        fps = self._fps
+        anim_dur = max(1, int(fps * 0.4))  # ~12 frames at 30fps
+        if age >= anim_dur:
+            return 1.0, 1.0
+        t = age / float(anim_dur)
+        mode = self._anim_mode
+        if mode == "pop":
+            if t < 0.25:
+                scale = 1.0 + 0.30 * (t / 0.25)
+            elif t < 0.5:
+                scale = 1.30 - 0.30 * ((t - 0.25) / 0.25)
             else:
                 scale = 1.0
-            alpha = 1.0 if age < 10 else max(0.0, 1.0 - (age - 10) / 4.0)
+            return scale, 1.0
+        if mode == "flash":
+            brightness_scale = 1.0 + 0.6 * max(0.0, 1.0 - t * 2.5)
+            return brightness_scale, 1.0
+        if mode == "shake":
+            return 1.0, 1.0
+        if mode == "fade_cross":
+            return 1.0, min(1.0, t * 3.0)
+        return 1.0, 1.0
 
-            txt = self.rating
-            fs  = (1.25 if W >= 1600 else 0.95) * scale
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, fs, 2)
-            pad_x = int(th * 0.9)
-            pad_y = int(th * 0.55)
-            bw, bh = tw + 2 * pad_x, th + 2 * pad_y
-            bx1 = W - int(W * 0.03)
-            bx0 = bx1 - bw
-            by0 = int(H * 0.22)
-            by1 = by0 + bh
+    def _shake_offset(self, cur_frame: int) -> tuple[int, int]:
+        if self._anim_mode != "shake":
+            return 0, 0
+        age = cur_frame - self._last_change_frame
+        dur = max(1, int(self._fps * 0.3))
+        if age < 0 or age >= dur:
+            return 0, 0
+        decay = max(0.0, 1.0 - age / float(dur)) ** 2
+        import random as _rnd
+        rng = _rnd.Random(cur_frame * 7919)
+        amp = max(2, int(self.cam.W * 0.006 * decay))
+        return rng.randint(-amp, amp), rng.randint(-amp // 2, amp // 2)
 
-            # badge fill (cyan-blue gradient approximation: two horizontal bands)
-            blue_dk = (200, 130, 60)     # BGR darker cyan-blue
-            blue_lt = (255, 200, 120)    # BGR brighter cyan
+    # ── tier helpers ─────────────────────────────────────────────────────────
 
-            overlay = canvas.copy()
-            mid = (by0 + by1) // 2
-            cv2.rectangle(overlay, (bx0, by0), (bx1, mid),
-                          tuple(int(c * alpha) for c in blue_lt), -1)
-            cv2.rectangle(overlay, (bx0, mid), (bx1, by1),
-                          tuple(int(c * alpha) for c in blue_dk), -1)
-            canvas[:] = cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0)
+    def _resolve_tier_index(self, combo: int) -> int:
+        if self._tier4_threshold > 0 and combo >= self._tier4_threshold:
+            return 4
+        if self._tier3_threshold > 0 and combo >= self._tier3_threshold:
+            return 3
+        if self._tier2_threshold > 0 and combo >= self._tier2_threshold:
+            return 2
+        if self._tier1_threshold > 0 and combo >= self._tier1_threshold:
+            return 1
+        return 0
 
-            # thin white border
-            cv2.rectangle(canvas, (bx0, by0), (bx1, by1),
-                          tuple(int(c * alpha) for c in (255, 255, 255)),
-                          max(1, int(2 * alpha)), lineType=cv2.LINE_AA)
+    def _resolve_tier_color(self, tier_idx: int) -> tuple:
+        if tier_idx == 1:
+            return _hex_to_bgr(self._tier1_color, default=(94, 197, 34))
+        if tier_idx == 2:
+            return _hex_to_bgr(self._tier2_color, default=(246, 130, 59))
+        if tier_idx == 3:
+            return _hex_to_bgr(self._tier3_color, default=(247, 85, 168))
+        if tier_idx == 4:
+            return _hex_to_bgr(self._tier4_color, default=(11, 158, 245))
+        return self._color_bgr
 
-            # text (white) centered in badge
-            tx = bx0 + pad_x
-            ty = by0 + pad_y + th - int(th * 0.05)
-            cv2.putText(canvas, txt, (tx, ty),
-                        cv2.FONT_HERSHEY_DUPLEX, fs,
-                        tuple(int(c * alpha) for c in CLR_WHITE), 2,
-                        lineType=cv2.LINE_AA)
+    def _tier_info(self, tier_idx: int) -> tuple[str, tuple]:
+        labels = {
+            1: self._tier1_label,
+            2: self._tier2_label,
+            3: self._tier3_label,
+            4: self._tier4_label,
+        }
+        return labels.get(tier_idx, self._label), self._resolve_tier_color(tier_idx)
+
+    # ── badge renderer ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _draw_rounded_rect(
+        img: np.ndarray,
+        pt1: tuple,
+        pt2: tuple,
+        color: tuple,
+        radius: int,
+        thickness: int,
+    ) -> None:
+        x1, y1 = pt1
+        x2, y2 = pt2
+        r = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+        if thickness < 0:
+            cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
+            cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
+            for cx, cy in ((x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)):
+                cv2.circle(img, (cx, cy), r, color, -1)
+        else:
+            t = max(1, thickness)
+            cv2.line(img, (x1+r, y1), (x2-r, y1), color, t, cv2.LINE_AA)
+            cv2.line(img, (x1+r, y2), (x2-r, y2), color, t, cv2.LINE_AA)
+            cv2.line(img, (x1, y1+r), (x1, y2-r), color, t, cv2.LINE_AA)
+            cv2.line(img, (x2, y1+r), (x2, y2-r), color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x1+r, y1+r), (r, r), 180, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x2-r, y1+r), (r, r), 270, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x1+r, y2-r), (r, r),  90, 0, 90, color, t, cv2.LINE_AA)
+            cv2.ellipse(img, (x2-r, y2-r), (r, r),   0, 0, 90, color, t, cv2.LINE_AA)
+
+    # ── neon v2 helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lighten_bgr(bgr: tuple, factor: float) -> tuple:
+        """Blend white into BGR to create a lighter/neon highlight."""
+        b, g, r = bgr
+        return (
+            int(min(255, b + (255 - b) * factor)),
+            int(min(255, g + (255 - g) * factor)),
+            int(min(255, r + (255 - r) * factor)),
+        )
+
+    @staticmethod
+    def _draw_rounded_rect_filled(
+        canvas: np.ndarray,
+        rect: tuple,
+        radius: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+    ) -> None:
+        x, y, w, h = rect
+        r = max(1, min(radius, w // 2, h // 2))
+        if alpha >= 0.999:
+            cv2.rectangle(canvas, (x + r, y), (x + w - r, y + h), color_bgr, -1)
+            cv2.rectangle(canvas, (x, y + r), (x + w, y + h - r), color_bgr, -1)
+            for cx_, cy_ in ((x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)):
+                cv2.circle(canvas, (cx_, cy_), r, color_bgr, -1)
+        else:
+            ovl = canvas.copy()
+            cv2.rectangle(ovl, (x + r, y), (x + w - r, y + h), color_bgr, -1)
+            cv2.rectangle(ovl, (x, y + r), (x + w, y + h - r), color_bgr, -1)
+            for cx_, cy_ in ((x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)):
+                cv2.circle(ovl, (cx_, cy_), r, color_bgr, -1)
+            cv2.addWeighted(ovl, alpha, canvas, 1 - alpha, 0, canvas)
+
+    @staticmethod
+    def _draw_rounded_rect_outline(
+        canvas: np.ndarray,
+        rect: tuple,
+        radius: int,
+        color_bgr: tuple,
+        thickness: int,
+        alpha: float = 1.0,
+    ) -> None:
+        x, y, w, h = rect
+        r = max(1, min(radius, w // 2, h // 2))
+        t = max(1, thickness)
+        if alpha < 0.999:
+            ovl = canvas.copy()
+            tgt = ovl
+        else:
+            tgt = canvas
+        cv2.line(tgt, (x+r, y),   (x+w-r, y),   color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x+r, y+h), (x+w-r, y+h), color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x, y+r),   (x, y+h-r),   color_bgr, t, cv2.LINE_AA)
+        cv2.line(tgt, (x+w, y+r), (x+w, y+h-r), color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+r,   y+r),   (r, r), 180, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+w-r, y+r),   (r, r), 270, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+r,   y+h-r), (r, r),  90, 0, 90, color_bgr, t, cv2.LINE_AA)
+        cv2.ellipse(tgt, (x+w-r, y+h-r), (r, r),   0, 0, 90, color_bgr, t, cv2.LINE_AA)
+        if alpha < 0.999:
+            cv2.addWeighted(ovl, alpha, canvas, 1 - alpha, 0, canvas)
+
+    def _auto_text_scale(self, text: str, max_w: int, max_h: int,
+                         ratio: float = 0.5, font=None) -> float:
+        """Height-primary scaling: font fills max_h×ratio, then clamp if width overflows."""
+        if font is None:
+            font = cv2.FONT_HERSHEY_TRIPLEX
+        target_h = max(1, int(max_h * ratio))
+        # Step 1: find scale that makes text_height == target_h (ignore width).
+        lo, hi = 0.1, 20.0
+        for _ in range(24):
+            mid = (lo + hi) / 2.0
+            th_arg = max(1, int(mid * 2))
+            (_, th), _ = cv2.getTextSize(text, font, mid, th_arg)
+            if th < target_h:
+                lo = mid
+            else:
+                hi = mid
+        fs = lo
+        # Step 2: clamp by width only if it overflows.
+        if max_w > 0:
+            th_arg = max(1, int(fs * 2))
+            (tw, _), _ = cv2.getTextSize(text, font, fs, th_arg)
+            if tw > max_w:
+                fs *= (max_w / tw)
+        return max(0.2, fs)
+
+    def _draw_neon_halo(
+        self,
+        canvas: np.ndarray,
+        badge_rect: tuple,
+        color_bgr: tuple,
+        intensity: float,
+    ) -> None:
+        """ROI-based optimized multi-pass neon halo (additive blend)."""
+        if intensity <= 1e-3:
+            return
+        x, y, w, h = badge_rect
+        H, W = canvas.shape[:2]
+        pad = int(min(w, h) * 1.2)
+        rx0 = max(0, x - pad);  ry0 = max(0, y - pad)
+        rx1 = min(W, x + w + pad); ry1 = min(H, y + h + pad)
+        if rx1 <= rx0 or ry1 <= ry0:
+            return
+        rw, rh = rx1 - rx0, ry1 - ry0
+
+        # mask in ROI coords
+        bx, by = x - rx0, y - ry0
+        mask = np.zeros((rh, rw), dtype=np.uint8)
+        cv2.rectangle(mask, (max(0, bx), max(0, by)),
+                      (min(rw, bx + w), min(rh, by + h)), 255, -1)
+
+        # downscale 4× for speed
+        sw, sh = max(1, rw // 4), max(1, rh // 4)
+        small_mask = cv2.resize(mask, (sw, sh))
+        glow_small = np.zeros((sh, sw, 3), dtype=np.float32)
+        col = np.array(color_bgr, dtype=np.float32)
+
+        for blur_r, a_m in [(7, 0.55), (15, 0.40), (29, 0.25), (51, 0.15)]:
+            blur_r = max(3, blur_r | 1)
+            blurred = cv2.GaussianBlur(small_mask, (blur_r, blur_r), 0)
+            a = (blurred.astype(np.float32) / 255.0) * a_m * intensity
+            for c in range(3):
+                glow_small[:, :, c] = np.clip(glow_small[:, :, c] + a * col[c], 0, 255)
+
+        glow = cv2.resize(glow_small.astype(np.uint8), (rw, rh))
+        canvas[ry0:ry1, rx0:rx1] = cv2.add(canvas[ry0:ry1, rx0:rx1], glow)
+
+    @staticmethod
+    def _blit_additive_alpha(
+        canvas: np.ndarray,
+        src: np.ndarray,
+        x0: int,
+        y0: int,
+        alpha: float,
+    ) -> None:
+        """Additive composite: canvas += src * alpha, masked by non-zero pixels."""
+        if alpha <= 1e-4:
+            return
+        H_c, W_c = canvas.shape[:2]
+        h_s, w_s = src.shape[:2]
+        sx0 = max(0, -x0);  sy0 = max(0, -y0)
+        sx1 = w_s - max(0, x0 + w_s - W_c)
+        sy1 = h_s - max(0, y0 + h_s - H_c)
+        dx0 = max(0, x0);   dy0 = max(0, y0)
+        dx1 = min(W_c, x0 + w_s)
+        dy1 = min(H_c, y0 + h_s)
+        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+            return
+        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+        src_s = src[sy0:sy1, sx0:sx1].astype(np.float32) * alpha
+        canvas[dy0:dy1, dx0:dx1] = np.clip(c_roi + src_s, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _blit_opaque(
+        canvas: np.ndarray,
+        src: np.ndarray,
+        x0: int,
+        y0: int,
+        alpha: float,
+    ) -> None:
+        """Opaque paste: where src is non-zero, blend src over canvas (not additive)."""
+        if alpha <= 1e-4:
+            return
+        H_c, W_c = canvas.shape[:2]
+        h_s, w_s = src.shape[:2]
+        sx0 = max(0, -x0);  sy0 = max(0, -y0)
+        sx1 = w_s - max(0, x0 + w_s - W_c)
+        sy1 = h_s - max(0, y0 + h_s - H_c)
+        dx0 = max(0, x0);   dy0 = max(0, y0)
+        dx1 = min(W_c, x0 + w_s)
+        dy1 = min(H_c, y0 + h_s)
+        if dx1 <= dx0 or dy1 <= dy0 or sx1 <= sx0 or sy1 <= sy0:
+            return
+        src_roi = src[sy0:sy1, sx0:sx1]
+        mask = (src_roi.max(axis=2) > 0).astype(np.float32)[:, :, np.newaxis] * alpha
+        c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+        blended = src_roi.astype(np.float32) * mask + c_roi * (1.0 - mask)
+        canvas[dy0:dy1, dx0:dx1] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    def _draw_tier_badge(
+        self,
+        canvas: np.ndarray,
+        text: str,
+        cx: int, cy: int,
+        badge_w: int, badge_h: int,
+        color_bgr: tuple,
+        alpha: float = 1.0,
+        font_scale: float | None = None,
+    ) -> None:
+        """Tier badge: outline frame + inner label, both with neon glow, tilted 15°.
+        No solid background fill — interior stays transparent.
+        Pass `font_scale` to keep text/box ratio consistent with caller.
+        """
+        if alpha <= 1e-4 or badge_w <= 0 or badge_h <= 0:
+            return
+
+        # Buffer with generous room for wide glow halo + rotation.
+        pad = max(50, int(max(badge_w, badge_h) * 1.4))
+        buf_w = badge_w + 2 * pad
+        buf_h = badge_h + 2 * pad
+        rx0, ry0 = pad, pad
+        rcx = pad + badge_w // 2
+        rcy = pad + badge_h // 2
+        rr = 0
+        border_th = max(4, int(round(self._border_thickness * 2)))
+
+        # ── Resolve text metrics ──
+        txt_upper = text.upper()
+        font_b = cv2.FONT_HERSHEY_TRIPLEX
+        if font_scale is not None and font_scale > 0:
+            tfs = float(font_scale)
+        elif self._tier_fs > 0:
+            tfs = float(self._tier_fs)
+        else:
+            tfs = self._auto_text_scale(txt_upper, badge_w, badge_h, ratio=0.50)
+        th_arg = max(2, int(tfs * 3))
+        (tw, th_text), _ = cv2.getTextSize(txt_upper, font_b, tfs, th_arg)
+        tx = rcx - tw // 2
+        ty = rcy + th_text // 2
+
+        # ── 1) GLOW SOURCE: thick OUTLINE + thick text (no interior fill) ──
+        glow_src = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        light_color = self._lighten_bgr(color_bgr, 0.3)
+        # Thick border outline as glow source (NOT filled)
+        glow_border_th = border_th + max(6, int(badge_h * 0.06))
+        self._draw_rounded_rect_outline(
+            glow_src, (rx0, ry0, badge_w, badge_h),
+            rr, light_color, glow_border_th, alpha=1.0,
+        )
+        # Thick text stroke as additional glow source
+        cv2.putText(glow_src, txt_upper, (tx, ty),
+                    font_b, tfs, light_color, th_arg + 8, cv2.LINE_AA)
+
+        # Multi-pass blur: large kernels → wide soft halo fading into dark.
+        glow_norm = max(0.0, min(1.0, self._glow_strength / 100.0))
+        glow_buf = np.zeros_like(glow_src)
+        if glow_norm > 1e-3:
+            for ksize, w in ((151, 0.20), (101, 0.28), (71, 0.32), (41, 0.20)):
+                blurred = cv2.GaussianBlur(glow_src, (ksize | 1, ksize | 1), 0)
+                glow_buf = cv2.addWeighted(glow_buf, 1.0, blurred, w * glow_norm, 0)
+            glow_buf = cv2.GaussianBlur(glow_buf, (41, 41), 0)
+
+        # ── 2) CONTENT: crisp border + 3D text (shadow → black stroke → color fill) ──
+        content_buf = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+        # Border outline
+        if border_th > 0:
+            self._draw_rounded_rect_outline(
+                content_buf, (rx0, ry0, badge_w, badge_h),
+                rr, light_color, border_th, alpha=1.0,
+            )
+        # Drop shadow (black, offset down-right)
+        shadow_off = max(2, int(tfs * 1.8))
+        cv2.putText(content_buf, txt_upper,
+                    (tx + shadow_off, ty + shadow_off),
+                    font_b, tfs, (0, 0, 0), th_arg + 4, cv2.LINE_AA)
+        # Black outline stroke
+        black_stroke = th_arg + max(2, int(tfs * 1.5))
+        cv2.putText(content_buf, txt_upper, (tx, ty),
+                    font_b, tfs, (0, 0, 0), black_stroke, cv2.LINE_AA)
+        # Main colored fill
+        cv2.putText(content_buf, txt_upper, (tx, ty),
+                    font_b, tfs, color_bgr, th_arg, cv2.LINE_AA)
+
+        # ── 3) Build content mask (tracks where content was painted, including black) ──
+        content_mask = np.zeros((buf_h, buf_w), dtype=np.uint8)
+        # Mark text regions (shadow + stroke cover area)
+        cv2.putText(content_mask, txt_upper,
+                    (tx + shadow_off, ty + shadow_off),
+                    font_b, tfs, 255, th_arg + 4, cv2.LINE_AA)
+        cv2.putText(content_mask, txt_upper, (tx, ty),
+                    font_b, tfs, 255, black_stroke, cv2.LINE_AA)
+        # Mark border region
+        if border_th > 0:
+            mask_3ch = np.zeros((buf_h, buf_w, 3), dtype=np.uint8)
+            self._draw_rounded_rect_outline(
+                mask_3ch, (rx0, ry0, badge_w, badge_h),
+                rr, (255, 255, 255), border_th, alpha=1.0,
+            )
+            content_mask = np.maximum(content_mask, mask_3ch[:, :, 0])
+
+        # ── 4) Rotate all buffers 7.5° CCW ──
+        M = cv2.getRotationMatrix2D((buf_w / 2.0, buf_h / 2.0), 7.5, 1.0)
+        rot_glow = cv2.warpAffine(glow_buf, M, (buf_w, buf_h),
+                                  flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        rot_content = cv2.warpAffine(content_buf, M, (buf_w, buf_h),
+                                     flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+        rot_mask = cv2.warpAffine(content_mask, M, (buf_w, buf_h),
+                                  flags=cv2.INTER_LINEAR, borderValue=0)
+
+        # ── 5) Pass 1: Additive blit glow onto canvas (soft neon halo) ──
+        self._blit_additive_alpha(canvas, rot_glow,
+                                  cx - buf_w // 2, cy - buf_h // 2, alpha)
+
+        # ── 6) Pass 2: Opaque paste content where mask > 0 (black stays black) ──
+        ox, oy = cx - buf_w // 2, cy - buf_h // 2
+        H_c, W_c = canvas.shape[:2]
+        sx0 = max(0, -ox);  sy0 = max(0, -oy)
+        sx1 = buf_w - max(0, ox + buf_w - W_c)
+        sy1 = buf_h - max(0, oy + buf_h - H_c)
+        dx0 = max(0, ox);   dy0 = max(0, oy)
+        dx1 = min(W_c, ox + buf_w)
+        dy1 = min(H_c, oy + buf_h)
+        if dx1 > dx0 and dy1 > dy0 and sx1 > sx0 and sy1 > sy0:
+            m_roi = rot_mask[sy0:sy1, sx0:sx1].astype(np.float32) / 255.0 * alpha
+            m_3 = m_roi[:, :, np.newaxis]
+            c_roi = canvas[dy0:dy1, dx0:dx1].astype(np.float32)
+            s_roi = rot_content[sy0:sy1, sx0:sx1].astype(np.float32)
+            canvas[dy0:dy1, dx0:dx1] = np.clip(
+                s_roi * m_3 + c_roi * (1.0 - m_3), 0, 255,
+            ).astype(np.uint8)
+
+    def draw(self, canvas: np.ndarray, cur_frame: int) -> np.ndarray:
+        W, H = self.cam.W, self.cam.H
+
+        # ── combo number + label ─────────────────────────────────────────
+        if self._enabled:
+            show_combo = self.combo > 0
+            fading = False
+            fade_alpha = 1.0
+            if self.combo == 0 and self._break_frame > -999_000:
+                if self._fade_break_sec > 0.0:
+                    elapsed_f = cur_frame - self._break_frame
+                    elapsed_s = elapsed_f / self._fps
+                    if elapsed_s < self._fade_break_sec:
+                        fading = True
+                        fade_alpha = max(0.0, 1.0 - elapsed_s / self._fade_break_sec)
+                        show_combo = True  # draw fading ghost
+
+            if show_combo:
+                display_combo = self._last_combo if fading else self.combo
+                txt_num = f"{display_combo}"
+                tier_idx = self._resolve_tier_index(display_combo)
+
+                bx = int(W * self._box_x)
+                by = int(H * self._box_y)
+                bw = int(W * self._box_w)
+                bh = int(H * self._box_h)
+
+                scale, anim_a = self._anim_scale_alpha(cur_frame)
+                final_alpha = fade_alpha * anim_a
+                dx, dy = self._shake_offset(cur_frame)
+
+                # Vertical layout — pure proportional, drag bbox = scale all parts:
+                #   number zone   : 0%   → 35%   (height 35%)
+                #   gap           : 35%  → 40%   (5%)
+                #   label zone    : 40%  → 45%   (height 5%)
+                #   gap           : 45%  → 57.5% (12.5%)
+                #   tier box zone : 57.5% → 100% (height 42.5%)
+                _num_zone_h   = int(bh * 0.35)
+                _lbl_zone_h   = int(bh * 0.05)
+                _badge_zone_h = int(bh * 0.425)
+                _num_zone_top   = by
+                _lbl_zone_top   = by + int(bh * 0.40)
+                _badge_zone_top = by + int(bh * 0.575)
+                num_max_w = bw - max(4, int(bw * 0.06))
+
+                # ── number — glow (separate source) + shadow + black stroke + white fill ──
+                num_font = self._get_font()
+                if self._number_fs > 0:
+                    num_fs = float(self._number_fs) * scale
+                else:
+                    num_fs = self._auto_text_scale(
+                        txt_num, num_max_w, _num_zone_h, 1.0, font=num_font,
+                    ) * scale
+                num_th = max(1, int(num_fs * 1.5))
+
+                (nw, nth), _ = cv2.getTextSize(txt_num, num_font, num_fs, num_th)
+                num_cx = bx + bw // 2 + dx
+                num_cy_base = _num_zone_top + (_num_zone_h + nth) // 2 + dy
+                num_x0 = num_cx - nw // 2
+
+                # Pass 1: Glow — thick text as source, multi-pass blur, additive
+                glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0)) * final_alpha
+                if glow_norm > 1e-3:
+                    glow_buf = np.zeros_like(canvas)
+                    light_c = self._lighten_bgr(self._color_bgr, 0.3)
+                    cv2.putText(glow_buf, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, light_c, num_th + 8, cv2.LINE_AA)
+                    blurred = np.zeros_like(canvas)
+                    for ksize, w in ((101, 0.22), (61, 0.30), (31, 0.25)):
+                        b = cv2.GaussianBlur(glow_buf, (ksize | 1, ksize | 1), 0)
+                        blurred = cv2.addWeighted(blurred, 1.0, b, w * glow_norm, 0)
+                    blurred = cv2.GaussianBlur(blurred, (21, 21), 0)
+                    canvas[:] = cv2.add(canvas, blurred)
+
+                # Pass 2: Content — shadow → black stroke → colored outline → white fill
+                num_shadow_off = max(2, int(num_fs * 1.8))
+                num_black_stroke = num_th + max(2, int(num_fs * 1.5))
+                num_outline = num_th + max(1, int(num_fs * 0.8))
+
+                if final_alpha >= 0.999:
+                    cv2.putText(canvas, txt_num,
+                                (num_x0 + num_shadow_off, num_cy_base + num_shadow_off),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke + 2, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, self._color_bgr,
+                                num_outline, cv2.LINE_AA)
+                    cv2.putText(canvas, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (255, 255, 255),
+                                num_th, cv2.LINE_AA)
+                else:
+                    ovl_n = canvas.copy()
+                    cv2.putText(ovl_n, txt_num,
+                                (num_x0 + num_shadow_off, num_cy_base + num_shadow_off),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke + 2, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (0, 0, 0),
+                                num_black_stroke, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, self._color_bgr,
+                                num_outline, cv2.LINE_AA)
+                    cv2.putText(ovl_n, txt_num, (num_x0, num_cy_base),
+                                num_font, num_fs, (255, 255, 255),
+                                num_th, cv2.LINE_AA)
+                    cv2.addWeighted(ovl_n, final_alpha, canvas, 1 - final_alpha, 0, canvas)
+
+                # ── label "COMBO" — glow + shadow + black stroke + colored outline + white fill ──
+                lbl_text = self._label.upper()
+                lbl_font = self._get_font()
+                lbl_th = max(1, int(num_fs * 0.3))
+                lbl_cx = bx + bw // 2 + dx
+
+                if self._label_fs > 0:
+                    lbl_fs = float(self._label_fs)
+                else:
+                    lbl_fs = self._auto_text_scale(
+                        lbl_text, int(bw * 0.60), _lbl_zone_h, 0.90, font=lbl_font,
+                    )
+
+                # letter-spacing 1.4×
+                spacing = 1.40
+                char_ws = []
+                for ch in lbl_text:
+                    (cw, _), _ = cv2.getTextSize(ch, lbl_font, lbl_fs, lbl_th)
+                    char_ws.append(cw)
+                total_lbl_w = int(sum(cw * spacing for cw in char_ws))
+                start_x = lbl_cx - total_lbl_w // 2
+                (_, lbl_ch), _ = cv2.getTextSize("A", lbl_font, lbl_fs, lbl_th)
+                lbl_baseline = _lbl_zone_top + (_lbl_zone_h + lbl_ch) // 2 + dy
+
+                # Pass 1: Glow for label (subtle, smaller than number)
+                if glow_norm > 1e-3:
+                    lbl_glow = np.zeros_like(canvas)
+                    light_c = self._lighten_bgr(self._color_bgr, 0.3)
+                    cur_x = start_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(lbl_glow, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, light_c, lbl_th + 6, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    lbl_glow = cv2.GaussianBlur(lbl_glow, (51 | 1, 51 | 1), 0)
+                    lbl_glow = (lbl_glow.astype(np.float32) * glow_norm * 0.6).clip(0, 255).astype(np.uint8)
+                    canvas[:] = cv2.add(canvas, lbl_glow)
+
+                # Pass 2: Content — shadow → black stroke → colored outline → white fill
+                lbl_shadow_off = max(1, int(lbl_fs * 1.8))
+                lbl_black_stroke = lbl_th + max(1, int(lbl_fs * 1.5))
+                lbl_color_stroke = lbl_th + max(1, int(lbl_fs * 0.8))
+
+                def _draw_label_pass(target):
+                    cur_x = start_x
+                    saved_x = cur_x
+                    # 1) shadow
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch,
+                                    (cur_x + lbl_shadow_off, lbl_baseline + lbl_shadow_off),
+                                    lbl_font, lbl_fs, (0, 0, 0),
+                                    lbl_black_stroke + 2, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 2) black stroke
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, (0, 0, 0),
+                                    lbl_black_stroke, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 3) colored outline
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, self._color_bgr,
+                                    lbl_color_stroke, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+                    # 4) white fill
+                    cur_x = saved_x
+                    for ch, cw in zip(lbl_text, char_ws):
+                        cv2.putText(target, ch, (cur_x, lbl_baseline),
+                                    lbl_font, lbl_fs, (255, 255, 255),
+                                    lbl_th, cv2.LINE_AA)
+                        cur_x += int(cw * spacing)
+
+                if final_alpha >= 0.999:
+                    _draw_label_pass(canvas)
+                else:
+                    ovl_l = canvas.copy()
+                    _draw_label_pass(ovl_l)
+                    cv2.addWeighted(ovl_l, final_alpha, canvas, 1 - final_alpha, 0, canvas)
+
+                # ── tier neon badge — fills tier box zone (35% bh × 80% bw) ────
+                if tier_idx > 0:
+                    tier_text, tier_color = self._tier_info(tier_idx)
+                    b_w = max(40, int(bw * 0.85))
+                    b_h = max(20, int(_badge_zone_h * 0.75))
+                    b_cx = bx + bw // 2 + dx
+                    b_cy = _badge_zone_top + _badge_zone_h // 2 + dy
+                    if self._tier_fs > 0:
+                        tier_fs_val = float(self._tier_fs)
+                    else:
+                        tier_fs_val = self._auto_text_scale(
+                            tier_text.upper(), int(b_w * 0.75), b_h, ratio=0.65,
+                        )
+                    self._draw_tier_badge(
+                        canvas, tier_text,
+                        cx=b_cx, cy=b_cy,
+                        badge_w=b_w, badge_h=b_h,
+                        color_bgr=tier_color,
+                        alpha=final_alpha,
+                        font_scale=tier_fs_val,
+                    )
+
         return canvas
 
     def current_mode(self, cur_frame: int) -> str:
-        """Return 'walk' unless recent punch → 'punch_l' / 'punch_r'."""
         return 'walk'
+
+
+class CountdownHUD:
+    """Top-right countdown bound to the currently visible relax obstacle."""
+
+    def __init__(self, cam: PerspectiveCamera, color: str = "#FFFFFF",
+                 max_show_sec: float = 5.0,
+                 box: tuple[float, float, float, float] | None = None,
+                 anim: str = "pop",
+                 border_thickness: float = 2.0,
+                 glow_strength: float = 60.0) -> None:
+        self.cam = cam
+        self._color_bgr = _hex_to_bgr(color, default=(255, 255, 255))
+        self._max_show_sec = float(max_show_sec)
+        self._font = cv2.FONT_HERSHEY_DUPLEX
+        self._anim_mode = self._normalize_anim(anim)
+        self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+        self._last_text: str | None = None
+        self._prev_text: str | None = None
+        self._last_change_frame: int = -10_000_000
+        self._audio_events: list[tuple[float, bool]] = []
+        if box is None:
+            box = (0.88, 0.04, 0.10, 0.16)  # top-right default
+        self.set_box(*box)
+
+    @staticmethod
+    def _normalize_anim(value: object) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        if raw in {"flash"}:
+            return "flash"
+        if raw in {"fade", "fade_cross", "crossfade", "cross_fade"}:
+            return "fade_cross"
+        if raw in {"shake", "jitter"}:
+            return "shake"
+        return "pop"
+
+    def set_animation(self, mode: str) -> None:
+        self._anim_mode = self._normalize_anim(mode)
+
+    def pop_audio_events(self) -> list[tuple[float, bool]]:
+        """Return and clear queued (time_sec, is_last_count) events."""
+        out = list(self._audio_events)
+        self._audio_events.clear()
+        return out
+
+    def set_box(self, x: float, y: float, w: float, h: float) -> None:
+        x = max(0.0, min(0.98, float(x)))
+        y = max(0.0, min(0.98, float(y)))
+        w = max(0.02, min(1.0 - x, float(w)))
+        h = max(0.02, min(1.0 - y, float(h)))
+        self._box_x = x
+        self._box_y = y
+        self._box_w = w
+        self._box_h = h
+
+    def set_style(
+        self,
+        *,
+        border_thickness: float | None = None,
+        glow_strength: float | None = None,
+    ) -> None:
+        """Hot-update countdown style without resetting HUD state."""
+        if border_thickness is not None:
+            self._border_thickness = max(0.0, min(10.0, float(border_thickness)))
+        if glow_strength is not None:
+            self._glow_strength = max(0.0, min(100.0, float(glow_strength)))
+
+    def _draw_glow_text(
+        self,
+        canvas: np.ndarray,
+        *,
+        text: str,
+        x: int,
+        y: int,
+        font_scale: float,
+        thickness: int,
+        alpha: float = 1.0,
+        glow_boost: float = 1.0,
+    ) -> None:
+        if alpha <= 1e-4:
+            return
+        alpha = float(max(0.0, min(1.0, alpha)))
+        glow_boost = float(max(0.2, glow_boost))
+
+        glow_norm = max(0.0, min(1.0, float(self._glow_strength) / 100.0))
+        if glow_norm > 1e-4:
+            glow = np.zeros_like(canvas)
+            for thick_off, base_weight in ((10, 0.10), (6, 0.18), (3, 0.28)):
+                layer = np.zeros_like(canvas)
+                cv2.putText(
+                    layer,
+                    text,
+                    (x, y),
+                    self._font,
+                    font_scale,
+                    self._color_bgr,
+                    max(1, int(thickness + thick_off)),
+                    cv2.LINE_AA,
+                )
+                weight = float(base_weight * glow_boost * glow_norm)
+                glow = cv2.addWeighted(glow, 1.0, layer, weight, 0.0)
+            sigma = max(0.5, 4.0 * glow_norm)
+            glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=sigma, sigmaY=sigma)
+            final_blend = 0.95 * alpha * glow_norm
+            canvas[:] = cv2.addWeighted(canvas, 1.0, glow, final_blend, 0.0)
+
+        crisp = np.zeros_like(canvas)
+        border_off = max(0, int(round(float(self._border_thickness))))
+        if border_off > 0:
+            cv2.putText(
+                crisp, text, (x, y), self._font, font_scale,
+                self._color_bgr, max(1, thickness + border_off), cv2.LINE_AA
+            )
+        cv2.putText(
+            crisp, text, (x, y), self._font, font_scale,
+            (255, 255, 255), max(1, thickness), cv2.LINE_AA
+        )
+        canvas[:] = cv2.addWeighted(canvas, 1.0, crisp, alpha, 0.0)
+
+    def draw(self, canvas: np.ndarray, targets: list, cur_frame: int, fps: float) -> None:
+        active_t = None
+        for t in targets:
+            if not isinstance(t, RelaxTarget):
+                continue
+            # Countdown is per-block life cycle: show only while this
+            # block is actually in-flight on screen (spawned and not yet
+            # removed). Do not show pre-spawn future targets.
+            if t.spawn_frame > cur_frame:
+                continue
+            if t.is_dead(cur_frame):
+                continue
+            if active_t is None or t.hit_frame < active_t.hit_frame:
+                active_t = t
+        if active_t is None:
+            return
+
+        # Countdown now represents the per-block WAIT window before
+        # movement starts.
+        move_start = int(active_t.move_start_frame)
+        if cur_frame >= move_start:
+            return
+        time_left = (move_start - cur_frame) / max(1.0, float(fps))
+        if time_left < 0.0:
+            return
+        text = str(max(0, int(np.ceil(time_left))))
+        if self._last_text != text:
+            self._prev_text = self._last_text
+            self._last_text = text
+            self._last_change_frame = int(cur_frame)
+            self._audio_events.append(
+                (float(cur_frame) / max(1.0, float(fps)), text == "1")
+            )
+        H, W = canvas.shape[:2]
+        bx = int(round(self._box_x * W))
+        by = int(round(self._box_y * H))
+        bw = max(1, int(round(self._box_w * W)))
+        bh = max(1, int(round(self._box_h * H)))
+        bx = max(0, min(W - 1, bx))
+        by = max(0, min(H - 1, by))
+        bw = min(bw, W - bx)
+        bh = min(bh, H - by)
+        if bw <= 1 or bh <= 1:
+            return
+
+        # Fit base font size tightly to the user box.
+        t_ref = max(1, int(round(2.0)))
+        (tw_ref, th_ref), _ = cv2.getTextSize(text, self._font, 1.0, t_ref)
+        target_w = max(1, int(bw * 0.995))
+        target_h = max(1, int(bh * 0.995))
+        scale_w = target_w / max(1.0, float(tw_ref))
+        scale_h = target_h / max(1.0, float(th_ref))
+        base_scale = max(0.20, min(scale_w, scale_h))
+        base_thickness = max(1, int(round(base_scale * 2.0)))
+
+        dt_sec = max(0.0, (float(cur_frame) - float(self._last_change_frame)) / max(1.0, float(fps)))
+        anim_progress = min(1.0, dt_sec / 0.16)
+
+        def _fit(scale_mul: float = 1.0) -> tuple[float, int, int, int, int, int]:
+            fs = max(0.12, base_scale * float(scale_mul))
+            thick = max(1, int(round(fs * 2.0)))
+            (tw, th), _ = cv2.getTextSize(text, self._font, fs, thick)
+            while (tw > target_w or th > target_h) and fs > 0.12:
+                fs *= 0.97
+                thick = max(1, int(round(fs * 2.0)))
+                (tw, th), _ = cv2.getTextSize(text, self._font, fs, thick)
+            tx = bx + (bw - tw) // 2
+            ty = by + (bh + th) // 2
+            return fs, thick, tw, th, tx, ty
+
+        if self._anim_mode == "flash":
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            boost = 1.0 + (1.35 * (1.0 - anim_progress))
+            self._draw_glow_text(
+                canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+                alpha=1.0, glow_boost=boost,
+            )
+            return
+
+        if self._anim_mode == "fade_cross" and self._prev_text is not None:
+            cur_a = max(0.0, min(1.0, anim_progress))
+            prev_a = max(0.0, 1.0 - cur_a)
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            if prev_a > 1e-4:
+                self._draw_glow_text(
+                    canvas,
+                    text=self._prev_text,
+                    x=x,
+                    y=y,
+                    font_scale=fs,
+                    thickness=thick,
+                    alpha=prev_a,
+                    glow_boost=1.0,
+                )
+            self._draw_glow_text(
+                canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+                alpha=cur_a, glow_boost=1.0,
+            )
+            if anim_progress >= 1.0:
+                self._prev_text = None
+            return
+
+        if self._anim_mode == "shake":
+            fs, thick, _tw, _th, x, y = _fit(1.0)
+            amp = 6.0 * (1.0 - anim_progress)
+            dx = int(round(math.sin(float(cur_frame) * 1.7) * amp * 0.45))
+            dy = int(round(math.sin(float(cur_frame) * 2.8) * amp))
+            self._draw_glow_text(
+                canvas, text=text, x=x + dx, y=y + dy, font_scale=fs, thickness=thick,
+                alpha=1.0, glow_boost=1.0,
+            )
+            return
+
+        # Default "pop" effect: overshoot scale then settle.
+        scale_mul = 1.0 + (0.25 * (1.0 - anim_progress))
+        fs, thick, _tw, _th, x, y = _fit(scale_mul)
+        self._draw_glow_text(
+            canvas, text=text, x=x, y=y, font_scale=fs, thickness=thick,
+            alpha=1.0, glow_boost=1.0,
+        )
 
 
 # ── GameManager ──────────────────────────────────────────────────────────────
@@ -3524,6 +6396,8 @@ class GameManager:
                       f"base_hold={line_hold_frames}f")
                 beat_frames = chain_starts
 
+        relax_wait_f = max(0, int(getattr(self, "RELAX_WAIT_FRAMES", 0)))
+
         def _spawn_target(m: str, spawn_f: int, bf: int, lane: int,
                           is_left: bool,
                           line_block_hits: list[int] | None = None,
@@ -3547,10 +6421,43 @@ class GameManager:
                 # and HIGH (floating bar → duck).  `relax_kind` lets the
                 # caller override to force one or the other (e.g. for
                 # testing).
-                if relax_kind not in ('low', 'high'):
-                    relax_kind = ('high' if self.rng.random() < 0.5
-                                  else 'low')
-                return RelaxTarget(spawn_f, bf, kind=relax_kind)
+                enabled_kinds = list(getattr(
+                    self, "RELAX_ENABLED_KINDS", ("low", "high", "middle")
+                ))
+                enabled_kinds = [k for k in enabled_kinds if k in ("low", "high", "middle")]
+                if not enabled_kinds:
+                    enabled_kinds = ["low", "high", "middle"]
+                if relax_kind not in enabled_kinds:
+                    if len(enabled_kinds) == 1:
+                        relax_kind = enabled_kinds[0]
+                    elif "middle" in enabled_kinds:
+                        ratio_mid = float(getattr(self, "RELAX_KIND_RATIO_MIDDLE", 0.33))
+                        ratio_mid = max(0.0, min(1.0, ratio_mid))
+                        other = [k for k in enabled_kinds if k != "middle"]
+                        if not other:
+                            relax_kind = "middle"
+                        else:
+                            r = self.rng.random()
+                            if r < ratio_mid:
+                                relax_kind = "middle"
+                            else:
+                                relax_kind = str(self.rng.choice(other))
+                    else:
+                        relax_kind = str(self.rng.choice(enabled_kinds))
+                target = RelaxTarget(
+                    spawn_f, bf, kind=relax_kind, wait_frames=relax_wait_f
+                )
+                tex_attr = f"RELAX_TEXTURE_{str(relax_kind).upper()}"
+                target.texture_path = getattr(self, tex_attr, None)
+                if relax_kind == 'middle':
+                    target.hole_mask_path = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+                    target.gate_rail_offset_x = float(
+                        getattr(self, "GATE_RAIL_OFFSET_X", 0.08)
+                    )
+                    target.gate_height = float(
+                        getattr(self, "GATE_HEIGHT", 0.14)
+                    )
+                return target
             return PunchTarget(spawn_f, bf, lane, is_left)
 
         def _target_cls_for(m: str):
@@ -3751,7 +6658,12 @@ class GameManager:
                 if beat_source != 'array' and bf < relax_busy_until:
                     skipped_stacked += 1
                     continue
-                t = _spawn_target('relax', spawn_f, bf, 0, False)
+                # Relax semantics: beat-frame is the APPEAR time at horizon.
+                # Target then waits `relax_wait_f`, and only after that starts
+                # moving for `travel` frames until hit.
+                relax_spawn_f = int(bf)
+                relax_hit_f = int(bf) + relax_wait_f + self.travel
+                t = _spawn_target('relax', relax_spawn_f, relax_hit_f, 0, False)
                 self.targets.append(t)
                 # Stream obstacles continuously: while one slab is
                 # front-and-centre, the NEXT should already be gliding
@@ -4039,6 +6951,11 @@ class RhythmVisualizer:
         # -- scene toggles --
         self.SHOW_FLOOR_PANELS: bool = True   # receding grey tile rows
         self.SHOW_STICKMAN:     bool = True   # left-column punching fighter
+        # -- segment background (drawn behind all scene elements) --
+        self.BACKGROUND_TYPE:   str = "solid"     # solid | image | video
+        self.BACKGROUND_COLOR:  str = "#000000"
+        self.BACKGROUND_IMAGE:  str | None = None
+        self.BACKGROUND_VIDEO:  str | None = None
         # -- stickman draw-box override (top-left corner + size, in PIXELS).
         #    Any value < 0 means "use the StickmanHUD default for that
         #    component" (left-column HUD: x=W*1%, y=H*9%, w=W*13.5%,
@@ -4053,7 +6970,8 @@ class RhythmVisualizer:
         # -- color overrides (None = use built-in defaults) --
         self.CUBE_COLOR_LEFT:   tuple | None = None
         self.CUBE_COLOR_RIGHT:  tuple | None = None
-        self.PANEL_NEON_COLOR:  tuple | None = None   # viewport 4-tile neon
+        self.PANEL_NEON_COLOR:   tuple | None = None   # viewport 4-tile neon
+        self.VIEWPORT_PANEL_DEPTH: float | None = None  # override panel depth
         # -- event export (for rendering a matched stickman-only video) --
         self.EXPORT_EVENTS:     str | None = None
         # -- detection-only mode: when True, run audio analysis + scheduler
@@ -4115,6 +7033,67 @@ class RhythmVisualizer:
         #                 audio beats so inter-mode alternation stays
         #                 coherent.
         self.RELAX_INTERVAL:    float = 0.0
+        self.RELAX_TRAVEL_SEC:  float = 0.0
+        self.RELAX_WAIT_SEC:    float = 0.0
+        self.RELAX_TEXTURE_LOW: str | None = None
+        self.RELAX_TEXTURE_HIGH: str | None = None
+        self.RELAX_TEXTURE_MIDDLE: str | None = None
+        self.RELAX_HOLE_MASK_PATH: str | None = None
+        self.RELAX_KIND_RATIO_MIDDLE: float = 0.33
+        self.RELAX_SHOW_LOW: bool = True
+        self.RELAX_SHOW_HIGH: bool = True
+        self.RELAX_SHOW_MIDDLE: bool = True
+        self.RELAX_COUNTDOWN_ENABLED: bool = True
+        self.RELAX_COUNTDOWN_COLOR: str = "#FFFFFF"
+        self.RELAX_COUNTDOWN_MAX_SEC: float = 5.0
+        self.RELAX_COUNTDOWN_ANIM: str = "pop"
+        self.RELAX_COUNTDOWN_AUDIO_ENABLED: bool = False
+        self.RELAX_COUNTDOWN_AUDIO_MODE: str = "default"
+        self.RELAX_COUNTDOWN_AUDIO_FILE: str | None = None
+        self.RELAX_COUNTDOWN_AUDIO_VOLUME: float = 0.65
+        self.RELAX_COUNTDOWN_AUDIO_LAST_MODE: str = "default"
+        self.RELAX_COUNTDOWN_AUDIO_LAST_FILE: str | None = None
+        self.RELAX_COUNTDOWN_X: float = 0.88
+        self.RELAX_COUNTDOWN_Y: float = 0.04
+        self.RELAX_COUNTDOWN_W: float = 0.10
+        self.RELAX_COUNTDOWN_H: float = 0.16
+        self.RELAX_COUNTDOWN_BORDER_THICKNESS: float = 2.0
+        self.RELAX_COUNTDOWN_GLOW_STRENGTH: float = 60.0
+        self.START_GATE_ENABLED: bool = False
+        self.START_GATE_TYPE: str = "color"
+        self.START_GATE_COLOR: str = "#1a1a1a"
+        self.START_GATE_BORDER_COLOR: str = "#ffffff"
+        self.START_GATE_BORDER_THICKNESS: float = 0.0
+        self.START_GATE_IMAGE: str | None = None
+        self.START_GATE_VIDEO: str | None = None
+        self.START_GATE_X: float = 0.30
+        self.START_GATE_Y: float = 0.18
+        self.START_GATE_W: float = 0.40
+        self.START_GATE_H: float = 0.14
+        self._countdown_audio_events: list[tuple[float, bool]] = []
+        # ── Camera perspective overrides ────────────────────────────────
+        self.FLOOR_HIT_FRAC:    float | None = None
+        self.HORIZON_FRAC:      float | None = None
+        self.FLOOR_SPREAD_FRAC: float | None = None
+        self.FAR_SPREAD_FRAC:   float | None = None   # independent far-end spread
+        # ── Side rails ─────────────────────────────────────────────────
+        self.SHOW_SIDE_RAILS:      bool  = False
+        self.RAIL_COLOR:           str   = '#FF60FF'
+        self.RAIL_SHAPE:           str   = 'chunky'
+        self.RAIL_HEIGHT:          float = 0.14
+        self.RAIL_OFFSET_X:        float = 0.08
+        self.RAIL_IMAGE:           str | None = None
+        self.RAIL_PULSE:           str   = 'beat'
+        self.RAIL_PULSE_INTENSITY: float = 0.6
+        self.RAIL_PILLAR_COUNT:    int = 16
+        self.RAIL_PILLAR_RADIUS:   float = 1.0
+        self.RAIL_CHASE_MODE:      str = "time"
+        self.RAIL_CHASE_SPEED_FRAMES: int = 4
+        self.RAIL_DOT_COUNT:       int = 24
+        self.RAIL_DOT_SIZE_PX:     int = 6
+        self.RAIL_DOT_ANIM_MODE:   str = "audio"
+        self.RAIL_DOT_COLOR_NEAR:  str = "#FF60FF"
+        self.RAIL_DOT_COLOR_FAR:   str = "#00FFFF"
 
     # -------------------------------------------------------------------
     def process_video(self, audio_file: str) -> str | None:
@@ -4451,9 +7430,20 @@ class RhythmVisualizer:
         # smaller air cubes, so lanes shouldn't fan out as far.
         n_lanes_mode = N_LANES_DANCE if mode == 'dance' else N_LANES
         floor_spread = _FLOOR_SPREAD_BY_MODE.get(mode, 0.50)
-        cam       = PerspectiveCamera(self.WIDTH, self.HEIGHT,
-                                      n_lanes=n_lanes_mode,
-                                      floor_spread_frac=floor_spread)
+        # Apply per-segment camera overrides (from drag-adjust UI)
+        cam_kwargs: dict = dict(n_lanes=n_lanes_mode,
+                                floor_spread_frac=floor_spread)
+        if self.FLOOR_HIT_FRAC is not None:
+            cam_kwargs["hit_zone_frac"] = float(self.FLOOR_HIT_FRAC)
+        if self.HORIZON_FRAC is not None:
+            cam_kwargs["horizon_frac"] = float(self.HORIZON_FRAC)
+        if self.FLOOR_SPREAD_FRAC is not None:
+            cam_kwargs["floor_spread_frac"] = float(self.FLOOR_SPREAD_FRAC)
+        if self.FAR_SPREAD_FRAC is not None:
+            cam_kwargs["far_spread_frac"] = float(self.FAR_SPREAD_FRAC)
+        if getattr(self, "WALL_FLOOR_GAP_FRAC", None) is not None:
+            cam_kwargs["wall_floor_gap_frac"] = float(self.WALL_FLOOR_GAP_FRAC)
+        cam       = PerspectiveCamera(self.WIDTH, self.HEIGHT, **cam_kwargs)
         # Apply color overrides to all targets.
         Target.COLOR_LEFT  = self.CUBE_COLOR_LEFT
         Target.COLOR_RIGHT = self.CUBE_COLOR_RIGHT
@@ -4462,7 +7452,72 @@ class RhythmVisualizer:
         # tiles should also be drawn 1-per-lane (matches the 4 viewport
         # panels below them and the 4 rails targets fly along).
         tunnel    = TunnelRenderer(cam, show_floor_panels=self.SHOW_FLOOR_PANELS,
-                                   lane_tiles=True)
+                                   lane_tiles=True,
+                                   floor_panel_color=getattr(self, "FLOOR_PANEL_COLOR", None),
+                                   floor_panel_opacity=float(getattr(self, "FLOOR_PANEL_OPACITY", 1.0)),
+                                   floor_panel_blink=getattr(self, "FLOOR_PANEL_BLINK", False),
+                                   floor_panel_image=getattr(self, "FLOOR_PANEL_IMAGE", None),
+                                   floor_full_static_image=bool(getattr(self, "FLOOR_FULL_STATIC_IMAGE", False)),
+                                   floor_layout=getattr(self, "FLOOR_LAYOUT", "auto"),
+                                   floor_bg_color=getattr(self, "FLOOR_BG_COLOR", None),
+                                   floor_bg_opacity=float(getattr(self, "FLOOR_BG_OPACITY", 1.0)),
+                                   chevron_color=getattr(self, "CHEVRON_COLOR", "#FFD700"),
+                                   chevron_scroll=bool(getattr(self, "CHEVRON_SCROLL", True)),
+                                   chevron_blink=bool(getattr(self, "CHEVRON_BLINK", False)),
+                                   chevron_width_frac=float(getattr(self, "CHEVRON_WIDTH_FRAC", 0.45)),
+                                   chevron_count=int(getattr(self, "CHEVRON_COUNT", 6)))
+        side_rail: SideRailRenderer | None = None
+        if self.SHOW_SIDE_RAILS:
+            side_rail = SideRailRenderer(
+                cam,
+                color=self.RAIL_COLOR,
+                shape=self.RAIL_SHAPE,
+                height=self.RAIL_HEIGHT,
+                offset_x=self.RAIL_OFFSET_X,
+                image_path=self.RAIL_IMAGE,
+                texture_non_loop=bool(getattr(self, "RAIL_TEXTURE_NON_LOOP", False)),
+                pulse=self.RAIL_PULSE,
+                pulse_intensity=self.RAIL_PULSE_INTENSITY,
+                chevron_depth=getattr(self, "RAIL_CHEVRON_DEPTH", 1.0),
+                chevron_density=getattr(self, "RAIL_CHEVRON_DENSITY", 6),
+                pillar_count=getattr(self, "RAIL_PILLAR_COUNT", 16),
+                pillar_highlight_count=getattr(self, "RAIL_PILLAR_HIGHLIGHT_COUNT", 1),
+                pillar_radius=getattr(self, "RAIL_PILLAR_RADIUS", 1.0),
+                chase_mode=getattr(self, "RAIL_CHASE_MODE", "time"),
+                chase_speed_frames=getattr(self, "RAIL_CHASE_SPEED_FRAMES", 4),
+                dot_count=getattr(self, "RAIL_DOT_COUNT", 24),
+                dot_lines=getattr(self, "RAIL_DOT_LINES", 1),
+                dot_size_px=getattr(self, "RAIL_DOT_SIZE_PX", 6),
+                dot_anim_mode=getattr(self, "RAIL_DOT_ANIM_MODE", "audio"),
+                dot_color_near=getattr(self, "RAIL_DOT_COLOR_NEAR", "#FF60FF"),
+                dot_color_far=getattr(self, "RAIL_DOT_COLOR_FAR", "#00FFFF"),
+            )
+        bg_layer = SegmentBackgroundLayer(
+            self.WIDTH,
+            self.HEIGHT,
+            bg_type=str(getattr(self, "BACKGROUND_TYPE", "solid")),
+            color=str(getattr(self, "BACKGROUND_COLOR", "#000000")),
+            image_path=getattr(self, "BACKGROUND_IMAGE", None),
+            video_path=getattr(self, "BACKGROUND_VIDEO", None),
+            fps=float(self.FPS),
+        )
+        start_gate = None
+        if bool(getattr(self, "START_GATE_ENABLED", False)):
+            start_gate = StartGate(
+                cam=cam,
+                view_w=self.WIDTH,
+                view_h=self.HEIGHT,
+                gate_type=str(getattr(self, "START_GATE_TYPE", "color")),
+                color=str(getattr(self, "START_GATE_COLOR", "#1a1a1a")),
+                border_color=str(getattr(self, "START_GATE_BORDER_COLOR", "#ffffff")),
+                border_thickness=float(getattr(self, "START_GATE_BORDER_THICKNESS", 0.0)),
+                image_path=getattr(self, "START_GATE_IMAGE", None),
+                video_path=getattr(self, "START_GATE_VIDEO", None),
+                rail_height=float(getattr(self, "RAIL_HEIGHT", 0.14)),
+                rail_offset_x=float(getattr(self, "RAIL_OFFSET_X", 0.08)),
+                gate_height=float(getattr(self, "START_GATE_H", 0.14)),
+                fps=float(self.FPS),
+            )
         particles = ParticleSystem()
         # Stickman action pick: combo if 2+ modes, else match the single
         # mode's action library.  Solo 'line' uses its own 'line' action
@@ -4503,9 +7558,63 @@ class RhythmVisualizer:
                                 box=_stick_box)
         else:
             stick = None
-        combo     = ComboHUD(cam)
+        combo = ComboHUD(
+            cam,
+            enabled=bool(getattr(self, "COMBO_ENABLED", True)),
+            color=str(getattr(self, "COMBO_COLOR", "#FFFFFF")),
+            label=str(getattr(self, "COMBO_LABEL", "COMBO")),
+            font_family=str(getattr(self, "COMBO_FONT_FAMILY", "duplex")),
+            fade_after_break_sec=float(getattr(self, "COMBO_FADE_AFTER_BREAK_SEC", 0.5)),
+            anim=str(getattr(self, "COMBO_ANIM", "pop")),
+            bbox=(
+                float(getattr(self, "COMBO_X", 0.85)),
+                float(getattr(self, "COMBO_Y", 0.08)),
+                float(getattr(self, "COMBO_W", 0.13)),
+                float(getattr(self, "COMBO_H", 0.18)),
+            ),
+            border_thickness=float(getattr(self, "COMBO_BORDER_THICKNESS", 2.0)),
+            glow_strength=float(getattr(self, "COMBO_GLOW_STRENGTH", 30.0)),
+            tier1_threshold=int(getattr(self, "COMBO_TIER1_THRESHOLD", 30)),
+            tier1_label=str(getattr(self, "COMBO_TIER1_LABEL", "Great")),
+            tier2_threshold=int(getattr(self, "COMBO_TIER2_THRESHOLD", 60)),
+            tier2_label=str(getattr(self, "COMBO_TIER2_LABEL", "Superb")),
+            tier3_threshold=int(getattr(self, "COMBO_TIER3_THRESHOLD", 90)),
+            tier3_label=str(getattr(self, "COMBO_TIER3_LABEL", "Perfect")),
+            tier4_threshold=int(getattr(self, "COMBO_TIER4_THRESHOLD", 120)),
+            tier4_label=str(getattr(self, "COMBO_TIER4_LABEL", "Godlike")),
+            tier1_color=str(getattr(self, "COMBO_TIER1_COLOR", "#22c55e")),
+            tier2_color=str(getattr(self, "COMBO_TIER2_COLOR", "#3b82f6")),
+            tier3_color=str(getattr(self, "COMBO_TIER3_COLOR", "#a855f7")),
+            tier4_color=str(getattr(self, "COMBO_TIER4_COLOR", "#f59e0b")),
+            number_font_scale=float(getattr(self, "COMBO_NUMBER_FONT_SCALE", 0.0)),
+            label_font_scale=float(getattr(self, "COMBO_LABEL_FONT_SCALE", 0.0)),
+            tier_font_scale=float(getattr(self, "COMBO_TIER_FONT_SCALE", 0.0)),
+            fps=float(getattr(self, "FPS", 30.0)),
+        )
+        countdown_hud = None
+        countdown_audio_events: list[tuple[float, bool]] = []
+        if bool(getattr(self, "RELAX_COUNTDOWN_ENABLED", True)):
+            countdown_hud = CountdownHUD(
+                cam,
+                color=str(getattr(self, "RELAX_COUNTDOWN_COLOR", "#FFFFFF")),
+                max_show_sec=float(getattr(self, "RELAX_COUNTDOWN_MAX_SEC", 5.0)),
+                anim=str(getattr(self, "RELAX_COUNTDOWN_ANIM", "pop")),
+                box=(
+                    float(getattr(self, "RELAX_COUNTDOWN_X", 0.88)),
+                    float(getattr(self, "RELAX_COUNTDOWN_Y", 0.04)),
+                    float(getattr(self, "RELAX_COUNTDOWN_W", 0.10)),
+                    float(getattr(self, "RELAX_COUNTDOWN_H", 0.16)),
+                ),
+                border_thickness=float(
+                    getattr(self, "RELAX_COUNTDOWN_BORDER_THICKNESS", 2.0)
+                ),
+                glow_strength=float(
+                    getattr(self, "RELAX_COUNTDOWN_GLOW_STRENGTH", 60.0)
+                ),
+            )
         viewport  = ViewportFrame(cam, neon_color=self.PANEL_NEON_COLOR,
-                                  mode=mode)
+                                  mode=mode,
+                                  panel_depth=self.VIEWPORT_PANEL_DEPTH)
         # ── auto-adjust TRAVEL so blocks flow smoothly ──────────────
         # Base auto-travel = one full L↔R cycle = 2 × beat_period, so a new
         # block enters the lane right as the previous one pops.
@@ -4558,6 +7667,10 @@ class RhythmVisualizer:
             travel = max(8, int(round(self.TRAVEL_FRAMES * _relax_slow_mult)))
             print(f"[travel:manual] user travel={self.TRAVEL_FRAMES}f "
                   f"× relax_slow {_relax_slow_mult:.1f} = {travel}f")
+        if solo_relax and float(getattr(self, "RELAX_TRAVEL_SEC", 0.0)) > 0.0:
+            travel = max(8, int(round(float(self.RELAX_TRAVEL_SEC) * float(self.FPS))))
+            print(f"[relax-travel] override travel={self.RELAX_TRAVEL_SEC:.2f}s "
+                  f"({travel}f)")
 
         game = GameManager(cam, travel=travel)
 
@@ -4593,17 +7706,17 @@ class RhythmVisualizer:
         #     next_spawn = prev_die + delay*FPS
         #
         # prev_die is derived analytically from RelaxTarget.is_dead
-        # (`hit + travel·1.2/v2`).  Since every block has its
-        # spawn_frame = hit_frame − travel, the inter-hit step is:
+        # (`hit + travel·1.2/v2`).  With the current semantics, each
+        # beat marks SPAWN-at-horizon time, then the block waits
+        # `relax_wait_f`, then moves for `travel` frames until hit.
+        # So the spawn-to-spawn step is:
         #
-        #     step_f = travel + exit_pad + 1 + delay_f
-        #            = (travel to fly in) + (travel past camera) +
+        #     step_f = wait + travel + exit_pad + 1 + delay_f
+        #            = (wait before movement) + (travel to fly in) +
+        #              (travel past camera) +
         #              (requested idle delay)
-        #
-        # The very first block's hit is pinned at `travel` so it
-        # glides in cleanly from the horizon at t=0 instead of popping
-        # into the camera plane.
         solo_relax = (len(modes_seq) == 1 and modes_seq[0] == 'relax')
+        relax_wait_f = max(0, int(round(float(self.RELAX_WAIT_SEC) * self.FPS)))
         if solo_relax and self.RELAX_INTERVAL > 0.0:
             # Derive exit_pad from the RelaxTarget motion profile so
             # the schedule stays correct even if the phase parameters
@@ -4613,63 +7726,57 @@ class RhythmVisualizer:
             v2       = z_split / max(1e-6, 1.0 - T_split)
             exit_pad = int(round(travel * 1.2 / v2))
             delay_f  = max(0, int(round(self.RELAX_INTERVAL * self.FPS)))
-            step_f   = max(1, travel + exit_pad + 1 + delay_f)
-            first_f  = travel
+            step_f   = max(1, travel + relax_wait_f + exit_pad + 1 + delay_f)
+            first_f  = 0
             beat_frames = list(range(first_f, total_frames, step_f))
             print(f"[relax-timer] fixed-delay cadence: "
                   f"delay={self.RELAX_INTERVAL:.2f}s ({delay_f}f) "
                   f"after disappearance  "
-                  f"(travel={travel}f + exit_pad={exit_pad}f "
-                  f"+ delay={delay_f}f → step={step_f}f)  "
+                  f"(wait={relax_wait_f}f + travel={travel}f "
+                  f"+ exit_pad={exit_pad}f + delay={delay_f}f "
+                  f"→ step={step_f}f)  "
                   f"→ {len(beat_frames)} obstacles "
                   f"(first @ frame {first_f} / {first_f/self.FPS:.2f}s)")
         elif solo_relax and self.BEAT_SOURCE == 'array':
-            # Editor preview (``src/live_renderer.py``) feeds the user's
-            # beat array into ``pre_schedule`` unchanged — so each tick
-            # marks the HIT frame (the moment the slab arrives at the
-            # camera plane and the player must be dodging).  Match that
-            # interpretation here so the final MP4 plays back the exact
-            # cadence the user judged in the timeline editor: tick at
-            # t = 5 s ⇒ slab hits the camera at t = 5 s in BOTH paths.
-            #
-            # An earlier revision added ``+travel`` to every user entry
-            # (interpreting beats as SPAWN times instead).  That made
-            # every rendered dodge land ``travel`` frames late vs. the
-            # preview the user signed off on, which is exactly the
-            # "preview đúng nhưng render sai" desync this branch fixes.
-            # ``pre_schedule`` downstream still derives
-            # ``spawn_frame = hit_frame − travel`` so the slab visibly
-            # appears ``travel`` frames before its hit, identical to
-            # the preview.
+            # Array ticks are interpreted as SPAWN times for relax.
             n_before = len(beat_frames)
             beat_frames = [int(bf) for bf in beat_frames
                            if 0 <= int(bf) < total_frames]
             n_clipped = n_before - len(beat_frames)
             print(f"[relax-array] interpreting {n_before} array "
-                  f"beat(s) as obstacle HIT times "
-                  f"(spawn_frame = hit − travel={travel}f, "
+                  f"beat(s) as obstacle SPAWN times "
+                  f"(hit_frame = spawn + wait={relax_wait_f}f + travel={travel}f, "
                   f"matching preview).  {len(beat_frames)} block(s) "
                   f"fit within audio ({total_frames}f); dropped "
                   f"{n_clipped} that fell outside the song.")
         elif solo_relax:
-            # Music-driven solo-relax: drop any beat whose spawn would
-            # fall before frame 0.  Without this, early-song beats
-            # (bf < travel) materialise "already mid-flight" at frame
-            # 0 — the block appears close to the camera and zooms in
-            # aggressively, reading as a sudden fast pop-in instead of
-            # the slow horizon-to-camera glide this mode is meant to
-            # show.  We only apply it to relax because combo / punch
-            # modes intentionally accept mid-flight spawns so the song
-            # can start on-beat.
+            # Music-driven solo-relax: beat ticks are spawn times, so no
+            # early-spawn clipping is needed beyond non-negative frames.
             n_before = len(beat_frames)
-            beat_frames = [int(bf) for bf in beat_frames if bf >= travel]
+            beat_frames = [int(bf) for bf in beat_frames if bf >= 0]
             dropped = n_before - len(beat_frames)
             if dropped:
                 print(f"[relax-timer] dropped {dropped} early beat(s) "
-                      f"(bf<{travel}) so every obstacle glides in "
-                      f"cleanly from the horizon instead of popping "
-                      f"in mid-flight.")
+                      f"(bf<0).")
 
+        game.RELAX_KIND_RATIO_MIDDLE = float(
+            max(0.0, min(1.0, getattr(self, "RELAX_KIND_RATIO_MIDDLE", 0.33)))
+        )
+        game.RELAX_WAIT_FRAMES = relax_wait_f
+        game.RELAX_TEXTURE_LOW = getattr(self, "RELAX_TEXTURE_LOW", None)
+        game.RELAX_TEXTURE_HIGH = getattr(self, "RELAX_TEXTURE_HIGH", None)
+        game.RELAX_TEXTURE_MIDDLE = getattr(self, "RELAX_TEXTURE_MIDDLE", None)
+        game.RELAX_HOLE_MASK_PATH = getattr(self, "RELAX_HOLE_MASK_PATH", None)
+        game.GATE_RAIL_OFFSET_X = float(getattr(self, "RAIL_OFFSET_X", 0.08))
+        game.GATE_HEIGHT = float(getattr(self, "START_GATE_H", 0.14))
+        enabled_kinds: list[str] = []
+        if bool(getattr(self, "RELAX_SHOW_LOW", True)):
+            enabled_kinds.append("low")
+        if bool(getattr(self, "RELAX_SHOW_HIGH", True)):
+            enabled_kinds.append("high")
+        if bool(getattr(self, "RELAX_SHOW_MIDDLE", True)):
+            enabled_kinds.append("middle")
+        game.RELAX_ENABLED_KINDS = tuple(enabled_kinds or ["low", "high", "middle"])
         game.pre_schedule(beat_frames, bass_arr,
                           min_gap_frames=self.BEAT_MIN_GAP,
                           min_lane_gap=min_lane_gap,
@@ -4725,6 +7832,8 @@ class RhythmVisualizer:
                 # rhythm between blocks instead of chaining SQ/JP
                 # waypoints end-to-end (which the user observed as
                 # "never returning to initial position").
+                if tg.kind == 'middle':
+                    continue
                 kind = 'JP' if tg.kind == 'low' else 'SQ'
                 lean_scale = 1.0
                 t_hit = tg.dodge_frame / self.FPS
@@ -5022,6 +8131,26 @@ class RhythmVisualizer:
                                       creationflags=_creation_flags)
             _vwriter = None
 
+        # ── ModernGL renderer setup (GPU batched PunchTarget) ──────────
+        _use_mgl = False
+        _mgl_renderer = None
+        _vp_matrix = None
+        _PunchBlockInstance = None
+        _composite_alpha = None
+        if getattr(args, 'use_moderngl', 1):
+            try:
+                from mgl_renderer import MGLPunchRenderer, PunchBlockInstance as _PBI
+                from mgl_renderer import composite_alpha_with_halo as _ca
+                _mgl_renderer = MGLPunchRenderer.get()
+                _vp_matrix = cam.view_proj_matrix()
+                _PunchBlockInstance = _PBI
+                _composite_alpha = _ca
+                _use_mgl = True
+                print("[MGL] ModernGL GPU renderer active for PunchTarget blocks.")
+            except Exception as _mgl_err:
+                print(f"[MGL] GPU renderer unavailable, using cv2 fallback: {_mgl_err}")
+                _use_mgl = False
+
         for fi in range(total_frames):
             pct = int(fi / total_frames * 100)
             if pct // 10 > last_pct:
@@ -5037,14 +8166,86 @@ class RhythmVisualizer:
             hits = game.update(fi)
 
             # ── canvas build ────────────────────────────────────────
-            canvas = np.full((self.HEIGHT, self.WIDTH, 3), CLR_BG, dtype=np.uint8)
+            canvas = bg_layer.frame(fi)
+            if start_gate is not None:
+                start_gate.draw(canvas, fi)
 
             # 1. tunnel walls + floor grid
             canvas = tunnel.draw(canvas, fi)
 
+            # 1b. side rails (drawn just after the tunnel grid, before targets)
+            if side_rail is not None:
+                _bass_val = float(bass_arr[fi]) if fi < len(bass_arr) else 0.0
+                _hit_this = len(hits) > 0
+                side_rail.draw(canvas, fi, bass_val=_bass_val, hit=_hit_this)
+
             # 2. targets (back to front)
-            for tg in game.alive_sorted(fi):
-                canvas = tg.draw(canvas, cam, fi)
+            # ModernGL batched path for PunchTarget (GPU accelerated)
+            if _use_mgl and _mgl_renderer is not None:
+                _punch_instances = []
+                # Block width derived from lane tile width so blocks scale with
+                # floor. Shrink further so rotated block (yaw) stays within
+                # lane bounds and never spills into adjacent lanes.
+                _lane_step = abs(cam.lane_world_x(1) - cam.lane_world_x(0)) if cam.n_lanes > 1 else 0.5
+                _tile_hw = _lane_step * 0.80 * 0.5
+                _ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W if PunchTarget.BLOCK_HALF_W > 0 else 1.0
+                _yaw_factor = 0.5
+                _max_yaw = max(
+                    abs(math.atan2(cam.lane_world_x(_l), abs(cam.FLOOR_WORLD_Y)) * _yaw_factor)
+                    for _l in range(cam.n_lanes)
+                )
+                _shrink = 1.0 / (abs(math.cos(_max_yaw)) + _ratio_DW * abs(math.sin(_max_yaw)))
+                _block_hw = _tile_hw * _shrink
+                _block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W) if PunchTarget.BLOCK_HALF_W > 0 else _block_hw
+                _block_hd = _block_hw * _ratio_DW
+                _wy_const = 0.0  # camera eye level → no top/bottom face visible
+                for tg in game.alive_sorted(fi):
+                    # LineTarget inherits PunchTarget but renders a chain
+                    # of cubes via its own draw() — must NOT be batched
+                    # into the single-cube GPU path or the chain
+                    # disappears and the head reads as a plain punch.
+                    if (isinstance(tg, PunchTarget)
+                            and not isinstance(tg, LineTarget)
+                            and tg.state == 'flying'):
+                        if (PunchTarget.MESH_LEFT is not None or
+                                PunchTarget.MESH_RIGHT is not None or
+                                PunchTarget.TEXTURE_LEFT is not None or
+                                PunchTarget.TEXTURE_RIGHT is not None):
+                            continue
+                        _zn = tg.depth(fi)
+                        if _zn <= 0.0:
+                            continue
+                        _wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+                        _wx = cam.lane_world_x(tg.lane)
+                        _wy = _wy_const
+                        _yaw = math.atan2(_wx, abs(cam.FLOOR_WORLD_Y)) * _yaw_factor
+                        b, g, r = tg.color
+                        _punch_instances.append(_PunchBlockInstance(
+                            position=(_wx, _wy, _wz),
+                            scale=(_block_hw, _block_hh, _block_hd),
+                            color=(r / 255.0, g / 255.0, b / 255.0),
+                            z_norm=_zn,
+                            yaw=_yaw,
+                        ))
+                if _punch_instances:
+                    _gl_bgr, _gl_alpha = _mgl_renderer.render(
+                        _punch_instances, _vp_matrix,
+                        (0.0, 0.0, 0.0), self.WIDTH, self.HEIGHT)
+                    canvas = _composite_alpha(canvas, _gl_bgr, _gl_alpha)
+                # Non-punch targets + punch targets with mesh/texture +
+                # LineTarget (always uses its own CPU chain renderer).
+                for tg in game.alive_sorted(fi):
+                    if (isinstance(tg, PunchTarget)
+                            and not isinstance(tg, LineTarget)):
+                        if (PunchTarget.MESH_LEFT is None and
+                                PunchTarget.MESH_RIGHT is None and
+                                PunchTarget.TEXTURE_LEFT is None and
+                                PunchTarget.TEXTURE_RIGHT is None):
+                            continue
+                    canvas = tg.draw(canvas, cam, fi)
+            else:
+                for tg in game.alive_sorted(fi):
+                    canvas = tg.draw(canvas, cam, fi)
 
             # 4. process hits → VFX (particles only, no flash/slash)
             for tg in hits:
@@ -5079,9 +8280,12 @@ class RhythmVisualizer:
                         _proj = cam.project(0.0,
                                             LineTarget.HORIZONTAL_WY,
                                             cam.Z_NEAR + 0.01)
-                        y = int(_proj[1]) if _proj else int(cam.air_y(0.02, 0.55))
+                        y = int(_proj[1]) if _proj else int(cam.cy_pix)
                     else:
-                        y = int(cam.air_y(0.02, 0.55))
+                        # PunchTarget blocks now fly at camera level (wy=0),
+                        # converging on horizon line. Burst at horizon = block
+                        # actual screen position (no longer at floor height).
+                        y = int(cam.cy_pix)
                     count = 50
                     viewport.trigger(1.0)
                 elif isinstance(tg, DanceTarget):
@@ -5115,8 +8319,11 @@ class RhythmVisualizer:
             # overlays stay pinned to their screen positions.
             if 'relax' in modes_seq:
                 _bob_dy = _relax_camera_dy(game.targets, fi, self.HEIGHT)
-                if _bob_dy != 0:
-                    _M = np.float32([[1, 0, 0], [0, 1, _bob_dy]])
+                _shake_dx, _shake_dy = _relax_middle_shake_offset(
+                    game.targets, fi, self.WIDTH, self.HEIGHT)
+                if _bob_dy != 0 or _shake_dx != 0 or _shake_dy != 0:
+                    _M = np.float32([[1, 0, _shake_dx],
+                                     [0, 1, _bob_dy + _shake_dy]])
                     canvas = cv2.warpAffine(
                         canvas, _M, (self.WIDTH, self.HEIGHT),
                         borderValue=(0, 0, 0))
@@ -5127,6 +8334,9 @@ class RhythmVisualizer:
             if stick is not None:
                 stick.draw(canvas, fi)
             combo.draw(canvas, fi)
+            if countdown_hud is not None and 'relax' in modes_seq:
+                countdown_hud.draw(canvas, game.targets, fi, float(self.FPS))
+                countdown_audio_events.extend(countdown_hud.pop_audio_events())
 
             if self.LINE_DEBUG and line_dbg_events:
                 # Top timeline: visualize where each line block event lands.
@@ -5207,6 +8417,9 @@ class RhythmVisualizer:
               f"avg {total_frames/(t_done-t_render):.1f} FPS")
 
         # ── finalise encoder ─────────────────────────────────────────
+        bg_layer.close()
+        if start_gate is not None:
+            start_gate.close()
         if _vwriter is not None:
             _vwriter.release()
         if _vproc is not None:
@@ -5218,6 +8431,7 @@ class RhythmVisualizer:
             _vproc.wait()
 
         print(f"\nTotal time: {time.time()-t0:.2f}s")
+        self._countdown_audio_events = countdown_audio_events
         return temp_video
 
     # -------------------------------------------------------------------
@@ -5237,15 +8451,102 @@ class RhythmVisualizer:
             except Exception:
                 _ffmpeg_bin = 'ffmpeg'
 
-            # Use plain ffmpeg CLI with -c:v copy + -shortest to keep A/V aligned.
-            cmd = [_ffmpeg_bin, '-y',
-                   '-i', temp_video,       # already-encoded video (keep as-is)
-                   '-i', audio_file,       # source audio
-                   '-map', '0:v:0',        # take video from input 0
-                   '-map', '1:a:0',        # take audio from input 1
-                   '-c:v', 'copy',         # DON'T re-encode video
-                   '-c:a', 'aac', '-b:a', '192k',
-                   '-shortest']
+            def _norm_mode(v: object) -> str:
+                raw = str(v or "").strip().lower()
+                return "file" if raw == "file" else "default"
+
+            def _norm_last_mode(v: object) -> str:
+                raw = str(v or "").strip().lower()
+                if raw in {"file", "same"}:
+                    return raw
+                return "default"
+
+            def _resolve_event_source(is_last: bool) -> tuple[str, str | tuple[float, float]]:
+                # Returns ("file", path) or ("tone", (freq_hz, duration_sec)).
+                mode = _norm_mode(getattr(self, "RELAX_COUNTDOWN_AUDIO_MODE", "default"))
+                last_mode = _norm_last_mode(
+                    getattr(self, "RELAX_COUNTDOWN_AUDIO_LAST_MODE", "default")
+                )
+                regular_file = str(getattr(self, "RELAX_COUNTDOWN_AUDIO_FILE", "") or "").strip()
+                last_file = str(getattr(self, "RELAX_COUNTDOWN_AUDIO_LAST_FILE", "") or "").strip()
+
+                if is_last:
+                    if last_mode == "same":
+                        if mode == "file" and regular_file and Path(regular_file).exists():
+                            return ("file", regular_file)
+                        return ("tone", (940.0, 0.09))
+                    if last_mode == "file" and last_file and Path(last_file).exists():
+                        return ("file", last_file)
+                    return ("tone", (1260.0, 0.13))
+
+                if mode == "file" and regular_file and Path(regular_file).exists():
+                    return ("file", regular_file)
+                return ("tone", (940.0, 0.09))
+
+            events = list(getattr(self, "_countdown_audio_events", []) or [])
+            enable_cd_audio = bool(getattr(self, "RELAX_COUNTDOWN_AUDIO_ENABLED", False))
+            cd_volume = float(max(0.0, min(1.0, getattr(self, "RELAX_COUNTDOWN_AUDIO_VOLUME", 0.65))))
+
+            # Base command: copy pre-rendered video stream, build output audio from
+            # original track + optional countdown overlay sounds.
+            cmd = [
+                _ffmpeg_bin, '-y',
+                '-i', temp_video,   # 0: video
+                '-i', audio_file,   # 1: source audio
+            ]
+
+            filter_parts: list[str] = ["[1:a]aresample=44100,asetpts=PTS-STARTPTS[base]"]
+            mix_inputs = ["[base]"]
+
+            next_input_idx = 2
+            if enable_cd_audio and events:
+                for ev_idx, (ev_t, is_last) in enumerate(events):
+                    try:
+                        t_sec = max(0.0, float(ev_t))
+                    except (TypeError, ValueError):
+                        continue
+                    src_kind, src_data = _resolve_event_source(bool(is_last))
+                    if src_kind == "file":
+                        src_path = str(src_data)
+                        cmd += ['-i', src_path]
+                    else:
+                        freq_hz, dur_s = src_data  # type: ignore[misc]
+                        cmd += [
+                            '-f', 'lavfi',
+                            '-t', f'{float(dur_s):.4f}',
+                            '-i', f'sine=frequency={float(freq_hz):.2f}:sample_rate=44100',
+                        ]
+                    delay_ms = int(round(t_sec * 1000.0))
+                    label = f"cd{ev_idx}"
+                    filter_parts.append(
+                        f"[{next_input_idx}:a]aformat=sample_rates=44100,"
+                        f"volume={cd_volume:.4f},"
+                        f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[{label}]"
+                    )
+                    mix_inputs.append(f"[{label}]")
+                    next_input_idx += 1
+
+            if len(mix_inputs) > 1:
+                filter_parts.append(
+                    "".join(mix_inputs)
+                    + f"amix=inputs={len(mix_inputs)}:normalize=0[aout]"
+                )
+                cmd += [
+                    '-filter_complex', ';'.join(filter_parts),
+                    '-map', '0:v:0',
+                    '-map', '[aout]',
+                ]
+            else:
+                cmd += [
+                    '-map', '0:v:0',
+                    '-map', '1:a:0',
+                ]
+
+            cmd += [
+                '-c:v', 'copy',     # DON'T re-encode video
+                '-c:a', 'aac', '-b:a', '192k',
+                '-shortest',
+            ]
             if self.TIME_LIMIT:
                 cmd += ['-t', str(self.TIME_LIMIT)]
             cmd += [output_filename]
@@ -5284,11 +8585,14 @@ def parse_arguments():
                          'zooms in only near hit zone (matches reference). '
                          '"inv" = 1/z mapping → linear on-screen growth. '
                          'Default: linear'))
-    p.add_argument('--cube_radius',    type=float, default=0.18,
+    p.add_argument('--cube_radius',    type=float, default=0.08,
                    help=('Corner rounding of the default neon cubes, '
                          'as a fraction of the shortest projected face '
                          'edge.  0 = perfectly sharp, 0.15-0.25 = soft '
-                         'bevel, 0.45 = nearly circular.  Default: 0.18'))
+                         'bevel, 0.45 = nearly circular.  Default: 0.08'))
+    p.add_argument('--use_moderngl', type=int, default=1, metavar='0|1',
+                   help='Use ModernGL GPU renderer for PunchTarget blocks. '
+                        'Falls back to cv2 software path if GPU unavailable. Default 1.')
     p.add_argument('-i', '--input',    type=str,   required=True)
     p.add_argument('-o', '--output',   type=str,   required=True)
     p.add_argument('-d', '--duration', type=float, default=None)
@@ -5300,6 +8604,49 @@ def parse_arguments():
                          'running down the tunnel. 0 = hide (minimal tunnel, '
                          'only the viewport panels remain on the ground). '
                          'Default 1.'))
+    p.add_argument('--floor_panel_color', type=str, default=None, metavar='#RRGGBB',
+                   help='Custom hex color for floor tile neon (e.g. #4af0c8). Default grey.')
+    p.add_argument('--floor_panel_opacity', type=float, default=1.0, metavar='0..1',
+                   help='Opacity of floor panel tiles (0=transparent, 1=solid). Default 1.0.')
+    p.add_argument('--floor_panel_blink', type=int, default=0, metavar='0|1',
+                   help='Flash floor tiles on/off each half-second. Default 0.')
+    p.add_argument('--floor_panel_image', type=str, default=None, metavar='PATH',
+                   help='Image file to perspective-warp onto floor tiles instead of flat fill.')
+    p.add_argument('--floor_full_static_image', type=int, default=0, metavar='0|1',
+                   help='When 1 AND --floor_panel_image is set, stretch the image '
+                        'to the entire floor trapezoid as a single static graphic. '
+                        'All other floor effects (chevron, tiles, BG color, blink, '
+                        'opacity) are bypassed. Default 0.')
+    # ── Floor layout + background ───────────────────────────────────────
+    p.add_argument('--floor_layout', type=str, default='auto',
+                   choices=['auto', 'chevron_strip'],
+                   help='Floor tile layout. auto = mode-dependent (legacy/lane tiles). '
+                        'chevron_strip = single >>>-arrow strip down the centre. Default auto.')
+    p.add_argument('--floor_bg_color', type=str, default=None, metavar='#RRGGBB',
+                   help='Solid background color for the runway trapezoid (drawn under '
+                        'tiles/chevron). None = transparent / canvas black (default).')
+    p.add_argument('--floor_bg_opacity', type=float, default=1.0, metavar='0..1',
+                   help='Opacity of the floor background trapezoid (0=transparent, 1=solid). Default 1.0.')
+    p.add_argument('--background_type', type=str, default='solid',
+                   choices=['solid', 'image', 'video'],
+                   help='Segment background type: solid color, image, or video.')
+    p.add_argument('--background_color', type=str, default='#000000', metavar='#RRGGBB',
+                   help='Background color when --background_type solid.')
+    p.add_argument('--background_image', type=str, default=None, metavar='PATH',
+                   help='Background image path when --background_type image.')
+    p.add_argument('--background_video', type=str, default=None, metavar='PATH',
+                   help='Background video path when --background_type video.')
+    # ── Chevron (used only when --floor_layout chevron_strip) ──────────
+    p.add_argument('--chevron_color', type=str, default='#FFD700', metavar='#RRGGBB',
+                   help='Chevron arrow fill color. Default #FFD700 (gold).')
+    p.add_argument('--chevron_scroll', type=int, default=1, metavar='0|1',
+                   help='Scroll chevrons toward camera continuously. Default 1.')
+    p.add_argument('--chevron_blink', type=int, default=0, metavar='0|1',
+                   help='Blink chevrons on/off every 15 frames (~0.5 s). Default 0.')
+    p.add_argument('--chevron_width_frac', type=float, default=0.45,
+                   help='Chevron strip width as fraction of lane spread (0.1..1.0). Default 0.45.')
+    p.add_argument('--chevron_count', type=int, default=6,
+                   help='Number of chevrons visible simultaneously (3..12). Default 6.')
     p.add_argument('--stickman', type=int, default=1, metavar='0|1',
                    help=('Show the left-column stickman fighter. 0 = hide '
                          '(useful when compositing a standalone stickman '
@@ -5322,6 +8669,71 @@ def parse_arguments():
     p.add_argument('--stick_h',  type=int, default=-1, metavar='PX',
                    help=('Stickman draw-box height in PIXELS. -1 = '
                          'auto (~H*54%%).'))
+    # ── Side rails ─────────────────────────────────────────────────────
+    p.add_argument('--far_spread_frac', type=float, default=None,
+                   help='Wall spread at far/horizon end (0.05-0.90). '
+                        'None = same as near (standard perspective).')
+    p.add_argument('--wall_floor_gap_frac', type=float, default=None,
+                   help='Vertical gap between near-wall bottom and floor (0.0-0.30). '
+                        'None = wall sits exactly on floor.')
+    p.add_argument('--floor_hit_frac', type=float, default=None,
+                   help='Fraction of frame height where floor meets near-camera edge (0.70-0.95). '
+                        'None = use per-mode default (0.86).')
+    p.add_argument('--horizon_frac', type=float, default=None,
+                   help='Fraction of frame height for the vanishing point / horizon (0.30-0.60). '
+                        'None = use default (0.45).')
+    p.add_argument('--floor_spread_frac', type=float, default=None,
+                   help='Fraction of frame width for the runway half-spread (0.30-0.85). '
+                        'None = use per-mode preset.')
+    p.add_argument('--side_rails', type=int, default=0, metavar='0|1',
+                   help='Draw decorative neon barriers along both sides of the runway. Default 0.')
+    p.add_argument('--rail_color', type=str, default='#FF60FF',
+                   help='Hex color for side-rail neon (e.g. "#FF60FF"). Default magenta.')
+    p.add_argument('--rail_shape', type=str, default='chunky',
+                  choices=['chunky', 'tube', 'chevron', 'pillar', 'dot'],
+                  help='Rail style: chunky=fence, tube=strip, chevron=arrows, pillar=LED-chase, dot=glowing dots.')
+    p.add_argument('--rail_height', type=float, default=0.14,
+                   help='Box height (world units). Default 0.14.')
+    p.add_argument('--rail_offset_x', type=float, default=0.08,
+                   help='Gap from outer lane tile edge to fence face (world units). Default 0.03.')
+    p.add_argument('--rail_image', type=str, default=None,
+                   help='Optional PNG/JPG to texture rail blocks. None = solid color.')
+    p.add_argument('--rail_texture_non_loop', type=int, default=0, metavar='0|1',
+                   help='Tube+texture only: 1 = map texture once across full rail length (no tiling). Default 0.')
+    p.add_argument('--rail_pulse', type=str, default='beat',
+                   choices=['none', 'beat', 'rms'],
+                   help='Audio-reactive pulse mode for rails. Default beat.')
+    p.add_argument('--rail_pulse_intensity', type=float, default=0.6, metavar='0..1',
+                   help='Pulse intensity 0=static, 1=full blink. Default 0.6.')
+    p.add_argument('--rail_pillar_count', type=int, default=16, metavar='N',
+                   help='Number of pillars in pillar shape (4..32). Default 16.')
+    p.add_argument('--rail_pillar_highlight_count', type=int, default=1, metavar='N',
+                   help='How many pillar columns are highlighted at once (1..32). Default 1.')
+    p.add_argument('--rail_pillar_radius', type=float, default=1.0, metavar='MULT',
+                   help='Pillar circumference scale (0.2..2.0). <1 smaller pillars, >1 thicker.')
+    p.add_argument('--rail_chase_mode', type=str, default='time',
+                   choices=['time', 'beat'],
+                   help='Chase advance trigger: time=constant interval (frames), beat=on each beat hit. Default time.')
+    p.add_argument('--rail_chase_speed_frames', type=int, default=4, metavar='N',
+                   help='Frames between chase advances (only for chase_mode=time). Default 4.')
+    p.add_argument('--rail_dot_count', type=int, default=24, metavar='N',
+                   help='Number of dots per rail (8..64). Default 24.')
+    p.add_argument('--rail_dot_lines', type=int, default=1, metavar='N',
+                   help='Number of vertical dot lines on each wall (top..bottom, 1..8). Default 1.')
+    p.add_argument('--rail_dot_size_px', type=int, default=6, metavar='PX',
+                   help='Base dot radius in pixels at Z_NEAR (2..20). Default 6.')
+    p.add_argument('--rail_dot_anim_mode', type=str, default='audio',
+                   choices=['audio', 'twinkle', 'wave'],
+                   help='Dot animation: audio=brightness from bass, twinkle=random fade, wave=sin wave. Default audio.')
+    p.add_argument('--rail_dot_color_near', type=str, default='#FF60FF', metavar='#RRGGBB',
+                   help='Color of dots closest to camera. Default magenta.')
+    p.add_argument('--rail_dot_color_far', type=str, default='#00FFFF', metavar='#RRGGBB',
+                   help='Color of dots at vanishing point. Default cyan.')
+    p.add_argument('--rail_chevron_depth', type=float, default=1.0, metavar='MULT',
+                   help='Chevron pointedness multiplier (shape=chevron only). '
+                        '1.0 = 120° opening angle; >1 = more pointed; <1 = flatter. Default 1.0.')
+    p.add_argument('--rail_chevron_density', type=int, default=6, metavar='N',
+                   help='Number of chevrons visible on each side wall (2-20). Default 6.')
     p.add_argument('--travel',  type=int, default=-1,
                    help=('Frames for target to fly from spawn to hit. '
                          'Default = -1 (auto: matches one L↔R beat cycle so '
@@ -5432,6 +8844,12 @@ def parse_arguments():
                          '(only visible while they flash on each punch). '
                          'Accepts "#RRGGBB", "RRGGBB", or "R,G,B". '
                          'Default: amber (90,170,255).'))
+    p.add_argument('--viewport_panel_depth', type=float, default=None,
+                   metavar='DEPTH',
+                   help=('World depth of each viewport panel (front→back '
+                         'distance in world units, min 0.05). '
+                         'Controls how tall the panels appear on screen. '
+                         'Default: 0.6 (punch) or 2×HALF_Z (dance).'))
     p.add_argument('--mode', type=str, default='punch',
                    help=('Gameplay mode. '
                          '"punch" (default) = air cubes flying at chest '
@@ -5519,6 +8937,160 @@ def parse_arguments():
                          'mode alternation stays coherent.  Typical '
                          'values: 0.5–2.0 for calm, breathing '
                          'gameplay.'))
+    p.add_argument('--relax_travel_sec', type=float, default=0.0,
+                   help=('Relax block travel time in seconds. '
+                         '>0 overrides auto travel only for solo relax.'))
+    p.add_argument('--relax_wait_sec', type=float, default=0.0,
+                  help=('Relax block hold time in seconds before movement. '
+                        'Block appears at horizon, waits this long, then '
+                        'moves with the normal travel duration.'))
+    p.add_argument('--relax_texture_low', type=str, default=None, metavar='PATH',
+                   help='Texture image for LOW relax block front face.')
+    p.add_argument('--relax_texture_high', type=str, default=None, metavar='PATH',
+                   help='Texture image for HIGH relax block front face.')
+    p.add_argument('--relax_texture_middle', type=str, default=None, metavar='PATH',
+                   help='Texture image for MIDDLE relax block face.')
+    p.add_argument('--relax_hole_mask_path', type=str, default=None, metavar='PATH',
+                   help='PNG alpha mask for MIDDLE hole (alpha=0 = hole).')
+    p.add_argument('--relax_kind_ratio_middle', type=float, default=0.33,
+                   help='Spawn ratio for middle relax block kind (0..1).')
+    p.add_argument('--relax_show_low', type=int, default=1, metavar='0|1',
+                   help='Enable low relax blocks.')
+    p.add_argument('--relax_show_high', type=int, default=1, metavar='0|1',
+                   help='Enable high relax blocks.')
+    p.add_argument('--relax_show_middle', type=int, default=1, metavar='0|1',
+                   help='Enable middle relax blocks.')
+    p.add_argument('--relax_countdown_enabled', type=int, default=1, metavar='0|1',
+                   help='Show relax countdown HUD in top-right.')
+    p.add_argument('--relax_countdown_color', type=str, default='#FFFFFF',
+                   metavar='#RRGGBB',
+                   help='Relax countdown text color.')
+    p.add_argument('--relax_countdown_max_sec', type=float, default=5.0,
+                   help='Only show countdown if next hit <= this many seconds.')
+    p.add_argument('--relax_countdown_anim', type=str, default='pop',
+                   choices=('pop', 'flash', 'fade_cross', 'shake'),
+                   help='Countdown number transition effect.')
+    p.add_argument('--relax_countdown_audio_enabled', type=int, default=0, metavar='0|1',
+                   help='Enable per-count countdown tick sounds.')
+    p.add_argument('--relax_countdown_audio_mode', type=str, default='default',
+                   choices=('default', 'file'),
+                   help='Regular count sound source.')
+    p.add_argument('--relax_countdown_audio_file', type=str, default=None, metavar='PATH',
+                   help='Audio file for regular count ticks (when mode=file).')
+    p.add_argument('--relax_countdown_audio_volume', type=float, default=0.65,
+                   help='Countdown sound mix volume (0..1).')
+    p.add_argument('--relax_countdown_audio_last_mode', type=str, default='default',
+                   choices=('default', 'file', 'same'),
+                   help='Last-count sound source (1 -> hit).')
+    p.add_argument('--relax_countdown_audio_last_file', type=str, default=None, metavar='PATH',
+                   help='Audio file for last-count tick (when last_mode=file).')
+    p.add_argument('--relax_countdown_x', type=float, default=0.88,
+                   help='Countdown box x (0..1, normalized).')
+    p.add_argument('--relax_countdown_y', type=float, default=0.04,
+                   help='Countdown box y (0..1, normalized).')
+    p.add_argument('--relax_countdown_w', type=float, default=0.10,
+                   help='Countdown box width (0..1, normalized).')
+    p.add_argument('--relax_countdown_h', type=float, default=0.16,
+                   help='Countdown box height (0..1, normalized).')
+    p.add_argument('--relax_countdown_border_thickness', type=float, default=2.0,
+                   help='Countdown text border thickness in pixels (0..10).')
+    p.add_argument('--relax_countdown_glow_strength', type=float, default=60.0,
+                   help='Countdown text glow strength (0..100).')
+    # ── Combo HUD ─────────────────────────────────────────────────────────────
+    p.add_argument('--combo_enabled', type=int, default=1, metavar='0|1',
+                   help='Show combo counter HUD (default: 1).')
+    p.add_argument('--combo_color', type=str, default='#FFFFFF',
+                   help='Combo counter color (hex, default #FFFFFF).')
+    p.add_argument('--combo_label', type=str, default='COMBO',
+                   help='Combo label text below the number (default COMBO).')
+    p.add_argument('--combo_font_family', type=str, default='duplex',
+                   choices=['simplex','plain','duplex','complex','triplex',
+                            'complex_small','script_simplex','script_complex'],
+                   help='cv2 font family for combo text (default duplex).')
+    p.add_argument('--combo_fade_after_break_sec', type=float, default=0.5,
+                   help='Seconds to fade combo after a miss (0 = instant hide).')
+    p.add_argument('--combo_anim', type=str, default='pop',
+                   choices=['pop','flash','fade_cross','shake'],
+                   help='Animation when combo number increases (default pop).')
+    p.add_argument('--combo_audio_enabled', type=int, default=0, metavar='0|1',
+                   help='Play a sound on each combo increment (default: 0).')
+    p.add_argument('--combo_audio_mode', type=str, default='default',
+                   choices=['default','file'],
+                   help='Combo hit sound source (default beep or file).')
+    p.add_argument('--combo_audio_file', type=str, default=None, metavar='PATH',
+                   help='Path to custom combo hit sound file (wav/mp3).')
+    p.add_argument('--combo_audio_volume', type=float, default=0.65,
+                   help='Combo hit sound volume 0..1 (default 0.65).')
+    p.add_argument('--combo_audio_milestone_mode', type=str, default='default',
+                   choices=['default','file','same'],
+                   help='Milestone sound mode (default/file/same).')
+    p.add_argument('--combo_audio_milestone_file', type=str, default=None, metavar='PATH',
+                   help='Path to milestone sound file.')
+    p.add_argument('--combo_x', type=float, default=0.85,
+                   help='Combo box left position 0..1 (default 0.85).')
+    p.add_argument('--combo_y', type=float, default=0.08,
+                   help='Combo box top position 0..1 (default 0.08).')
+    p.add_argument('--combo_w', type=float, default=0.13,
+                   help='Combo box width 0..1 (default 0.13).')
+    p.add_argument('--combo_h', type=float, default=0.18,
+                   help='Combo box height 0..1 (default 0.18).')
+    p.add_argument('--combo_border_thickness', type=float, default=2.0,
+                   help='Combo text border thickness in px (0..10, default 2.0).')
+    p.add_argument('--combo_glow_strength', type=float, default=30.0,
+                   help='Combo text glow strength (0..100, default 30).')
+    p.add_argument('--combo_tier1_threshold', type=int, default=30,
+                   help='Combo count for Tier 1 label (0=disabled, default 30).')
+    p.add_argument('--combo_tier1_label', type=str, default='Great',
+                   help='Tier 1 label text (default Great).')
+    p.add_argument('--combo_tier2_threshold', type=int, default=60,
+                   help='Combo count for Tier 2 label (0=disabled, default 60).')
+    p.add_argument('--combo_tier2_label', type=str, default='Superb',
+                   help='Tier 2 label text (default Superb).')
+    p.add_argument('--combo_tier3_threshold', type=int, default=90,
+                   help='Combo count for Tier 3 label (0=disabled, default 90).')
+    p.add_argument('--combo_tier3_label', type=str, default='Perfect',
+                   help='Tier 3 label text (default Perfect).')
+    p.add_argument('--combo_tier4_threshold', type=int, default=120,
+                   help='Combo count for Tier 4 label (0=disabled, default 120).')
+    p.add_argument('--combo_tier4_label', type=str, default='Godlike',
+                   help='Tier 4 label text (default Godlike).')
+    p.add_argument('--combo_tier1_color', type=str, default='#22c55e',
+                   help='Tier 1 badge color (hex, default #22c55e green).')
+    p.add_argument('--combo_tier2_color', type=str, default='#3b82f6',
+                   help='Tier 2 badge color (hex, default #3b82f6 blue).')
+    p.add_argument('--combo_tier3_color', type=str, default='#a855f7',
+                   help='Tier 3 badge color (hex, default #a855f7 purple).')
+    p.add_argument('--combo_tier4_color', type=str, default='#f59e0b',
+                   help='Tier 4 badge color (hex, default #f59e0b gold).')
+    p.add_argument('--combo_number_font_scale', type=float, default=0.0,
+                   help='Override combo number font scale (0=auto-fit).')
+    p.add_argument('--combo_label_font_scale', type=float, default=0.0,
+                   help='Override combo label font scale (0=auto-fit).')
+    p.add_argument('--combo_tier_font_scale', type=float, default=0.0,
+                   help='Override tier badge font scale (0=auto-fit).')
+    p.add_argument('--start_gate_enabled', type=int, default=0, metavar='0|1',
+                   help='Show the start gate at the far end of floor.')
+    p.add_argument('--start_gate_type', type=str, default='color',
+                   choices=['color', 'image', 'video'],
+                   help='Start gate fill type.')
+    p.add_argument('--start_gate_color', type=str, default='#1a1a1a',
+                   help='Start gate solid color (used when type=color or fallback).')
+    p.add_argument('--start_gate_border_color', type=str, default='#ffffff',
+                   help='Start gate border color.')
+    p.add_argument('--start_gate_border_thickness', type=float, default=0.0,
+                   help='Start gate border thickness in px (0..10).')
+    p.add_argument('--start_gate_image', type=str, default=None, metavar='PATH',
+                   help='Start gate image (used when type=image).')
+    p.add_argument('--start_gate_video', type=str, default=None, metavar='PATH',
+                   help='Start gate video (used when type=video, loops).')
+    p.add_argument('--start_gate_x', type=float, default=0.30,
+                   help='Start gate left position (0..1, normalized).')
+    p.add_argument('--start_gate_y', type=float, default=0.18,
+                   help='Start gate top position (0..1, normalized).')
+    p.add_argument('--start_gate_w', type=float, default=0.40,
+                   help='Start gate width (0..1, normalized).')
+    p.add_argument('--start_gate_h', type=float, default=0.14,
+                   help='Start gate height in world units (>= 0.03).')
     p.add_argument('--lanes', type=str, default=None, metavar='SPEC',
                    help=('Restrict target spawns to the listed 1-based '
                          'lanes.  Accepts a comma-separated list '
@@ -5599,8 +9171,52 @@ if __name__ == '__main__':
     viz.CUBE_MODEL_LEFT   = args.cube_model_left
     viz.CUBE_MODEL_RIGHT  = args.cube_model_right
     viz.MESH_WIREFRAME    = args.mesh_wireframe
-    viz.SHOW_FLOOR_PANELS = bool(args.floor_panels)
-    viz.SHOW_STICKMAN     = bool(args.stickman)
+    viz.SHOW_FLOOR_PANELS  = bool(args.floor_panels)
+    viz.FLOOR_PANEL_COLOR  = args.floor_panel_color or None
+    viz.FLOOR_PANEL_OPACITY = float(args.floor_panel_opacity)
+    viz.FLOOR_PANEL_BLINK  = bool(args.floor_panel_blink)
+    viz.FLOOR_PANEL_IMAGE  = args.floor_panel_image or None
+    viz.FLOOR_FULL_STATIC_IMAGE = bool(int(args.floor_full_static_image))
+    viz.FLOOR_LAYOUT         = args.floor_layout
+    viz.FLOOR_BG_COLOR       = args.floor_bg_color or None
+    viz.FLOOR_BG_OPACITY     = float(args.floor_bg_opacity)
+    viz.BACKGROUND_TYPE      = str(args.background_type or "solid")
+    viz.BACKGROUND_COLOR     = str(args.background_color or "#000000")
+    viz.BACKGROUND_IMAGE     = args.background_image or None
+    viz.BACKGROUND_VIDEO     = args.background_video or None
+    viz.CHEVRON_COLOR        = args.chevron_color
+    viz.CHEVRON_SCROLL       = bool(int(args.chevron_scroll))
+    viz.CHEVRON_BLINK        = bool(int(args.chevron_blink))
+    viz.CHEVRON_WIDTH_FRAC   = float(args.chevron_width_frac)
+    viz.CHEVRON_COUNT        = int(args.chevron_count)
+    viz.FAR_SPREAD_FRAC        = args.far_spread_frac        # None or float
+    viz.WALL_FLOOR_GAP_FRAC    = args.wall_floor_gap_frac   # None or float
+    viz.FLOOR_HIT_FRAC         = args.floor_hit_frac        # None or float
+    viz.HORIZON_FRAC           = args.horizon_frac        # None or float
+    viz.FLOOR_SPREAD_FRAC      = args.floor_spread_frac   # None or float
+    viz.SHOW_SIDE_RAILS        = bool(args.side_rails)
+    viz.RAIL_COLOR             = str(args.rail_color)
+    viz.RAIL_SHAPE             = str(args.rail_shape)
+    viz.RAIL_HEIGHT            = float(args.rail_height)
+    viz.RAIL_OFFSET_X          = float(args.rail_offset_x)
+    viz.RAIL_IMAGE             = args.rail_image or None
+    viz.RAIL_TEXTURE_NON_LOOP  = bool(int(args.rail_texture_non_loop))
+    viz.RAIL_PULSE             = str(args.rail_pulse)
+    viz.RAIL_PULSE_INTENSITY   = float(args.rail_pulse_intensity)
+    viz.RAIL_PILLAR_COUNT      = int(args.rail_pillar_count)
+    viz.RAIL_PILLAR_HIGHLIGHT_COUNT = int(args.rail_pillar_highlight_count)
+    viz.RAIL_PILLAR_RADIUS     = float(args.rail_pillar_radius)
+    viz.RAIL_CHASE_MODE        = str(args.rail_chase_mode)
+    viz.RAIL_CHASE_SPEED_FRAMES = int(args.rail_chase_speed_frames)
+    viz.RAIL_DOT_COUNT         = int(args.rail_dot_count)
+    viz.RAIL_DOT_LINES         = int(args.rail_dot_lines)
+    viz.RAIL_DOT_SIZE_PX       = int(args.rail_dot_size_px)
+    viz.RAIL_DOT_ANIM_MODE     = str(args.rail_dot_anim_mode)
+    viz.RAIL_DOT_COLOR_NEAR    = str(args.rail_dot_color_near)
+    viz.RAIL_DOT_COLOR_FAR     = str(args.rail_dot_color_far)
+    viz.RAIL_CHEVRON_DEPTH     = float(args.rail_chevron_depth)
+    viz.RAIL_CHEVRON_DENSITY   = int(args.rail_chevron_density)
+    viz.SHOW_STICKMAN      = bool(args.stickman)
     viz.STICK_X0          = int(args.stick_x0)
     viz.STICK_Y0          = int(args.stick_y0)
     viz.STICK_W           = int(args.stick_w)
@@ -5612,6 +9228,10 @@ if __name__ == '__main__':
     except ValueError as e:
         print(f"[color] {e}")
         sys.exit(1)
+    viz.VIEWPORT_PANEL_DEPTH = (
+        float(args.viewport_panel_depth)
+        if args.viewport_panel_depth is not None else None
+    )
     viz.EXPORT_EVENTS = args.export_events
     viz.DETECT_ONLY   = bool(args.detect_only)
     # Validate --mode early so bad spellings (e.g. "pouch,dance") surface
@@ -5628,6 +9248,88 @@ if __name__ == '__main__':
     viz.LINE_DEBUG       = bool(args.line_debug)
     viz.LINE_ZIGZAG      = str(args.line_zigzag).lower().strip() or 'vertical'
     viz.RELAX_INTERVAL   = max(0.0, float(args.relax_interval))
+    viz.RELAX_TRAVEL_SEC = max(0.0, float(args.relax_travel_sec))
+    viz.RELAX_WAIT_SEC   = max(0.0, float(args.relax_wait_sec))
+    viz.RELAX_TEXTURE_LOW = args.relax_texture_low or None
+    viz.RELAX_TEXTURE_HIGH = args.relax_texture_high or None
+    viz.RELAX_TEXTURE_MIDDLE = args.relax_texture_middle or None
+    viz.RELAX_HOLE_MASK_PATH = args.relax_hole_mask_path or None
+    viz.RELAX_KIND_RATIO_MIDDLE = max(
+        0.0, min(1.0, float(args.relax_kind_ratio_middle))
+    )
+    viz.RELAX_SHOW_LOW = bool(int(args.relax_show_low))
+    viz.RELAX_SHOW_HIGH = bool(int(args.relax_show_high))
+    viz.RELAX_SHOW_MIDDLE = bool(int(args.relax_show_middle))
+    viz.RELAX_COUNTDOWN_ENABLED = bool(int(args.relax_countdown_enabled))
+    viz.RELAX_COUNTDOWN_COLOR = str(args.relax_countdown_color)
+    viz.RELAX_COUNTDOWN_MAX_SEC = max(0.0, float(args.relax_countdown_max_sec))
+    viz.RELAX_COUNTDOWN_ANIM = CountdownHUD._normalize_anim(args.relax_countdown_anim)
+    viz.RELAX_COUNTDOWN_AUDIO_ENABLED = bool(int(args.relax_countdown_audio_enabled))
+    viz.RELAX_COUNTDOWN_AUDIO_MODE = str(args.relax_countdown_audio_mode or "default")
+    viz.RELAX_COUNTDOWN_AUDIO_FILE = args.relax_countdown_audio_file or None
+    viz.RELAX_COUNTDOWN_AUDIO_VOLUME = max(
+        0.0, min(1.0, float(args.relax_countdown_audio_volume))
+    )
+    viz.RELAX_COUNTDOWN_AUDIO_LAST_MODE = str(
+        args.relax_countdown_audio_last_mode or "default"
+    )
+    viz.RELAX_COUNTDOWN_AUDIO_LAST_FILE = args.relax_countdown_audio_last_file or None
+    viz.RELAX_COUNTDOWN_X = max(0.0, min(1.0, float(args.relax_countdown_x)))
+    viz.RELAX_COUNTDOWN_Y = max(0.0, min(1.0, float(args.relax_countdown_y)))
+    viz.RELAX_COUNTDOWN_W = max(0.02, min(1.0, float(args.relax_countdown_w)))
+    viz.RELAX_COUNTDOWN_H = max(0.02, min(1.0, float(args.relax_countdown_h)))
+    viz.RELAX_COUNTDOWN_BORDER_THICKNESS = max(
+        0.0, min(10.0, float(args.relax_countdown_border_thickness))
+    )
+    viz.RELAX_COUNTDOWN_GLOW_STRENGTH = max(
+        0.0, min(100.0, float(args.relax_countdown_glow_strength))
+    )
+    viz.COMBO_ENABLED = bool(int(args.combo_enabled))
+    viz.COMBO_COLOR = str(args.combo_color or "#FFFFFF")
+    viz.COMBO_LABEL = str(args.combo_label or "COMBO")
+    viz.COMBO_FONT_FAMILY = str(args.combo_font_family or "duplex")
+    viz.COMBO_FADE_AFTER_BREAK_SEC = max(0.0, float(args.combo_fade_after_break_sec))
+    viz.COMBO_ANIM = ComboHUD._normalize_anim(args.combo_anim)
+    viz.COMBO_AUDIO_ENABLED = bool(int(args.combo_audio_enabled))
+    viz.COMBO_AUDIO_MODE = str(args.combo_audio_mode or "default")
+    viz.COMBO_AUDIO_FILE = args.combo_audio_file or None
+    viz.COMBO_AUDIO_VOLUME = max(0.0, min(1.0, float(args.combo_audio_volume)))
+    viz.COMBO_AUDIO_MILESTONE_MODE = str(args.combo_audio_milestone_mode or "default")
+    viz.COMBO_AUDIO_MILESTONE_FILE = args.combo_audio_milestone_file or None
+    viz.COMBO_X = max(0.0, min(1.0, float(args.combo_x)))
+    viz.COMBO_Y = max(0.0, min(1.0, float(args.combo_y)))
+    viz.COMBO_W = max(0.05, min(0.5, float(args.combo_w)))
+    viz.COMBO_H = max(0.03, min(0.3, float(args.combo_h)))
+    viz.COMBO_BORDER_THICKNESS = max(0.0, min(10.0, float(args.combo_border_thickness)))
+    viz.COMBO_GLOW_STRENGTH = max(0.0, min(100.0, float(args.combo_glow_strength)))
+    viz.COMBO_TIER1_THRESHOLD = max(0, int(args.combo_tier1_threshold))
+    viz.COMBO_TIER1_LABEL = str(args.combo_tier1_label or "Great")
+    viz.COMBO_TIER2_THRESHOLD = max(0, int(args.combo_tier2_threshold))
+    viz.COMBO_TIER2_LABEL = str(args.combo_tier2_label or "Superb")
+    viz.COMBO_TIER3_THRESHOLD = max(0, int(args.combo_tier3_threshold))
+    viz.COMBO_TIER3_LABEL = str(args.combo_tier3_label or "Perfect")
+    viz.COMBO_TIER4_THRESHOLD = max(0, int(args.combo_tier4_threshold))
+    viz.COMBO_TIER4_LABEL = str(args.combo_tier4_label or "Godlike")
+    viz.COMBO_TIER1_COLOR = str(args.combo_tier1_color or "#22c55e")
+    viz.COMBO_TIER2_COLOR = str(args.combo_tier2_color or "#3b82f6")
+    viz.COMBO_TIER3_COLOR = str(args.combo_tier3_color or "#a855f7")
+    viz.COMBO_TIER4_COLOR = str(args.combo_tier4_color or "#f59e0b")
+    viz.COMBO_NUMBER_FONT_SCALE = max(0.0, float(args.combo_number_font_scale))
+    viz.COMBO_LABEL_FONT_SCALE = max(0.0, float(args.combo_label_font_scale))
+    viz.COMBO_TIER_FONT_SCALE = max(0.0, float(args.combo_tier_font_scale))
+    viz.START_GATE_ENABLED = bool(int(args.start_gate_enabled))
+    viz.START_GATE_TYPE = str(args.start_gate_type or "color")
+    viz.START_GATE_COLOR = str(args.start_gate_color or "#1a1a1a")
+    viz.START_GATE_BORDER_COLOR = str(args.start_gate_border_color or "#ffffff")
+    viz.START_GATE_BORDER_THICKNESS = max(
+        0.0, min(10.0, float(args.start_gate_border_thickness))
+    )
+    viz.START_GATE_IMAGE = args.start_gate_image or None
+    viz.START_GATE_VIDEO = args.start_gate_video or None
+    viz.START_GATE_X = max(0.0, min(1.0, float(args.start_gate_x)))
+    viz.START_GATE_Y = max(0.0, min(1.0, float(args.start_gate_y)))
+    viz.START_GATE_W = max(0.02, min(1.0, float(args.start_gate_w)))
+    viz.START_GATE_H = max(0.03, float(args.start_gate_h))
     # Lane filter is always evaluated against the 4-lane layout both modes
     # now use (see N_LANES / N_LANES_DANCE).  --lanes uses 1-based indices.
     try:

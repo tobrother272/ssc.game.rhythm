@@ -13,13 +13,23 @@ __pycache__/
 # Build & distribution artifacts
 /build/
 /dist/
+manifest.json
+manifest.json.gz
+changelog.md
 
 # Runtime temp files
 /temp/
 /temps/
+/temps/*
 output/
+_update_staging/
+*.old
+*.lock
 
 *.sh
-
+*.mp3
 # PyInstaller
 *.spec.bak
+
+# Publish credentials (real values; example template stays committed)
+.env.publish

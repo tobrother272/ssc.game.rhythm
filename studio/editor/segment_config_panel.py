@@ -9,24 +9,62 @@ from typing import Optional
 
 
 
-from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from studio.models import Project, Segment, build_settings
+from studio.editor.inspector_drop_helper import (
+    get_media_from_drop,
+    set_drop_highlight,
+    set_drop_reject_flash,
+)
+
+
+class _NoScrollWheelFilter(QObject):
+    """Event filter that drops wheel events unless the widget has keyboard focus.
+
+    Install this on any QSpinBox / QDoubleSpinBox / QComboBox to prevent
+    accidental value changes while the user is scrolling the config panel.
+    """
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.Wheel:
+            # Only let the wheel through when the widget is actively focused
+            # (i.e. the user clicked into it first).
+            if not obj.hasFocus():
+                event.ignore()
+                return True   # consumed — do NOT propagate to the widget
+        return super().eventFilter(obj, event)
+
+
+def _no_scroll(widget: QWidget) -> QWidget:
+    """Attach the wheel-lock filter and set StrongFocus on *widget*, then return it."""
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_NO_SCROLL_FILTER)
+    return widget
+
+
+# Single shared instance — stateless, safe to reuse across all widgets.
+_NO_SCROLL_FILTER = _NoScrollWheelFilter()
 
 
 class _ModeListWidget(QWidget):
@@ -61,6 +99,1277 @@ class _ModeListWidget(QWidget):
     def get_value(self) -> list:
         selected = [m for m in self._ALL_MODES if self._boxes[m].isChecked()]
         return selected or ["punch"]
+
+
+class _PathBrowseWidget(QWidget):
+    """Line-edit file path with a browse button."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        value: Optional[str],
+        *,
+        title: str,
+        file_filter: str,
+        placeholder: str = "Optional file path",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._file_filter = file_filter
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._edit = QLineEdit("" if value is None else str(value))
+        self._edit.setPlaceholderText(placeholder)
+        self._edit.editingFinished.connect(self.changed)
+        browse = QPushButton("…")
+        browse.setFixedWidth(28)
+        browse.setToolTip("Browse for a file")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self._edit)
+        row.addWidget(browse)
+
+    def _browse(self) -> None:
+        current = self._edit.text().strip()
+        start_dir = ""
+        if current:
+            p = Path(current)
+            start_dir = str(p.parent if p.parent.exists() else p)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self._title,
+            start_dir,
+            self._file_filter,
+        )
+        if path:
+            self._edit.setText(path)
+            self.changed.emit()
+
+    def get_value(self) -> Optional[str]:
+        text = self._edit.text().strip()
+        return text or None
+
+    def set_value(self, value: Optional[str], *, emit_changed: bool = True) -> None:
+        self._edit.setText("" if value is None else str(value))
+        if emit_changed:
+            self.changed.emit()
+
+
+class _ColorPickerWidget(QWidget):
+    """Simple color picker button that stores a #RRGGBB value."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        value: Optional[str],
+        *,
+        title: str,
+        default_color: str = "#FFFFFF",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._default_color = default_color
+        self._color = str(value or default_color)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._btn = QPushButton()
+        self._btn.setMinimumWidth(100)
+        self._btn.setMaximumWidth(170)
+        self._btn.clicked.connect(self._pick)
+        row.addWidget(self._btn)
+        row.addStretch()
+        self._refresh()
+
+    def _refresh(self) -> None:
+        c = QColor(self._color)
+        if not c.isValid():
+            self._color = self._default_color
+            c = QColor(self._color)
+        self._btn.setText(self._color.upper())
+        text_col = "#000000" if c.lightness() > 140 else "#FFFFFF"
+        self._btn.setStyleSheet(
+            f"background-color:{self._color}; color:{text_col};"
+            " border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick(self) -> None:
+        initial = QColor(self._color)
+        dlg = QColorDialog(initial, self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setWindowTitle(self._title)
+        if dlg.exec():
+            color = dlg.selectedColor()
+            if color.isValid():
+                self._color = color.name(QColor.NameFormat.HexRgb)
+                self._refresh()
+                self.changed.emit()
+
+    def get_value(self) -> str:
+        return str(self._color or self._default_color)
+
+
+class _FloorPanelSection(QGroupBox):
+    """Collapsible config sub-section for floor panel customisation.
+
+    Shown/hidden by the parent form based on the "Floor panels" toggle.
+    Emits ``changed`` when any of its controls changes so the parent can
+    persist the values immediately.
+
+    Controls (top → bottom):
+        Layout combobox  (auto / chevron_strip)
+        BG color picker + Clear button
+        Tile color picker
+        Blink checkbox
+        Tile image chooser
+        ── Chevron sub-group (enabled only when layout='chevron_strip') ──
+        Chevron color picker
+        Chevron blink checkbox
+        Chevron scroll checkbox
+        Chevron width fraction spinbox
+        Chevron count spinbox
+    """
+
+    changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
+
+    _LAYOUTS = [
+        ("Auto (mode default)", "auto"),
+        ("Chevron strip (>>>)", "chevron_strip"),
+    ]
+
+    def __init__(
+        self,
+        color: str | None,
+        blink: bool,
+        image: str | None,
+        floor_panel_opacity: float = 1.0,
+        floor_layout: str = "auto",
+        floor_bg_color: str | None = None,
+        floor_bg_opacity: float = 1.0,
+        chevron_color: str = "#FFD700",
+        chevron_scroll: bool = True,
+        chevron_blink: bool = False,
+        chevron_width_frac: float = 0.45,
+        chevron_count: int = 6,
+        full_static_image: bool = False,
+        project: Optional[Project] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Floor Panel Options", parent)
+        self._project = project
+        self.setAcceptDrops(True)
+        form = QFormLayout(self)
+        self._form = form
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # ---- Layout combobox ----
+        self._layout_cb = QComboBox()
+        for label, val in self._LAYOUTS:
+            self._layout_cb.addItem(label, val)
+        lidx = next((i for i, (_, v) in enumerate(self._LAYOUTS)
+                     if v == floor_layout), 0)
+        self._layout_cb.setCurrentIndex(lidx)
+        _no_scroll(self._layout_cb)
+        self._layout_cb.currentIndexChanged.connect(self._on_layout_changed)
+        form.addRow("Layout", self._layout_cb)
+
+        # ---- BG color picker + Clear ----
+        bg_row = QWidget()
+        bg_layout = QHBoxLayout(bg_row)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(4)
+        self._bg_color: str | None = floor_bg_color or None
+        self._bg_btn = QPushButton()
+        self._bg_btn.setMinimumWidth(90)
+        self._bg_btn.setMaximumWidth(160)
+        self._bg_btn.setToolTip("Background color for the whole runway trapezoid")
+        self._refresh_bg_btn()
+        self._bg_btn.clicked.connect(self._pick_bg_color)
+        self._bg_clear_btn = QPushButton("✕")
+        self._bg_clear_btn.setFixedWidth(26)
+        self._bg_clear_btn.setToolTip("Remove background color (transparent)")
+        self._bg_clear_btn.clicked.connect(self._clear_bg_color)
+        bg_layout.addWidget(self._bg_btn)
+        bg_layout.addWidget(self._bg_clear_btn)
+        bg_layout.addStretch()
+        form.addRow("BG color", bg_row)
+
+        # ---- BG opacity (numeric input, no slider) ----
+        self._bg_opacity_sp = QDoubleSpinBox()
+        self._bg_opacity_sp.setRange(0.0, 1.0)
+        self._bg_opacity_sp.setSingleStep(0.05)
+        self._bg_opacity_sp.setDecimals(2)
+        self._bg_opacity_sp.setValue(float(floor_bg_opacity))
+        self._bg_opacity_sp.setToolTip("Background opacity: 0 = invisible, 1 = fully opaque")
+        _no_scroll(self._bg_opacity_sp)
+        self._bg_opacity_sp.valueChanged.connect(self.changed)
+        form.addRow("BG opacity", self._bg_opacity_sp)
+
+        # ---- Tile color picker + opacity on same row ----
+        color_row = QWidget()
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._color_btn.setMaximumWidth(160)
+        self._color_btn.setToolTip("Click to choose the neon color for floor tiles")
+        self._color: str | None = color
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        color_layout.addWidget(self._color_btn)
+        self._tile_opacity_lbl = QLabel("Opacity")
+        self._tile_opacity_sp = QDoubleSpinBox()
+        self._tile_opacity_sp.setRange(0.0, 1.0)
+        self._tile_opacity_sp.setSingleStep(0.05)
+        self._tile_opacity_sp.setDecimals(2)
+        self._tile_opacity_sp.setValue(float(floor_panel_opacity))
+        self._tile_opacity_sp.setToolTip("Tile opacity: 0 = invisible, 1 = fully opaque")
+        self._tile_opacity_sp.setFixedWidth(72)
+        _no_scroll(self._tile_opacity_sp)
+        self._tile_opacity_sp.valueChanged.connect(self.changed)
+        color_layout.addWidget(self._tile_opacity_lbl)
+        color_layout.addWidget(self._tile_opacity_sp)
+        form.addRow("Tile color", color_row)
+        self._tile_color_row = color_row
+
+        # ---- Blink checkbox ----
+        blink_row = QWidget()
+        blink_layout = QHBoxLayout(blink_row)
+        blink_layout.setContentsMargins(0, 0, 0, 0)
+        self._blink_cb = QCheckBox()
+        self._blink_cb.setChecked(bool(blink))
+        self._blink_cb.setToolTip("Flash tiles on/off every half-second")
+        self._blink_cb.stateChanged.connect(self.changed)
+        blink_layout.addWidget(self._blink_cb)
+        blink_layout.addStretch()
+        form.addRow("Blink to beat", blink_row)
+
+        # ---- Image file chooser ----
+        self._img_row = QWidget()
+        img_layout = QHBoxLayout(self._img_row)
+        img_layout.setContentsMargins(0, 0, 0, 0)
+        img_layout.setSpacing(4)
+        self._img_edit = QLineEdit(image or "")
+        self._img_edit.setPlaceholderText("Image file (optional)…")
+        self._img_edit.setToolTip(
+            "Image to warp onto floor tiles instead of flat fill.\n"
+            "Leave blank to use the default shape fill."
+        )
+        self._img_edit.editingFinished.connect(self._on_img_edit_changed)
+        img_browse = QPushButton("…")
+        img_browse.setFixedWidth(28)
+        img_browse.setToolTip("Browse for an image file")
+        img_browse.clicked.connect(self._browse_image)
+        img_layout.addWidget(self._img_edit)
+        img_layout.addWidget(img_browse)
+        form.addRow("Tile image", self._img_row)
+
+        # ── Full static image checkbox (visible only with image set) ───
+        full_row = QWidget()
+        full_layout = QHBoxLayout(full_row)
+        full_layout.setContentsMargins(0, 0, 0, 0)
+        self._full_static_cb = QCheckBox()
+        self._full_static_cb.setChecked(bool(full_static_image))
+        self._full_static_cb.setToolTip(
+            "Stretch the tile image across the WHOLE floor as a single static\n"
+            "graphic. All other floor effects (chevron, tiles, BG color, blink,\n"
+            "opacity) are bypassed. Visible only when a tile image is selected."
+        )
+        self._full_static_cb.stateChanged.connect(self._on_full_static_changed)
+        full_layout.addWidget(self._full_static_cb)
+        full_layout.addStretch()
+        form.addRow("Full static image", full_row)
+        self._full_static_row = full_row
+
+        # ── Chevron sub-group separator ────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(sep)
+        self._chevron_header = QLabel("<b>Chevron options</b>")
+        form.addRow(self._chevron_header)
+
+        # ---- Chevron color picker ----
+        chev_color_row = QWidget()
+        chcl = QHBoxLayout(chev_color_row)
+        chcl.setContentsMargins(0, 0, 0, 0)
+        self._chev_color: str = chevron_color or "#FFD700"
+        self._chev_color_btn = QPushButton()
+        self._chev_color_btn.setMinimumWidth(90)
+        self._chev_color_btn.setMaximumWidth(160)
+        self._chev_color_btn.setToolTip("Arrow fill color")
+        self._refresh_chev_color_btn()
+        self._chev_color_btn.clicked.connect(self._pick_chev_color)
+        chcl.addWidget(self._chev_color_btn)
+        chcl.addStretch()
+        self._chev_color_label = form.addRow("Color", chev_color_row)
+
+        # ---- Chevron scroll checkbox ----
+        cs_row = QWidget()
+        csl = QHBoxLayout(cs_row)
+        csl.setContentsMargins(0, 0, 0, 0)
+        self._chev_scroll_cb = QCheckBox()
+        self._chev_scroll_cb.setChecked(bool(chevron_scroll))
+        self._chev_scroll_cb.setToolTip("Scroll arrows toward the camera continuously")
+        self._chev_scroll_cb.stateChanged.connect(self.changed)
+        csl.addWidget(self._chev_scroll_cb)
+        csl.addStretch()
+        form.addRow("Scroll", cs_row)
+
+        # ---- Chevron blink checkbox ----
+        cb_row = QWidget()
+        cbl = QHBoxLayout(cb_row)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        self._chev_blink_cb = QCheckBox()
+        self._chev_blink_cb.setChecked(bool(chevron_blink))
+        self._chev_blink_cb.setToolTip("Blink chevrons on/off every ~0.5 s")
+        self._chev_blink_cb.stateChanged.connect(self.changed)
+        cbl.addWidget(self._chev_blink_cb)
+        cbl.addStretch()
+        form.addRow("Blink", cb_row)
+
+        # ---- Chevron width fraction ----
+        self._chev_width_sp = QDoubleSpinBox()
+        self._chev_width_sp.setRange(0.10, 2.0)
+        self._chev_width_sp.setSingleStep(0.05)
+        self._chev_width_sp.setDecimals(2)
+        self._chev_width_sp.setValue(float(chevron_width_frac))
+        self._chev_width_sp.setToolTip("Strip width as fraction of lane spread (0.1 – 2.0)")
+        _no_scroll(self._chev_width_sp)
+        self._chev_width_sp.valueChanged.connect(self.changed)
+        form.addRow("Width frac", self._chev_width_sp)
+
+        # ---- Chevron count ----
+        self._chev_count_sp = QSpinBox()
+        self._chev_count_sp.setRange(3, 12)
+        self._chev_count_sp.setValue(int(chevron_count))
+        self._chev_count_sp.setToolTip("Number of arrows visible simultaneously (3 – 12)")
+        _no_scroll(self._chev_count_sp)
+        self._chev_count_sp.valueChanged.connect(self.changed)
+        form.addRow("Count", self._chev_count_sp)
+
+        # Keep references to all chevron widgets for enable/disable
+        self._chevron_widgets = [
+            chev_color_row, self._chev_color_btn,
+            cs_row, self._chev_scroll_cb,
+            cb_row, self._chev_blink_cb,
+            self._chev_width_sp, self._chev_count_sp,
+            sep, self._chevron_header,
+        ]
+        # Rows that disappear when "Full static image" is enabled.
+        # (Layout / BG / tiles / blink / chevron all become irrelevant — the
+        # whole floor becomes a single stretched image.)
+        self._effect_rows = [
+            self._layout_cb, bg_row, self._bg_opacity_sp,
+            color_row, blink_row, sep, self._chevron_header,
+            chev_color_row, cs_row, cb_row,
+            self._chev_width_sp, self._chev_count_sp,
+        ]
+        self._update_chevron_visibility()
+        self._update_full_static_visibility()
+
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind != "image":
+            self._notify_drop("Floor accepts image only.", True)
+            event.ignore()
+            return
+        self._img_edit.setText(str(media.source_path))
+        self._on_img_edit_changed()
+        self._notify_drop(f"Floor panel image set: {media.display_name}")
+        event.acceptProposedAction()
+
+    # ------------------------------------------------------------------
+    def _on_layout_changed(self) -> None:
+        self._update_chevron_visibility()
+        self.changed.emit()
+
+    def _update_chevron_visibility(self) -> None:
+        enabled = (self._layout_cb.currentData() == "chevron_strip")
+        for w in self._chevron_widgets:
+            w.setEnabled(enabled)
+        # In auto layout, chevron controls are not needed -> hide the whole block.
+        for w in self._chevron_widgets:
+            self._set_floor_row_visible(w, enabled)
+        # In chevron layout, tile color/opacity are irrelevant (legacy tiles only).
+        self._set_floor_row_visible(self._tile_color_row, not enabled)
+
+    # ------------------------------------------------------------------
+    def _refresh_bg_btn(self) -> None:
+        if self._bg_color:
+            self._bg_btn.setText(self._bg_color)
+            self._bg_btn.setStyleSheet(
+                f"background-color:{self._bg_color}; color: #fff;"
+                f" border:1px solid #888; border-radius:3px;"
+            )
+        else:
+            self._bg_btn.setText("None")
+            self._bg_btn.setStyleSheet("")
+
+    def _pick_bg_color(self) -> None:
+        initial = QColor(self._bg_color) if self._bg_color else QColor(90, 26, 140)
+        dlg = QColorDialog(initial, self)
+        # Native dialog on some Windows setups occasionally reports stale/invalid
+        # selected color; force Qt dialog for deterministic behavior.
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dlg.setWindowTitle("Runway background color")
+        if dlg.exec():
+            color = dlg.selectedColor()
+            if color.isValid():
+                self._bg_color = color.name(QColor.NameFormat.HexRgb)
+                self._refresh_bg_btn()
+                self.changed.emit()
+
+    def _clear_bg_color(self) -> None:
+        self._bg_color = None
+        self._refresh_bg_btn()
+        self.changed.emit()
+
+    # ------------------------------------------------------------------
+    def _refresh_color_btn(self) -> None:
+        if self._color:
+            self._color_btn.setText(self._color)
+            self._color_btn.setStyleSheet(
+                f"background-color:{self._color}; color: #fff;"
+                f" border:1px solid #888; border-radius:3px;"
+            )
+        else:
+            self._color_btn.setText("Default")
+            self._color_btn.setStyleSheet("")
+
+    def _pick_color(self) -> None:
+        initial = QColor(self._color) if self._color else QColor(170, 175, 180)
+        color = QColorDialog.getColor(initial, self, "Floor tile color")
+        if color.isValid():
+            self._color = color.name()
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _browse_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select tile image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+        )
+        if path:
+            self._img_edit.setText(path)
+            self._update_full_static_visibility()
+            self.changed.emit()
+
+    def _on_img_edit_changed(self) -> None:
+        self._update_full_static_visibility()
+        self.changed.emit()
+
+    def _on_full_static_changed(self) -> None:
+        self._apply_full_static_state()
+        self.changed.emit()
+
+    def _has_image(self) -> bool:
+        return bool(self._img_edit.text().strip())
+
+    def _update_full_static_visibility(self) -> None:
+        """Show the 'Full static image' row only when a tile image is set."""
+        has_img = self._has_image()
+        self._set_floor_row_visible(self._full_static_row, has_img)
+        # If the image was just cleared, also clear the checkbox state so the
+        # value persisted to render_settings reflects what's currently usable.
+        if not has_img and self._full_static_cb.isChecked():
+            self._full_static_cb.blockSignals(True)
+            self._full_static_cb.setChecked(False)
+            self._full_static_cb.blockSignals(False)
+        self._apply_full_static_state()
+
+    def _apply_full_static_state(self) -> None:
+        """Hide the rest of the floor effect rows when full-static is on."""
+        full = (self._full_static_cb.isChecked() and self._has_image())
+        for w in self._effect_rows:
+            self._set_floor_row_visible(w, not full)
+        # Image row stays visible regardless (user must see/edit the path).
+        # When full-static is OFF, restore the layout-driven chevron visibility.
+        if not full:
+            self._update_chevron_visibility()
+
+    def _set_floor_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """Safely toggle a floor row without Qt invalid-widget warnings."""
+        try:
+            if self._form.indexOf(widget) >= 0:
+                self._form.setRowVisible(widget, visible)
+            else:
+                widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
+
+    # ------------------------------------------------------------------
+    def _refresh_chev_color_btn(self) -> None:
+        self._chev_color_btn.setText(self._chev_color)
+        self._chev_color_btn.setStyleSheet(
+            f"background-color:{self._chev_color}; color: #000;"
+            f" border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick_chev_color(self) -> None:
+        initial = QColor(self._chev_color)
+        color = QColorDialog.getColor(initial, self, "Chevron arrow color")
+        if color.isValid():
+            self._chev_color = color.name()
+            self._refresh_chev_color_btn()
+            self.changed.emit()
+
+    # ------------------------------------------------------------------
+    def get_color(self) -> str | None:
+        return self._color or None
+
+    def get_blink(self) -> bool:
+        return self._blink_cb.isChecked()
+
+    def get_image(self) -> str | None:
+        t = self._img_edit.text().strip()
+        return t or None
+
+    def get_floor_layout(self) -> str:
+        return self._layout_cb.currentData() or "auto"
+
+    def get_floor_bg_color(self) -> str | None:
+        return self._bg_color or None
+
+    def get_floor_bg_opacity(self) -> float:
+        return self._bg_opacity_sp.value()
+
+    def get_floor_panel_opacity(self) -> float:
+        return self._tile_opacity_sp.value()
+
+    def get_chevron_color(self) -> str:
+        return self._chev_color
+
+    def get_chevron_scroll(self) -> bool:
+        return self._chev_scroll_cb.isChecked()
+
+    def get_chevron_blink(self) -> bool:
+        return self._chev_blink_cb.isChecked()
+
+    def get_chevron_width_frac(self) -> float:
+        return self._chev_width_sp.value()
+
+    def get_chevron_count(self) -> int:
+        return self._chev_count_sp.value()
+
+    def get_full_static_image(self) -> bool:
+        return bool(self._full_static_cb.isChecked()) and self._has_image()
+
+    def get_config(self) -> dict:
+        """Export current state as a layer config dict."""
+        return {
+            "floor_panels": True,
+            "floor_panel_color": self.get_color(),
+            "floor_panel_opacity": self.get_floor_panel_opacity(),
+            "floor_panel_blink": self.get_blink(),
+            "floor_panel_image": self.get_image(),
+            "floor_full_static_image": self.get_full_static_image(),
+            "floor_layout": self.get_floor_layout(),
+            "floor_bg_color": self.get_floor_bg_color(),
+            "floor_bg_opacity": self.get_floor_bg_opacity(),
+            "chevron_color": self.get_chevron_color(),
+            "chevron_scroll": self.get_chevron_scroll(),
+            "chevron_blink": self.get_chevron_blink(),
+            "chevron_width_frac": self.get_chevron_width_frac(),
+            "chevron_count": self.get_chevron_count(),
+        }
+
+
+class _SideRailSection(QGroupBox):
+    """Config sub-section for side-rail settings.
+
+    Shown/hidden by the parent form based on the "Side rails" toggle.
+    """
+
+    changed = Signal()
+    media_dropped = Signal(str, bool)  # message, is_error
+
+    _SHAPES = [("Chunky (fence blocks)", "chunky"),
+               ("Tube (strip)", "tube"),
+               ("Chevron (arrows)", "chevron"),
+               ("Pillar (LED chase)", "pillar"),
+               ("Dot (glowing dots)", "dot")]
+    _PULSES = [("None (static)", "none"),
+               ("Beat (flash on hit)", "beat"),
+               ("RMS (breathe with bass)", "rms")]
+
+    def __init__(
+        self,
+        color: str,
+        shape: str,
+        height: float,
+        offset_x: float,
+        image: str | None,
+        pulse: str,
+        pulse_intensity: float,
+        texture_non_loop: bool = False,
+        chevron_depth: float = 1.0,
+        chevron_density: int = 6,
+        pillar_count: int = 16,
+        pillar_highlight_count: int = 1,
+        pillar_radius: float = 1.0,
+        chase_mode: str = "time",
+        chase_speed_frames: int = 4,
+        dot_count: int = 24,
+        dot_lines: int = 1,
+        dot_size_px: int = 6,
+        dot_anim_mode: str = "audio",
+        dot_color_near: str = "#FF60FF",
+        dot_color_far: str = "#00FFFF",
+        project: Optional[Project] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Side Rail Options", parent)
+        self._project = project
+        self.setAcceptDrops(True)
+        form = QFormLayout(self)
+        self._form = form
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # ---- Color ----
+        color_row = QWidget()
+        cl = QHBoxLayout(color_row)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self._color: str = color or "#FF60FF"
+        self._color_btn = QPushButton()
+        self._color_btn.setMinimumWidth(90)
+        self._color_btn.setMaximumWidth(160)
+        self._color_btn.setToolTip("Neon color for side rails")
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        cl.addWidget(self._color_btn)
+        cl.addStretch()
+        form.addRow("Color", color_row)
+
+        # ---- Shape ----
+        self._shape_cb = QComboBox()
+        for label, val in self._SHAPES:
+            self._shape_cb.addItem(label, val)
+        idx = next((i for i, (_, v) in enumerate(self._SHAPES) if v == shape), 0)
+        self._shape_cb.setCurrentIndex(idx)
+        _no_scroll(self._shape_cb)
+        self._shape_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Shape", self._shape_cb)
+
+        # ---- Height ----
+        self._height_sp = QDoubleSpinBox()
+        self._height_sp.setRange(0.01, 1.0)
+        self._height_sp.setSingleStep(0.01)
+        self._height_sp.setDecimals(2)
+        self._height_sp.setValue(float(height))
+        self._height_sp.setToolTip("Fence height above floor (world units, e.g. 0.12)")
+        _no_scroll(self._height_sp)
+        self._height_sp.valueChanged.connect(self.changed)
+        form.addRow("Height", self._height_sp)
+
+        # ---- Offset X ----
+        self._offset_sp = QDoubleSpinBox()
+        self._offset_sp.setRange(0.0, 1.0)
+        self._offset_sp.setSingleStep(0.01)
+        self._offset_sp.setDecimals(2)
+        self._offset_sp.setValue(float(offset_x))
+        self._offset_sp.setToolTip("Gap from outer lane tile to fence face (0 = flush with lane edge)")
+        _no_scroll(self._offset_sp)
+        self._offset_sp.valueChanged.connect(self.changed)
+        form.addRow("Offset X", self._offset_sp)
+
+        # ---- Image file ----
+        self._img_edit = QLineEdit(image or "")
+        self._img_edit.setPlaceholderText("Texture image (optional)…")
+        self._img_edit.setToolTip(
+            "Optional PNG/JPG to texture the rail blocks.\n"
+            "Leave blank to use the solid neon color."
+        )
+        self._img_edit.editingFinished.connect(self._on_texture_edited)
+        img_browse = QPushButton("…")
+        img_browse.setFixedWidth(28)
+        img_browse.clicked.connect(self._browse_image)
+        img_row = QWidget()
+        ir = QHBoxLayout(img_row)
+        ir.setContentsMargins(0, 0, 0, 0)
+        ir.setSpacing(4)
+        ir.addWidget(self._img_edit)
+        ir.addWidget(img_browse)
+        form.addRow("Texture", img_row)
+        self._texture_row = img_row
+
+        # Tube-only texture option
+        non_loop_row = QWidget()
+        nl = QHBoxLayout(non_loop_row)
+        nl.setContentsMargins(0, 0, 0, 0)
+        self._texture_non_loop_cb = QCheckBox()
+        self._texture_non_loop_cb.setChecked(bool(texture_non_loop))
+        self._texture_non_loop_cb.setToolTip(
+            "Tube mode only. ON = map texture once over full rail length;\n"
+            "OFF = tile/loop texture per segment."
+        )
+        self._texture_non_loop_cb.stateChanged.connect(self.changed)
+        nl.addWidget(self._texture_non_loop_cb)
+        nl.addStretch()
+        form.addRow("Non-loop", non_loop_row)
+        self._texture_non_loop_row = non_loop_row
+
+        # ---- Pulse mode ----
+        self._pulse_cb = QComboBox()
+        for label, val in self._PULSES:
+            self._pulse_cb.addItem(label, val)
+        pidx = next((i for i, (_, v) in enumerate(self._PULSES) if v == pulse), 1)
+        self._pulse_cb.setCurrentIndex(pidx)
+        _no_scroll(self._pulse_cb)
+        self._pulse_cb.currentIndexChanged.connect(self.changed)
+        form.addRow("Pulse", self._pulse_cb)
+
+        # ---- Pulse intensity ----
+        self._intensity_sp = QDoubleSpinBox()
+        self._intensity_sp.setRange(0.0, 1.0)
+        self._intensity_sp.setSingleStep(0.05)
+        self._intensity_sp.setDecimals(2)
+        self._intensity_sp.setValue(float(pulse_intensity))
+        self._intensity_sp.setToolTip("Pulse intensity 0 = static, 1 = full flash")
+        _no_scroll(self._intensity_sp)
+        self._intensity_sp.valueChanged.connect(self.changed)
+        form.addRow("Intensity", self._intensity_sp)
+
+        # ── Chevron-only sub-group ─────────────────────────────────────
+        self._chev_sep = QFrame()
+        self._chev_sep.setFrameShape(QFrame.Shape.HLine)
+        self._chev_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._chev_sep)
+        self._chev_header = QLabel("<b>Chevron options</b>")
+        form.addRow(self._chev_header)
+
+        # ---- Depth (pointedness) — slider 0.2 … 5.0 step 0.1 ----
+        depth_row = QWidget()
+        dl = QHBoxLayout(depth_row)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(6)
+        self._chev_depth_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chev_depth_sl.setRange(2, 50)   # ×10 of real value
+        self._chev_depth_sl.setSingleStep(1)
+        self._chev_depth_sl.setPageStep(5)
+        self._chev_depth_sl.setValue(max(2, min(50, round(float(chevron_depth) * 10))))
+        self._chev_depth_sl.setToolTip(
+            "Chevron pointedness multiplier.\n"
+            "1.0 = 120° opening angle.  >1 = sharper.  <1 = flatter."
+        )
+        self._chev_depth_lbl = QLabel(f"{float(chevron_depth):.1f}×")
+        self._chev_depth_lbl.setMinimumWidth(36)
+        self._chev_depth_sl.valueChanged.connect(self._on_chev_depth_changed)
+        dl.addWidget(self._chev_depth_sl, stretch=1)
+        dl.addWidget(self._chev_depth_lbl)
+        form.addRow("Depth", depth_row)
+
+        # ---- Density (count) — slider 6 … 20 ----
+        density_row = QWidget()
+        dsl = QHBoxLayout(density_row)
+        dsl.setContentsMargins(0, 0, 0, 0)
+        dsl.setSpacing(6)
+        self._chev_density_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chev_density_sl.setRange(6, 20)
+        self._chev_density_sl.setSingleStep(1)
+        self._chev_density_sl.setValue(max(6, min(20, int(chevron_density))))
+        self._chev_density_sl.setToolTip("Number of chevrons visible on each wall (6 – 20)")
+        self._chev_density_lbl = QLabel(str(self._chev_density_sl.value()))
+        self._chev_density_lbl.setMinimumWidth(26)
+        self._chev_density_sl.valueChanged.connect(self._on_chev_density_changed)
+        dsl.addWidget(self._chev_density_sl, stretch=1)
+        dsl.addWidget(self._chev_density_lbl)
+        form.addRow("Density", density_row)
+
+        self._chev_widgets = [
+            self._chev_sep, self._chev_header,
+            depth_row, density_row,
+        ]
+
+        # ── Pillar-only sub-group ──────────────────────────────────────
+        self._pillar_sep = QFrame()
+        self._pillar_sep.setFrameShape(QFrame.Shape.HLine)
+        self._pillar_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._pillar_sep)
+        self._pillar_header = QLabel("<b>Pillar options</b>")
+        form.addRow(self._pillar_header)
+
+        pillar_count_row = QWidget()
+        pcr = QHBoxLayout(pillar_count_row)
+        pcr.setContentsMargins(0, 0, 0, 0)
+        pcr.setSpacing(6)
+        self._pillar_count_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_count_sl.setRange(4, 32)
+        self._pillar_count_sl.setSingleStep(1)
+        self._pillar_count_sl.setPageStep(2)
+        self._pillar_count_sl.setValue(max(4, min(32, int(pillar_count))))
+        self._pillar_count_sl.setToolTip("Number of pillars (4..32). More = denser LED row.")
+        self._pillar_count_lbl = QLabel(str(self._pillar_count_sl.value()))
+        self._pillar_count_lbl.setMinimumWidth(28)
+        self._pillar_count_sl.valueChanged.connect(self._on_pillar_count_changed)
+        pcr.addWidget(self._pillar_count_sl, stretch=1)
+        pcr.addWidget(self._pillar_count_lbl)
+        form.addRow("Count", pillar_count_row)
+
+        pillar_highlight_row = QWidget()
+        phr = QHBoxLayout(pillar_highlight_row)
+        phr.setContentsMargins(0, 0, 0, 0)
+        phr.setSpacing(6)
+        self._pillar_highlight_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_highlight_sl.setRange(1, 32)
+        self._pillar_highlight_sl.setSingleStep(1)
+        self._pillar_highlight_sl.setPageStep(2)
+        self._pillar_highlight_sl.setValue(max(1, min(32, int(pillar_highlight_count))))
+        self._pillar_highlight_sl.setToolTip(
+            "How many pillar columns glow at the same time."
+        )
+        self._pillar_highlight_lbl = QLabel(str(self._pillar_highlight_sl.value()))
+        self._pillar_highlight_lbl.setMinimumWidth(28)
+        self._pillar_highlight_sl.valueChanged.connect(self._on_pillar_highlight_changed)
+        phr.addWidget(self._pillar_highlight_sl, stretch=1)
+        phr.addWidget(self._pillar_highlight_lbl)
+        form.addRow("Highlight columns", pillar_highlight_row)
+
+        pillar_radius_row = QWidget()
+        prr = QHBoxLayout(pillar_radius_row)
+        prr.setContentsMargins(0, 0, 0, 0)
+        prr.setSpacing(6)
+        self._pillar_radius_sl = QSlider(Qt.Orientation.Horizontal)
+        self._pillar_radius_sl.setRange(20, 200)  # x100 of real value (0.20..2.00)
+        self._pillar_radius_sl.setSingleStep(1)
+        self._pillar_radius_sl.setPageStep(5)
+        self._pillar_radius_sl.setValue(max(20, min(200, round(float(pillar_radius) * 100))))
+        self._pillar_radius_sl.setToolTip(
+            "Pillar circumference scale. <1 = thinner columns, >1 = thicker."
+        )
+        self._pillar_radius_lbl = QLabel(f"{self._pillar_radius_sl.value() / 100.0:.2f}")
+        self._pillar_radius_lbl.setMinimumWidth(38)
+        self._pillar_radius_sl.valueChanged.connect(self._on_pillar_radius_changed)
+        prr.addWidget(self._pillar_radius_sl, stretch=1)
+        prr.addWidget(self._pillar_radius_lbl)
+        form.addRow("Radius", pillar_radius_row)
+
+        self._chase_mode_cb = QComboBox()
+        self._chase_mode_cb.addItems(["time", "beat"])
+        self._chase_mode_cb.setCurrentText(str(chase_mode))
+        self._chase_mode_cb.setToolTip(
+            "time = constant frame interval; beat = advance on each beat hit"
+        )
+        _no_scroll(self._chase_mode_cb)
+        self._chase_mode_cb.currentTextChanged.connect(self.changed)
+        form.addRow("Chase mode", self._chase_mode_cb)
+
+        chase_speed_row = QWidget()
+        csr = QHBoxLayout(chase_speed_row)
+        csr.setContentsMargins(0, 0, 0, 0)
+        csr.setSpacing(6)
+        self._chase_speed_sl = QSlider(Qt.Orientation.Horizontal)
+        self._chase_speed_sl.setRange(1, 60)
+        self._chase_speed_sl.setSingleStep(1)
+        self._chase_speed_sl.setPageStep(4)
+        self._chase_speed_sl.setValue(max(1, min(60, int(chase_speed_frames))))
+        self._chase_speed_sl.setToolTip(
+            "Frames per chase advance (only for time mode). 4 ≈ 133ms @30fps."
+        )
+        self._chase_speed_lbl = QLabel(str(self._chase_speed_sl.value()))
+        self._chase_speed_lbl.setMinimumWidth(28)
+        self._chase_speed_sl.valueChanged.connect(self._on_chase_speed_changed)
+        csr.addWidget(self._chase_speed_sl, stretch=1)
+        csr.addWidget(self._chase_speed_lbl)
+        form.addRow("Chase speed", chase_speed_row)
+
+        self._pillar_widgets = [
+            self._pillar_sep, self._pillar_header,
+            pillar_count_row, pillar_highlight_row, pillar_radius_row,
+            self._chase_mode_cb, chase_speed_row,
+        ]
+        self._sync_pillar_highlight_limit()
+
+        # ── Dot-only sub-group ─────────────────────────────────────────
+        self._dot_sep = QFrame()
+        self._dot_sep.setFrameShape(QFrame.Shape.HLine)
+        self._dot_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(self._dot_sep)
+        self._dot_header = QLabel("<b>Dot options</b>")
+        form.addRow(self._dot_header)
+
+        self._dot_count_sp = QSpinBox()
+        self._dot_count_sp.setRange(8, 64)
+        self._dot_count_sp.setValue(int(dot_count))
+        self._dot_count_sp.setToolTip("Number of dots per rail (8..64)")
+        _no_scroll(self._dot_count_sp)
+        self._dot_count_sp.valueChanged.connect(self.changed)
+        form.addRow("Count", self._dot_count_sp)
+
+        self._dot_lines_sp = QSpinBox()
+        self._dot_lines_sp.setRange(1, 8)
+        self._dot_lines_sp.setValue(int(dot_lines))
+        self._dot_lines_sp.setToolTip("Number of vertical dot lines on wall (top -> bottom) (1..8)")
+        _no_scroll(self._dot_lines_sp)
+        self._dot_lines_sp.valueChanged.connect(self.changed)
+        form.addRow("Lines (vertical)", self._dot_lines_sp)
+
+        self._dot_size_sp = QSpinBox()
+        self._dot_size_sp.setRange(2, 20)
+        self._dot_size_sp.setValue(int(dot_size_px))
+        self._dot_size_sp.setToolTip("Base dot radius in pixels at Z_NEAR")
+        _no_scroll(self._dot_size_sp)
+        self._dot_size_sp.valueChanged.connect(self.changed)
+        form.addRow("Size (px)", self._dot_size_sp)
+
+        self._dot_anim_cb = QComboBox()
+        self._dot_anim_cb.addItems(["audio", "twinkle", "wave"])
+        self._dot_anim_cb.setCurrentText(str(dot_anim_mode))
+        self._dot_anim_cb.setToolTip(
+            "audio = brightness from bass; twinkle = random fade; wave = sin wave"
+        )
+        _no_scroll(self._dot_anim_cb)
+        self._dot_anim_cb.currentTextChanged.connect(self.changed)
+        form.addRow("Anim mode", self._dot_anim_cb)
+
+        self._dot_color_near = str(dot_color_near or "#FF60FF")
+        self._dot_near_btn = QPushButton(self._dot_color_near)
+        self._refresh_dot_color_btn(self._dot_near_btn, self._dot_color_near)
+        self._dot_near_btn.clicked.connect(self._pick_dot_color_near)
+        form.addRow("Near color", self._dot_near_btn)
+
+        self._dot_color_far = str(dot_color_far or "#00FFFF")
+        self._dot_far_btn = QPushButton(self._dot_color_far)
+        self._refresh_dot_color_btn(self._dot_far_btn, self._dot_color_far)
+        self._dot_far_btn.clicked.connect(self._pick_dot_color_far)
+        form.addRow("Far color", self._dot_far_btn)
+
+        self._dot_widgets = [
+            self._dot_sep, self._dot_header,
+            self._dot_count_sp, self._dot_lines_sp, self._dot_size_sp, self._dot_anim_cb,
+            self._dot_near_btn, self._dot_far_btn,
+        ]
+        # Wire shape change to show/hide chevron sub-group
+        self._shape_cb.currentIndexChanged.connect(self._on_shape_changed)
+        self._update_chev_visibility()
+        self._update_pillar_visibility()
+        self._update_dot_visibility()
+        self._update_texture_visibility()
+        self._update_texture_tube_options_visibility()
+
+        # 2-second debounce for continuous slider input — label updates
+        # instantly but `changed` is emitted only after the user stops
+        # dragging for ≥2 s to avoid rebuilding the scene on every tick.
+        self._slider_debounce = QTimer(self)
+        self._slider_debounce.setSingleShot(True)
+        self._slider_debounce.setInterval(2000)
+        self._slider_debounce.timeout.connect(self.changed)
+
+    def _notify_drop(self, msg: str, is_error: bool = False) -> None:
+        self.media_dropped.emit(msg, is_error)
+        if is_error:
+            set_drop_reject_flash(self)
+            QTimer.singleShot(800, lambda: set_drop_highlight(self, False))
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+            set_drop_highlight(self, True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData() and event.mimeData().hasFormat("application/x-htstudio-media-id"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_drop_highlight(self, False)
+        result = get_media_from_drop(event, self._project)
+        if result is None:
+            event.ignore()
+            return
+        media, kind = result
+        if kind != "image":
+            self._notify_drop("Side rails accept image only.", True)
+            event.ignore()
+            return
+        self._img_edit.setText(str(media.source_path))
+        self._on_texture_edited()
+        self._notify_drop(f"Side rail texture set: {media.display_name}")
+        event.acceptProposedAction()
+
+    # ------------------------------------------------------------------
+    def _on_shape_changed(self) -> None:
+        self._update_chev_visibility()
+        self._update_pillar_visibility()
+        self._update_dot_visibility()
+        self._update_texture_visibility()
+        self._update_texture_tube_options_visibility()
+        self.changed.emit()
+
+    def _on_chev_depth_changed(self, raw: int) -> None:
+        self._chev_depth_lbl.setText(f"{raw / 10:.1f}×")
+        self._slider_debounce.start()   # restart 2-s window
+
+    def _on_chev_density_changed(self, val: int) -> None:
+        self._chev_density_lbl.setText(str(val))
+        self._slider_debounce.start()   # restart 2-s window
+
+    def _on_pillar_count_changed(self, val: int) -> None:
+        self._pillar_count_lbl.setText(str(val))
+        self._sync_pillar_highlight_limit()
+        self._slider_debounce.start()
+
+    def _on_pillar_highlight_changed(self, val: int) -> None:
+        self._pillar_highlight_lbl.setText(str(val))
+        self._slider_debounce.start()
+
+    def _on_pillar_radius_changed(self, raw: int) -> None:
+        self._pillar_radius_lbl.setText(f"{raw / 100.0:.2f}")
+        self._slider_debounce.start()
+
+    def _on_chase_speed_changed(self, val: int) -> None:
+        self._chase_speed_lbl.setText(str(val))
+        self._slider_debounce.start()
+
+    def _sync_pillar_highlight_limit(self) -> None:
+        cap = max(1, int(self._pillar_count_sl.value()))
+        self._pillar_highlight_sl.setMaximum(cap)
+        if self._pillar_highlight_sl.value() > cap:
+            self._pillar_highlight_sl.setValue(cap)
+        self._pillar_highlight_lbl.setText(str(self._pillar_highlight_sl.value()))
+
+    def _update_chev_visibility(self) -> None:
+        is_chev = (self._shape_cb.currentData() == "chevron")
+        for w in self._chev_widgets:
+            self._set_side_row_visible(w, is_chev)
+
+    def _update_pillar_visibility(self) -> None:
+        is_pillar = (self._shape_cb.currentData() == "pillar")
+        for w in self._pillar_widgets:
+            self._set_side_row_visible(w, is_pillar)
+
+    def _update_dot_visibility(self) -> None:
+        is_dot = (self._shape_cb.currentData() == "dot")
+        for w in self._dot_widgets:
+            self._set_side_row_visible(w, is_dot)
+
+    def _set_side_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """Hide/show a full form row (label + field) when possible."""
+        # During panel rebuilds, stale signals can hit widgets that are no
+        # longer attached to this form. Guard to avoid Qt warning:
+        # "QFormLayout::setRowVisible: Invalid widget".
+        try:
+            if self._form.indexOf(widget) >= 0:
+                self._form.setRowVisible(widget, visible)
+            else:
+                widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
+
+    def _update_texture_visibility(self) -> None:
+        shape = self._shape_cb.currentData()
+        show_texture = shape not in ("chevron", "pillar", "dot")
+        self._set_side_row_visible(self._texture_row, show_texture)
+
+    def _update_texture_tube_options_visibility(self) -> None:
+        is_tube = (self._shape_cb.currentData() == "tube")
+        has_tex = bool(self._img_edit.text().strip())
+        self._set_side_row_visible(self._texture_non_loop_row, is_tube and has_tex)
+
+    @staticmethod
+    def _refresh_dot_color_btn(btn: QPushButton, hex_color: str) -> None:
+        btn.setText(hex_color)
+        btn.setStyleSheet(
+            f"background-color:{hex_color}; color:#fff;"
+            " border:1px solid #888; border-radius:3px;"
+        )
+
+    # ------------------------------------------------------------------
+    def _refresh_color_btn(self) -> None:
+        self._color_btn.setText(self._color)
+        self._color_btn.setStyleSheet(
+            f"background-color:{self._color}; color: #fff;"
+            f" border:1px solid #888; border-radius:3px;"
+        )
+
+    def _pick_color(self) -> None:
+        initial = QColor(self._color)
+        color = QColorDialog.getColor(initial, self, "Rail neon color")
+        if color.isValid():
+            self._color = color.name()
+            self._refresh_color_btn()
+            self.changed.emit()
+
+    def _browse_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select rail texture", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+        )
+        if path:
+            self._img_edit.setText(path)
+            self._update_texture_tube_options_visibility()
+            self.changed.emit()
+
+    def _on_texture_edited(self) -> None:
+        self._update_texture_tube_options_visibility()
+        self.changed.emit()
+
+    def _pick_dot_color_near(self) -> None:
+        self._pick_dot_color_for("near")
+
+    def _pick_dot_color_far(self) -> None:
+        self._pick_dot_color_for("far")
+
+    def _pick_dot_color_for(self, side: str) -> None:
+        current = self._dot_color_near if side == "near" else self._dot_color_far
+        dlg = QColorDialog(QColor(current), self)
+        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        if dlg.exec():
+            col = dlg.selectedColor()
+            if col.isValid():
+                hex_str = col.name(QColor.NameFormat.HexRgb).upper()
+                if side == "near":
+                    self._dot_color_near = hex_str
+                    self._refresh_dot_color_btn(self._dot_near_btn, hex_str)
+                else:
+                    self._dot_color_far = hex_str
+                    self._refresh_dot_color_btn(self._dot_far_btn, hex_str)
+                self.changed.emit()
+
+    # ------------------------------------------------------------------
+    def get_color(self) -> str:
+        return self._color
+
+    def get_shape(self) -> str:
+        return self._shape_cb.currentData() or "chunky"
+
+    def get_height(self) -> float:
+        return self._height_sp.value()
+
+    def get_offset_x(self) -> float:
+        return self._offset_sp.value()
+
+    def get_image(self) -> str | None:
+        t = self._img_edit.text().strip()
+        return t or None
+
+    def get_texture_non_loop(self) -> bool:
+        return (
+            bool(self._texture_non_loop_cb.isChecked())
+            and (self.get_shape() == "tube")
+            and bool(self.get_image())
+        )
+
+    def get_pulse(self) -> str:
+        return self._pulse_cb.currentData() or "beat"
+
+    def get_pulse_intensity(self) -> float:
+        return self._intensity_sp.value()
+
+    def get_chevron_depth(self) -> float:
+        return self._chev_depth_sl.value() / 10.0
+
+    def get_chevron_density(self) -> int:
+        return self._chev_density_sl.value()
+
+    def get_pillar_count(self) -> int:
+        return self._pillar_count_sl.value()
+
+    def get_pillar_radius(self) -> float:
+        return self._pillar_radius_sl.value() / 100.0
+
+    def get_pillar_highlight_count(self) -> int:
+        return self._pillar_highlight_sl.value()
+
+    def get_chase_mode(self) -> str:
+        return self._chase_mode_cb.currentText()
+
+    def get_chase_speed_frames(self) -> int:
+        return self._chase_speed_sl.value()
+
+    def get_dot_count(self) -> int:
+        return self._dot_count_sp.value()
+
+    def get_dot_lines(self) -> int:
+        return self._dot_lines_sp.value()
+
+    def get_dot_size_px(self) -> int:
+        return self._dot_size_sp.value()
+
+    def get_dot_anim_mode(self) -> str:
+        return self._dot_anim_cb.currentText()
+
+    def get_dot_color_near(self) -> str:
+        return self._dot_color_near
+
+    def get_dot_color_far(self) -> str:
+        return self._dot_color_far
+
+    def get_config(self) -> dict:
+        """Export current state as a layer config dict."""
+        return {
+            "side_rails": True,
+            "rail_color": self.get_color(),
+            "rail_shape": self.get_shape(),
+            "rail_height": self.get_height(),
+            "rail_offset_x": self.get_offset_x(),
+            "rail_image": self.get_image(),
+            "rail_texture_non_loop": self.get_texture_non_loop(),
+            "rail_pulse": self.get_pulse(),
+            "rail_pulse_intensity": self.get_pulse_intensity(),
+            "rail_chevron_depth": self.get_chevron_depth(),
+            "rail_chevron_density": self.get_chevron_density(),
+            "rail_pillar_count": self.get_pillar_count(),
+            "rail_pillar_highlight_count": self.get_pillar_highlight_count(),
+            "rail_pillar_radius": self.get_pillar_radius(),
+            "rail_chase_mode": self.get_chase_mode(),
+            "rail_chase_speed_frames": self.get_chase_speed_frames(),
+            "rail_dot_count": self.get_dot_count(),
+            "rail_dot_lines": self.get_dot_lines(),
+            "rail_dot_size_px": self.get_dot_size_px(),
+            "rail_dot_anim_mode": self.get_dot_anim_mode(),
+            "rail_dot_color_near": self.get_dot_color_near(),
+            "rail_dot_color_far": self.get_dot_color_far(),
+        }
 
 
 def format_sec(value: float) -> str:
@@ -103,6 +1412,38 @@ class SegmentConfigPanel(QWidget):
         self._refresh_audio_options()
         self._load_segment_fields(segment)
         self._rebuild_dynamic_settings()
+        self._apply_video_segment_lock_state(segment)
+
+    @staticmethod
+    def _is_video_segment_locked(segment: Segment | None) -> bool:
+        return bool(segment is not None and getattr(segment, "is_video_segment", False))
+
+    def _apply_video_segment_lock_state(self, segment: Segment) -> None:
+        """Lock inspector controls for source-video playback segments."""
+        locked = self._is_video_segment_locked(segment)
+        self.start_spin.setEnabled(not locked)
+        self.end_spin.setEnabled(not locked)
+        self.min_spacing_spin.setEnabled(not locked)
+        self.mode_combo.setEnabled(not locked)
+        self.dynamic_root.setEnabled(not locked)
+        self.reset_button.setEnabled(not locked)
+        self.preview_button.setChecked(False)
+        self.preview_button.setEnabled(False if locked else bool(segment.audio_path))
+        self.render_button.setEnabled(False if locked else bool(segment.audio_path))
+        if locked:
+            msg = (
+                "Source-video segment: duration/video are fixed from dropped media "
+                "and effect settings are locked."
+            )
+            self.status_label.setText("Status: source-video segment (locked)")
+            self.status_label.setStyleSheet("color:#a78bfa;")
+            self.status_label.setToolTip(msg)
+            self.preview_button.setToolTip(
+                "This segment previews directly from its source video."
+            )
+            self.render_button.setToolTip(
+                "Source-video segments are playback-only and do not render."
+            )
 
     def refresh_status_only(self, segment: Segment) -> None:
         """Update only the status label/header without rebuilding the form.
@@ -212,7 +1553,17 @@ class SegmentConfigPanel(QWidget):
         self.form_layout.addRow("Name", self.name_input)
 
         self.audio_combo = QComboBox()
-        self.audio_combo.currentIndexChanged.connect(self._commit_general)
+        # Audio source is bound to the segment at creation/split/join/duplicate
+        # time only.  Config edits MUST NEVER mutate ``segment.audio_path`` —
+        # otherwise toggling unrelated render settings during preview races
+        # with the trim service and corrupts the per-segment trim file.
+        # The combo is therefore display-only here.
+        self.audio_combo.setEnabled(False)
+        self.audio_combo.setToolTip(
+            "Audio source is set when the segment is created, split, joined, "
+            "or duplicated. To change the source, recreate the segment."
+        )
+        _no_scroll(self.audio_combo)
         self.form_layout.addRow("Audio source", self.audio_combo)
 
         # Trimmed audio path — read-only display + "Open" button to reveal
@@ -242,12 +1593,14 @@ class SegmentConfigPanel(QWidget):
         self.start_spin.setRange(0.0, 36000.0)
         self.start_spin.setDecimals(2)
         self.start_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.start_spin)
         self.form_layout.addRow("Start (s)", self.start_spin)
 
         self.end_spin = QDoubleSpinBox()
         self.end_spin.setRange(0.0, 36000.0)
         self.end_spin.setDecimals(2)
         self.end_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.end_spin)
         self.form_layout.addRow("End (s)", self.end_spin)
 
         # Min beat spacing — anti-cluster filter for *Gen by Chart*.
@@ -276,12 +1629,14 @@ class SegmentConfigPanel(QWidget):
             "0.20–0.30 s    = aggressive merge for very dense audio."
         )
         self.min_spacing_spin.valueChanged.connect(self._commit_general)
+        _no_scroll(self.min_spacing_spin)
         self.form_layout.addRow("Min beat spacing", self.min_spacing_spin)
 
         self.mode_combo = QComboBox()
         for mode in ["punch", "dance", "line", "relax", "combo"]:
             self.mode_combo.addItem(mode.capitalize(), mode)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        _no_scroll(self.mode_combo)
         self.form_layout.addRow("Mode", self.mode_combo)
 
         self.dynamic_root = QWidget()
@@ -333,8 +1688,9 @@ class SegmentConfigPanel(QWidget):
             and self._segment is not None
             and bool(self._segment.audio_path)
         )
-        self.preview_button.setEnabled(has_audio)
-        self.render_button.setEnabled(has_audio)
+        is_video_locked = self._is_video_segment_locked(self._segment)
+        self.preview_button.setEnabled(has_audio and not is_video_locked)
+        self.render_button.setEnabled(has_audio and not is_video_locked)
         self._refresh_open_folder_state()
         if empty:
             self.preview_button.setToolTip(
@@ -346,12 +1702,20 @@ class SegmentConfigPanel(QWidget):
             self.header_label.setText("Select a segment in the timeline to configure")
             self.status_label.setText("")
         elif not has_audio:
-            self.preview_button.setToolTip(
-                "Assign an audio source to this segment to enable preview"
-            )
-            self.render_button.setToolTip(
-                "Assign an audio source to this segment to enable render"
-            )
+            if is_video_locked:
+                self.preview_button.setToolTip(
+                    "This segment previews directly from its source video."
+                )
+                self.render_button.setToolTip(
+                    "Source-video segments are playback-only and do not render."
+                )
+            else:
+                self.preview_button.setToolTip(
+                    "Assign an audio source to this segment to enable preview"
+                )
+                self.render_button.setToolTip(
+                    "Assign an audio source to this segment to enable render"
+                )
         else:
             self.preview_button.setToolTip(
                 "Render and play this segment with current settings"
@@ -491,14 +1855,16 @@ class SegmentConfigPanel(QWidget):
         self._setting_widgets.clear()
 
     # Fields always shown in the Properties panel, in display order.
+    # Base fields — always shown.  Visual decoration (background, floor,
+    # rails, stickman, countdown) has moved to the layer system and is
+    # edited via double-click on the corresponding timeline layer block.
     _VISIBLE_FIELDS = (
         "beat_source",
         "beat_sens",
         "density",
         "speed",
         "max_per_lane",
-        "floor_panels",
-        "stickman",
+        "bloom",
     )
 
     # Extra fields shown only for specific modes.  Keys must exist on the
@@ -508,6 +1874,20 @@ class SegmentConfigPanel(QWidget):
     _MODE_EXTRA_FIELDS: dict[str, tuple[str, ...]] = {
         "combo": ("mode_list",),
         "line":  ("line_zigzag",),
+        "relax": (
+            "relax_interval",
+            "relax_travel_sec",
+            "relax_wait_sec",
+            "relax_texture_low",
+            "relax_texture_high",
+            "relax_texture_middle",
+            "relax_hole_mask_path",
+            "relax_kind_ratio_middle",
+            "relax_show_low",
+            "relax_show_high",
+            "relax_show_middle",
+            # countdown fields moved to Countdown layer — removed from here
+        ),
     }
 
     _FIELD_LABELS = {
@@ -516,10 +1896,20 @@ class SegmentConfigPanel(QWidget):
         "density":     "Density",
         "speed":       "Speed",
         "max_per_lane":"Max / lane",
-        "floor_panels":"Floor panels",
-        "stickman":    "Stickman",
+        "bloom":       "Bloom",
         "mode_list":   "Sub-modes",
         "line_zigzag": "Zigzag",
+        "relax_interval": "Relax interval",
+        "relax_travel_sec": "Relax travel (sec)",
+        "relax_wait_sec": "Relax wait (sec)",
+        "relax_texture_low": "Relax texture low",
+        "relax_texture_high": "Relax texture high",
+        "relax_texture_middle": "Relax texture middle",
+        "relax_hole_mask_path": "Relax hole mask",
+        "relax_kind_ratio_middle": "Middle ratio",
+        "relax_show_low": "Show low",
+        "relax_show_high": "Show high",
+        "relax_show_middle": "Show middle",
     }
 
     def _rebuild_dynamic_settings(self) -> None:
@@ -537,6 +1927,14 @@ class SegmentConfigPanel(QWidget):
         segment.render_settings = persist_defaults
 
         mode_extras = self._MODE_EXTRA_FIELDS.get(segment.mode, ())
+        if segment.mode == "combo":
+            mode_list = model.model_dump(mode="json").get("mode_list") or []
+            if "relax" in mode_list:
+                mode_extras = (
+                    mode_extras
+                    + self._MODE_EXTRA_FIELDS.get("relax", ())
+                )
+        rs = segment.render_settings or {}
         for key in self._VISIBLE_FIELDS + mode_extras:
             # Prefer the full dump so Optional fields with value=None still
             # get a widget (their key may be absent from persist_defaults).
@@ -552,6 +1950,10 @@ class SegmentConfigPanel(QWidget):
             self._setting_widgets[key] = widget
             label = self._FIELD_LABELS.get(key, key.replace("_", " ").capitalize())
             self.dynamic_layout.addRow(label, widget)
+
+        # Visual decoration sections (floor, rails, background, stickman,
+        # countdown) have moved to the layer system.  They are now edited
+        # via double-click on the corresponding timeline layer block.
 
     # Per-key UI hints (range, step, decimals, tooltip).
     # Keys not listed fall back to generic wide-range spinboxes.
@@ -585,9 +1987,63 @@ class SegmentConfigPanel(QWidget):
             "so blocks drift slowly.  A large value here (e.g. 2.0) adds\n"
             "2s on top of that ~15s cycle → only 1–2 blocks per minute.\n"
             "Recommended: 0.0 (beat-driven) or 0.3–0.5s for a slight gap."),
+        "relax_travel_sec": (0.5, 10.0, 0.1, 2, "Relax block travel seconds (solo relax)."),
+        "relax_wait_sec": (0.0, 10.0, 0.1, 2, "Hold time before relax block starts moving."),
+        "relax_kind_ratio_middle": (0.0, 1.0, 0.01, 2, "Middle block spawn ratio (0..1)."),
     }
 
     def _build_widget_for_value(self, key: str, value):
+        if key == "background_type":
+            combo = QComboBox()
+            combo.addItem("Solid color", "solid")
+            combo.addItem("Image", "image")
+            combo.addItem("Video", "video")
+            combo.setCurrentIndex(max(0, combo.findData(str(value or "solid"))))
+            combo.currentIndexChanged.connect(self._commit_settings)
+            return _no_scroll(combo)
+        if key == "background_color":
+            widget = _ColorPickerWidget(
+                None if value is None else str(value),
+                title="Background color",
+                default_color="#000000",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
+        if key in {"background_image", "background_video"}:
+            filt = ("Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)"
+                    if key == "background_video"
+                    else "Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)")
+            title = "Select background video" if key == "background_video" else "Select background image"
+            widget = _PathBrowseWidget(
+                "" if value is None else str(value),
+                title=title,
+                file_filter=filt,
+                placeholder="Optional file path",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
+        if key in {
+            "relax_texture_low",
+            "relax_texture_high",
+            "relax_texture_middle",
+        }:
+            widget = _PathBrowseWidget(
+                "" if value is None else str(value),
+                title="Select relax texture image",
+                file_filter="Images (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+                placeholder="Optional file path",
+                parent=self,
+            )
+            widget.changed.connect(self._commit_settings)
+            return widget
+        if key == "relax_hole_mask_path":
+            line = QLineEdit("" if value is None else str(value))
+            line.setPlaceholderText("Optional file path")
+            line.editingFinished.connect(self._commit_settings)
+            return line
+
         if isinstance(value, bool):
             widget = QCheckBox()
             widget.setChecked(value)
@@ -607,7 +2063,7 @@ class SegmentConfigPanel(QWidget):
                 widget.setRange(-100000, 100000)
             widget.setValue(value)
             widget.valueChanged.connect(self._commit_settings)
-            return widget
+            return _no_scroll(widget)
 
         if isinstance(value, float):
             widget = QDoubleSpinBox()
@@ -622,7 +2078,7 @@ class SegmentConfigPanel(QWidget):
                 widget.setDecimals(3)
             widget.setValue(value)
             widget.valueChanged.connect(self._commit_settings)
-            return widget
+            return _no_scroll(widget)
 
         if key == "mode_list":
             # Combo sub-mode selector: list of punch/dance/line/relax.
@@ -646,7 +2102,7 @@ class SegmentConfigPanel(QWidget):
                 "Horizontal = chain alternates left/right lanes"
             )
             combo.currentIndexChanged.connect(self._commit_settings)
-            return combo
+            return _no_scroll(combo)
 
         if isinstance(value, str):
             if key == "beat_source":
@@ -660,7 +2116,7 @@ class SegmentConfigPanel(QWidget):
                     "onset = every transient"
                 )
                 combo.currentIndexChanged.connect(self._commit_settings)
-                return combo
+                return _no_scroll(combo)
             line = QLineEdit(value)
             line.editingFinished.connect(self._commit_settings)
             return line
@@ -672,8 +2128,21 @@ class SegmentConfigPanel(QWidget):
             return line
         return None
 
+    def _set_dynamic_row_visible(self, widget: QWidget, visible: bool) -> None:
+        try:
+            lbl = self.dynamic_layout.labelForField(widget)
+            if lbl is not None:
+                lbl.setVisible(visible)
+            widget.setVisible(visible)
+        except Exception:
+            widget.setVisible(visible)
+
     def _collect_setting_widget_value(self, key: str, widget: QWidget):
         if isinstance(widget, _ModeListWidget):
+            return widget.get_value()
+        if isinstance(widget, _ColorPickerWidget):
+            return widget.get_value()
+        if isinstance(widget, _PathBrowseWidget):
             return widget.get_value()
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
@@ -695,8 +2164,13 @@ class SegmentConfigPanel(QWidget):
         segment = self._segment
         if segment is None:
             return
+        if self._is_video_segment_locked(segment):
+            return
+        # NOTE: ``segment.audio_path`` is intentionally NOT written here.
+        # The audio source is bound to the segment by the create / split /
+        # join / duplicate operations only; config edits must never change
+        # which file the segment plays.
         segment.name = self.name_input.text().strip() or "Segment"
-        segment.audio_path = str(self.audio_combo.currentData() or "")
         start = float(self.start_spin.value())
         end = float(self.end_spin.value())
         segment.start_time_sec = min(start, end)
@@ -705,13 +2179,14 @@ class SegmentConfigPanel(QWidget):
             0.0, min(5.0, float(self.min_spacing_spin.value()))
         )
         self._load_segment_fields(segment)
-        # Audio source may have just changed → re-evaluate preview/render gating.
         self._set_empty_state(False)
         self.segment_changed.emit(segment.id)
 
     def _on_mode_changed(self) -> None:
         segment = self._segment
         if segment is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         segment.mode = str(self.mode_combo.currentData())
         self._rebuild_dynamic_settings()
@@ -720,6 +2195,8 @@ class SegmentConfigPanel(QWidget):
     def _commit_settings(self) -> None:
         segment = self._segment
         if segment is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         for key, widget in self._setting_widgets.items():
             segment.render_settings[key] = self._collect_setting_widget_value(key, widget)
@@ -745,6 +2222,8 @@ class SegmentConfigPanel(QWidget):
         """
         if not hasattr(self, "preview_button"):
             return
+        # Stop any in-progress loading animation first.
+        self.set_preview_loading(False)
         # ``blockSignals`` would also work, but Qt's QAbstractButton
         # only fires ``clicked`` from a real user click — programmatic
         # ``setChecked`` does not — so we don't need the guard.
@@ -759,6 +2238,54 @@ class SegmentConfigPanel(QWidget):
         else:
             self.preview_button.setText("▶  Preview")
             self.preview_button.setToolTip(self._preview_default_tooltip)
+
+    # Loading animation frames — cycled by _preview_loading_timer
+    _LOADING_FRAMES = ["⠋  Loading…", "⠙  Loading…", "⠹  Loading…",
+                       "⠸  Loading…", "⠼  Loading…", "⠴  Loading…",
+                       "⠦  Loading…", "⠧  Loading…", "⠇  Loading…", "⠏  Loading…"]
+
+    def set_preview_loading(self, loading: bool) -> None:
+        """Show/hide a spinner animation on the Preview button while the
+        renderer worker is building (~1-3 s)."""
+        if not hasattr(self, "preview_button"):
+            return
+
+        # Lazily create the animation timer once.
+        if not hasattr(self, "_preview_loading_timer"):
+            self._preview_loading_timer = QTimer(self)
+            self._preview_loading_timer.setInterval(80)
+            self._preview_loading_frame = 0
+            self._preview_loading_timer.timeout.connect(self._tick_preview_loading)
+
+        if loading:
+            if self._preview_loading_timer.isActive():
+                return  # already loading
+            self._preview_loading_frame = 0
+            self.preview_button.setChecked(False)
+            self.preview_button.setEnabled(False)
+            self.preview_button.setToolTip(
+                "Renderer is initialising (audio analysis + scene build).\n"
+                "Click to cancel."
+            )
+            self._preview_loading_timer.start()
+            self._tick_preview_loading()
+        else:
+            self._preview_loading_timer.stop()
+            # Restore normal idle state (set_preview_active will set the
+            # final label, so we only reset here if not already active).
+            if not self.preview_button.isChecked():
+                self.preview_button.setText("▶  Preview")
+                self.preview_button.setEnabled(
+                    self._segment is not None
+                    and bool(getattr(self._segment, "audio_path", None))
+                    and not self._is_video_segment_locked(self._segment)
+                )
+                self.preview_button.setToolTip(self._preview_default_tooltip)
+
+    def _tick_preview_loading(self) -> None:
+        frames = self._LOADING_FRAMES
+        self.preview_button.setText(frames[self._preview_loading_frame % len(frames)])
+        self._preview_loading_frame += 1
 
     def _on_render_clicked(self) -> None:
         if self._segment is None:
@@ -792,6 +2319,8 @@ class SegmentConfigPanel(QWidget):
         """
         segment = self._segment
         if segment is None:
+            return
+        if self._is_video_segment_locked(segment):
             return
         segment.render_settings = build_settings(segment.mode, {}).model_dump(
             mode="json", exclude_none=True

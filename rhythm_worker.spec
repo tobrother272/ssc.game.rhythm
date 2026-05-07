@@ -42,6 +42,10 @@ hiddenimports = [
     "pydantic",
     "pydantic_core",
     "trimesh",
+    # numpy.testing imports unittest at module level; PyInstaller must not
+    # strip the stdlib unittest package (previously broken by excludes=["test"]).
+    "unittest",
+    "unittest.mock",
 ]
 
 hiddenimports += collect_submodules("librosa")
@@ -56,7 +60,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "PySide6", "matplotlib", "test"],
+    excludes=["tkinter", "PySide6", "matplotlib"],
     noarchive=False,
     optimize=0,
 )

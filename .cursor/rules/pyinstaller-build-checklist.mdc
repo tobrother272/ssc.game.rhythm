@@ -1,0 +1,54 @@
+---
+description: PyInstaller build checklist for rhythm_worker.spec and ssc_studio.spec — prevents recurring bundle errors
+globs: "**/*.spec"
+alwaysApply: false
+---
+
+# PyInstaller Build Checklist
+
+Apply this checklist **every time** either spec file is edited or a production build is triggered.
+
+## ❌ Forbidden in `excludes`
+
+```python
+# ❌ NEVER add "test" — it strips stdlib unittest which numpy.testing requires
+excludes=["tkinter", "PySide6", "matplotlib", "test"],   # WRONG
+
+# ✅ CORRECT
+excludes=["tkinter", "PySide6", "matplotlib"],
+```
+
+**Rule:** Only exclude exact top-level package names you are 100% certain are unused.  
+Never use short/generic names (`"test"`, `"lib"`, `"core"`) — they silently sweep out stdlib modules.
+
+## ✅ Required `hiddenimports` for numpy/scipy stack
+
+These must always be present in `rhythm_worker.spec`:
+
+```python
+"unittest",       # numpy.testing imports unittest unconditionally
+"unittest.mock",  # pulled in by numpy.testing sub-modules
+```
+
+If `numpy`, `scipy`, or `librosa` are upgraded, re-verify that no new stdlib
+dependency was introduced by running:
+
+```
+python -c "import numpy.testing; import scipy; import librosa"
+```
+inside the **activated venv** before building.
+
+## Pre-build checklist
+
+- [ ] `excludes` list contains NO stdlib package names (`unittest`, `test`, `json`, `logging`, …)
+- [ ] `hiddenimports` includes `"unittest"` and `"unittest.mock"`
+- [ ] After build, smoke-test the exe directly: `dist\rhythm_worker\rhythm_worker.exe --help`
+  - Exit code 0 and no `ModuleNotFoundError` in output = OK
+- [ ] Test a real render: spawn `rhythm_worker.exe -i <audio> -o out.mp4 --duration 5`
+
+## Why this breaks
+
+`numpy.testing.__init__` line 8 does a **hard** `import unittest` (no try/except).  
+PyInstaller's `excludes=["test"]` pattern-matches the `unittest` package alongside
+the stdlib `test/` suite and removes both. The error only appears at runtime in the
+built bundle — never during development — which makes it easy to miss.

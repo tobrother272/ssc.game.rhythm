@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import struct
+import tempfile
+import wave
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -12,6 +16,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -70,7 +75,6 @@ class StickmanBoxOverlay(QWidget):
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
@@ -234,6 +238,784 @@ class StickmanBoxOverlay(QWidget):
         p.drawText(lx, ly, label)
 
 
+class FloorWallOverlay(QWidget):
+    """Drag handles to adjust camera perspective.
+
+    Handle types
+    ------------
+    - **Floor line** (cyan)    → ``floor_hit_frac``   (drag up/down)
+    - **Horizon line** (amber) → ``horizon_frac``     (drag up/down)
+    - **Near wall** (magenta, bottom) — INDEPENDENT → ``floor_spread_frac``
+    - **Far wall**  (magenta, top)    — INDEPENDENT → ``far_spread_frac``
+
+    Near and far handle pairs are connected by dashed lines.
+    Moving near does NOT move far, and vice versa.
+    """
+
+    # 13 floats:
+    # hit_frac, horizon_frac, near_spread, far_spread, wall_floor_gap_frac,
+    # countdown_x, countdown_y, countdown_w, countdown_h, rail_height,
+    # start_gate_h, chevron_width_frac, vp_panel_depth
+    changing  = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
+    committed = Signal(float, float, float, float, float, float, float, float, float, float, float, float, float)
+    # Separate signal for combo box drag (x, y, w, h)
+    combo_committed = Signal(float, float, float, float)
+
+    _HANDLE_R    = 10
+    _HIT_CLR     = QColor(0,   210, 210)
+    _HORIZON_CLR = QColor(220, 170,   0)
+    _WALL_CLR    = QColor(220,  60, 220)
+    _GAP_CLR     = QColor(255, 150,  50)  
+    _FAR_DISP    = 0.40
+    
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+
+        self._hit_frac:            float = 0.86
+        self._horizon_frac:        float = 0.45
+        self._near_spread:         float = 0.65   # controls floor_spread_frac
+        self._far_spread:          float = 0.65   # controls far_spread_frac (independent)
+        self._wall_floor_gap_frac: float = 0.0    # near-wall Y lifted above floor line
+        self._rail_height: float = 0.15
+        self._countdown_enabled: bool = False
+        self._cd_x: float = 0.88
+        self._cd_y: float = 0.04
+        self._cd_w: float = 0.10
+        self._cd_h: float = 0.16
+
+        self._drag: str | None = None  # + 'cd_move'|'cd_tl'|'cd_tr'|'cd_bl'|'cd_br'
+        self._drag_anchor: QPoint = QPoint()
+        self._drag_cd_x0 = 0.0
+        self._drag_cd_y0 = 0.0
+        self._drag_cd_w0 = 0.0
+        self._drag_cd_h0 = 0.0
+        self._drag_rail_h0 = 0.15
+        self._drag_gate_h0 = 0.14
+        self._start_gate_enabled: bool = False
+        self._start_gate_h: float = 0.14
+        self._sg_x: float = 0.0
+        self._sg_y: float = 0.0
+        self._sg_w: float = 0.0
+        self._sg_h: float = 0.0
+        self._chevron_width_frac: float = 0.45
+        self._drag_chevron_w0 = 0.45
+        self._vp_panel_depth: float = 0.6
+        self._drag_vp_panel_depth0: float = 0.6
+        self._cached_frame_idx: int = 0
+        # ── Combo box ──────────────────────────────────────────────────────
+        self._combo_enabled: bool = False
+        self._cb_x: float = 0.85
+        self._cb_y: float = 0.08
+        self._cb_w: float = 0.13
+        self._cb_h: float = 0.18
+        self._drag_cb_x0 = 0.0
+        self._drag_cb_y0 = 0.0
+        self._drag_cb_w0 = 0.0
+        self._drag_cb_h0 = 0.0
+
+    def set_frame_idx(self, frame_idx: int) -> None:
+        """Update tile-scroll frame index so hit-block overlay matches renderer."""
+        fi = int(frame_idx)
+        if fi != self._cached_frame_idx:
+            self._cached_frame_idx = fi
+            self.update()
+
+    # ── public API ──────────────────────────────────────────────────────
+    def _hit_frac_bounds(self) -> tuple[float, float]:
+        """Dynamic Floor-handle bounds so the circle can touch screen edges."""
+        h = max(1, int(self.height()))
+        margin = float(self._HANDLE_R) / float(h)
+        lo = max(0.0, min(0.49, margin))
+        hi = min(1.0, max(0.51, 1.0 - margin))
+        return (lo, hi)
+
+    def set_fractions(
+        self,
+        hit_frac: float,
+        horizon_frac: float,
+        near_spread: float,
+        far_spread: float,
+        wall_floor_gap_frac: float = 0.0,
+        rail_height: float = 0.15,
+        countdown_enabled: bool = False,
+        countdown_x: float = 0.88,
+        countdown_y: float = 0.04,
+        countdown_w: float = 0.10,
+        countdown_h: float = 0.16,
+        chevron_width_frac: float = 0.45,
+        vp_panel_depth: float = 0.6,
+    ) -> None:
+        hit_lo, hit_hi = self._hit_frac_bounds()
+        self._hit_frac             = max(hit_lo, min(hit_hi, float(hit_frac)))
+        self._horizon_frac         = max(0.20, min(0.60, float(horizon_frac)))
+        self._near_spread          = max(0.20, min(3.00, float(near_spread)))
+        self._far_spread           = max(0.05, min(3.00, float(far_spread)))
+        self._wall_floor_gap_frac  = max(0.00, min(0.30, float(wall_floor_gap_frac)))
+        self._rail_height          = max(0.15, float(rail_height))
+        self._countdown_enabled = bool(countdown_enabled)
+        self._cd_x = max(0.0, min(0.98, float(countdown_x)))
+        self._cd_y = max(0.0, min(0.98, float(countdown_y)))
+        self._cd_w = max(0.02, min(1.0 - self._cd_x, float(countdown_w)))
+        self._cd_h = max(0.02, min(1.0 - self._cd_y, float(countdown_h)))
+        self._chevron_width_frac = max(0.05, min(0.95, float(chevron_width_frac)))
+        self._vp_panel_depth = max(0.05, float(vp_panel_depth))
+        self.update()
+
+    def get_fractions(self) -> tuple:
+        return (self._hit_frac, self._horizon_frac,
+                self._near_spread, self._far_spread,
+                self._wall_floor_gap_frac,
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h, self._rail_height,
+                self._start_gate_h, self._chevron_width_frac, self._vp_panel_depth)
+
+    def set_start_gate_proxy(
+        self,
+        *,
+        enabled: bool,
+        gate_height: float,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> None:
+        self._start_gate_enabled = bool(enabled)
+        self._start_gate_h = max(0.03, float(gate_height))
+        self._sg_x = max(0.0, min(1.0, float(x)))
+        self._sg_y = max(0.0, min(1.0, float(y)))
+        self._sg_w = max(0.0, min(1.0, float(w)))
+        self._sg_h = max(0.0, min(1.0, float(h)))
+        self.update()
+
+    def set_combo_proxy(
+        self,
+        *,
+        enabled: bool,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> None:
+        """Set combo box position from caller (analogous to set_start_gate_proxy)."""
+        self._combo_enabled = bool(enabled)
+        self._cb_x = max(0.0, min(0.98, float(x)))
+        self._cb_y = max(0.0, min(0.98, float(y)))
+        self._cb_w = max(0.02, min(1.0 - self._cb_x, float(w)))
+        self._cb_h = max(0.02, min(1.0 - self._cb_y, float(h)))
+        self.update()
+
+    # ── geometry helpers ────────────────────────────────────────────────
+    def _hit_y(self)   -> int: return int(self._hit_frac     * self.height())
+    def _hz_y(self)    -> int: return int(self._horizon_frac * self.height())
+    # Near handles: at hit_y (floor line), near_spread from centre.
+    # "raw" = unclamped world position (may be outside widget).
+    # "display" = clamped to widget edge so the circle is always clickable.
+    def _near_rx_raw(self)     -> int: return int((0.5 + self._near_spread * 0.5) * self.width())
+    def _near_lx_raw(self)     -> int: return int((0.5 - self._near_spread * 0.5) * self.width())
+    def _near_rx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._near_rx_raw()))
+    def _near_lx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._near_lx_raw()))
+    # Far handles: 22% below horizon, far_spread displayed at _FAR_DISP scale.
+    # Display positions are clamped to widget edge so handles remain clickable.
+    def _far_y(self)   -> int: return int(self._hz_y() + (self._hit_y() - self._hz_y()) * 0.22)
+    def _far_rx_raw(self) -> int: return int((0.5 + self._far_spread * 0.5 * self._FAR_DISP) * self.width())
+    def _far_lx_raw(self) -> int: return int((0.5 - self._far_spread * 0.5 * self._FAR_DISP) * self.width())
+    def _far_rx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._far_rx_raw()))
+    def _far_lx(self)  -> int:
+        return max(self._HANDLE_R, min(self.width() - self._HANDLE_R, self._far_lx_raw()))
+
+    # Gap handles sit at the two front-bottom wall corners:
+    # the intersection between front wall edge and wall bottom edge.
+    # Keep gap handles as close to the edge as possible while ensuring
+    # the whole circle remains visible/clickable inside the overlay.
+    _GAP_MARGIN = _HANDLE_R
+    def _gap_y(self)  -> int:
+        return int(self._hit_y() - self._wall_floor_gap_frac * self.height())
+    def _gap_lx(self) -> int: return self._GAP_MARGIN
+    def _gap_rx(self) -> int: return max(0, self.width() - 1 - self._GAP_MARGIN)
+
+    def _rail_handle_y(self) -> int:
+        # Visual proxy for rail height: higher rail => handle moves upward.
+        y = int(self._hit_y() - self._rail_height * self.height() * 0.55)
+        return max(self._hz_y() + self._HANDLE_R, min(self._hit_y() - self._HANDLE_R, y))
+
+    def _countdown_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._cd_x * w),
+            int(self._cd_y * h),
+            max(1, int(self._cd_w * w)),
+            max(1, int(self._cd_h * h)),
+        )
+
+    def _start_gate_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._sg_x * w),
+            int(self._sg_y * h),
+            max(1, int(self._sg_w * w)),
+            max(1, int(self._sg_h * h)),
+        )
+
+    def _combo_rect_px(self) -> QRect:
+        w = self.width()
+        h = self.height()
+        return QRect(
+            int(self._cb_x * w),
+            int(self._cb_y * h),
+            max(1, int(self._cb_w * w)),
+            max(1, int(self._cb_h * h)),
+        )
+
+    def _floor_footprint_points(self) -> list[QPoint]:
+        """Approximate floor trapezoid points for overlay visualization."""
+        y_bot = self._hit_y()
+        y_top = self._hz_y()
+        return [
+            QPoint(self._near_lx(), y_bot),
+            QPoint(self._near_rx(), y_bot),
+            QPoint(self._far_rx(), y_top),
+            QPoint(self._far_lx(), y_top),
+        ]
+
+    def _chevron_width_handle_pos(self) -> QPoint:
+        """Middle handle for floor chevron width control."""
+        y_mid = int((self._hit_y() + self._hz_y()) * 0.5)
+        return QPoint(self.width() // 2, y_mid)
+
+    def _vp_panel_handle_y(self) -> int:
+        """Screen y of viewport-panel back-edge (pinhole: Z_NEAR / (Z_NEAR+depth))."""
+        hy = self._hit_y()
+        cy = self._hz_y()
+        Z_NEAR = 2.5
+        sy = cy + (hy - cy) * Z_NEAR / (Z_NEAR + max(0.05, self._vp_panel_depth))
+        return max(cy + self._HANDLE_R, min(hy - self._HANDLE_R, int(sy)))
+
+    def _hit_block_polys(self, n: int = 4, frame_idx: int = 0) -> list:
+        """Trapezoid polygons using pinhole projection matching cam.project()
+        in rhythm.py — exact equivalent of _draw_floor_tiles_legacy (lane_tiles).
+
+        All constants mirror PerspectiveCamera.__init__ and
+        _draw_floor_tiles_legacy exactly:
+          Z_NEAR=2.5, fov_deg=55, tile_len=1.6, z_slots=[3.0, 5.5, …]
+          tile_w = max(0.25, step_world * 0.80)
+          clip: wz < Z_NEAR + 0.2  (rhythm.py line 1196)
+
+        ``frame_idx`` enables tile-scroll sync; pass 0 for a static snapshot.
+        """
+        H_w = self.height()
+        W_w = self.width()
+        if H_w <= 0 or W_w <= 0 or n < 2:
+            return []
+        hy = self._hit_y()    # y_hit in widget pixels
+        cy = self._hz_y()     # horizon (cy_v) in widget pixels
+        if hy <= cy:
+            return []         # invalid: floor above horizon
+
+        # ── Mirror PerspectiveCamera constants ────────────────────────────
+        Z_NEAR   = 2.5
+        fov_deg  = 55.0
+        cx_pix   = W_w / 2.0
+        cy_pix   = float(cy)
+        fx       = W_w / 2.0 / math.tan(math.radians(fov_deg) / 2.0)
+        fy       = fx
+
+        # FLOOR_WORLD_Y — same formula as renderer
+        FLOOR_WORLD_Y = (float(hy) - cy_pix) * Z_NEAR / fy
+
+        # Lane world positions — match cam.lane_world_x(i)
+        lane_half_spread_px = W_w * self._near_spread * 0.5
+        LANE_WORLD_X        = lane_half_spread_px * Z_NEAR / fx
+        spacing             = 2.0 * LANE_WORLD_X / (n - 1)
+        x_centers           = [-LANE_WORLD_X + i * spacing for i in range(n)]
+
+        # Tile geometry — match _draw_floor_tiles_legacy
+        z_slots   = [3.0, 5.5, 8.5, 12.5, 17.5]
+        tile_len  = 1.6
+        step_w    = abs(x_centers[1] - x_centers[0]) if n >= 2 else 0.0
+        tile_w    = max(0.25, step_w * 0.80)
+        scroll    = (float(frame_idx) * 0.30) % (z_slots[1] - z_slots[0])
+        z_clip    = Z_NEAR + 0.2
+
+        def _proj(wx: float, wy: float, wz: float):
+            if wz <= 1e-6:
+                return None
+            return QPoint(int(round(cx_pix + fx * wx / wz)),
+                          int(round(cy_pix + fy * wy / wz)))
+
+        polys = []
+        for xc in x_centers:
+            # Pick first visible tile (nearest, not clipped)
+            wz = None
+            for z_c in z_slots:
+                candidate = z_c - scroll
+                if candidate >= z_clip:
+                    wz = candidate
+                    break
+            if wz is None:
+                continue
+            corners = [
+                (xc - tile_w / 2.0, FLOOR_WORLD_Y, wz - tile_len / 2.0),
+                (xc + tile_w / 2.0, FLOOR_WORLD_Y, wz - tile_len / 2.0),
+                (xc + tile_w / 2.0, FLOOR_WORLD_Y, wz + tile_len / 2.0),
+                (xc - tile_w / 2.0, FLOOR_WORLD_Y, wz + tile_len / 2.0),
+            ]
+            pts = [_proj(*c) for c in corners]
+            if all(p is not None for p in pts):
+                polys.append(pts)
+        return polys
+
+    def _handle_at(self, pos: QPoint) -> str | None:
+        r = self._HANDLE_R + 7
+        if self._countdown_enabled:
+            cd = self._countdown_rect_px()
+            hs = 14
+            corners = {
+                "cd_tl": QRect(cd.left() - hs // 2, cd.top() - hs // 2, hs, hs),
+                "cd_tr": QRect(cd.right() - hs // 2, cd.top() - hs // 2, hs, hs),
+                "cd_bl": QRect(cd.left() - hs // 2, cd.bottom() - hs // 2, hs, hs),
+                "cd_br": QRect(cd.right() - hs // 2, cd.bottom() - hs // 2, hs, hs),
+            }
+            for kind, rr in corners.items():
+                if rr.contains(pos):
+                    return kind
+            if cd.contains(pos):
+                return "cd_move"
+        if self._start_gate_enabled:
+            sg = self._start_gate_rect_px()
+            hs = 14
+            top_mid = QRect(
+                sg.center().x() - hs // 2,
+                sg.top() - hs // 2,
+                hs,
+                hs,
+            )
+            if top_mid.contains(pos):
+                return "gate_top"
+        if self._combo_enabled:
+            cb = self._combo_rect_px()
+            hs = 14
+            cb_corners = {
+                "cb_tl": QRect(cb.left() - hs // 2, cb.top() - hs // 2, hs, hs),
+                "cb_tr": QRect(cb.right() - hs // 2, cb.top() - hs // 2, hs, hs),
+                "cb_bl": QRect(cb.left() - hs // 2, cb.bottom() - hs // 2, hs, hs),
+                "cb_br": QRect(cb.right() - hs // 2, cb.bottom() - hs // 2, hs, hs),
+            }
+            for kind, rr in cb_corners.items():
+                if rr.contains(pos):
+                    return kind
+            if cb.contains(pos):
+                return "cb_move"
+        ch = self._chevron_width_handle_pos()
+        cr = self._HANDLE_R - 1
+        if abs(pos.x() - ch.x()) <= cr and abs(pos.y() - ch.y()) <= cr:
+            return "chevron_width"
+        # Viewport panel depth handle — centered on screen, vertical drag.
+        vph_y = self._vp_panel_handle_y()
+        vph_x = self.width() * 3 // 4  # right-of-centre to avoid chevron overlap
+        if abs(pos.x() - vph_x) <= self._HANDLE_R + 4 and abs(pos.y() - vph_y) <= self._HANDLE_R + 4:
+            return "vp_panel_depth"
+        # Side-rail height handles (left/right), dragged vertically in sync.
+        r2 = self._HANDLE_R + 6
+        rhy = self._rail_handle_y()
+        if abs(pos.y() - rhy) <= r2 and (
+            abs(pos.x() - self._near_lx()) <= r2 or abs(pos.x() - self._near_rx()) <= r2
+        ):
+            return "rail_height"
+        # Gap handles on the wall diagonal lines — checked before near handles
+        gy = self._gap_y()
+        if abs(pos.y() - gy) <= r and (
+            abs(pos.x() - self._gap_lx()) <= r or abs(pos.x() - self._gap_rx()) <= r
+        ):
+            return "gap_side"
+        ny = self._hit_y()
+        if abs(pos.y() - ny) <= r and abs(pos.x() - self.width() // 2) <= r:
+            return "hit"
+        if abs(pos.y() - self._hz_y()) <= r and abs(pos.x() - self.width() // 2) <= r:
+            return "horizon"
+        fy = self._far_y()
+        if abs(pos.y() - fy) <= r and (
+            abs(pos.x() - self._far_rx()) <= r or abs(pos.x() - self._far_lx()) <= r
+        ):
+            return "wall_far"
+        # Use clamped (display) positions for hit detection so handles at edge are clickable
+        if abs(pos.y() - ny) <= r + 4 and (
+            abs(pos.x() - self._near_rx()) <= r or abs(pos.x() - self._near_lx()) <= r
+        ):
+            return "wall_near"
+        return None
+
+    # ── Qt events ───────────────────────────────────────────────────────
+    def mousePressEvent(self, ev) -> None:
+        self._drag = self._handle_at(ev.pos())
+        if self._drag in ("wall_near", "wall_far"):
+            self.grabMouse()
+        if self._drag and self._drag.startswith("cd_"):
+            self._drag_anchor = ev.pos()
+            self._drag_cd_x0 = self._cd_x
+            self._drag_cd_y0 = self._cd_y
+            self._drag_cd_w0 = self._cd_w
+            self._drag_cd_h0 = self._cd_h
+        if self._drag and self._drag.startswith("cb_"):
+            self._drag_anchor = ev.pos()
+            self._drag_cb_x0 = self._cb_x
+            self._drag_cb_y0 = self._cb_y
+            self._drag_cb_w0 = self._cb_w
+            self._drag_cb_h0 = self._cb_h
+        if self._drag == "rail_height":
+            self._drag_anchor = ev.pos()
+            self._drag_rail_h0 = self._rail_height
+        if self._drag == "gate_top":
+            self._drag_anchor = ev.pos()
+            self._drag_gate_h0 = self._start_gate_h
+        if self._drag == "chevron_width":
+            self._drag_anchor = ev.pos()
+            self._drag_chevron_w0 = self._chevron_width_frac
+        if self._drag == "vp_panel_depth":
+            self._drag_anchor = ev.pos()
+            self._drag_vp_panel_depth0 = self._vp_panel_depth
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._drag in ("wall_near", "wall_far"):
+            self.releaseMouse()
+        if self._drag:
+            was_combo = self._drag.startswith("cb_")
+            self._drag = None
+            self.committed.emit(
+                self._hit_frac, self._horizon_frac, self._near_spread,
+                self._far_spread, self._wall_floor_gap_frac,
+                self._cd_x, self._cd_y, self._cd_w, self._cd_h,
+                self._rail_height,
+                self._start_gate_h,
+                self._chevron_width_frac,
+                self._vp_panel_depth,
+            )
+            if was_combo:
+                self.combo_committed.emit(
+                    self._cb_x, self._cb_y, self._cb_w, self._cb_h
+                )
+
+    def mouseMoveEvent(self, ev) -> None:
+        hover = self._handle_at(ev.pos()) if self._drag is None else None
+        if hover:
+            if hover in ("hit", "horizon", "gap_side", "rail_height", "gate_top", "vp_panel_depth"):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            elif hover == "chevron_width":
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif hover == "wall_near":
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif hover in ("cd_tl", "cd_br", "cb_tl", "cb_br"):
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif hover in ("cd_tr", "cd_bl", "cb_tr", "cb_bl"):
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif hover in ("cd_move", "cb_move"):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif self._drag is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if self._drag is None:
+            return
+        h, w = self.height(), self.width()
+
+        if self._drag == "hit":
+            hit_lo, hit_hi = self._hit_frac_bounds()
+            self._hit_frac = max(hit_lo, min(hit_hi, ev.pos().y() / h))
+        elif self._drag == "gap_side":
+            # Drag the wall-bottom corner vertically: convert to wall-floor gap frac
+            gap_frac = (self._hit_y() - float(ev.pos().y())) / h
+            self._wall_floor_gap_frac = max(0.00, min(0.30, gap_frac))
+        elif self._drag == "horizon":
+            v = max(0.20, min(0.60, ev.pos().y() / h))
+            if v < self._hit_frac - 0.05:
+                self._horizon_frac = v
+        elif self._drag == "wall_near":
+            rx = float(ev.pos().x())
+            self._near_spread = max(0.20, min(3.00, (rx / w - 0.5) * 2))
+        elif self._drag == "wall_far":
+            # Horizontal drag — grabMouse() keeps events firing outside widget
+            rx = float(ev.pos().x())
+            self._far_spread = max(0.05, min(3.00, (rx / w - 0.5) * 2 / self._FAR_DISP))
+        elif self._drag and self._drag.startswith("cd_"):
+            dx = (ev.pos().x() - self._drag_anchor.x()) / float(max(1, w))
+            dy = (ev.pos().y() - self._drag_anchor.y()) / float(max(1, h))
+            x, y, ww, hh = self._drag_cd_x0, self._drag_cd_y0, self._drag_cd_w0, self._drag_cd_h0
+            minf = 0.02
+            if self._drag == "cd_move":
+                x = max(0.0, min(1.0 - ww, x + dx))
+                y = max(0.0, min(1.0 - hh, y + dy))
+            elif self._drag == "cd_tl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                ww = ww - (nx - x)
+                hh = hh - (ny - y)
+                x, y = nx, ny
+            elif self._drag == "cd_tr":
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                nw = max(minf, min(1.0 - x, ww + dx))
+                hh = hh - (ny - y)
+                y, ww = ny, nw
+            elif self._drag == "cd_bl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                nh = max(minf, min(1.0 - y, hh + dy))
+                ww = ww - (nx - x)
+                x, hh = nx, nh
+            elif self._drag == "cd_br":
+                ww = max(minf, min(1.0 - x, ww + dx))
+                hh = max(minf, min(1.0 - y, hh + dy))
+            self._cd_x, self._cd_y, self._cd_w, self._cd_h = x, y, ww, hh
+        elif self._drag and self._drag.startswith("cb_"):
+            dx = (ev.pos().x() - self._drag_anchor.x()) / float(max(1, w))
+            dy = (ev.pos().y() - self._drag_anchor.y()) / float(max(1, h))
+            x, y, ww, hh = self._drag_cb_x0, self._drag_cb_y0, self._drag_cb_w0, self._drag_cb_h0
+            minf = 0.02
+            if self._drag == "cb_move":
+                x = max(0.0, min(1.0 - ww, x + dx))
+                y = max(0.0, min(1.0 - hh, y + dy))
+            elif self._drag == "cb_tl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                ww = ww - (nx - x)
+                hh = hh - (ny - y)
+                x, y = nx, ny
+            elif self._drag == "cb_tr":
+                ny = max(0.0, min(y + hh - minf, y + dy))
+                nw = max(minf, min(1.0 - x, ww + dx))
+                hh = hh - (ny - y)
+                y, ww = ny, nw
+            elif self._drag == "cb_bl":
+                nx = max(0.0, min(x + ww - minf, x + dx))
+                nh = max(minf, min(1.0 - y, hh + dy))
+                ww = ww - (nx - x)
+                x, hh = nx, nh
+            elif self._drag == "cb_br":
+                ww = max(minf, min(1.0 - x, ww + dx))
+                hh = max(minf, min(1.0 - y, hh + dy))
+            self._cb_x, self._cb_y, self._cb_w, self._cb_h = x, y, ww, hh
+        elif self._drag == "rail_height":
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._rail_height = max(0.15, self._drag_rail_h0 - (dy / h) * 1.8)
+        elif self._drag == "gate_top":
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._start_gate_h = max(0.03, self._drag_gate_h0 - (dy / h) * 1.8)
+        elif self._drag == "chevron_width":
+            dx = float(ev.pos().x() - self._drag_anchor.x())
+            w = max(1.0, float(self.width()))
+            self._chevron_width_frac = max(
+                0.05,
+                min(0.95, self._drag_chevron_w0 + (dx / w) * 1.6),
+            )
+        elif self._drag == "vp_panel_depth":
+            # Drag up → larger depth (panels taller), drag down → smaller depth.
+            # One full widget height ≈ 8 world units.
+            dy = float(ev.pos().y() - self._drag_anchor.y())
+            h = max(1.0, float(self.height()))
+            self._vp_panel_depth = max(0.05, self._drag_vp_panel_depth0 - (dy / h) * 8.0)
+        self.update()
+        self.changing.emit(
+            self._hit_frac, self._horizon_frac, self._near_spread,
+            self._far_spread, self._wall_floor_gap_frac,
+            self._cd_x, self._cd_y, self._cd_w, self._cd_h,
+            self._rail_height,
+            self._start_gate_h,
+            self._chevron_width_frac,
+            self._vp_panel_depth,
+        )
+
+    # ── paint ────────────────────────────────────────────────────────────
+    def paintEvent(self, _ev) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = self._HANDLE_R
+
+        def _h_line_with_handle(y: int, color: QColor, label: str) -> None:
+            p.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+            p.drawLine(0, y, w, y)
+            p.setBrush(QBrush(color))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+            cx = w // 2
+            p.drawEllipse(cx - r, y - r, r * 2, r * 2)
+            p.setPen(QPen(color))
+            p.drawText(cx + r + 6, y + 5, label)
+
+        _h_line_with_handle(self._hit_y(), self._HIT_CLR,     "Floor")
+        _h_line_with_handle(self._hz_y(),  self._HORIZON_CLR, "Horizon")
+
+        ny = self._hit_y()
+        fy = self._far_y()
+
+        # Floor footprint outline (visual-only).
+        floor_pts = self._floor_footprint_points()
+        p.setBrush(QBrush(QColor(8, 145, 178, 30)))
+        p.setPen(QPen(QColor(8, 145, 178, 150), 1.2, Qt.PenStyle.DashLine))
+        p.drawPolygon(floor_pts)
+
+        # Dashed lines connecting far ↔ near handles (left and right)
+        p.setPen(QPen(self._WALL_CLR, 1.2, Qt.PenStyle.DashLine))
+        p.drawLine(self._far_lx(), fy, self._near_lx(), ny)
+        p.drawLine(self._far_rx(), fy, self._near_rx(), ny)
+
+        # Far handles (smaller circles, labelled "Far")
+        rf = max(6, r - 3)
+        p.setBrush(QBrush(self._WALL_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.2))
+        for fx_pos in (self._far_lx(), self._far_rx()):
+            p.drawEllipse(fx_pos - rf, fy - rf, rf * 2, rf * 2)
+        p.setPen(QPen(self._WALL_CLR))
+        p.drawText(self._far_rx() + rf + 4, fy + 4, "Far")
+
+        # Near handles — horizontal spread only
+        p.setBrush(QBrush(self._WALL_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for nx_pos in (self._near_lx(), self._near_rx()):
+            p.drawEllipse(nx_pos - r, ny - r, r * 2, r * 2)
+        p.setPen(QPen(self._WALL_CLR))
+        p.drawText(self._near_rx() + r + 4, ny + 5, "Near")
+
+        # Rail-height handles (left/right, dragged vertically in sync).
+        rhy = self._rail_handle_y()
+        rrh = max(6, r - 2)
+        rail_col = QColor(255, 90, 90)
+        p.setBrush(QBrush(rail_col))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for rxh in (self._near_lx(), self._near_rx()):
+            p.drawEllipse(rxh - rrh, rhy - rrh, rrh * 2, rrh * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(rxh, rhy - rrh + 2, rxh, rhy + rrh - 2)
+            p.drawLine(rxh - 4, rhy - rrh + 6, rxh, rhy - rrh + 2)
+            p.drawLine(rxh + 4, rhy - rrh + 6, rxh, rhy - rrh + 2)
+            p.drawLine(rxh - 4, rhy + rrh - 6, rxh, rhy + rrh - 2)
+            p.drawLine(rxh + 4, rhy + rrh - 6, rxh, rhy + rrh - 2)
+            p.setBrush(QBrush(rail_col))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        p.setPen(QPen(rail_col))
+        p.drawText(self._near_rx() + rrh + 6, rhy + 5, f"Rail H {self._rail_height:.2f}")
+
+        # Gap handles — front-bottom wall corners (left/right)
+        # Drag vertically to change wall-floor gap.
+        rg = r + 2
+        gy = self._gap_y()
+        p.setBrush(QBrush(self._GAP_CLR))
+        p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        for gx in (self._gap_lx(), self._gap_rx()):
+            p.drawEllipse(gx - rg, gy - rg, rg * 2, rg * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(gx, gy - rg + 3, gx, gy + rg - 3)
+            p.drawLine(gx - 4, gy - rg + 7, gx, gy - rg + 3)
+            p.drawLine(gx + 4, gy - rg + 7, gx, gy - rg + 3)
+            p.drawLine(gx - 4, gy + rg - 7, gx, gy + rg - 3)
+            p.drawLine(gx + 4, gy + rg - 7, gx, gy + rg - 3)
+            p.setBrush(QBrush(self._GAP_CLR))
+            p.setPen(QPen(QColor(255, 255, 255), 1.5))
+        p.setPen(QPen(self._GAP_CLR))
+        p.drawText(self._gap_rx() + rg + 4, gy + 5, "Gap")
+
+        # Chevron width handle (horizontal drag).
+        ch = self._chevron_width_handle_pos()
+        cmid_w = max(8, int((self._near_rx() - self._near_lx()) * self._chevron_width_frac))
+        x_l = ch.x() - cmid_w // 2
+        x_r = ch.x() + cmid_w // 2
+        p.setPen(QPen(QColor(8, 145, 178), 1.4))
+        p.drawLine(x_l, ch.y() - 6, x_l, ch.y() + 6)
+        p.drawLine(x_r, ch.y() - 6, x_r, ch.y() + 6)
+        p.setBrush(QBrush(QColor(8, 145, 178)))
+        p.setPen(QPen(QColor(255, 255, 255), 1.4))
+        p.drawEllipse(ch.x() - 7, ch.y() - 7, 14, 14)
+        p.setPen(QPen(QColor(8, 145, 178)))
+        p.drawText(ch.x() + 10, ch.y() + 4, f"Chevron W {self._chevron_width_frac:.2f}")
+
+        # Viewport panel depth handle — right-of-centre, vertical arrow.
+        _vp_clr = QColor(255, 160, 30)   # amber
+        vph_y = self._vp_panel_handle_y()
+        vph_x = self.width() * 3 // 4
+        p.setBrush(QBrush(_vp_clr))
+        p.setPen(QPen(QColor(255, 255, 255), 1.4))
+        p.drawEllipse(vph_x - r, vph_y - r, r * 2, r * 2)
+        # Double-arrow icon
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.drawLine(vph_x, vph_y - r + 2, vph_x, vph_y + r - 2)
+        p.drawLine(vph_x - 4, vph_y - r + 6, vph_x, vph_y - r + 2)
+        p.drawLine(vph_x + 4, vph_y - r + 6, vph_x, vph_y - r + 2)
+        p.drawLine(vph_x - 4, vph_y + r - 6, vph_x, vph_y + r - 2)
+        p.drawLine(vph_x + 4, vph_y + r - 6, vph_x, vph_y + r - 2)
+        p.setPen(QPen(_vp_clr))
+        p.drawText(vph_x + r + 4, vph_y + 4, f"Panel H {self._vp_panel_depth:.2f}")
+        # Horizontal dashed line showing back-edge of panels
+        p.setPen(QPen(_vp_clr, 1.2, Qt.PenStyle.DashLine))
+        p.drawLine(0, vph_y, self.width(), vph_y)
+
+        if self._start_gate_enabled:
+            sg = self._start_gate_rect_px()
+            gate_col = QColor(255, 70, 70)
+            p.setBrush(QBrush(QColor(255, 70, 70, 26)))
+            p.setPen(QPen(gate_col, 1.8, Qt.PenStyle.DashLine))
+            p.drawRect(sg)
+            hs = 8
+            hx = sg.center().x()
+            hy = sg.top()
+            p.setBrush(QBrush(gate_col))
+            p.setPen(QPen(QColor(255, 255, 255), 1.4))
+            p.drawRect(hx - hs, hy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            p.drawLine(hx, hy - hs + 2, hx, hy + hs - 2)
+            p.drawLine(hx - 4, hy - hs + 6, hx, hy - hs + 2)
+            p.drawLine(hx + 4, hy - hs + 6, hx, hy - hs + 2)
+            p.drawLine(hx - 4, hy + hs - 6, hx, hy + hs - 2)
+            p.drawLine(hx + 4, hy + hs - 6, hx, hy + hs - 2)
+            p.setPen(QPen(gate_col))
+            p.drawText(sg.left() + 6, max(14, sg.top() - 8), f"Gate H {self._start_gate_h:.2f}")
+
+        if self._countdown_enabled:
+            cd = self._countdown_rect_px()
+            p.setBrush(QBrush(QColor(255, 80, 220, 36)))
+            p.setPen(QPen(QColor(255, 120, 235), 2.0, Qt.PenStyle.DashLine))
+            p.drawRect(cd)
+            hs = 7
+            p.setBrush(QBrush(QColor(255, 120, 235)))
+            p.setPen(QPen(QColor(255, 255, 255), 1.2))
+            for cx, cy in (
+                (cd.left(), cd.top()),
+                (cd.right(), cd.top()),
+                (cd.left(), cd.bottom()),
+                (cd.right(), cd.bottom()),
+            ):
+                p.drawRect(cx - hs, cy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 120, 235)))
+            p.drawText(cd.left() + 6, max(14, cd.top() - 6), "Countdown")
+
+        if self._combo_enabled:
+            cb = self._combo_rect_px()
+            p.setBrush(QBrush(QColor(220, 50, 50, 36)))
+            p.setPen(QPen(QColor(255, 90, 90), 2.0, Qt.PenStyle.DashLine))
+            p.drawRect(cb)
+            hs = 7
+            p.setBrush(QBrush(QColor(255, 90, 90)))
+            p.setPen(QPen(QColor(255, 255, 255), 1.2))
+            for cx, cy in (
+                (cb.left(), cb.top()),
+                (cb.right(), cb.top()),
+                (cb.left(), cb.bottom()),
+                (cb.right(), cb.bottom()),
+            ):
+                p.drawRect(cx - hs, cy - hs, hs * 2, hs * 2)
+            p.setPen(QPen(QColor(255, 90, 90)))
+            p.drawText(cb.left() + 6, max(14, cb.top() - 6), "Combo")
+
+
 def format_ms(ms: int) -> str:
     """Format milliseconds to mm:ss string."""
     seconds = max(0, ms // 1000)
@@ -257,6 +1039,15 @@ class PreviewPanel(QWidget):
     # (0..1) of the rendered video frame.  MainWindow listens, writes
     # to ``segment.stickman_location``, and triggers a project save.
     stickman_location_changed = Signal(str, dict)
+    # Emitted on mouse-release when the user finishes dragging floor/wall
+    # handles or the relax countdown box.
+    # MainWindow saves these into segment.render_settings and requests a preview update.
+    floor_wall_committed = Signal(
+        float, float, float, float, float, float, float, float, float, float, float, float, float
+    )
+    # Emitted when user finishes dragging the combo box overlay.
+    # Carries (x, y, w, h) normalized floats.
+    combo_box_committed = Signal(float, float, float, float)
     # Emitted whenever the panel exits live-preview mode, whether the
     # caller explicitly invoked ``stop_live_preview`` or the panel
     # auto-stopped because a different source was loaded (user
@@ -265,6 +1056,15 @@ class PreviewPanel(QWidget):
     # so its ``_preview_mode_active`` flag stays in sync with the
     # panel's actual state.
     live_preview_stopped = Signal()
+    # Emitted when full-preview auto-advance picks a next segment.
+    # Empty id ("") means we reached end-of-timeline.
+    segment_auto_advanced = Signal(str)
+    # Emitted whenever the full-preview checkbox toggles.
+    full_preview_mode_changed = Signal(bool)
+    # Emitted when full-preview seek crosses into another segment while live
+    # preview is active. MainWindow should rebuild renderer using that segment's
+    # config, then seek to the requested project time.
+    segment_seek_requested = Signal(str, float)  # segment_id, project_time_sec
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -300,7 +1100,42 @@ class PreviewPanel(QWidget):
         self._live_active: bool = False
         self._live_renderer: Optional["LiveFrameRenderer"] = None
         self._live_buffer_rgb: object = None  # holds QImage backing array alive
+        # Full-preview mode: when True, EndOfMedia auto-advances to the next
+        # timeline segment instead of stopping at the current segment end.
+        self._full_preview_mode: bool = False
+        # Auto project playback mode: enabled when user presses Play while
+        # no segment/source is selected. Behaves like full-preview chaining
+        # without requiring the checkbox to be toggled manually.
+        self._project_playback_mode: bool = False
+        # Countdown audio (preview-only playback of countdown ticks).
+        self._countdown_audio_enabled: bool = False
+        self._countdown_audio_mode: str = "default"
+        self._countdown_audio_file: str = ""
+        self._countdown_audio_volume: float = 0.65
+        self._countdown_audio_last_mode: str = "default"
+        self._countdown_audio_last_file: str = ""
+        self._countdown_prev_text: str | None = None
+        self._default_countdown_sound: str = self._ensure_countdown_default_sound(
+            "ssc_countdown_regular.wav", hz=940.0, duration_sec=0.09
+        )
+        self._default_countdown_last_sound: str = self._ensure_countdown_default_sound(
+            "ssc_countdown_last.wav", hz=1260.0, duration_sec=0.13
+        )
+        # Cached timeline order pushed by MainWindow.
+        self._project_segments: list[Segment] = []
+        # Shared project layers reference for layer-first visual resolves.
+        self._project_layers: list = []
+        # Last observed playback state (used to decide auto-resume on advance).
+        self._was_playing: bool = False
+        # While user drags the seek slider in full-preview mode, we defer the
+        # expensive cross-segment source-switch to slider release.
+        self._full_seek_dragging: bool = False
+        self._pending_full_seek_ms: int = -1
         self._build_ui()
+        if hasattr(self, "_full_preview_cb"):
+            self._full_preview_cb.blockSignals(True)
+            self._full_preview_cb.setChecked(False)
+            self._full_preview_cb.blockSignals(False)
 
     def set_source_media(self, media: MediaItem | None) -> None:
         """Set selected media source and load it for preview."""
@@ -309,6 +1144,167 @@ class PreviewPanel(QWidget):
         self._playhead_offset_sec = 0.0
         if self.source_combo.currentData() == "media":
             self._load_active_source()
+
+    def set_project_segments(self, segments: list[Segment]) -> None:
+        """Set sorted segment cache used by full-preview auto-advance."""
+        self._project_segments = sorted(
+            list(segments or []), key=lambda s: float(s.start_time_sec or 0.0)
+        )
+        # If no source is currently loaded, allow Play to start project-wide
+        # playback from the first segment.
+        if self._current_url.isEmpty() and not self._media_ready:
+            self.play_button.setEnabled(bool(self._project_segments))
+            if self._project_segments:
+                self._show_empty("No segment selected - press Play to preview project")
+        self._refresh_seek_ui(self.player.position(), self.player.duration())
+
+    def set_project_layers(self, layers: list) -> None:
+        """Set project layers reference used by overlay resolution."""
+        self._project_layers = layers if isinstance(layers, list) else []
+
+    def _is_project_timeline_mode(self) -> bool:
+        return bool(self._full_preview_mode or self._project_playback_mode)
+
+    def is_full_preview_mode(self) -> bool:
+        return bool(self._full_preview_mode)
+
+    def _on_full_preview_toggled(self, checked: bool) -> None:
+        self._full_preview_mode = bool(checked)
+        self._refresh_seek_ui(self.player.position(), self.player.duration())
+        self.full_preview_mode_changed.emit(self._full_preview_mode)
+
+    def _timeline_total_duration_ms(self) -> int:
+        """Total project duration from cached segments (ms)."""
+        if not self._project_segments:
+            return 0
+        end_sec = max(float(getattr(s, "end_time_sec", 0.0) or 0.0) for s in self._project_segments)
+        return max(0, int(round(end_sec * 1000.0)))
+
+    def _refresh_time_label(self, position_ms: int, media_duration_ms: int) -> None:
+        """Refresh time label for segment-mode or full-project mode."""
+        show_project_timeline = (
+            self._selected_segment is not None
+            and bool(self._project_segments)
+        )
+        if show_project_timeline:
+            current_project_ms = int(
+                round((self._playhead_offset_sec + max(0, position_ms) / 1000.0) * 1000.0)
+            )
+            total_project_ms = self._timeline_total_duration_ms()
+            if total_project_ms > 0:
+                self.time_label.setText(
+                    f"{format_ms(current_project_ms)} / {format_ms(total_project_ms)}"
+                )
+                return
+        self.time_label.setText(
+            f"{format_ms(max(0, position_ms))} / {format_ms(max(0, media_duration_ms))}"
+        )
+
+    def _project_ms_from_local_ms(self, local_ms: int) -> int:
+        return int(
+            round((self._playhead_offset_sec + max(0, local_ms) / 1000.0) * 1000.0)
+        )
+
+    def _refresh_seek_ui(self, position_ms: int, media_duration_ms: int) -> None:
+        """Refresh both seek range/value and time label for current mode."""
+        self._refresh_time_label(position_ms, media_duration_ms)
+        if self._is_project_timeline_mode() and self._project_segments:
+            total_ms = self._timeline_total_duration_ms()
+            proj_ms = self._project_ms_from_local_ms(position_ms)
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setRange(0, max(0, total_ms))
+            self.seek_slider.setValue(max(0, min(total_ms, proj_ms)))
+            self.seek_slider.blockSignals(False)
+            return
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setRange(0, max(0, media_duration_ms))
+        self.seek_slider.setValue(max(0, position_ms))
+        self.seek_slider.blockSignals(False)
+
+    def _segment_for_project_time(self, t_sec: float) -> Optional[Segment]:
+        if not self._project_segments:
+            return None
+        t = float(max(0.0, t_sec))
+        # Primary: segment containing t.
+        for seg in self._project_segments:
+            s = float(seg.start_time_sec or 0.0)
+            e = float(seg.end_time_sec or s)
+            if s <= t < e:
+                return seg
+        # If inside a gap, pick next segment; if beyond end, clamp to last.
+        for seg in self._project_segments:
+            if float(seg.start_time_sec or 0.0) >= t:
+                return seg
+        return self._project_segments[-1]
+
+    def _seek_project_time_sec(self, t_sec: float, *, resume_play: bool = False) -> None:
+        """Seek by project time; switches source segment if needed."""
+        target = self._segment_for_project_time(t_sec)
+        if target is None:
+            return
+        if (
+            self._is_project_timeline_mode()
+            and self._live_active
+            and self._selected_segment is not None
+            and self._selected_segment.id != target.id
+        ):
+            # Do NOT swap source in-place here: live renderer config would still
+            # belong to the old segment. Delegate to MainWindow to rebuild with
+            # the target segment's settings.
+            self.segment_seek_requested.emit(target.id, float(max(0.0, t_sec)))
+            self.playhead_changed.emit(float(max(0.0, t_sec)))
+            return
+        local_sec = max(0.0, float(t_sec) - float(target.start_time_sec or 0.0))
+        local_ms = int(round(local_sec * 1000.0))
+        was_playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        ) or bool(resume_play)
+
+        if self._selected_segment is None or self._selected_segment.id != target.id:
+            self.set_source_segment(target)
+
+        if self._media_ready:
+            self.player.setPosition(local_ms)
+            if was_playing:
+                self.player.play()
+        else:
+            self._pending_seek_ms = local_ms
+            if was_playing:
+                self._pending_play = True
+                self._set_play_button_state(playing=True)
+
+        self.playhead_changed.emit(float(max(0.0, t_sec)))
+
+    def _on_seek_slider_moved(self, value: int) -> None:
+        if not (self._is_project_timeline_mode() and self._project_segments):
+            self.player.setPosition(int(value))
+            return
+        self._full_seek_dragging = True
+        self._pending_full_seek_ms = int(value)
+        total_ms = self._timeline_total_duration_ms()
+        self.time_label.setText(
+            f"{format_ms(max(0, value))} / {format_ms(max(0, total_ms))}"
+        )
+
+    def _on_seek_slider_pressed(self) -> None:
+        """Any seek interaction forces playback into paused state."""
+        self._pending_play = False
+        self.player.pause()
+        if self._is_project_timeline_mode() and self._project_segments:
+            self._full_seek_dragging = True
+            self._pending_full_seek_ms = int(self.seek_slider.value())
+
+    def _on_seek_slider_released(self) -> None:
+        if not (self._is_project_timeline_mode() and self._project_segments):
+            return
+        self._full_seek_dragging = False
+        target_ms = (
+            self._pending_full_seek_ms
+            if self._pending_full_seek_ms >= 0
+            else int(self.seek_slider.value())
+        )
+        self._pending_full_seek_ms = -1
+        self._seek_project_time_sec(float(target_ms) / 1000.0, resume_play=False)
 
     # ------------------------------------------------------------------
     # Stickman overlay
@@ -342,18 +1338,20 @@ class PreviewPanel(QWidget):
         return bool(val)
 
     def _refresh_stickman_button_state(self) -> None:
-        """Enable/disable the toolbar toggle based on current segment."""
+        """Sync stickman overlay state with current segment."""
         seg = self._selected_segment
         enabled = self._segment_stickman_enabled(seg)
-        self.stickman_button.setEnabled(enabled)
-        if not enabled and self.stickman_button.isChecked():
-            # Auto-untoggle when leaving a stickman-enabled segment so a
-            # stale overlay doesn't linger over an unrelated source.
-            self.stickman_button.setChecked(False)
+        # Stick box is controlled by the shared Floor/Wall toggle.
+        self.stickman_button.setVisible(False)
+        self.stickman_button.setEnabled(False)
+        if not enabled and self._stickman_edit_active:
+            self._on_stickman_edit_toggled(False)
         if enabled and seg is not None:
             self.stickman_overlay.set_normalized(
                 *self._segment_stick_fractions(seg)
             )
+        # Floor/Wall button is available whenever a segment is loaded (live or not)
+        self.floor_wall_button.setEnabled(seg is not None)
 
     def _sync_stickman_overlay_pos(self) -> None:
         """Keep the floating overlay snapped to the rendered-image rect.
@@ -428,7 +1426,9 @@ class PreviewPanel(QWidget):
         if checked:
             seg = self._selected_segment
             if seg is None or not self._segment_stickman_enabled(seg):
-                self.stickman_button.setChecked(False)
+                self._stickman_edit_active = False
+                self._stickman_pos_timer.stop()
+                self.stickman_overlay.hide()
                 return
             self.stickman_overlay.set_normalized(
                 *self._segment_stick_fractions(seg)
@@ -462,7 +1462,309 @@ class PreviewPanel(QWidget):
             pass
         self.stickman_location_changed.emit(seg.id, location)
 
-    def set_source_segment(self, segment: Segment | None) -> None:
+    # ── Floor/Wall overlay methods ──────────────────────────────────────
+    def _sync_floor_wall_overlay_pos(self) -> None:
+        if not self._floor_wall_edit_active:
+            return
+        rect = self._rendered_image_rect_global()
+        if rect is None:
+            tl = self.stage_stack.mapToGlobal(QPoint(0, 0))
+            sz = self.stage_stack.size()
+            self.floor_wall_overlay.setGeometry(
+                tl.x(), tl.y(), sz.width(), sz.height()
+            )
+            return
+        self.floor_wall_overlay.setGeometry(rect)
+
+    def _on_floor_wall_edit_toggled(self, checked: bool) -> None:
+        self._floor_wall_edit_active = bool(checked)
+        if checked:
+            seg = self._selected_segment
+            # Selection can become stale after undo/redo paths that replace
+            # project segment objects. Rebind by id to the latest instance.
+            if seg is not None and self._project_segments:
+                seg_latest = next(
+                    (s for s in self._project_segments if s.id == seg.id),
+                    seg,
+                )
+                if seg_latest is not seg:
+                    self._selected_segment = seg_latest
+                    seg = seg_latest
+            rs: dict = {}
+            if seg is not None:
+                # Use layer-resolved config so Adjust opens with the exact
+                # currently effective values (layer-first projects included).
+                try:
+                    from studio.models.layer import resolve_segment_config
+                    rs = dict(resolve_segment_config(seg, self._project_layers))
+                except Exception:
+                    rs = dict(getattr(seg, "render_settings", {}) or {})
+            # Default camera values (must match PerspectiveCamera defaults).
+            _CAM_HIT_DEFAULT   = 0.86
+            _CAM_HZ_DEFAULT    = 0.45
+            _CAM_NEAR_DEFAULT  = 0.65
+            try:
+                hit     = float(rs["floor_hit_frac"])  if rs.get("floor_hit_frac")  is not None else _CAM_HIT_DEFAULT
+                hz      = float(rs["horizon_frac"])     if rs.get("horizon_frac")     is not None else _CAM_HZ_DEFAULT
+                near_sp = float(rs["floor_spread_frac"])if rs.get("floor_spread_frac")is not None else _CAM_NEAR_DEFAULT
+            except (TypeError, ValueError):
+                hit, hz, near_sp = _CAM_HIT_DEFAULT, _CAM_HZ_DEFAULT, _CAM_NEAR_DEFAULT
+            try:
+                far_sp = float(rs["far_spread_frac"])   if rs.get("far_spread_frac")  is not None else near_sp
+                gap    = float(rs["wall_floor_gap_frac"])if rs.get("wall_floor_gap_frac")is not None else 0.0
+            except (TypeError, ValueError):
+                far_sp, gap = near_sp, 0.0
+            has_relax = False
+            if seg is not None:
+                if str(seg.mode) == "relax":
+                    has_relax = True
+                elif str(seg.mode) == "combo":
+                    modes = rs.get("mode_list") or []
+                    has_relax = "relax" in [str(m) for m in modes]
+            cdx, cdy, cdw, cdh = self._get_countdown_bbox(seg)
+            rail_h = float(rs.get("rail_height", 0.14) or 0.14)
+            gate_enabled = bool(rs.get("start_gate_enabled", False))
+            gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
+            chevron_w = self._get_floor_chevron_width(seg, rs=rs)
+            vp_depth = float(rs.get("viewport_panel_depth") or 0.6)
+            gate_rect = None
+            # Live renderer is the ground truth: its camera was already built
+            # with the resolved values, so always prefer it over stale rs.
+            if self._live_active and self._live_renderer is not None:
+                lr = self._live_renderer
+                _fhf = getattr(lr, "_floor_hit_frac", None)
+                if _fhf is not None:
+                    hit = float(_fhf)
+                _hzf = getattr(lr, "_horizon_frac", None)
+                if _hzf is not None:
+                    hz = float(_hzf)
+                _nsf = getattr(lr, "_floor_spread_frac", None)
+                if _nsf is not None:
+                    near_sp = float(_nsf)
+                _fsf = getattr(lr, "_far_spread_frac", None)
+                if _fsf is not None:
+                    far_sp = float(_fsf)
+                _wgf = getattr(lr, "_wall_floor_gap_frac", None)
+                if _wgf is not None:
+                    gap = float(_wgf)
+                cdx = float(getattr(lr, "_relax_countdown_x", cdx))
+                cdy = float(getattr(lr, "_relax_countdown_y", cdy))
+                cdw = float(getattr(lr, "_relax_countdown_w", cdw))
+                cdh = float(getattr(lr, "_relax_countdown_h", cdh))
+                rail_h = float(getattr(lr, "_rail_height", rail_h))
+                gate_enabled = bool(getattr(lr, "_start_gate_enabled", gate_enabled))
+                gate_h = float(getattr(lr, "_start_gate_h", gate_h))
+                chevron_w = float(getattr(lr, "_chevron_width_frac", chevron_w))
+                vp_depth = float(getattr(lr, "_viewport_panel_depth", None) or vp_depth)
+                gate_rect = lr.get_start_gate_rect()
+            # Set geometry BEFORE set_fractions so _hit_frac_bounds() has the
+            # correct widget height. Without this, the overlay height is 0 at
+            # construction time, which makes the margin huge and clamps any
+            # hit_frac value to ~0.51 (screen middle).
+            self._sync_floor_wall_overlay_pos()
+            self.floor_wall_overlay.set_fractions(
+                hit, hz, near_sp, far_sp, gap, rail_h,
+                has_relax, cdx, cdy, cdw, cdh, chevron_w,
+                vp_panel_depth=vp_depth,
+            )
+            if gate_rect is not None:
+                gx, gy, gw, gh = gate_rect
+            else:
+                gx, gy, gw, gh = (0.30, 0.18, 0.40, 0.22)
+            self.floor_wall_overlay.set_start_gate_proxy(
+                enabled=gate_enabled,
+                gate_height=gate_h,
+                x=gx,
+                y=gy,
+                w=gw,
+                h=gh,
+            )
+            # ── Combo box proxy ─────────────────────────────────────────────
+            combo_enabled_ov = bool(rs.get("combo_enabled", True))
+            cbx = float(rs.get("combo_x", 0.85) or 0.85)
+            cby = float(rs.get("combo_y", 0.08) or 0.08)
+            cbw = float(rs.get("combo_w", 0.13) or 0.13)
+            cbh = float(rs.get("combo_h", 0.18) or 0.18)
+            if self._live_active and self._live_renderer is not None:
+                lr = self._live_renderer
+                combo_enabled_ov = bool(getattr(lr, "_combo_enabled", combo_enabled_ov))
+                cbx = float(getattr(lr, "_combo_x", cbx))
+                cby = float(getattr(lr, "_combo_y", cby))
+                cbw = float(getattr(lr, "_combo_w", cbw))
+                cbh = float(getattr(lr, "_combo_h", cbh))
+            self.floor_wall_overlay.set_combo_proxy(
+                enabled=combo_enabled_ov,
+                x=cbx, y=cby, w=cbw, h=cbh,
+            )
+            self._on_stickman_edit_toggled(
+                seg is not None and self._segment_stickman_enabled(seg)
+            )
+            self.floor_wall_overlay.show()
+            self._floor_wall_pos_timer.start()
+        else:
+            self._floor_wall_pos_timer.stop()
+            self.floor_wall_overlay.hide()
+            self._on_stickman_edit_toggled(False)
+
+    def _on_floor_wall_changing(
+        self,
+        hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
+        cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
+        start_gate_h: float,
+        chevron_width_frac: float,
+        vp_panel_depth: float = 0.6,
+    ) -> None:
+        """Live-update the renderer while the user drags a handle."""
+        if not self._live_active or self._live_renderer is None:
+            return
+        self._live_renderer.update_floor_wall(
+            floor_hit_frac=hit,
+            horizon_frac=hz,
+            floor_spread_frac=near_sp,
+            far_spread_frac=far_sp,
+            wall_floor_gap_frac=gap,
+        )
+        self._live_renderer.update_side_rail_height(rail_h)
+        self._live_renderer.update_start_gate_height(start_gate_h)
+        self._live_renderer.update_floor_chevron_width(chevron_width_frac)
+        self._live_renderer.update_viewport_panel_depth(vp_panel_depth)
+        self._live_renderer.update_countdown_box(x=cdx, y=cdy, w=cdw, h=cdh)
+        gate_rect = self._live_renderer.get_start_gate_rect()
+        if gate_rect is not None:
+            gx, gy, gw, gh = gate_rect
+            self.floor_wall_overlay.set_start_gate_proxy(
+                enabled=bool(getattr(self._live_renderer, "_start_gate_enabled", False)),
+                gate_height=float(getattr(self._live_renderer, "_start_gate_h", start_gate_h)),
+                x=gx,
+                y=gy,
+                w=gw,
+                h=gh,
+            )
+        self._render_live_frame(self.player.position() / 1000.0)
+
+    def _on_floor_wall_committed(
+        self,
+        hit: float, hz: float, near_sp: float, far_sp: float, gap: float,
+        cdx: float, cdy: float, cdw: float, cdh: float, rail_h: float,
+        start_gate_h: float,
+        chevron_width_frac: float,
+        vp_panel_depth: float = 0.6,
+    ) -> None:
+        """Persist the final drag result and notify MainWindow."""
+        seg = self._selected_segment
+        if seg is not None:
+            seg.render_settings["floor_hit_frac"]        = round(hit,     4)
+            seg.render_settings["horizon_frac"]          = round(hz,      4)
+            seg.render_settings["floor_spread_frac"]     = round(near_sp, 4)
+            seg.render_settings["far_spread_frac"]       = round(far_sp,  4)
+            seg.render_settings["wall_floor_gap_frac"]   = round(gap,     4)
+            seg.render_settings["rail_height"]           = round(max(0.15, rail_h), 4)
+            seg.render_settings["start_gate_h"]          = round(max(0.03, start_gate_h), 4)
+            seg.render_settings["chevron_width_frac"]    = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
+            seg.render_settings["viewport_panel_depth"] = round(max(0.05, vp_panel_depth), 4)
+        self.floor_wall_committed.emit(
+            hit, hz, near_sp, far_sp, gap, cdx, cdy, cdw, cdh,
+            max(0.15, rail_h), max(0.03, start_gate_h),
+            max(0.05, min(0.95, chevron_width_frac)),
+            max(0.05, vp_panel_depth),
+        )
+
+    def _on_combo_box_committed(
+        self, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Persist combo bbox from overlay drag into the combo layer config."""
+        seg = self._selected_segment
+        if seg is None or not self._project_layers:
+            return
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        combo_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "combo"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not combo_layers:
+            return
+        top = max(combo_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        top.config["combo_x"] = round(float(x), 4)
+        top.config["combo_y"] = round(float(y), 4)
+        top.config["combo_w"] = round(float(w), 4)
+        top.config["combo_h"] = round(float(h), 4)
+        # Hot-update the renderer bbox without rebuilding
+        if self._live_active and self._live_renderer is not None:
+            self._live_renderer.update_combo_box(x=x, y=y, w=w, h=h)
+            self._render_live_frame(self.player.position() / 1000.0)
+        self.combo_box_committed.emit(x, y, w, h)
+
+    def _get_countdown_bbox(
+        self, seg: Segment | None
+    ) -> tuple[float, float, float, float]:
+        """Resolve countdown box from countdown layer config."""
+        if seg is None or not self._project_layers:
+            return (0.88, 0.04, 0.10, 0.16)
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        cd_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "countdown"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not cd_layers:
+            return (0.88, 0.04, 0.10, 0.16)
+        top = max(cd_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        cfg = getattr(top, "config", {}) or {}
+        return (
+            float(cfg.get("relax_countdown_x", 0.88) or 0.88),
+            float(cfg.get("relax_countdown_y", 0.04) or 0.04),
+            float(cfg.get("relax_countdown_w", 0.10) or 0.10),
+            float(cfg.get("relax_countdown_h", 0.16) or 0.16),
+        )
+
+    def _get_floor_chevron_width(
+        self,
+        seg: Segment | None,
+        *,
+        rs: Optional[dict] = None,
+    ) -> float:
+        """Resolve floor chevron width from floor layer config."""
+        base = 0.45
+        if rs is not None:
+            try:
+                base = float(rs.get("chevron_width_frac", base) or base)
+            except (TypeError, ValueError):
+                base = 0.45
+        if seg is None or not self._project_layers:
+            return max(0.05, min(0.95, base))
+        seg_start = float(getattr(seg, "start_time_sec", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end_time_sec", 0.0) or 0.0)
+        floor_layers = [
+            la for la in self._project_layers
+            if getattr(la, "kind", "") == "floor"
+            and la.overlaps(seg_start, seg_end)
+        ]
+        if not floor_layers:
+            return max(0.05, min(0.95, base))
+        top = max(floor_layers, key=lambda la: int(getattr(la, "z_index", 0)))
+        cfg = getattr(top, "config", {}) or {}
+        try:
+            return max(0.05, min(0.95, float(cfg.get("chevron_width_frac", base) or base)))
+        except (TypeError, ValueError):
+            return max(0.05, min(0.95, base))
+
+    def set_floor_wall_edit_enabled(self, enabled: bool) -> None:
+        """Enable or disable the Floor/Wall button (only meaningful in live-preview)."""
+        self.floor_wall_button.setEnabled(enabled)
+        if not enabled and self._floor_wall_edit_active:
+            self.floor_wall_button.setChecked(False)
+
+    def set_source_segment(
+        self,
+        segment: Segment | None,
+        *,
+        keep_project_mode: bool = False,
+    ) -> None:
         """Set selected segment and load the most useful source for preview.
 
         Priority:
@@ -475,10 +1777,15 @@ class PreviewPanel(QWidget):
            content, not at the start of the full source file.
         4. Nothing → clear.
         """
+        if not keep_project_mode:
+            self._project_playback_mode = False
+        was_live_preview = self.is_live_preview_active()
+        keep_live = was_live_preview and self._full_preview_mode
         self._selected_segment = segment
 
         if segment is None:
-            self.clear()
+            if not keep_live:
+                self.clear()
             return
 
         rendered_ready = bool(
@@ -488,7 +1795,10 @@ class PreviewPanel(QWidget):
         if rendered_ready:
             self._set_source_combo_silently("segment")
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
-            self._load_path(segment.video_path)  # type: ignore[arg-type]
+            self._load_path(
+                segment.video_path,  # type: ignore[arg-type]
+                keep_live_preview=keep_live,
+            )
             self._refresh_stickman_button_state()
             return
 
@@ -500,7 +1810,7 @@ class PreviewPanel(QWidget):
         if trimmed and Path(trimmed).exists():
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = float(segment.start_time_sec or 0.0)
-            self._load_path(trimmed)
+            self._load_path(trimmed, keep_live_preview=keep_live)
             self._refresh_stickman_button_state()
             return
 
@@ -511,7 +1821,7 @@ class PreviewPanel(QWidget):
             # once the trim completes via _on_trim_ready → set_source_segment.
             self._set_source_combo_silently("media")
             self._playhead_offset_sec = 0.0
-            self._load_path(segment.audio_path)
+            self._load_path(segment.audio_path, keep_live_preview=keep_live)
             self._refresh_stickman_button_state()
             return
 
@@ -563,6 +1873,18 @@ class PreviewPanel(QWidget):
                 self.stickman_button.setChecked(False)
                 self.stickman_button.blockSignals(False)
             self.stickman_button.setEnabled(False)
+        # Also hide floor/wall overlay
+        if hasattr(self, "_floor_wall_pos_timer"):
+            self._floor_wall_pos_timer.stop()
+        if hasattr(self, "floor_wall_overlay"):
+            self._floor_wall_edit_active = False
+            self.floor_wall_overlay.hide()
+        if hasattr(self, "floor_wall_button"):
+            if self.floor_wall_button.isChecked():
+                self.floor_wall_button.blockSignals(True)
+                self.floor_wall_button.setChecked(False)
+                self.floor_wall_button.blockSignals(False)
+            self.floor_wall_button.setEnabled(False)
 
     def _build_ui(self) -> None:
         self.setObjectName("PanelRoot")
@@ -715,6 +2037,16 @@ class PreviewPanel(QWidget):
             self._sync_stickman_overlay_pos
         )
 
+        # Floor/Wall drag overlay (same floating-Tool-window pattern).
+        self.floor_wall_overlay = FloorWallOverlay(self)
+        self.floor_wall_overlay.changing.connect(self._on_floor_wall_changing)
+        self.floor_wall_overlay.committed.connect(self._on_floor_wall_committed)
+        self.floor_wall_overlay.combo_committed.connect(self._on_combo_box_committed)
+        self._floor_wall_edit_active: bool = False
+        self._floor_wall_pos_timer = QTimer(self)
+        self._floor_wall_pos_timer.setInterval(50)
+        self._floor_wall_pos_timer.timeout.connect(self._sync_floor_wall_overlay_pos)
+
         # Dots animation timer for loading label.
         self._loading_dots = 0
         self._loading_timer = QTimer(self)
@@ -740,6 +2072,18 @@ class PreviewPanel(QWidget):
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
 
+        # Dedicated media players for countdown SFX so play/pause of the main
+        # preview audio track does not interrupt short per-tick sounds.
+        self._countdown_sfx_out = QAudioOutput(self)
+        self._countdown_sfx_out.setVolume(self._countdown_audio_volume)
+        self._countdown_sfx_player = QMediaPlayer(self)
+        self._countdown_sfx_player.setAudioOutput(self._countdown_sfx_out)
+
+        self._countdown_sfx_last_out = QAudioOutput(self)
+        self._countdown_sfx_last_out.setVolume(self._countdown_audio_volume)
+        self._countdown_sfx_last_player = QMediaPlayer(self)
+        self._countdown_sfx_last_player.setAudioOutput(self._countdown_sfx_last_out)
+
         control_row = QHBoxLayout()
         self.play_button = QPushButton("Play")
         self.play_button.clicked.connect(self._toggle_play)
@@ -752,7 +2096,9 @@ class PreviewPanel(QWidget):
         self.stop_button.clicked.connect(self._on_stop_clicked)
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
-        self.seek_slider.sliderMoved.connect(self.player.setPosition)
+        self.seek_slider.sliderPressed.connect(self._on_seek_slider_pressed)
+        self.seek_slider.sliderMoved.connect(self._on_seek_slider_moved)
+        self.seek_slider.sliderReleased.connect(self._on_seek_slider_released)
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet(
             "color:#c0c0c0;font-family:Consolas,Menlo,monospace;"
@@ -777,18 +2123,36 @@ class PreviewPanel(QWidget):
             self._on_stickman_edit_toggled
         )
         self.stickman_button.setEnabled(False)
+        self.stickman_button.setVisible(False)
+
+        self.floor_wall_button = QPushButton("Edit Layout")
+        self.floor_wall_button.setCheckable(True)
+        self.floor_wall_button.setToolTip(
+            "Toggle drag handles to adjust floor/wall and stick box.\n"
+            "Drag directly on the player."
+        )
+        self.floor_wall_button.toggled.connect(self._on_floor_wall_edit_toggled)
+        self.floor_wall_button.setEnabled(False)
+        self._full_preview_cb = QCheckBox("Preview full")
+        self._full_preview_cb.setToolTip(
+            "Auto-play next segment when current reaches end.\n"
+            "When selecting another segment on timeline, keep preview mode on."
+        )
+        self._full_preview_cb.setChecked(self._full_preview_mode)
+        self._full_preview_cb.toggled.connect(self._on_full_preview_toggled)
 
         self.play_button.setEnabled(False)
 
         # FPS selector for live preview.  Options kept deliberately small
         # (6 / 12 / 24 / 30) — higher means more CPU per second on the
-        # render thread.  Default 24 matches what users consider "smooth".
+        # render thread.  Default 12 keeps preview responsive on heavy
+        # scenes (multi-tile dance, glow effects) while still readable.
         self.fps_combo = QComboBox()
         self.fps_combo.setToolTip("Live preview frame-rate (higher = smoother but more CPU)")
         self.fps_combo.setFixedWidth(72)
         for fps_val in (6, 12, 24, 30):
             self.fps_combo.addItem(f"{fps_val} fps", fps_val)
-        self.fps_combo.setCurrentIndex(2)  # default 24 fps
+        self.fps_combo.setCurrentIndex(1)  # default 12 fps
         self.fps_combo.currentIndexChanged.connect(self._on_fps_changed)
 
         control_row.addWidget(self.play_button)
@@ -800,7 +2164,8 @@ class PreviewPanel(QWidget):
         control_row.addWidget(vol_label)
         control_row.addWidget(self.volume_slider)
         control_row.addWidget(self.fps_combo)
-        control_row.addWidget(self.stickman_button)
+        control_row.addWidget(self._full_preview_cb)
+        control_row.addWidget(self.floor_wall_button)
         control_row.addWidget(self.full_button)
         body_layout.addLayout(control_row)
 
@@ -829,14 +2194,20 @@ class PreviewPanel(QWidget):
         self.clear()
         self.empty_label.setText("Main timeline preview is TODO in skeleton")
 
-    def _load_path(self, raw_path: str, *, force_reload: bool = False) -> None:
+    def _load_path(
+        self,
+        raw_path: str,
+        *,
+        force_reload: bool = False,
+        keep_live_preview: bool = False,
+    ) -> None:
         # When live-preview is active, ANY call to load a different
         # video/audio source is a deliberate choice by the caller
         # (user picked another segment, switched the source-combo,
         # auto-loaded a freshly-rendered file…) that supersedes live
         # mode.  Tear it down first so the renderer + frame timer
         # release cleanly before we start a new probe.
-        if self._live_active:
+        if self._live_active and not keep_live_preview:
             self.stop_live_preview()
         # ``raw_path`` is always a local filesystem path now that live
         # preview is in-process and HLS streaming has been removed.
@@ -894,7 +2265,12 @@ class PreviewPanel(QWidget):
         self.play_button.setEnabled(False)
         self._set_play_button_state(playing=False)
         self._current_url = url
-        self._show_loading()
+        if self._live_active and keep_live_preview:
+            # Keep live page visible while swapping audio source in-place.
+            self.stage_stack.setCurrentIndex(self._live_page_index)
+            self._loading_timer.stop()
+        else:
+            self._show_loading()
         self.player.setSource(url)
         self._load_watchdog.start()
 
@@ -925,7 +2301,28 @@ class PreviewPanel(QWidget):
             # Some backends (Windows ffmpeg) won't auto-rewind; reset position.
             self.player.setPosition(0)
 
-        # Case 4: no media loaded but we have a cached url -> reattach source.
+        # Case 4: no source loaded, but project has segments -> start project playback.
+        if (
+            status == MS.NoMedia
+            and self._current_url.isEmpty()
+            and self._project_segments
+        ):
+            first = next(
+                (seg for seg in self._project_segments if self._is_segment_playable(seg)),
+                None,
+            )
+            if first is None:
+                self._show_empty("No playable segment found")
+                self.play_button.setEnabled(False)
+                return
+            self._project_playback_mode = True
+            self._pending_play = True
+            self._pending_seek_ms = 0
+            self._set_play_button_state(playing=True)
+            self.set_source_segment(first, keep_project_mode=True)
+            return
+
+        # Case 5: no media loaded but we have a cached url -> reattach source.
         if status == MS.NoMedia and not self._current_url.isEmpty():
             self._pending_play = True
             self._set_play_button_state(playing=True)
@@ -935,33 +2332,44 @@ class PreviewPanel(QWidget):
         self.player.play()
 
     def _on_stop_clicked(self) -> None:
-        """Stop button: pause and rewind to the start.
+        """Hard-stop player and drop current source selection/cache.
 
-        ``QMediaPlayer.stop()`` would reset ``duration()`` to 0 and
-        collapse the seek slider to an unusable ``(0, 0)`` range.  By
-        pausing instead we keep the duration so the user can still
-        scrub the slider while playback is parked.
+        User intent for this button is "reset player state completely".
+        We therefore clear the loaded media URL and selected source refs
+        so pressing Play cannot revive a stale/deleted segment by cache.
         """
-        self.player.pause()
-        self.player.setPosition(0)
+        self.clear()
+        self._selected_media = None
+        self._selected_segment = None
+        self._project_playback_mode = False
+        self._pending_play = False
+        self._pending_seek_ms = -1
+        self._playhead_offset_sec = 0.0
+        self._full_seek_dragging = False
+        self.source_combo.blockSignals(True)
+        try:
+            idx = self.source_combo.findData("media")
+            if idx >= 0:
+                self.source_combo.setCurrentIndex(idx)
+        finally:
+            self.source_combo.blockSignals(False)
+        self.play_button.setEnabled(bool(self._project_segments))
+        if self._project_segments:
+            self._show_empty("No segment selected - press Play to preview project")
 
     def _on_position_changed(self, value: int) -> None:
-        self.seek_slider.blockSignals(True)
-        self.seek_slider.setValue(value)
-        self.seek_slider.blockSignals(False)
-        self.time_label.setText(
-            f"{format_ms(value)} / {format_ms(self.player.duration())}"
-        )
+        if self._is_project_timeline_mode() and self._full_seek_dragging:
+            # Keep user's dragged thumb position untouched while dragging.
+            self._refresh_time_label(self.player.position(), self.player.duration())
+        else:
+            self._refresh_seek_ui(value, self.player.duration())
         # Translate media-local time → project timeline time so the timeline
         # red playhead tracks correctly even when we're playing a rendered
         # segment video that starts mid-project (offset = segment.start).
         self.playhead_changed.emit(value / 1000.0 + self._playhead_offset_sec)
 
     def _on_duration_changed(self, value: int) -> None:
-        self.seek_slider.setRange(0, max(0, value))
-        self.time_label.setText(
-            f"{format_ms(self.player.position())} / {format_ms(value)}"
-        )
+        self._refresh_seek_ui(self.player.position(), value)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         MS = QMediaPlayer.MediaStatus
@@ -981,6 +2389,8 @@ class PreviewPanel(QWidget):
                 # Stop the loading-dots animation; the live page is
                 # already current and we don't want it switched away.
                 self._loading_timer.stop()
+                if self.stage_stack.currentIndex() == 1:
+                    self.stage_stack.setCurrentIndex(self._live_page_index)
             self.play_button.setEnabled(True)
             if self._pending_seek_ms >= 0:
                 self.player.setPosition(self._pending_seek_ms)
@@ -991,6 +2401,13 @@ class PreviewPanel(QWidget):
             return
 
         if status == MS.EndOfMedia:
+            # Full-preview mode: advance only on genuine end-position events.
+            if self._is_project_timeline_mode():
+                dur = int(self.player.duration())
+                pos = int(self.player.position())
+                at_end = (dur <= 0) or (pos >= max(0, dur - 120))
+                if at_end and self._auto_advance_to_next_segment():
+                    return
             # File finished - keep button enabled so user can replay.
             self._load_watchdog.stop()
             self._media_ready = True
@@ -1039,6 +2456,7 @@ class PreviewPanel(QWidget):
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         """Keep play/pause button label in sync with the actual player state."""
         is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._was_playing = bool(is_playing)
         self._set_play_button_state(playing=is_playing)
         # Ensure button stays enabled whenever we have a usable source.
         if self._media_ready or is_playing:
@@ -1051,6 +2469,46 @@ class PreviewPanel(QWidget):
         # ``TypeError: int() argument must be ... not 'PlaybackState'``
         # on direct ``int(...)`` conversion).
         self.playback_state_changed.emit(int(state.value))
+
+    def _is_segment_playable(self, segment: Segment | None) -> bool:
+        if segment is None:
+            return False
+        if segment.video_path and Path(segment.video_path).exists():
+            return True
+        p = segment.trimmed_audio_path or segment.audio_path
+        return bool(p) and Path(str(p)).exists()
+
+    def _auto_advance_to_next_segment(self) -> bool:
+        """Advance to next playable segment; returns True if advanced."""
+        current = self._selected_segment
+        if current is None or not self._project_segments:
+            return False
+        cur_idx = next(
+            (i for i, s in enumerate(self._project_segments) if s.id == current.id),
+            -1,
+        )
+        if cur_idx < 0:
+            return False
+
+        next_idx = cur_idx + 1
+        while next_idx < len(self._project_segments):
+            cand = self._project_segments[next_idx]
+            if self._is_segment_playable(cand):
+                next_seg = cand
+                self.segment_auto_advanced.emit(next_seg.id)
+                self.set_source_segment(next_seg, keep_project_mode=True)
+                # EndOfMedia-triggered advance should continue playing.
+                if self._media_ready:
+                    self.player.play()
+                else:
+                    self._pending_play = True
+                    self._set_play_button_state(playing=True)
+                return True
+            next_idx += 1
+
+        # End reached (or no later playable segment).
+        self.segment_auto_advanced.emit("")
+        return False
 
     @property
     def preview_fps(self) -> int:
@@ -1128,6 +2586,114 @@ class PreviewPanel(QWidget):
 
     def _on_volume_changed(self, value: int) -> None:
         self.audio_output.setVolume(value / 100.0)
+
+    @staticmethod
+    def _normalize_countdown_audio_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return "file" if raw == "file" else "default"
+
+    @staticmethod
+    def _normalize_countdown_last_mode(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"file", "same"}:
+            return raw
+        return "default"
+
+    @staticmethod
+    def _ensure_countdown_default_sound(
+        filename: str, *, hz: float, duration_sec: float
+    ) -> str:
+        """Create a tiny wav beep file in temp dir if missing."""
+        out = Path(tempfile.gettempdir()) / filename
+        if out.exists():
+            return str(out)
+        sr = 44100
+        n = max(1, int(sr * float(duration_sec)))
+        with wave.open(str(out), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            frames = bytearray()
+            for i in range(n):
+                t = i / float(sr)
+                env = 1.0 - (i / float(n))
+                s = math.sin(2.0 * math.pi * float(hz) * t) * env
+                amp = int(max(-1.0, min(1.0, s)) * 28000)
+                frames.extend(struct.pack("<h", amp))
+            wf.writeframes(bytes(frames))
+        return str(out)
+
+    def _resolve_countdown_sfx_path(self, *, is_last: bool) -> str:
+        if is_last:
+            mode = self._normalize_countdown_last_mode(self._countdown_audio_last_mode)
+            if mode == "same":
+                return self._resolve_countdown_sfx_path(is_last=False)
+            if mode == "file" and self._countdown_audio_last_file:
+                p = Path(self._countdown_audio_last_file)
+                if p.exists():
+                    return str(p)
+            return self._default_countdown_last_sound
+
+        mode = self._normalize_countdown_audio_mode(self._countdown_audio_mode)
+        if mode == "file" and self._countdown_audio_file:
+            p = Path(self._countdown_audio_file)
+            if p.exists():
+                return str(p)
+        return self._default_countdown_sound
+
+    def _play_countdown_tick_sound(self, tick_text: str) -> None:
+        if not self._countdown_audio_enabled:
+            return
+        is_last = str(tick_text).strip() == "1"
+        path = self._resolve_countdown_sfx_path(is_last=is_last)
+        if not path:
+            return
+        player = self._countdown_sfx_last_player if is_last else self._countdown_sfx_player
+        out = self._countdown_sfx_last_out if is_last else self._countdown_sfx_out
+        out.setVolume(float(max(0.0, min(1.0, self._countdown_audio_volume))))
+        url = QUrl.fromLocalFile(str(Path(path).resolve()))
+        if player.source() != url:
+            player.setSource(url)
+        else:
+            player.setPosition(0)
+        player.play()
+
+    def _tick_countdown_audio(self) -> None:
+        """Play countdown SFX in live preview when the number changes."""
+        if not self._live_active or self._live_renderer is None:
+            self._countdown_prev_text = None
+            return
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        hud = getattr(self._live_renderer, "_countdown_hud", None)
+        text = getattr(hud, "_last_text", None) if hud is not None else None
+        if text != self._countdown_prev_text:
+            if text is not None:
+                self._play_countdown_tick_sound(str(text))
+            self._countdown_prev_text = text
+
+    def _sync_countdown_audio_config_from_renderer(self) -> None:
+        rdr = self._live_renderer
+        if rdr is None:
+            return
+        self._countdown_audio_enabled = bool(
+            getattr(rdr, "_relax_countdown_audio_enabled", self._countdown_audio_enabled)
+        )
+        self._countdown_audio_mode = str(
+            getattr(rdr, "_relax_countdown_audio_mode", self._countdown_audio_mode)
+        )
+        self._countdown_audio_file = str(
+            getattr(rdr, "_relax_countdown_audio_file", self._countdown_audio_file) or ""
+        )
+        self._countdown_audio_volume = float(max(
+            0.0, min(1.0, float(getattr(rdr, "_relax_countdown_audio_volume", self._countdown_audio_volume)))
+        ))
+        self._countdown_audio_last_mode = str(
+            getattr(rdr, "_relax_countdown_audio_last_mode", self._countdown_audio_last_mode)
+        )
+        self._countdown_audio_last_file = str(
+            getattr(rdr, "_relax_countdown_audio_last_file", self._countdown_audio_last_file) or ""
+        )
 
     def play(self) -> None:
         """Start playback; queues if media is still loading."""
@@ -1220,6 +2786,9 @@ class PreviewPanel(QWidget):
         If the media source is still loading, the seek is queued and applied
         automatically once the player signals it is ready.
         """
+        if self._is_project_timeline_mode() and self._project_segments:
+            self._seek_project_time_sec(float(time_sec), resume_play=False)
+            return
         local_sec = max(0.0, time_sec - self._playhead_offset_sec)
         ms = int(local_sec * 1000)
         if self._media_ready:
@@ -1242,6 +2811,7 @@ class PreviewPanel(QWidget):
         *,
         start_local_sec: float = 0.0,
         project_offset_sec: float = 0.0,
+        auto_play: bool = True,
     ) -> None:
         """Switch the panel into live-render mode.
 
@@ -1282,6 +2852,8 @@ class PreviewPanel(QWidget):
 
         self._live_active = True
         self._live_renderer = renderer
+        self._sync_countdown_audio_config_from_renderer()
+        self._countdown_prev_text = None
         self._playhead_offset_sec = float(project_offset_sec)
 
         # Hand the audio track to the existing player.  We deliberately
@@ -1294,9 +2866,9 @@ class PreviewPanel(QWidget):
         self._media_ready = False
         self._load_retries = 0
         self._pending_seek_ms = max(0, int(start_local_sec * 1000))
-        self._pending_play = True
+        self._pending_play = bool(auto_play)
         self.play_button.setEnabled(False)
-        self._set_play_button_state(playing=True)
+        self._set_play_button_state(playing=bool(auto_play))
         self.player.setSource(audio_url)
         self._load_watchdog.start()
 
@@ -1306,6 +2878,10 @@ class PreviewPanel(QWidget):
         self.stage_stack.setCurrentIndex(self._live_page_index)
         self._loading_timer.stop()
         self._render_live_frame(start_local_sec)
+
+        # Enable Floor/Wall drag button now that live preview is running.
+        if hasattr(self, "floor_wall_button"):
+            self.floor_wall_button.setEnabled(True)
 
         # Pump frames at the user-selected preview fps (fps_combo).
         interval_ms = max(8, int(round(1000.0 / max(1, self.preview_fps))))
@@ -1325,6 +2901,7 @@ class PreviewPanel(QWidget):
             return
         self._live_active = False
         self._live_frame_timer.stop()
+        self._countdown_prev_text = None
         # Stop audio playback before dropping the renderer so the timer
         # tick that already fired (if any) doesn't land in a half-torn
         # state.
@@ -1347,6 +2924,16 @@ class PreviewPanel(QWidget):
         self._show_empty("No preview source selected")
         self.play_button.setEnabled(False)
         self._set_play_button_state(playing=False)
+        # Hide floor/wall overlay when live preview stops
+        if hasattr(self, "floor_wall_overlay"):
+            self._floor_wall_edit_active = False
+            self._floor_wall_pos_timer.stop()
+            self.floor_wall_overlay.hide()
+        if hasattr(self, "floor_wall_button"):
+            self.floor_wall_button.blockSignals(True)
+            self.floor_wall_button.setChecked(False)
+            self.floor_wall_button.blockSignals(False)
+            self.floor_wall_button.setEnabled(False)
         # Notify MainWindow so its toggle state mirrors ours regardless
         # of who initiated the stop.  ``Qt.QueuedConnection`` is
         # implicit between thread boundaries, but we're on the GUI
@@ -1373,24 +2960,243 @@ class PreviewPanel(QWidget):
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        floor_panel_color: Optional[str] = None,
+        floor_panel_opacity: Optional[float] = None,
+        floor_panel_blink: Optional[bool] = None,
+        floor_panel_image: Optional[str] = None,
+        floor_full_static_image: Optional[bool] = None,
+        floor_layout: Optional[str] = None,
+        floor_bg_color: Optional[str] = None,
+        floor_bg_opacity: Optional[float] = None,
+        background_type: Optional[str] = None,
+        background_color: Optional[str] = None,
+        background_image: Optional[str] = None,
+        background_video: Optional[str] = None,
+        chevron_color: Optional[str] = None,
+        chevron_scroll: Optional[bool] = None,
+        chevron_blink: Optional[bool] = None,
+        chevron_width_frac: Optional[float] = None,
+        chevron_count: Optional[int] = None,
+        show_side_rails: Optional[bool] = None,
+        rail_color: Optional[str] = None,
+        rail_shape: Optional[str] = None,
+        rail_height: Optional[float] = None,
+        rail_offset_x: Optional[float] = None,
+        rail_image: Optional[str] = None,
+        rail_texture_non_loop: Optional[bool] = None,
+        rail_pulse: Optional[str] = None,
+        rail_pulse_intensity: Optional[float] = None,
+        rail_chevron_depth: Optional[float] = None,
+        rail_chevron_density: Optional[int] = None,
+        rail_pillar_count: Optional[int] = None,
+        rail_pillar_highlight_count: Optional[int] = None,
+        rail_pillar_radius: Optional[float] = None,
+        rail_chase_mode: Optional[str] = None,
+        rail_chase_speed_frames: Optional[int] = None,
+        rail_dot_count: Optional[int] = None,
+        rail_dot_lines: Optional[int] = None,
+        rail_dot_size_px: Optional[int] = None,
+        rail_dot_anim_mode: Optional[str] = None,
+        rail_dot_color_near: Optional[str] = None,
+        rail_dot_color_far: Optional[str] = None,
+        relax_interval: Optional[float] = None,
+        relax_travel_sec: Optional[float] = None,
+        relax_wait_sec: Optional[float] = None,
+        relax_texture_low: Optional[str] = None,
+        relax_texture_high: Optional[str] = None,
+        relax_texture_middle: Optional[str] = None,
+        relax_hole_mask_path: Optional[str] = None,
+        relax_kind_ratio_middle: Optional[float] = None,
+        relax_show_low: Optional[bool] = None,
+        relax_show_high: Optional[bool] = None,
+        relax_show_middle: Optional[bool] = None,
+        relax_countdown_enabled: Optional[bool] = None,
+        relax_countdown_color: Optional[str] = None,
+        relax_countdown_max_sec: Optional[float] = None,
+        relax_countdown_anim: Optional[str] = None,
+        relax_countdown_audio_enabled: Optional[bool] = None,
+        relax_countdown_audio_mode: Optional[str] = None,
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: Optional[float] = None,
+        relax_countdown_audio_last_mode: Optional[str] = None,
+        relax_countdown_audio_last_file: Optional[str] = None,
+        relax_countdown_x: Optional[float] = None,
+        relax_countdown_y: Optional[float] = None,
+        relax_countdown_w: Optional[float] = None,
+        relax_countdown_h: Optional[float] = None,
+        relax_countdown_border_thickness: Optional[float] = None,
+        relax_countdown_glow_strength: Optional[float] = None,
+        start_gate_enabled: Optional[bool] = None,
+        start_gate_type: Optional[str] = None,
+        start_gate_color: Optional[str] = None,
+        start_gate_border_color: Optional[str] = None,
+        start_gate_border_thickness: Optional[float] = None,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: Optional[float] = None,
+        start_gate_y: Optional[float] = None,
+        start_gate_w: Optional[float] = None,
+        start_gate_h: Optional[float] = None,
+        combo_enabled: Optional[bool] = None,
+        combo_color: Optional[str] = None,
+        combo_label: Optional[str] = None,
+        combo_font_family: Optional[str] = None,
+        combo_fade_after_break_sec: Optional[float] = None,
+        combo_anim: Optional[str] = None,
+        combo_x: Optional[float] = None,
+        combo_y: Optional[float] = None,
+        combo_w: Optional[float] = None,
+        combo_h: Optional[float] = None,
+        combo_border_thickness: Optional[float] = None,
+        combo_glow_strength: Optional[float] = None,
+        combo_tier1_threshold: Optional[int] = None,
+        combo_tier1_label: Optional[str] = None,
+        combo_tier2_threshold: Optional[int] = None,
+        combo_tier2_label: Optional[str] = None,
+        combo_tier3_threshold: Optional[int] = None,
+        combo_tier3_label: Optional[str] = None,
+        combo_tier4_threshold: Optional[int] = None,
+        combo_tier4_label: Optional[str] = None,
+        combo_tier1_color: Optional[str] = None,
+        combo_tier2_color: Optional[str] = None,
+        combo_tier3_color: Optional[str] = None,
+        combo_tier4_color: Optional[str] = None,
+        combo_number_font_scale: Optional[float] = None,
+        combo_label_font_scale: Optional[float] = None,
+        combo_tier_font_scale: Optional[float] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
-        """Hot-reload the renderer's gameplay mode + decor and redraw.
-
-        ``show_stickman`` / ``stickman_box`` / ``show_floor_panels`` /
-        ``max_per_lane`` are pass-through overrides for
-        :meth:`LiveFrameRenderer.update_mode`; ``None`` keeps the
-        renderer's current value.  The editor folds the segment-config
-        "Sticky Man / Floor panels / mode / Max per lane" form edits
-        into a single call so the scene is rebuilt exactly once.
-        """
+        """Hot-reload the renderer's gameplay mode + decor and redraw."""
         if not self._live_active or self._live_renderer is None:
             return
+        if relax_countdown_audio_enabled is not None:
+            self._countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        if relax_countdown_audio_mode is not None:
+            self._countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        if relax_countdown_audio_file is not None:
+            self._countdown_audio_file = str(relax_countdown_audio_file or "")
+        if relax_countdown_audio_volume is not None:
+            self._countdown_audio_volume = float(
+                max(0.0, min(1.0, float(relax_countdown_audio_volume)))
+            )
+        if relax_countdown_audio_last_mode is not None:
+            self._countdown_audio_last_mode = str(
+                relax_countdown_audio_last_mode or "default"
+            )
+        if relax_countdown_audio_last_file is not None:
+            self._countdown_audio_last_file = str(relax_countdown_audio_last_file or "")
+
         self._live_renderer.update_mode(
             mode,
             show_stickman=show_stickman,
             stickman_box=stickman_box,
             show_floor_panels=show_floor_panels,
+            floor_panel_color=floor_panel_color,
+            floor_panel_opacity=floor_panel_opacity,
+            floor_panel_blink=floor_panel_blink,
+            floor_panel_image=floor_panel_image,
+            floor_full_static_image=floor_full_static_image,
+            floor_layout=floor_layout,
+            floor_bg_color=floor_bg_color,
+            floor_bg_opacity=floor_bg_opacity,
+            background_type=background_type,
+            background_color=background_color,
+            background_image=background_image,
+            background_video=background_video,
+            chevron_color=chevron_color,
+            chevron_scroll=chevron_scroll,
+            chevron_blink=chevron_blink,
+            chevron_width_frac=chevron_width_frac,
+            chevron_count=chevron_count,
+            show_side_rails=show_side_rails,
+            rail_color=rail_color,
+            rail_shape=rail_shape,
+            rail_height=rail_height,
+            rail_offset_x=rail_offset_x,
+            rail_image=rail_image,
+            rail_texture_non_loop=rail_texture_non_loop,
+            rail_pulse=rail_pulse,
+            rail_pulse_intensity=rail_pulse_intensity,
+            rail_chevron_depth=rail_chevron_depth,
+            rail_chevron_density=rail_chevron_density,
+            rail_pillar_count=rail_pillar_count,
+            rail_pillar_highlight_count=rail_pillar_highlight_count,
+            rail_pillar_radius=rail_pillar_radius,
+            rail_chase_mode=rail_chase_mode,
+            rail_chase_speed_frames=rail_chase_speed_frames,
+            rail_dot_count=rail_dot_count,
+            rail_dot_lines=rail_dot_lines,
+            rail_dot_size_px=rail_dot_size_px,
+            rail_dot_anim_mode=rail_dot_anim_mode,
+            rail_dot_color_near=rail_dot_color_near,
+            rail_dot_color_far=rail_dot_color_far,
+            relax_interval=relax_interval,
+            relax_travel_sec=relax_travel_sec,
+            relax_wait_sec=relax_wait_sec,
+            relax_texture_low=relax_texture_low,
+            relax_texture_high=relax_texture_high,
+            relax_texture_middle=relax_texture_middle,
+            relax_hole_mask_path=relax_hole_mask_path,
+            relax_kind_ratio_middle=relax_kind_ratio_middle,
+            relax_show_low=relax_show_low,
+            relax_show_high=relax_show_high,
+            relax_show_middle=relax_show_middle,
+            relax_countdown_enabled=relax_countdown_enabled,
+            relax_countdown_color=relax_countdown_color,
+            relax_countdown_max_sec=relax_countdown_max_sec,
+            relax_countdown_anim=relax_countdown_anim,
+            relax_countdown_audio_enabled=relax_countdown_audio_enabled,
+            relax_countdown_audio_mode=relax_countdown_audio_mode,
+            relax_countdown_audio_file=relax_countdown_audio_file,
+            relax_countdown_audio_volume=relax_countdown_audio_volume,
+            relax_countdown_audio_last_mode=relax_countdown_audio_last_mode,
+            relax_countdown_audio_last_file=relax_countdown_audio_last_file,
+            relax_countdown_x=relax_countdown_x,
+            relax_countdown_y=relax_countdown_y,
+            relax_countdown_w=relax_countdown_w,
+            relax_countdown_h=relax_countdown_h,
+            relax_countdown_border_thickness=relax_countdown_border_thickness,
+            relax_countdown_glow_strength=relax_countdown_glow_strength,
+            start_gate_enabled=start_gate_enabled,
+            start_gate_type=start_gate_type,
+            start_gate_color=start_gate_color,
+            start_gate_border_color=start_gate_border_color,
+            start_gate_border_thickness=start_gate_border_thickness,
+            start_gate_image=start_gate_image,
+            start_gate_video=start_gate_video,
+            start_gate_x=start_gate_x,
+            start_gate_y=start_gate_y,
+            start_gate_w=start_gate_w,
+            start_gate_h=start_gate_h,
+            combo_enabled=combo_enabled,
+            combo_color=combo_color,
+            combo_label=combo_label,
+            combo_font_family=combo_font_family,
+            combo_fade_after_break_sec=combo_fade_after_break_sec,
+            combo_anim=combo_anim,
+            combo_x=combo_x,
+            combo_y=combo_y,
+            combo_w=combo_w,
+            combo_h=combo_h,
+            combo_border_thickness=combo_border_thickness,
+            combo_glow_strength=combo_glow_strength,
+            combo_tier1_threshold=combo_tier1_threshold,
+            combo_tier1_label=combo_tier1_label,
+            combo_tier2_threshold=combo_tier2_threshold,
+            combo_tier2_label=combo_tier2_label,
+            combo_tier3_threshold=combo_tier3_threshold,
+            combo_tier3_label=combo_tier3_label,
+            combo_tier4_threshold=combo_tier4_threshold,
+            combo_tier4_label=combo_tier4_label,
+            combo_tier1_color=combo_tier1_color,
+            combo_tier2_color=combo_tier2_color,
+            combo_tier3_color=combo_tier3_color,
+            combo_tier4_color=combo_tier4_color,
+            combo_number_font_scale=combo_number_font_scale,
+            combo_label_font_scale=combo_label_font_scale,
+            combo_tier_font_scale=combo_tier_font_scale,
+            viewport_panel_depth=viewport_panel_depth,
             max_per_lane=max_per_lane,
         )
         self._render_live_frame(self.player.position() / 1000.0)
@@ -1428,6 +3234,7 @@ class PreviewPanel(QWidget):
         # alloc each tick, but at 720p the BGR→RGB cost is ~0.4 ms in
         # OpenCV and negligible compared to the actual compose.
         bgr = rdr.render_at(float(t_sec))
+        self._tick_countdown_audio()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         # Force a contiguous C-order copy so QImage's memory view has
         # a deterministic stride; without this, ``cvtColor`` can in
@@ -1450,4 +3257,8 @@ class PreviewPanel(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         self.live_label.setPixmap(pix)
+        # Keep hit-block overlay in sync with tile scroll animation.
+        if self._floor_wall_edit_active and hasattr(self, "floor_wall_overlay"):
+            fi = int(round(float(t_sec) * float(getattr(rdr, "fps", 30))))
+            self.floor_wall_overlay.set_frame_idx(fi)
 

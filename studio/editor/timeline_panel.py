@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -22,6 +22,10 @@ from PySide6.QtGui import (
     QUndoStack,
 )
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsLineItem,
@@ -32,6 +36,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -42,7 +47,8 @@ from PySide6.QtWidgets import (
 )
 
 from studio.editor.media_library import MEDIA_ID_MIME
-from studio.models import Project, Segment
+from studio.models import Layer, Project, Segment
+from studio.models.layer import LAYER_KIND_COLORS
 
 
 def format_seconds(value: float) -> str:
@@ -67,6 +73,21 @@ def format_ruler_time(time_sec: float, major_step_sec: float) -> str:
     if major_step_sec >= 0.1:
         return f"{mm:02d}:{ss:02d}.{int(round(frac * 10)) % 10:01d}"
     return f"{mm:02d}:{ss:02d}.{int(round(frac * 100)) % 100:02d}"
+
+
+def format_time_millis(time_sec: float) -> str:
+    """Format absolute seconds as MM:SS.mmm."""
+    t = max(0.0, float(time_sec))
+    whole = int(t)
+    mm, ss = divmod(whole, 60)
+    mmm = int(round((t - whole) * 1000.0))
+    if mmm >= 1000:
+        mmm = 0
+        ss += 1
+        if ss >= 60:
+            ss = 0
+            mm += 1
+    return f"{mm:02d}:{ss:02d}.{mmm:03d}"
 
 
 class _Cmd(QUndoCommand):
@@ -448,6 +469,133 @@ def _zoom_control_icons(size: int = 18) -> tuple[QIcon, QIcon, QIcon, QIcon, QIc
     return tuple(_mk(a, b) for a, b in zip(pms_on, pms_off))  # type: ignore[return-value]
 
 
+def _layer_button_pixmaps(size: int, stroke: QColor) -> dict[str, QPixmap]:
+    """Return one pixmap per layer kind, keyed by kind name."""
+    s = float(size)
+    m = s * 0.10
+
+    def _blank() -> QPixmap:
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    pen = QPen(stroke)
+    pen.setWidthF(1.1)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    result: dict[str, QPixmap] = {}
+
+    # --- Background: rectangle outline + diagonal stripe ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    rx0, ry0 = m, m + s * 0.15
+    rw, rh = s - 2 * m, s - 2 * m - s * 0.15
+    p.drawRect(QRectF(rx0, ry0, rw, rh))
+    p.drawLine(QPointF(rx0, ry0 + rh * 0.55), QPointF(rx0 + rw * 0.45, ry0))
+    p.drawLine(QPointF(rx0 + rw * 0.45, ry0 + rh), QPointF(rx0 + rw, ry0 + rh * 0.35))
+    p.end()
+    result["background"] = pm
+
+    # --- Floor: 3×2 tile grid ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    gx0, gy0 = m, m + s * 0.10
+    gw, gh = s - 2 * m, s - 2 * m - s * 0.10
+    p.drawRect(QRectF(gx0, gy0, gw, gh))
+    for xi in (1.0 / 3.0, 2.0 / 3.0):
+        p.drawLine(QPointF(gx0 + gw * xi, gy0), QPointF(gx0 + gw * xi, gy0 + gh))
+    p.drawLine(QPointF(gx0, gy0 + gh * 0.5), QPointF(gx0 + gw, gy0 + gh * 0.5))
+    p.end()
+    result["floor"] = pm
+
+    # --- Side rails: two vertical bars (left + right) ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    bar_w = s * 0.22
+    bar_h = s - 2 * m
+    p.drawRect(QRectF(m, m, bar_w, bar_h))
+    p.drawRect(QRectF(s - m - bar_w, m, bar_w, bar_h))
+    p.end()
+    result["side_rails"] = pm
+
+    # --- Stickman: circle head + body lines ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    cx, head_r = s * 0.5, s * 0.14
+    head_y = m + head_r
+    p.drawEllipse(QPointF(cx, head_y), head_r, head_r)
+    body_top = head_y + head_r
+    body_bot = s - m - s * 0.22
+    mid_y = body_top + (body_bot - body_top) * 0.45
+    p.drawLine(QPointF(cx, body_top), QPointF(cx, body_bot))
+    p.drawLine(QPointF(m + s * 0.05, mid_y - s * 0.04), QPointF(s - m - s * 0.05, mid_y - s * 0.04))
+    p.drawLine(QPointF(cx, body_bot), QPointF(m + s * 0.12, s - m))
+    p.drawLine(QPointF(cx, body_bot), QPointF(s - m - s * 0.12, s - m))
+    p.end()
+    result["stickman"] = pm
+
+    # --- Countdown: clock circle + hands ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    cr = (s - 2 * m) * 0.48
+    ccx, ccy = s * 0.5, s * 0.52
+    p.drawEllipse(QPointF(ccx, ccy), cr, cr)
+    import math
+    p.drawLine(QPointF(ccx, ccy), QPointF(ccx, ccy - cr * 0.7))
+    angle = math.radians(45)
+    p.drawLine(QPointF(ccx, ccy),
+               QPointF(ccx + cr * 0.55 * math.sin(angle), ccy - cr * 0.55 * math.cos(angle)))
+    p.end()
+    result["countdown"] = pm
+
+    # --- Start Gate: two pillars + top beam ---
+    pm = _blank()
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    gx0, gy0 = m + s * 0.18, m + s * 0.20
+    gx1, gy1 = s - m - s * 0.18, s - m
+    p.drawLine(QPointF(gx0, gy0), QPointF(gx0, gy1))
+    p.drawLine(QPointF(gx1, gy0), QPointF(gx1, gy1))
+    p.drawLine(QPointF(gx0 - s * 0.05, gy0), QPointF(gx1 + s * 0.05, gy0))
+    p.end()
+    result["start_gate"] = pm
+
+    return result
+
+
+def _layer_button_icons(size: int = 18) -> dict[str, QIcon]:
+    """Return a dict mapping layer kind -> QIcon for all layer kinds."""
+    c_on = QColor("#c8c8c8")
+    c_off = QColor("#4f4f4f")
+    pms_on = _layer_button_pixmaps(size, c_on)
+    pms_off = _layer_button_pixmaps(size, c_off)
+
+    return {
+        kind: (lambda a, b: (ic := QIcon(a), ic.addPixmap(b, QIcon.Mode.Disabled), ic)[2])(
+            pms_on[kind], pms_off[kind]
+        )
+        for kind in pms_on
+    }
+
+
 # ---------------------------------------------------------------------------
 # Zoom range — controls the timeline's pixels-per-second (pps) values.
 #
@@ -755,6 +903,22 @@ class SegmentBlockMeta:
     segment_id: str
 
 
+@dataclass
+class _LayerDragThresholdState:
+    """Visual preview state for threshold-based layer drag commits."""
+
+    layer_id: str
+    will_commit: bool
+    commit_start: float
+    commit_end: float
+    commit_segment_id: str | None
+    affected_delete_ids: set[str]
+    affected_trim_cuts: dict[str, float]
+    resize_edge: str | None
+    cursor_scene_x: float
+    cursor_scene_y: float
+
+
 class SegmentRectItem(QGraphicsRectItem):
     """Static timeline block bound to one segment.
 
@@ -779,8 +943,8 @@ class SegmentRectItem(QGraphicsRectItem):
     re-rendered on every paint event regardless of mouse handling.
     """
 
-    # Y locked to the segment track body (ruler_h + 2px padding).
-    SEGMENT_Y = 40.0
+    # Y locked to the segment track body: _SEGMENT_TRACK_Y(24) + 4px margin.
+    SEGMENT_Y = 28.0
 
     def __init__(self, segment: Segment, pixels_per_second: float):
         super().__init__()
@@ -822,6 +986,229 @@ class SegmentRectItem(QGraphicsRectItem):
         # label) paint themselves on top of the background layer
         # via Qt's normal item recursion.
         return
+
+
+class LayerBlockItem(QGraphicsRectItem):
+    """Draggable / resizable timeline block for a layer.
+
+    Visuals are painted by :meth:`TimelinePanel._paint_layer_blocks` in the
+    scene background pass (same pattern as SegmentRectItem).  This item
+    only carries geometry + selection + mouse interaction.
+    """
+
+    EDGE_HIT_W = 8.0
+    MIN_DURATION_SEC = 0.1
+
+    def __init__(self, layer_id: str, panel: "TimelinePanel") -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self._panel = panel
+        self._resize_edge: Optional[str] = None  # "left" | "right" | None
+        self._drag_start_scene_x: float = 0.0
+        self._drag_start_layer_start: float = 0.0
+        self._drag_start_layer_end: float = 0.0
+        self._drag_moved: bool = False  # True only if mouse actually moved
+        self.setFlags(
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(
+            Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton
+        )
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        return  # visuals painted in drawBackground pass
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            event.accept()
+            sp = event.screenPos()
+            pos = sp.toPoint() if hasattr(sp, "toPoint") else sp
+            self._panel._on_layer_block_context_menu(self.layer_id, pos)
+            return
+        left_click = event.button() == Qt.MouseButton.LeftButton
+        r = self.rect()
+        pos = event.pos()
+        if pos.x() <= self.EDGE_HIT_W:
+            self._resize_edge = "left"
+        elif pos.x() >= r.width() - self.EDGE_HIT_W:
+            self._resize_edge = "right"
+        else:
+            self._resize_edge = None
+        if self._resize_edge in ("left", "right"):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self._drag_start_scene_x = event.scenePos().x()
+        self._drag_moved = False
+        layer = self._panel._get_layer(self.layer_id)
+        if layer is not None:
+            self._drag_start_layer_start = layer.start_time_sec
+            self._drag_start_layer_end = layer.end_time_sec
+        # IMPORTANT: call super() BEFORE notifying panel selection.
+        # ``_on_layer_block_clicked`` can emit signals that trigger a scene
+        # rebuild in other parts of the app; if that happens before
+        # ``super().mousePressEvent`` we may call into a deleted C++ item and
+        # crash with "Internal C++ object already deleted".
+        try:
+            super().mousePressEvent(event)
+        except RuntimeError:
+            return
+        if left_click:
+            QTimer.singleShot(
+                0, lambda lid=self.layer_id, p=self._panel: p._on_layer_block_clicked(lid)
+            )
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_moved = True
+        dx = event.scenePos().x() - self._drag_start_scene_x
+        dt = dx / max(0.001, self._panel._effective_pps)
+        layer = self._panel._get_layer(self.layer_id)
+        if layer is None:
+            return
+        if self._resize_edge == "left":
+            new_start = max(0.0, self._drag_start_layer_start + dt)
+            new_start = min(
+                new_start, self._drag_start_layer_end - self.MIN_DURATION_SEC
+            )
+            layer.start_time_sec = new_start
+        elif self._resize_edge == "right":
+            new_end = max(
+                self._drag_start_layer_start + self.MIN_DURATION_SEC,
+                self._drag_start_layer_end + dt,
+            )
+            layer.end_time_sec = new_end
+        else:
+            dur = self._drag_start_layer_end - self._drag_start_layer_start
+            new_start = max(0.0, self._drag_start_layer_start + dt)
+            layer.start_time_sec = new_start
+            layer.end_time_sec = new_start + dur
+        # Trigger repaint without full rebuild
+        try:
+            self._panel.scene.invalidate(
+                self._panel.scene.sceneRect(),
+                QGraphicsScene.SceneLayer.BackgroundLayer,
+            )
+        except RuntimeError:
+            pass
+        self._panel._update_layer_drag_threshold_preview(
+            self.layer_id,
+            self._resize_edge,
+            self._drag_start_layer_start,
+            self._drag_start_layer_end,
+            float(event.scenePos().x()),
+            float(event.scenePos().y()),
+        )
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        # Call super() BEFORE _on_layer_move_finished because that method
+        # calls refresh() which destroys all LayerBlockItem C++ objects;
+        # calling super() afterwards would crash on the deleted object.
+        self.unsetCursor()
+        moved = self._drag_moved
+        resize_edge = self._resize_edge
+        drag_old_start = self._drag_start_layer_start
+        drag_old_end = self._drag_start_layer_end
+        self._resize_edge = None
+        self._drag_moved = False
+        super().mouseReleaseEvent(event)
+        if moved:
+            self._panel._on_layer_move_finished(
+                self.layer_id,
+                resize_edge,
+                drag_old_start,
+                drag_old_end,
+            )
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        # Accept first so Qt doesn't propagate, THEN trigger the handler.
+        # The handler defers refresh() via QTimer so that Qt's second
+        # mouseReleaseEvent (part of double-click sequence) fires before
+        # the C++ object is destroyed.
+        event.accept()
+        self._panel._on_layer_block_double_clicked(self.layer_id)
+
+    def hoverMoveEvent(self, event) -> None:  # type: ignore[override]
+        r = self.rect()
+        pos = event.pos()
+        if pos.x() <= self.EDGE_HIT_W or pos.x() >= r.width() - self.EDGE_HIT_W:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def hoverLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+
+    def itemChange(self, change, value):  # type: ignore[override]
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemSelectedHasChanged:
+            scene = self.scene()
+            if scene is not None:
+                try:
+                    scene.invalidate(
+                        scene.sceneRect(),
+                        QGraphicsScene.SceneLayer.BackgroundLayer,
+                    )
+                except RuntimeError:
+                    pass
+        return super().itemChange(change, value)
+
+
+class LayerAddButtonItem(QGraphicsRectItem):
+    """Small '+' button in a layer lane to create a missing layer."""
+
+    _SIZE = 10.0
+
+    def __init__(self, panel: "TimelinePanel", segment_id: str, kind: str) -> None:
+        super().__init__(0.0, 0.0, self._SIZE, self._SIZE)
+        self._panel = panel
+        self._segment_id = str(segment_id)
+        self._kind = str(kind)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setAcceptHoverEvents(True)
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setZValue(26.0)
+        self.setToolTip(
+            f"Add {self._kind.replace('_', ' ').title()} layer for this segment"
+        )
+
+    def paint(self, painter, option, widget=None):  # type: ignore[override]
+        r = self.rect()
+        base = QColor(LAYER_KIND_COLORS.get(self._kind, "#ff5a5a"))
+        base.setAlpha(235)
+        ring = QPen(base, 1.4)
+        ring.setCosmetic(True)
+        painter.setPen(ring)
+        fill = QColor(12, 12, 12, 180)
+        painter.setBrush(QBrush(fill))
+        painter.drawEllipse(r.adjusted(0.5, 0.5, -0.5, -0.5))
+
+        plus_pen = QPen(base, 1.8)
+        plus_pen.setCosmetic(True)
+        painter.setPen(plus_pen)
+        c = r.center()
+        arm = 2.0
+        painter.drawLine(QPointF(c.x() - arm, c.y()), QPointF(c.x() + arm, c.y()))
+        painter.drawLine(QPointF(c.x(), c.y() - arm), QPointF(c.x(), c.y() + arm))
+
+    def hoverEnterEvent(self, event) -> None:  # type: ignore[override]
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            self._panel._on_add_layer_for_segment_clicked(self._segment_id, self._kind)
+            return
+        super().mousePressEvent(event)
 
 
 class WaveformThresholdLine(QGraphicsRectItem):
@@ -1461,6 +1848,7 @@ class TimelineScene(QGraphicsScene):
             # items and paint on top of this background pass.
             self._panel._paint_track_decorations(painter, rect)
             self._panel._paint_segment_blocks(painter, rect)
+            self._panel._paint_layer_blocks(painter, rect)
             self._panel._paint_waveform_background(painter, rect)
             self._panel._paint_beat_strip_decorations(painter, rect)
             self._panel._paint_beat_ticks(painter, rect)
@@ -1481,6 +1869,9 @@ class TimelineView(QGraphicsView):
     """
 
     media_dropped_at = Signal(str, float)  # media_id, time_sec
+    background_media_dropped_at = Signal(str, float)  # media_id, time_sec
+    floor_media_dropped_at = Signal(str, float)  # media_id, time_sec
+    start_gate_media_dropped_at = Signal(str, float)  # media_id, time_sec
     empty_clicked = Signal()
     playhead_scrubbed = Signal(float)  # time_sec
     segment_double_clicked = Signal(str)  # segment_id
@@ -1578,6 +1969,29 @@ class TimelineView(QGraphicsView):
         media_id = bytes(event.mimeData().data(MEDIA_ID_MIME)).decode("utf-8")
         scene_pos = self.mapToScene(event.position().toPoint())
         time_sec = max(0.0, self._x_to_time(scene_pos.x()))
+        panel = self._panel_ref
+        if panel is not None:
+            layer_top = float(panel._LAYER_TRACK_Y)
+            layer_bot = float(panel._LAYER_TRACK_Y + panel._LAYER_TRACKS_TOTAL_H)
+            if layer_top <= scene_pos.y() <= layer_bot:
+                idx = int((scene_pos.y() - layer_top) // float(panel._LAYER_TRACK_H))
+                if 0 <= idx < len(panel._LAYER_KINDS):
+                    kind = panel._LAYER_KINDS[idx]
+                    if kind == "background":
+                        self.background_media_dropped_at.emit(media_id, time_sec)
+                        # Handled by background-layer drop flow.
+                        event.acceptProposedAction()
+                        return
+                    if kind == "floor":
+                        self.floor_media_dropped_at.emit(media_id, time_sec)
+                        # Handled by floor-layer drop flow.
+                        event.acceptProposedAction()
+                        return
+                    if kind == "start_gate":
+                        self.start_gate_media_dropped_at.emit(media_id, time_sec)
+                        # Handled by start-gate-layer drop flow.
+                        event.acceptProposedAction()
+                        return
         self.media_dropped_at.emit(media_id, time_sec)
         event.acceptProposedAction()
 
@@ -1591,6 +2005,7 @@ class TimelineView(QGraphicsView):
         on_tick = isinstance(hit_item, BeatTickItem)
         on_segment = isinstance(hit_item, SegmentRectItem)
         on_beat_strip_bg = isinstance(hit_item, BeatStripBgItem)
+        on_layer_add_button = isinstance(hit_item, LayerAddButtonItem)
         # Threshold line (no child items — hit is the line itself).
         thr_line_hit: Optional[WaveformThresholdLine] = None
         _probe = hit_item
@@ -1613,12 +2028,51 @@ class TimelineView(QGraphicsView):
         # also matches when ``itemAt`` returns ``None`` because Qt
         # filtered them out of hit-testing.
         panel = self._panel_ref
-        if panel is not None and not on_tick and not on_threshold and not on_segment:
+        on_layer_block = isinstance(hit_item, LayerBlockItem)
+        if (
+            panel is not None
+            and not on_tick
+            and not on_threshold
+            and not on_segment
+            and not on_layer_add_button
+        ):
             wave_top = float(panel._WAVE_TRACK_Y)
             wave_bot = wave_top + float(panel._WAVE_TRACK_H)
             if wave_top <= scene_pos.y() <= wave_bot:
                 event.accept()
                 return
+
+        # ── Layer-track-area guard ────────────────────────────────────
+        # Clicks on empty layer track area (not a LayerBlockItem) should
+        # not scrub the playhead.  Treat as a "clear selection" event.
+        if (
+            panel is not None
+            and not on_tick
+            and not on_threshold
+            and not on_segment
+            and not on_layer_block
+            and not on_layer_add_button
+        ):
+            layer_top = float(panel._LAYER_TRACK_Y)
+            layer_bot = float(panel._LAYER_TRACK_Y + panel._LAYER_TRACKS_TOTAL_H)
+            if layer_top <= scene_pos.y() <= layer_bot:
+                panel._on_empty_area_clicked()
+                event.accept()
+                return
+
+        # ── Empty segment-track area → clear selection ────────────────
+        if (
+            panel is not None
+            and not on_tick
+            and not on_threshold
+            and not on_segment
+            and not on_layer_block
+            and not on_layer_add_button
+        ):
+            seg_top = float(panel._SEGMENT_TRACK_Y)
+            seg_bot = seg_top + float(panel._SEGMENT_TRACK_H)
+            if seg_top <= scene_pos.y() <= seg_bot:
+                panel._on_empty_area_clicked()
 
         # ── Beat-strip-area guard ─────────────────────────────────────
         # The strip is a *beat-edit* surface: double-click adds a beat
@@ -1664,6 +2118,7 @@ class TimelineView(QGraphicsView):
             and not on_tick
             and not on_threshold
             and not on_beat_strip
+            and not on_layer_add_button
             and in_ruler
         ):
             self._dragging_playhead = True
@@ -1676,7 +2131,7 @@ class TimelineView(QGraphicsView):
         if not on_tick and self._panel_ref is not None:
             self._panel_ref._clear_focused_beat()
 
-        if on_segment or on_tick or on_threshold:
+        if on_segment or on_tick or on_threshold or on_layer_block or on_layer_add_button:
             # Start a potential segment drag on plain left-click of a segment block
             # (Ctrl+click is reserved for join-partner selection — skip drag there).
             panel = self._panel_ref
@@ -1719,6 +2174,10 @@ class TimelineView(QGraphicsView):
                 # Threshold crossed — activate drag
                 self._seg_drag_active = True
                 if panel is not None:
+                    seg = panel._project.get_segment(seg_id) if panel._project else None
+                    if seg is not None:
+                        panel._drag_press_scene_x = float(press_x)
+                        panel._drag_start_seg_start = float(seg.start_time_sec)
                     panel._drag_seg_id = seg_id
                     panel._drag_ghost_x = scene_pos.x()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -1736,7 +2195,7 @@ class TimelineView(QGraphicsView):
             event.accept()
             return
 
-        # ── Playhead handle hover — show SizeHor cursor ──────────────────────
+        # ── Playhead / segment hover cursors ──────────────────────────────────
         if not self._dragging_playhead and not self._seg_drag_active:
             vp = event.position()
             scene_pos_h = self.mapToScene(vp.toPoint())
@@ -1750,7 +2209,17 @@ class TimelineView(QGraphicsView):
             if near_x and in_handle_y:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             else:
-                if self.cursor().shape() == Qt.CursorShape.SizeHorCursor:
+                hit_hover = self.itemAt(vp.toPoint())
+                if (
+                    isinstance(hit_hover, SegmentRectItem)
+                    and panel_h is not None
+                    and panel_h._focus_segment_id is None
+                ):
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                elif self.cursor().shape() in (
+                    Qt.CursorShape.SizeHorCursor,
+                    Qt.CursorShape.OpenHandCursor,
+                ):
                     self.setCursor(Qt.CursorShape.ArrowCursor)
 
         super().mouseMoveEvent(event)
@@ -1796,6 +2265,11 @@ class TimelineView(QGraphicsView):
         panel = self._panel_ref
 
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            # Delete selected layer if one is active.
+            if panel is not None and panel._selected_layer_id is not None:
+                panel._do_delete_layer(panel._selected_layer_id)
+                event.accept()
+                return
             scene = self.scene()
             beat_ticks = [
                 it for it in (scene.selectedItems() if scene else [])
@@ -1803,6 +2277,14 @@ class TimelineView(QGraphicsView):
             ]
             if beat_ticks:
                 beat_ticks[0]._panel._on_delete_selected_beat_ticks()
+                event.accept()
+                return
+            # Delete selected segment (same flow as toolbar Delete button).
+            if (
+                panel is not None
+                and panel._selected_segment_id is not None
+            ):
+                panel._on_delete_segment_clicked()
                 event.accept()
                 return
 
@@ -1911,6 +2393,9 @@ class TimelinePanel(QWidget):
     segment_selected = Signal(object)  # Segment | None
     segment_changed = Signal(str)  # segment_id
     create_segment_requested = Signal(str, float)  # media_id, start_time
+    background_media_dropped = Signal(str, float)  # media_id, project_time_sec
+    floor_media_dropped = Signal(str, float)  # media_id, project_time_sec
+    start_gate_media_dropped = Signal(str, float)  # media_id, project_time_sec
     playhead_seek_requested = Signal(float)  # time_sec
     segment_split = Signal(str, str)   # original_id, new_id
     segment_joined = Signal(str, str)  # kept_id, removed_id
@@ -1946,14 +2431,30 @@ class TimelinePanel(QWidget):
     # Emitted after Ctrl+D duplicates a segment.  Carries the new segment id.
     segment_duplicated = Signal(str)  # new_segment_id
 
+    # Emitted whenever a layer block is moved, resized, added, or deleted.
+    # MainWindow listens and triggers a live-preview hot-reload so the
+    # preview reflects the new effective config immediately.
+    layer_changed = Signal()
+    # Text to be shown on MainWindow status bar.
+    layer_status_message = Signal(str, int)  # message, timeout_ms
+
     # Emitted after a drag moves a segment to a new time position.
     # Carries segment_id, new_start_time_sec, new_end_time_sec.
     segment_moved = Signal(str, float, float)
+
+    # Inspector selection signals (Phase C)
+    layer_selected = Signal(object)   # Layer | None — single-click on a layer block
+    selection_cleared = Signal()      # click on empty timeline area
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._project: Optional[Project] = None
         self._block_map: dict[str, SegmentRectItem] = {}
+        # Maps layer_id → LayerBlockItem for Phase 1 layer tracks.
+        self._layer_block_map: dict[str, LayerBlockItem] = {}
+        # Maps (segment_id, kind) → '+' helper button for missing layers.
+        self._layer_add_button_map: dict[tuple[str, str], LayerAddButtonItem] = {}
+        self._selected_layer_id: str | None = None  # Inspector selection
         # Maps ``(segment_id, event_idx)`` → the BeatTickItem so the
         # background paint pass can read each tick's current
         # position / selection state without scanning ``scene.items()``.
@@ -2053,15 +2554,15 @@ class TimelinePanel(QWidget):
         # duplicate, move) and beat-level ops (insert, drag, delete).
         self.undo_stack = QUndoStack(self)
 
-        # CapCut-style segment drag state.
+        # Segment drag state.
         # ``_drag_seg_id``:      id of the segment being dragged
         # ``_drag_ghost_x``:     scene-X of the left edge of the drag ghost
-        # ``_drag_insert_idx``:  insertion index into sorted-segments (excluding
-        #                        the dragged segment).  0 = before the first
-        #                        remaining segment, len = after the last.
         self._drag_seg_id: Optional[str] = None
         self._drag_ghost_x: float = 0.0
-        self._drag_insert_idx: int = 0
+        self._drag_press_scene_x: float = 0.0
+        self._drag_start_seg_start: float = 0.0
+        # Live visual preview for threshold-based layer move/resize.
+        self._drag_threshold_state: Optional[_LayerDragThresholdState] = None
 
         self._build_ui()
 
@@ -2071,6 +2572,17 @@ class TimelinePanel(QWidget):
 
     def _x_to_time(self, x: float) -> float:
         return x / max(0.001, self._effective_pps) + self._offset_sec
+
+    def _segment_drag_ghost_left_x(self) -> float:
+        """Delta-based segment ghost left edge preserving grab offset."""
+        delta_px = float(self._drag_ghost_x - self._drag_press_scene_x)
+        start_x = float(self._time_to_x(self._drag_start_seg_start))
+        return max(0.0, start_x + delta_px)
+
+    def _reset_segment_drag_state(self) -> None:
+        self._drag_seg_id = None
+        self._drag_press_scene_x = 0.0
+        self._drag_start_seg_start = 0.0
 
     def set_project(self, project: Project) -> None:
         """Attach project and draw timeline content."""
@@ -2083,6 +2595,826 @@ class TimelinePanel(QWidget):
         self.view._offset_sec = 0.0
         self.view._pps = self.pixels_per_second
         self.refresh()
+
+    # -- Layer helpers -------------------------------------------------------
+    def _get_layer(self, layer_id: str) -> Optional[Layer]:
+        if self._project is None:
+            return None
+        return self._project.get_layer(layer_id)
+
+    def _get_selected_segment_id(self) -> Optional[str]:
+        return self._selected_segment_id
+
+    def _sorted_segments(self) -> list[Segment]:
+        if self._project is None:
+            return []
+        return sorted(self._project.segments, key=lambda s: (s.start_time_sec, s.end_time_sec))
+
+    def _defer_layer_refresh(self, *, emit_layer_changed: bool) -> None:
+        def _do_refresh() -> None:
+            self.refresh()
+            if emit_layer_changed:
+                self.layer_changed.emit()
+
+        QTimer.singleShot(0, _do_refresh)
+
+    def _build_override_plan(
+        self,
+        active_layer: Layer,
+        new_start: float,
+        new_end: float,
+    ) -> tuple[list[dict], list[dict], set[str], dict[str, float]]:
+        """Collect delete/trim mutations for same-kind overlapping layers."""
+        if self._project is None:
+            return ([], [], set(), {})
+        deleted: list[dict] = []
+        trimmed: list[dict] = []
+        delete_ids: set[str] = set()
+        trim_cuts: dict[str, float] = {}
+        min_dur = float(LayerBlockItem.MIN_DURATION_SEC)
+
+        for idx, other in enumerate(list(self._project.layers)):
+            if other.id == active_layer.id or other.kind != active_layer.kind:
+                continue
+            ov_start = max(new_start, other.start_time_sec)
+            ov_end = min(new_end, other.end_time_sec)
+            if ov_end <= ov_start:
+                continue
+
+            fully_contained = (
+                new_start <= other.start_time_sec
+                and other.end_time_sec <= new_end
+            )
+            if fully_contained:
+                delete_ids.add(other.id)
+                deleted.append(
+                    {"id": other.id, "layer": copy.deepcopy(other), "index": idx}
+                )
+                continue
+
+            if other.start_time_sec < new_start:
+                new_other_start = float(other.start_time_sec)
+                new_other_end = float(new_start)
+                trim_cut = float(new_start)
+            else:
+                new_other_start = float(new_end)
+                new_other_end = float(other.end_time_sec)
+                trim_cut = float(new_end)
+
+            if (new_other_end - new_other_start) < min_dur:
+                delete_ids.add(other.id)
+                deleted.append(
+                    {"id": other.id, "layer": copy.deepcopy(other), "index": idx}
+                )
+                continue
+
+            trimmed.append(
+                {
+                    "id": other.id,
+                    "old_start": float(other.start_time_sec),
+                    "old_end": float(other.end_time_sec),
+                    "new_start": new_other_start,
+                    "new_end": new_other_end,
+                }
+            )
+            trim_cuts[other.id] = trim_cut
+
+        return (deleted, trimmed, delete_ids, trim_cuts)
+
+    def _apply_override_plan(
+        self,
+        active_layer: Layer,
+        new_start: float,
+        new_end: float,
+        deleted: list[dict],
+        trimmed: list[dict],
+    ) -> None:
+        if self._project is None:
+            return
+        active_layer.start_time_sec = float(new_start)
+        active_layer.end_time_sec = float(new_end)
+
+        trim_by_id = {item["id"]: item for item in trimmed}
+        for other in self._project.layers:
+            plan = trim_by_id.get(other.id)
+            if plan is None:
+                continue
+            other.start_time_sec = float(plan["new_start"])
+            other.end_time_sec = float(plan["new_end"])
+
+        delete_ids = {item["id"] for item in deleted}
+        if delete_ids:
+            self._project.layers = [
+                la for la in self._project.layers if la.id not in delete_ids
+            ]
+
+    def _restore_override_plan(
+        self,
+        active_layer: Layer,
+        old_start: float,
+        old_end: float,
+        deleted: list[dict],
+        trimmed: list[dict],
+    ) -> None:
+        if self._project is None:
+            return
+        active_layer.start_time_sec = float(old_start)
+        active_layer.end_time_sec = float(old_end)
+
+        trim_by_id = {item["id"]: item for item in trimmed}
+        for other in self._project.layers:
+            plan = trim_by_id.get(other.id)
+            if plan is None:
+                continue
+            other.start_time_sec = float(plan["old_start"])
+            other.end_time_sec = float(plan["old_end"])
+
+        if deleted:
+            existing_ids = {la.id for la in self._project.layers}
+            for snap in sorted(deleted, key=lambda x: int(x["index"])):
+                layer_copy = copy.deepcopy(snap["layer"])
+                if layer_copy.id in existing_ids:
+                    continue
+                insert_at = max(0, min(int(snap["index"]), len(self._project.layers)))
+                self._project.layers.insert(insert_at, layer_copy)
+                existing_ids.add(layer_copy.id)
+
+    def _commit_layer_change_with_undo(
+        self,
+        *,
+        layer: Layer,
+        old_start: float,
+        old_end: float,
+        new_start: float,
+        new_end: float,
+        undo_label: str,
+        base_status_text: str | None = None,
+        always_show_status: bool = False,
+    ) -> bool:
+        if self._project is None:
+            return False
+        min_dur = float(LayerBlockItem.MIN_DURATION_SEC)
+        new_start = max(0.0, float(new_start))
+        new_end = max(new_start + min_dur, float(new_end))
+
+        if (
+            abs(new_start - old_start) < 1e-9
+            and abs(new_end - old_end) < 1e-9
+        ):
+            return False
+
+        deleted, trimmed, _delete_ids, _trim_cuts = self._build_override_plan(
+            layer, new_start, new_end
+        )
+        self._apply_override_plan(layer, new_start, new_end, deleted, trimmed)
+
+        def _undo() -> None:
+            self._restore_override_plan(layer, old_start, old_end, deleted, trimmed)
+            self.refresh()
+            self.layer_changed.emit()
+
+        def _redo() -> None:
+            self._apply_override_plan(layer, new_start, new_end, deleted, trimmed)
+            self.refresh()
+            self.layer_changed.emit()
+
+        self.undo_stack.push(_Cmd(undo_label, _undo, _redo))
+        self._defer_layer_refresh(emit_layer_changed=True)
+
+        affected_n = len(deleted) + len(trimmed)
+        if base_status_text is not None:
+            if affected_n > 0:
+                self.layer_status_message.emit(
+                    f"{base_status_text}; replaced {affected_n} layer(s)",
+                    3000,
+                )
+            elif always_show_status:
+                self.layer_status_message.emit(base_status_text, 3000)
+        return True
+
+    def _compute_layer_drag_commit(
+        self,
+        layer: Layer,
+        resize_edge: str | None,
+        old_start: float,
+        old_end: float,
+    ) -> tuple[bool, float, float, str | None]:
+        """Return (should_commit, new_start, new_end, commit_segment_id)."""
+        min_dur = float(LayerBlockItem.MIN_DURATION_SEC)
+        tentative_start = float(layer.start_time_sec)
+        tentative_end = max(tentative_start + min_dur, float(layer.end_time_sec))
+        segments = self._sorted_segments()
+
+        if resize_edge == "right":
+            right_segs = [
+                s for s in segments if float(s.start_time_sec) >= float(old_end)
+            ]
+            if not right_segs:
+                return (True, tentative_start, tentative_end, None)
+            armed_seg: Segment | None = None
+            for seg in right_segs:
+                seg_start = float(seg.start_time_sec)
+                seg_end = float(seg.end_time_sec)
+                if tentative_end <= seg_start:
+                    continue
+                penetration = min(tentative_end, seg_end) - seg_start
+                threshold = 0.20 * max(0.0, seg_end - seg_start)
+                if penetration >= threshold:
+                    armed_seg = seg
+            if armed_seg is None:
+                return (False, float(old_start), float(old_end), None)
+            return (True, tentative_start, float(armed_seg.end_time_sec), armed_seg.id)
+
+        if resize_edge == "left":
+            left_segs = [
+                s for s in sorted(
+                    segments,
+                    key=lambda ss: float(ss.end_time_sec),
+                    reverse=True,
+                )
+                if float(s.end_time_sec) <= float(old_start)
+            ]
+            if not left_segs:
+                return (True, tentative_start, tentative_end, None)
+            armed_seg = None
+            for seg in left_segs:
+                seg_start = float(seg.start_time_sec)
+                seg_end = float(seg.end_time_sec)
+                if tentative_start >= seg_end:
+                    continue
+                penetration = seg_end - max(tentative_start, seg_start)
+                threshold = 0.20 * max(0.0, seg_end - seg_start)
+                if penetration >= threshold:
+                    armed_seg = seg
+            if armed_seg is None:
+                return (False, float(old_start), float(old_end), None)
+            new_start = float(armed_seg.start_time_sec)
+            new_end = max(new_start + min_dur, tentative_end)
+            return (True, new_start, new_end, armed_seg.id)
+
+        # MOVE (resize_edge is None)
+        dur = max(min_dur, float(old_end - old_start))
+        dx = tentative_start - float(old_start)
+        if abs(dx) < 1e-9:
+            return (False, float(old_start), float(old_end), None)
+        if not segments:
+            return (False, float(old_start), float(old_end), None)
+
+        if dx > 0:
+            candidates = [
+                s for s in sorted(segments, key=lambda ss: float(ss.start_time_sec))
+                if float(s.start_time_sec) > float(old_start)
+            ]
+            if not candidates:
+                return (False, float(old_start), float(old_end), None)
+            armed_seg = None
+            for seg in candidates:
+                seg_start = float(seg.start_time_sec)
+                seg_end = float(seg.end_time_sec)
+                if tentative_start < seg_start:
+                    continue
+                penetration = tentative_start - seg_start
+                threshold = 0.20 * max(0.0, seg_end - seg_start)
+                if penetration >= threshold:
+                    armed_seg = seg
+            if armed_seg is None:
+                return (False, float(old_start), float(old_end), None)
+            snap_start = float(armed_seg.start_time_sec)
+            return (True, snap_start, snap_start + dur, armed_seg.id)
+
+        candidates = [
+            s
+            for s in sorted(segments, key=lambda ss: float(ss.start_time_sec), reverse=True)
+            if float(s.end_time_sec) <= float(old_start)
+        ]
+        if not candidates:
+            return (False, float(old_start), float(old_end), None)
+        armed_seg = None
+        for seg in candidates:
+            seg_start = float(seg.start_time_sec)
+            seg_end = float(seg.end_time_sec)
+            if tentative_start > seg_end:
+                continue
+            penetration = seg_end - tentative_start
+            threshold = 0.20 * max(0.0, seg_end - seg_start)
+            if penetration >= threshold:
+                armed_seg = seg
+        if armed_seg is None:
+            return (False, float(old_start), float(old_end), None)
+        snap_start = float(armed_seg.start_time_sec)
+        return (True, snap_start, snap_start + dur, armed_seg.id)
+
+    def _update_layer_drag_threshold_preview(
+        self,
+        layer_id: str,
+        resize_edge: str | None,
+        old_start: float,
+        old_end: float,
+        cursor_scene_x: float,
+        cursor_scene_y: float,
+    ) -> None:
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            self._drag_threshold_state = None
+            return
+        should_commit, commit_start, commit_end, commit_seg_id = (
+            self._compute_layer_drag_commit(layer, resize_edge, old_start, old_end)
+        )
+        if should_commit:
+            deleted, trimmed, _delete_ids, trim_cuts = self._build_override_plan(
+                layer, commit_start, commit_end
+            )
+            delete_ids = {item["id"] for item in deleted}
+            self._drag_threshold_state = _LayerDragThresholdState(
+                layer_id=layer_id,
+                will_commit=True,
+                commit_start=float(commit_start),
+                commit_end=float(commit_end),
+                commit_segment_id=commit_seg_id,
+                affected_delete_ids=delete_ids,
+                affected_trim_cuts=trim_cuts,
+                resize_edge=resize_edge,
+                cursor_scene_x=float(cursor_scene_x),
+                cursor_scene_y=float(cursor_scene_y),
+            )
+        else:
+            self._drag_threshold_state = _LayerDragThresholdState(
+                layer_id=layer_id,
+                will_commit=False,
+                commit_start=float(old_start),
+                commit_end=float(old_end),
+                commit_segment_id=None,
+                affected_delete_ids=set(),
+                affected_trim_cuts={},
+                resize_edge=resize_edge,
+                cursor_scene_x=float(cursor_scene_x),
+                cursor_scene_y=float(cursor_scene_y),
+            )
+
+    def _on_layer_move_finished(
+        self,
+        layer_id: str,
+        resize_edge: str | None,
+        old_start: float,
+        old_end: float,
+    ) -> None:
+        """Finalize threshold-based move/resize with undo-safe override behavior."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            self._drag_threshold_state = None
+            return
+
+        should_commit, new_start, new_end, _commit_seg_id = self._compute_layer_drag_commit(
+            layer, resize_edge, old_start, old_end
+        )
+        self._drag_threshold_state = None
+
+        kind_label = layer.kind.replace("_", " ")
+        if should_commit:
+            op = "Resize" if resize_edge in ("left", "right") else "Move"
+            status_prefix = (
+                f"Resized {kind_label} layer"
+                if op == "Resize"
+                else f"Moved {kind_label} layer"
+            )
+            self._commit_layer_change_with_undo(
+                layer=layer,
+                old_start=float(old_start),
+                old_end=float(old_end),
+                new_start=float(new_start),
+                new_end=float(new_end),
+                undo_label=f"{op} {kind_label} layer",
+                base_status_text=status_prefix,
+                always_show_status=False,
+            )
+            return
+
+        # Below threshold: revert with no undo step and no status message.
+        layer.start_time_sec = float(old_start)
+        layer.end_time_sec = float(old_end)
+        self._defer_layer_refresh(emit_layer_changed=False)
+
+    def _on_layer_block_clicked(self, layer_id: str) -> None:
+        """Single-click on a layer block: set Inspector selection."""
+        layer = self._get_layer(layer_id)
+        # Visual: update layer selection state
+        self._selected_layer_id = layer_id
+        # Deselect segment items so their halos disappear (mutual exclusive)
+        self.scene.blockSignals(True)
+        try:
+            for item in self.scene.selectedItems():
+                if isinstance(item, SegmentRectItem):
+                    item.setSelected(False)
+        finally:
+            self.scene.blockSignals(False)
+        self.scene.update()
+        self.layer_selected.emit(layer)
+
+    def _on_empty_area_clicked(self) -> None:
+        """Click on empty timeline area — clear all selections."""
+        self._selected_layer_id = None
+        self.scene.clearSelection()
+        self.selection_cleared.emit()
+
+    def _on_layer_block_context_menu(
+        self, layer_id: str, screen_pos: "QPoint"
+    ) -> None:
+        """Right-click context menu for a layer block."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        menu = QMenu(self)
+        edit_act = menu.addAction("Edit…")
+        dup_act = menu.addAction("Duplicate")
+        menu.addSeparator()
+        # "Fill full this segment" — snap layer to cover the selected / overlapping segment.
+        cur_seg = self._find_current_segment_for_layer(layer)
+        fill_seg_act = menu.addAction("Fill full this segment")
+        fill_seg_act.setEnabled(cur_seg is not None)
+        if cur_seg is None:
+            fill_seg_act.setToolTip("No segment overlapping this layer")
+        menu.addSeparator()
+        fill_prev_act = menu.addAction("Fill to previous segment")
+        fill_next_act = menu.addAction("Fill to next segment")
+        prev_seg = self._find_previous_segment_for_fill(layer)
+        next_seg = self._find_next_segment_for_fill(layer)
+        fill_prev_act.setEnabled(prev_seg is not None)
+        fill_next_act.setEnabled(next_seg is not None)
+        if prev_seg is None:
+            fill_prev_act.setToolTip("No segment before this layer")
+        if next_seg is None:
+            fill_next_act.setToolTip("No segment after this layer")
+        menu.addSeparator()
+        del_act = menu.addAction("Delete")
+        chosen = menu.exec(screen_pos)
+        if chosen == del_act:
+            self._do_delete_layer(layer_id)
+        elif chosen == dup_act:
+            self._do_duplicate_layer(layer_id)
+        elif chosen == edit_act:
+            self._on_layer_block_double_clicked(layer_id)
+        elif chosen == fill_seg_act:
+            self._do_fill_layer_to_segment(layer_id, cur_seg)
+        elif chosen == fill_next_act:
+            self._do_fill_layer_to_next_segment(layer_id)
+        elif chosen == fill_prev_act:
+            self._do_fill_layer_to_previous_segment(layer_id)
+
+    def _find_current_segment_for_layer(self, layer: Layer) -> Optional[Segment]:
+        """Return the segment this layer should 'fill full'.
+
+        Priority: (1) the currently selected segment if it overlaps the layer,
+        (2) the segment with the greatest overlap otherwise.
+        """
+        if self._project is None:
+            return None
+        la_s = float(layer.start_time_sec)
+        la_e = float(layer.end_time_sec)
+        overlapping = [
+            s for s in self._project.segments
+            if float(s.start_time_sec) < la_e and float(s.end_time_sec) > la_s
+        ]
+        if not overlapping:
+            return None
+        # Prefer the selected segment if it overlaps.
+        if self._selected_segment_id:
+            for seg in overlapping:
+                if seg.id == self._selected_segment_id:
+                    return seg
+        # Fall back to the segment with most overlap.
+        def _overlap(seg: Segment) -> float:
+            return min(float(seg.end_time_sec), la_e) - max(float(seg.start_time_sec), la_s)
+        return max(overlapping, key=_overlap)
+
+    def _do_fill_layer_to_segment(self, layer_id: str, seg: Optional[Segment]) -> None:
+        """Resize the layer to exactly cover ``seg``."""
+        layer = self._get_layer(layer_id)
+        if layer is None or seg is None:
+            return
+        old_start = float(layer.start_time_sec)
+        old_end   = float(layer.end_time_sec)
+        new_start = float(seg.start_time_sec)
+        new_end   = float(seg.end_time_sec)
+        if abs(new_start - old_start) < 1e-9 and abs(new_end - old_end) < 1e-9:
+            return  # already matches
+        kind_label = layer.kind.replace("_", " ")
+        self._commit_layer_change_with_undo(
+            layer=layer,
+            old_start=old_start,
+            old_end=old_end,
+            new_start=new_start,
+            new_end=new_end,
+            undo_label=f"Fill {kind_label} layer to segment",
+            base_status_text=f"Filled {kind_label} layer to segment bounds",
+            always_show_status=True,
+        )
+
+    def _find_next_segment_for_fill(self, layer: Layer) -> Optional[Segment]:
+        if self._project is None:
+            return None
+        candidates = [
+            s for s in self._project.segments
+            if float(s.end_time_sec) > float(layer.end_time_sec)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda s: float(s.end_time_sec))
+
+    def _find_previous_segment_for_fill(self, layer: Layer) -> Optional[Segment]:
+        if self._project is None:
+            return None
+        candidates = [
+            s for s in self._project.segments
+            if float(s.start_time_sec) < float(layer.start_time_sec)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: float(s.start_time_sec))
+
+    def _do_fill_layer_to_next_segment(self, layer_id: str) -> None:
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        next_seg = self._find_next_segment_for_fill(layer)
+        if next_seg is None:
+            return
+        old_start = float(layer.start_time_sec)
+        old_end = float(layer.end_time_sec)
+        new_end = float(next_seg.end_time_sec)
+        if new_end <= old_end:
+            return
+        kind_label = layer.kind.replace("_", " ")
+        self._commit_layer_change_with_undo(
+            layer=layer,
+            old_start=old_start,
+            old_end=old_end,
+            new_start=old_start,
+            new_end=new_end,
+            undo_label=f"Fill {kind_label} layer to next segment",
+            base_status_text=f"Filled {kind_label} layer to next segment",
+            always_show_status=True,
+        )
+
+    def _do_fill_layer_to_previous_segment(self, layer_id: str) -> None:
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        prev_seg = self._find_previous_segment_for_fill(layer)
+        if prev_seg is None:
+            return
+        old_start = float(layer.start_time_sec)
+        old_end = float(layer.end_time_sec)
+        new_start = float(prev_seg.start_time_sec)
+        if new_start >= old_start:
+            return
+        kind_label = layer.kind.replace("_", " ")
+        self._commit_layer_change_with_undo(
+            layer=layer,
+            old_start=old_start,
+            old_end=old_end,
+            new_start=new_start,
+            new_end=old_end,
+            undo_label=f"Fill {kind_label} layer to previous segment",
+            base_status_text=f"Filled {kind_label} layer to previous segment",
+            always_show_status=True,
+        )
+
+    def _on_layer_block_double_clicked(self, layer_id: str) -> None:
+        """Double-click: zoom timeline to the layer range + select it."""
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        # Zoom the view to fit this layer's time range with a small padding
+        dur = max(0.1, layer.end_time_sec - layer.start_time_sec)
+        padding = dur * 0.15
+        viewport_w = max(200, self.view.viewport().width())
+        new_pps = viewport_w / (dur + 2 * padding)
+        self._effective_pps = max(ZOOM_MIN_PPS, min(ZOOM_MAX_PPS, new_pps))
+        self._offset_sec = max(0.0, layer.start_time_sec - padding)
+        self.view._pps = self._effective_pps
+        self.view._offset_sec = self._offset_sec
+        # Also emit selection so Inspector opens the layer form.
+        # Defer refresh() so the LayerBlockItem C++ object is not destroyed
+        # before Qt dispatches the second mouseReleaseEvent of the double-click.
+        self._on_layer_block_clicked(layer_id)
+        QTimer.singleShot(0, self.refresh)
+
+    def _do_delete_layer(self, layer_id: str) -> None:
+        if self._project is None:
+            return
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        self._project.layers.remove(layer)
+
+        def _undo():
+            if self._project and layer not in self._project.layers:
+                self._project.layers.append(layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and layer in self._project.layers:
+                self._project.layers.remove(layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Delete {layer.kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+        # If the deleted layer was selected in Inspector, clear selection
+        if self._selected_layer_id == layer_id:
+            self._selected_layer_id = None
+            self.selection_cleared.emit()
+
+    def _do_duplicate_layer(self, layer_id: str) -> None:
+        if self._project is None:
+            return
+        layer = self._get_layer(layer_id)
+        if layer is None:
+            return
+        from uuid import uuid4
+        new_layer = Layer(
+            id=str(uuid4()),
+            kind=layer.kind,
+            start_time_sec=layer.start_time_sec,
+            end_time_sec=layer.end_time_sec,
+            z_index=layer.z_index + 1,
+            name=f"{layer.name} (copy)" if layer.name else "",
+            config=dict(layer.config),
+        )
+        self._project.layers.append(new_layer)
+
+        def _undo():
+            if self._project and new_layer in self._project.layers:
+                self._project.layers.remove(new_layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and new_layer not in self._project.layers:
+                self._project.layers.append(new_layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Duplicate {layer.kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
+
+    def _on_add_layer_clicked(self, kind: str) -> None:
+        """Create a new layer block at the appropriate time range."""
+        if self._project is None:
+            return
+        sel_id = self._get_selected_segment_id()
+        if sel_id:
+            seg = self._project.get_segment(sel_id)
+            start = seg.start_time_sec if seg else 0.0
+            end = seg.end_time_sec if seg else 30.0
+        elif self._project.segments:
+            start = 0.0
+            end = max(s.end_time_sec for s in self._project.segments)
+        else:
+            start = 0.0
+            end = 30.0
+
+        self._create_layer(kind, start, end)
+
+    def _on_add_layer_for_segment_clicked(self, segment_id: str, kind: str) -> None:
+        """Create a missing auxiliary layer for one segment from '+' button."""
+        if self._project is None:
+            return
+        seg = self._project.get_segment(segment_id)
+        if seg is None:
+            return
+        if self._segment_has_layer_kind(seg, kind):
+            return
+        self._create_layer(kind, float(seg.start_time_sec), float(seg.end_time_sec))
+
+    def _segment_has_layer_kind(self, segment: "Segment", kind: str) -> bool:
+        """True when this segment already owns at least one layer of ``kind``."""
+        if self._project is None:
+            return False
+        seg_start = float(segment.start_time_sec or 0.0)
+        seg_end = float(segment.end_time_sec or 0.0)
+        for layer in self._project.layers:
+            if layer.kind != kind:
+                continue
+            # "+" should appear only when the segment has NO effective layer
+            # of this kind on its timeline span. Any overlap means the layer
+            # is already present for this segment view.
+            if layer.overlaps(seg_start, seg_end):
+                return True
+        return False
+
+    def _default_layer_config(self, kind: str) -> dict:
+        """Default config payload used by toolbar-add and '+' quick-add."""
+        from studio.models.layer import _default_floor_config
+        if kind == "background":
+            return {"bg_type": "solid", "bg_color": "#000000"}
+        if kind == "floor":
+            return _default_floor_config()
+        if kind == "side_rails":
+            return {
+                "side_rails": True,
+                "rail_color": "#FF60FF",
+                "rail_shape": "chunky",
+                "rail_height": 0.14,
+                "rail_offset_x": 0.08,
+                "rail_pulse": "beat",
+                "rail_pulse_intensity": 0.6,
+                "rail_pillar_highlight_count": 1,
+            }
+        if kind == "stickman":
+            return {
+                "stickman": True,
+                "stickman_location": {"x": 0.010, "y": 0.090, "w": 0.135, "h": 0.540},
+            }
+        if kind == "countdown":
+            return {
+                "relax_countdown_enabled": True,
+                "relax_countdown_color": "#FFFFFF",
+                "relax_countdown_max_sec": 5.0,
+                "relax_countdown_anim": "pop",
+                "relax_countdown_audio_enabled": False,
+                "relax_countdown_audio_mode": "default",
+                "relax_countdown_audio_file": "",
+                "relax_countdown_audio_volume": 0.65,
+                "relax_countdown_audio_last_mode": "default",
+                "relax_countdown_audio_last_file": "",
+                "relax_countdown_x": 0.88,
+                "relax_countdown_y": 0.04,
+                "relax_countdown_w": 0.10,
+                "relax_countdown_h": 0.16,
+                "relax_countdown_border_thickness": 2.0,
+                "relax_countdown_glow_strength": 60.0,
+            }
+        if kind == "start_gate":
+            return {
+                "start_gate_enabled": True,
+                "start_gate_type": "color",
+                "start_gate_color": "#1a1a1a",
+                "start_gate_border_color": "#ffffff",
+                "start_gate_border_thickness": 0.0,
+                "start_gate_image": "",
+                "start_gate_video": "",
+                "start_gate_x": 0.30,
+                "start_gate_y": 0.18,
+                "start_gate_w": 0.40,
+                "start_gate_h": 0.14,
+            }
+        if kind == "combo":
+            return {
+                "combo_enabled": True,
+                "combo_color": "#FFFFFF",
+                "combo_label": "COMBO",
+                "combo_font_family": "duplex",
+                "combo_fade_after_break_sec": 0.5,
+                "combo_anim": "pop",
+                "combo_audio_enabled": False,
+                "combo_audio_mode": "default",
+                "combo_audio_file": "",
+                "combo_audio_volume": 0.65,
+                "combo_audio_milestone_mode": "default",
+                "combo_audio_milestone_file": "",
+                "combo_x": 0.85, "combo_y": 0.08,
+                "combo_w": 0.065, "combo_h": 0.09,
+                "combo_border_thickness": 8.0,
+                "combo_glow_strength": 85.0,
+                "combo_tier1_threshold": 30,  "combo_tier1_label": "Great",
+                "combo_tier2_threshold": 60,  "combo_tier2_label": "Superb",
+                "combo_tier3_threshold": 90,  "combo_tier3_label": "Perfect",
+                "combo_tier4_threshold": 120, "combo_tier4_label": "Godlike",
+                "combo_tier1_color": "#22c55e", "combo_tier2_color": "#3b82f6",
+                "combo_tier3_color": "#a855f7", "combo_tier4_color": "#f59e0b",
+                "combo_number_font_scale": 0.0,
+                "combo_label_font_scale": 0.0,
+                "combo_tier_font_scale": 0.0,
+            }
+        return {}
+
+    def _create_layer(self, kind: str, start: float, end: float) -> None:
+        """Create layer, push undo command, refresh scene and emit change."""
+        if self._project is None:
+            return
+        new_layer = Layer(
+            kind=kind,
+            start_time_sec=float(start),
+            end_time_sec=float(end),
+            z_index=0,
+            name=kind.replace("_", " ").title(),
+            config=self._default_layer_config(kind),
+        )
+        self._project.layers.append(new_layer)
+
+        def _undo():
+            if self._project and new_layer in self._project.layers:
+                self._project.layers.remove(new_layer)
+                self.refresh()
+
+        def _redo():
+            if self._project and new_layer not in self._project.layers:
+                self._project.layers.append(new_layer)
+                self.refresh()
+
+        self.undo_stack.push(_Cmd(f"Add {kind} layer", _undo, _redo))
+        self.refresh()
+        self.layer_changed.emit()
 
     def refresh(self) -> None:
         """Rebuild scene from project segments.
@@ -2115,6 +3447,8 @@ class TimelinePanel(QWidget):
                 self._block_map.clear()
                 self._tick_map.clear()
                 self._threshold_map.clear()
+                self._layer_block_map.clear()
+                self._layer_add_button_map.clear()
                 self._update_scene_width()
                 self._draw_ruler()
                 self._draw_tracks()
@@ -2123,13 +3457,22 @@ class TimelinePanel(QWidget):
                 if self._project:
                     for segment in self._project.sorted_segments():
                         self._draw_segment(segment)
+                    self._draw_layer_blocks()
+                    self._draw_layer_add_buttons()
                     # Restore selection silently while signals are blocked.
                     if prev_selected_id and prev_selected_id in self._block_map:
                         self._block_map[prev_selected_id].setSelected(True)
+                    # Also restore layer block selection halo so it doesn't
+                    # vanish when config edits trigger a scene rebuild.
+                    if self._selected_layer_id and self._selected_layer_id in self._layer_block_map:
+                        self._layer_block_map[self._selected_layer_id].setSelected(True)
                     self._draw_playhead(self._playhead_time_sec)
             finally:
                 self.scene.blockSignals(False)
             # Sync overview bar highlights with current state.
+            # Also recompute minimum width in case segments were added/removed
+            # (split, join, delete) since the last refresh.
+            self.overview_bar._update_minimum_width()
             self.overview_bar.set_selected(self._selected_segment_id)
             self.overview_bar.set_focused(self._focus_segment_id)
             self.overview_bar.update()
@@ -2152,6 +3495,9 @@ class TimelinePanel(QWidget):
         if segment is None or segment.duration_sec <= 0:
             return
         if self._focus_segment_id == segment_id:
+            # Clicking overview should still arm keyboard shortcuts (Delete, arrows)
+            # even when we're already focused on this same segment.
+            self.view.setFocus(Qt.FocusReason.MouseFocusReason)
             return
         # Initial zoom so the segment fills the viewport. _update_scene_width
         # re-fits this on every refresh, so it stays correct after resizes.
@@ -2184,6 +3530,9 @@ class TimelinePanel(QWidget):
         # at the left edge — regardless of where the user had previously scrolled.
         self.view.horizontalScrollBar().setValue(0)
         self.segment_selected.emit(segment)
+        # Ensure Delete/Backspace shortcuts land on TimelineView after
+        # selecting via the overview strip.
+        self.view.setFocus(Qt.FocusReason.MouseFocusReason)
 
     def exit_focus_mode(self) -> None:
         """Return to the full project overview view."""
@@ -2907,6 +4256,18 @@ class TimelinePanel(QWidget):
         self._playhead_time_sec = max(0.0, time_sec)
         self._draw_playhead(time_sec)
         self._playhead_label.setText(format_seconds(self._playhead_time_sec))
+        # Allow split even without explicit segment selection: when playhead
+        # is inside a segment (with split-safe margin), keep Split enabled.
+        if hasattr(self, "split_button"):
+            if self._selected_segment_id:
+                self.split_button.setEnabled(True)
+            else:
+                self.split_button.setEnabled(
+                    self._segment_covering_time(
+                        self._playhead_time_sec, inner_margin_sec=0.1
+                    )
+                    is not None
+                )
 
     def _build_ui(self) -> None:
         self.setObjectName("PanelRoot")
@@ -3246,6 +4607,9 @@ class TimelinePanel(QWidget):
         self.view._panel_ref = self
         self.view.setObjectName("timelineView")
         self.view.media_dropped_at.connect(self.create_segment_requested.emit)
+        self.view.background_media_dropped_at.connect(self.background_media_dropped.emit)
+        self.view.floor_media_dropped_at.connect(self.floor_media_dropped.emit)
+        self.view.start_gate_media_dropped_at.connect(self.start_gate_media_dropped.emit)
         self.view.empty_clicked.connect(self._on_empty_clicked)
         self.view.playhead_scrubbed.connect(self._on_playhead_scrubbed)
         self.view.segment_double_clicked.connect(self._on_segment_double_clicked)
@@ -3488,19 +4852,24 @@ class TimelinePanel(QWidget):
     # Timeline Y layout constants (shared by draw methods).
     _RULER_H = 22
     _SEGMENT_TRACK_Y = 24
-    _SEGMENT_TRACK_H = 80
-    # The BEAT-DBG strip sits between the segment track and the waveform.
-    # Strip body and tick overhang were doubled vs the original
-    # rhythm.py-mirroring layout to make ticks easy to target with a
-    # mouse — the strip is now 16 px tall and ticks extend 12 px above
-    # and below it (40 px total).  Numbers go ~6 px above the tick top.
-    # The waveform track was nudged 10 px down to keep a comfortable gap
-    # below the lengthened ticks; scene height grew accordingly.
-    _BEAT_STRIP_Y = 114
+    _SEGMENT_TRACK_H = 40
+    # Layer tracks sit between the segment track and the beat-strip / waveform.
+    # All 6 kinds are active; each track row is 16 px tall.
+    _LAYER_TRACK_Y = 64           # = _SEGMENT_TRACK_Y + _SEGMENT_TRACK_H
+    _LAYER_TRACK_H = 16           # height per layer track row
+    # All layer kinds — order determines top-to-bottom track position.
+    _LAYER_KINDS = (
+        "background", "floor", "side_rails", "stickman", "countdown", "start_gate", "combo"
+    )
+    _LAYER_TRACKS_TOTAL_H = 112   # len(_LAYER_KINDS) * _LAYER_TRACK_H  (7 × 16)
+    # The BEAT-DBG strip sits between the layer tracks and the waveform.
+    _BEAT_STRIP_Y = 186            # 64 + 112 + 10 gap
     _BEAT_STRIP_H = 16
-    _WAVE_TRACK_Y = 144
-    _WAVE_TRACK_H = 160   # doubled from 80
-    _SCENE_H = 314        # ruler + segment + beat-strip + waveform + padding
+    _WAVE_TRACK_Y = 216            # 186 + 16 + 14 gap
+    _WAVE_TRACK_H = 160
+    _SCENE_H = 386                 # 216 + 160 + 10
+    _LAYER_LABEL_FONT_PT = 7.0
+    _LAYER_BLOCK_FONT_PT = 7.0
 
     def _draw_tracks(self) -> None:
         """No-op kept for call-site compatibility.
@@ -3582,15 +4951,39 @@ class TimelinePanel(QWidget):
                 float(self._SEGMENT_TRACK_H),
             ))
 
-            # ── Lane labels ("Segments" / "Waveform") ───────────────
+            # ── Layer track strips ──────────────────────────────────
+            for idx, kind in enumerate(self._LAYER_KINDS):
+                ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
+                # Slightly lighter than segment track to differentiate
+                painter.setBrush(QBrush(QColor("#141414")))
+                painter.setPen(QPen(QColor("#222222")))
+                painter.drawRect(QRectF(0.0, ty, float(scene_w), float(self._LAYER_TRACK_H)))
+                # Top border separator line
+                sep_pen = QPen(QColor("#2a2a2a"))
+                sep_pen.setWidthF(1.0)
+                painter.setPen(sep_pen)
+                painter.drawLine(QPointF(0.0, ty), QPointF(float(scene_w), ty))
+
+            # ── Lane labels ("Segments" / layer kinds / "Waveform") ─
+            label_font = painter.font()
+            label_font.setPointSizeF(self._LAYER_LABEL_FONT_PT)
+            painter.setFont(label_font)
             painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             fm = painter.fontMetrics()
-            label_baseline_offset = float(fm.ascent()) + 2.0
+            label_baseline_offset = float(fm.ascent()) + 1.0
             painter.drawText(
                 QPointF(4.0, float(self._SEGMENT_TRACK_Y) + label_baseline_offset),
                 "Segments",
             )
+            for idx, kind in enumerate(self._LAYER_KINDS):
+                ty = float(self._LAYER_TRACK_Y + idx * self._LAYER_TRACK_H)
+                label = kind.replace("_", " ").title()
+                color = QColor(LAYER_KIND_COLORS.get(kind, "#888888"))
+                color.setAlphaF(0.55)
+                painter.setPen(QPen(color))
+                painter.drawText(QPointF(4.0, ty + label_baseline_offset), label)
+            painter.setPen(QPen(QColor(255, 255, 255, int(255 * 0.25))))
             painter.drawText(
                 QPointF(4.0, float(self._WAVE_TRACK_Y) + label_baseline_offset),
                 "Waveform",
@@ -3686,7 +5079,7 @@ class TimelinePanel(QWidget):
                 if drag_rect_local is not None and not drag_rect_local.isEmpty():
                     w = drag_rect_local.width()
                     h = drag_rect_local.height()
-                    ghost_x = self._drag_ghost_x - w / 2
+                    ghost_x = self._segment_drag_ghost_left_x()
                     ghost_rect = QRectF(
                         ghost_x,
                         float(SegmentRectItem.SEGMENT_Y),
@@ -3724,6 +5117,270 @@ class TimelinePanel(QWidget):
                     diamond.lineTo(insert_x - d, y_top - 4)
                     diamond.closeSubpath()
                     painter.drawPath(diamond)
+                    self._paint_drag_time_tooltip(
+                        painter,
+                        kind="segment",
+                        cursor_scene_x=float(self._drag_ghost_x),
+                        cursor_scene_y=float(SegmentRectItem.SEGMENT_Y),
+                    )
+        finally:
+            painter.restore()
+
+    def _draw_layer_blocks(self) -> None:
+        """Create LayerBlockItem scene items for all Phase-1 layers."""
+        if not self._project:
+            return
+        for layer in self._project.layers:
+            if layer.kind not in self._LAYER_KINDS:
+                continue
+            kind_idx = self._LAYER_KINDS.index(layer.kind)
+            x = self._time_to_x(layer.start_time_sec)
+            w = max(4.0, layer.duration_sec * self._effective_pps)
+            item_y = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)
+            item_h = float(self._LAYER_TRACK_H - 4)
+            block = LayerBlockItem(layer.id, self)
+            block.setRect(0, 0, w, item_h)
+            block.setPos(x, item_y)
+            self.scene.addItem(block)
+            self._layer_block_map[layer.id] = block
+
+    def _draw_layer_add_buttons(self) -> None:
+        """Create per-segment '+' buttons for missing auxiliary layers."""
+        if not self._project:
+            return
+        btn_size = LayerAddButtonItem._SIZE
+        for seg in self._project.sorted_segments():
+            seg_x = float(self._time_to_x(seg.start_time_sec))
+            seg_w = max(4.0, float(seg.duration_sec) * float(self._effective_pps))
+            if seg_w <= 0.0:
+                continue
+            if seg_w <= btn_size + 8.0:
+                x = seg_x + max(0.0, (seg_w - btn_size) * 0.5)
+            else:
+                x = seg_x + 6.0
+            for kind_idx, kind in enumerate(self._LAYER_KINDS):
+                if self._segment_has_layer_kind(seg, kind):
+                    continue
+                y = (
+                    float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H)
+                    + (float(self._LAYER_TRACK_H) - btn_size) * 0.5
+                )
+                item = LayerAddButtonItem(self, seg.id, kind)
+                item.setPos(x, y)
+                self.scene.addItem(item)
+                self._layer_add_button_map[(str(seg.id), str(kind))] = item
+
+    def _paint_drag_time_tooltip(
+        self,
+        painter: QPainter,
+        *,
+        kind: str,
+        cursor_scene_x: float,
+        cursor_scene_y: float,
+        layer: Layer | None = None,
+    ) -> None:
+        """Paint a compact drag-time tooltip near the cursor."""
+        if kind == "segment" and self._drag_seg_id:
+            seg = self._project.get_segment(self._drag_seg_id) if self._project else None
+            if seg is None:
+                return
+            duration = max(0.0, float(seg.end_time_sec - seg.start_time_sec))
+            delta_px = float(self._drag_ghost_x - self._drag_press_scene_x)
+            delta_t = delta_px / max(0.001, self._effective_pps)
+            start_t = max(0.0, float(self._drag_start_seg_start) + delta_t)
+            end_t = start_t + duration
+            text = (
+                f"[{format_time_millis(start_t)} -> {format_time_millis(end_t)}]    "
+                f"duration: {duration:.2f}s"
+            )
+        elif layer is not None:
+            start_t = float(layer.start_time_sec)
+            end_t = float(layer.end_time_sec)
+            duration = max(0.0, end_t - start_t)
+            if kind == "layer-resize-left":
+                text = f"start: {format_time_millis(start_t)}    duration: {duration:.2f}s"
+            elif kind == "layer-resize-right":
+                text = f"end: {format_time_millis(end_t)}    duration: {duration:.2f}s"
+            else:
+                text = (
+                    f"[{format_time_millis(start_t)} -> {format_time_millis(end_t)}]    "
+                    f"duration: {duration:.2f}s"
+                )
+        else:
+            return
+
+        font = painter.font()
+        font.setFamily("Consolas")
+        font.setPointSize(8)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        pad_x = 6
+        pad_y = 3
+        text_w = fm.horizontalAdvance(text)
+        text_h = fm.height()
+        box_w = float(text_w + pad_x * 2)
+        box_h = float(text_h + pad_y * 2)
+
+        x = float(cursor_scene_x + 16.0)
+        y = float(cursor_scene_y - box_h - 8.0)
+        scene_rect = self.scene.sceneRect()
+        if x + box_w > scene_rect.right() - 2.0:
+            x = float(cursor_scene_x - box_w - 16.0)
+        if x < scene_rect.left() + 2.0:
+            x = float(scene_rect.left() + 2.0)
+        if y < scene_rect.top() + 2.0:
+            y = float(cursor_scene_y + 10.0)
+        if y + box_h > scene_rect.bottom() - 2.0:
+            y = float(scene_rect.bottom() - box_h - 2.0)
+
+        box = QRectF(x, y, box_w, box_h)
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1.0))
+        painter.setBrush(QBrush(QColor(0, 0, 0, 200)))
+        painter.drawRoundedRect(box, 3.0, 3.0)
+        painter.setPen(QPen(QColor("#ffffff")))
+        painter.drawText(
+            QRectF(x + pad_x, y + pad_y, text_w + 2, text_h + 2),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            text,
+        )
+
+    def _paint_layer_blocks(self, painter, rect) -> None:
+        """Paint layer block fills, outlines and labels in the background pass."""
+        if not self._project or not self._layer_block_map:
+            return
+        painter.save()
+        try:
+            block_font = painter.font()
+            block_font.setPointSizeF(self._LAYER_BLOCK_FONT_PT)
+            painter.setFont(block_font)
+            for layer_id, block in list(self._layer_block_map.items()):
+                layer = self._project.get_layer(layer_id)
+                if layer is None:
+                    continue
+                if layer.kind not in self._LAYER_KINDS:
+                    continue
+                kind_idx = self._LAYER_KINDS.index(layer.kind)
+                x = self._time_to_x(layer.start_time_sec)
+                w = max(4.0, layer.duration_sec * self._effective_pps)
+                ty = float(self._LAYER_TRACK_Y + kind_idx * self._LAYER_TRACK_H + 2)
+                th = float(self._LAYER_TRACK_H - 4)
+                scene_rect = QRectF(x, ty, w, th)
+                drag_state = self._drag_threshold_state
+                is_dragging_layer = bool(
+                    drag_state is not None and drag_state.layer_id == layer_id
+                )
+                is_affected_delete = bool(
+                    drag_state is not None
+                    and drag_state.will_commit
+                    and layer_id in drag_state.affected_delete_ids
+                )
+                is_affected_trim = bool(
+                    drag_state is not None
+                    and drag_state.will_commit
+                    and layer_id in drag_state.affected_trim_cuts
+                )
+
+                if is_dragging_layer and drag_state is not None:
+                    if drag_state.will_commit:
+                        fill = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                        fill.setAlphaF(0.80)
+                        outline_pen = QPen(QColor("#00e5ff"), 2.0)
+                    else:
+                        fill = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                        fill.setAlphaF(0.40)
+                        outline_pen = QPen(QColor("#cccccc"), 1.0, Qt.PenStyle.DashLine)
+                elif is_affected_delete:
+                    fill = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                    fill.setAlphaF(0.20)
+                    outline_pen = QPen(QColor("#ff4444"), 1.5, Qt.PenStyle.DashLine)
+                elif is_affected_trim:
+                    fill = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                    fill.setAlphaF(0.50)
+                    outline_pen = QPen(QColor("#ff8800"), 1.5, Qt.PenStyle.DashLine)
+                else:
+                    fill = QColor(LAYER_KIND_COLORS.get(layer.kind, "#2563eb"))
+                    fill.setAlphaF(0.65)
+                    outline_pen = QPen(QColor(255, 255, 255, 60), 1.0)
+
+                painter.setBrush(QBrush(fill))
+                painter.setPen(outline_pen)
+                painter.drawRoundedRect(scene_rect, 3.0, 3.0)
+
+                # Selection halo — driven by _selected_layer_id (Inspector selection)
+                is_selected = (layer_id == self._selected_layer_id)
+                if is_selected:
+                    halo_pen = QPen(QColor("#ffffff"), 2)
+                    painter.setPen(halo_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRoundedRect(
+                        scene_rect.adjusted(0.5, 0.5, -0.5, -0.5), 3.0, 3.0
+                    )
+
+                # Label + duration text
+                if w > 30:
+                    painter.setPen(QPen(QColor(255, 255, 255, 210)))
+                    label = layer.name or layer.kind.replace("_", " ").title()
+                    dur_str = f"  ({format_seconds(layer.duration_sec)})"
+                    display = label + dur_str if w > 90 else label
+                    painter.drawText(
+                        QRectF(x + 5, ty, w - 10, th),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                        display,
+                    )
+
+                if is_affected_delete:
+                    painter.setPen(QPen(QColor("#ff4444"), 1.8))
+                    painter.drawText(
+                        QRectF(x, ty, w, th),
+                        Qt.AlignmentFlag.AlignCenter,
+                        "X",
+                    )
+                elif is_affected_trim and drag_state is not None:
+                    cut_t = float(drag_state.affected_trim_cuts[layer_id])
+                    cut_x = self._time_to_x(cut_t)
+                    painter.setPen(QPen(QColor("#ff8800"), 2.0))
+                    painter.drawLine(
+                        QPointF(cut_x, ty + 1.0),
+                        QPointF(cut_x, ty + th - 1.0),
+                    )
+
+                if is_dragging_layer and drag_state is not None and w > 80:
+                    msg: str
+                    if drag_state.will_commit:
+                        affected_n = (
+                            len(drag_state.affected_delete_ids)
+                            + len(drag_state.affected_trim_cuts)
+                        )
+                        if affected_n > 0:
+                            msg = f"Release - replaces {affected_n} layer(s)"
+                        else:
+                            msg = "Release to commit"
+                    else:
+                        msg = "Release to revert"
+                    painter.setPen(QPen(QColor(255, 255, 255, 220)))
+                    painter.drawText(
+                        QRectF(x + 6, ty + 2, w - 12, th - 4),
+                        Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                        msg,
+                    )
+                    if drag_state.resize_edge == "left":
+                        tip_kind = "layer-resize-left"
+                    elif drag_state.resize_edge == "right":
+                        tip_kind = "layer-resize-right"
+                    else:
+                        tip_kind = "layer-move"
+                    self._paint_drag_time_tooltip(
+                        painter,
+                        kind=tip_kind,
+                        cursor_scene_x=float(drag_state.cursor_scene_x),
+                        cursor_scene_y=float(drag_state.cursor_scene_y),
+                        layer=layer,
+                    )
+
+                # Left/right resize-handle ticks
+                handle_color = QColor(255, 255, 255, 90)
+                painter.fillRect(QRectF(x, ty + 2, 3, th - 4), handle_color)
+                painter.fillRect(QRectF(x + w - 3, ty + 2, 3, th - 4), handle_color)
         finally:
             painter.restore()
 
@@ -4774,6 +6431,10 @@ class TimelinePanel(QWidget):
         # ``setSelected`` fires after ``refresh``).
         same_segment = (segment.id == self._selected_segment_id)
         self._selected_segment_id = segment.id
+        # Mutual exclusive: clear layer selection when segment is selected
+        if self._selected_layer_id is not None:
+            self._selected_layer_id = None
+            self.scene.update()
         self.split_button.setEnabled(True)
         self.join_button.setEnabled(False)  # need Ctrl+click a second segment
         self.delete_segment_button.setEnabled(True)
@@ -4796,7 +6457,10 @@ class TimelinePanel(QWidget):
         self._focused_beat = None
         self._defocus_other_threshold_lines(None)
         self.scene.clearSelection()
-        self.split_button.setEnabled(False)
+        self.split_button.setEnabled(
+            self._segment_covering_time(self._playhead_time_sec, inner_margin_sec=0.1)
+            is not None
+        )
         self.join_button.setEnabled(False)
         self.delete_segment_button.setEnabled(False)
         self.duplicate_segment_button.setEnabled(False)
@@ -4808,103 +6472,46 @@ class TimelinePanel(QWidget):
 
     # ── Segment drag helpers ────────────────────────────────────────────────
 
-    # ── CapCut-style segment drag helpers ────────────────────────────────────
-
-    def _sorted_others(self, seg_id: str) -> list:
-        """Sorted segment list excluding the dragged segment."""
-        if self._project is None:
-            return []
-        return [s for s in self._project.sorted_segments() if s.id != seg_id]
-
-    def _compute_drag_insert_idx(self, seg_id: str, scene_x: float) -> int:
-        """Return the insertion index closest to ``scene_x``.
-
-        Builds one "gap" position per possible slot (before the first
-        other, between each pair, after the last) then snaps to the
-        nearest gap.  This avoids the "wide segment" problem where the
-        naive midpoint comparison requires the cursor to travel half the
-        segment's width before the indicator switches slots.
-        """
-        others = self._sorted_others(seg_id)
-        if not others:
-            return 0
-
-        gap_xs: list[float] = []
-        # Gap 0: just before the first other segment
-        gap_xs.append(self._time_to_x(others[0].start_time_sec))
-        # Gaps 1 … N-1: centre of the boundary between consecutive others
-        for i in range(len(others) - 1):
-            mid_t = (others[i].end_time_sec + others[i + 1].start_time_sec) / 2.0
-            gap_xs.append(self._time_to_x(mid_t))
-        # Gap N: just after the last other segment
-        gap_xs.append(self._time_to_x(others[-1].end_time_sec))
-
-        # Snap to the nearest gap
-        nearest = min(range(len(gap_xs)), key=lambda k: abs(scene_x - gap_xs[k]))
-        return nearest
-
     def _drag_insertion_x(self) -> Optional[float]:
         """Scene-X of the ghost's left edge — shows where segment will land on drop."""
         if self._drag_seg_id is None:
             return None
-        block = self._block_map.get(self._drag_seg_id)
-        if block is None:
-            return None
-        try:
-            seg_width_px = block.rect().width()
-        except RuntimeError:
-            return None
-        return max(0.0, self._drag_ghost_x - seg_width_px / 2.0)
-
-    def _repack_segments(self, ordered: list) -> list[tuple]:
-        """Return ``[(seg, new_start, new_end), …]`` packing *ordered* sequentially.
-
-        The pack starts at the original start time of whatever segment
-        currently sits first in time (before the drag began), so the
-        overall clip doesn't jump in the timeline.
-        """
-        if not ordered:
-            return []
-        if self._project is None:
-            return []
-        all_segs = self._project.sorted_segments()
-        base_t = all_segs[0].start_time_sec if all_segs else 0.0
-        result: list[tuple] = []
-        t = base_t
-        for s in ordered:
-            dur = s.end_time_sec - s.start_time_sec
-            result.append((s, t, t + dur))
-            t += dur
-        return result
+        return self._segment_drag_ghost_left_x()
 
     def _commit_segment_drag(self) -> None:
         """Place segment at exact ghost position, push only overlapping segments right."""
         if self._project is None or self._drag_seg_id is None:
-            self._drag_seg_id = None
+            self._reset_segment_drag_state()
             return
         seg = self._project.get_segment(self._drag_seg_id)
         if seg is None:
-            self._drag_seg_id = None
+            self._reset_segment_drag_state()
             return
 
         block = self._block_map.get(self._drag_seg_id)
         if block is None:
-            self._drag_seg_id = None
+            self._reset_segment_drag_state()
             self.refresh()
             return
         try:
-            seg_width_px = block.rect().width()
+            _ = block.rect().width()
         except RuntimeError:
-            self._drag_seg_id = None
+            self._reset_segment_drag_state()
             self.refresh()
             return
 
-        # Ghost left-edge → exact new start time (clamp to t≥0)
-        ghost_left_x = self._drag_ghost_x - seg_width_px / 2.0
-        new_start_t = max(0.0, self._x_to_time(ghost_left_x))
+        # Delta-based offset preservation: new start follows cursor delta
+        # relative to the moment drag activated (not segment center).
+        delta_px = float(self._drag_ghost_x - self._drag_press_scene_x)
+        delta_t = delta_px / max(0.001, self._effective_pps)
+        new_start_t = max(0.0, float(self._drag_start_seg_start) + delta_t)
 
         old_positions = {s.id: (s.start_time_sec, s.end_time_sec)
                          for s in self._project.segments}
+        old_layer_positions = {
+            la.id: (la.start_time_sec, la.end_time_sec)
+            for la in self._project.layers
+        }
 
         # Place dragged segment at the exact dropped position
         duration = seg.end_time_sec - seg.start_time_sec
@@ -4928,12 +6535,45 @@ class TimelinePanel(QWidget):
                for s in self._project.segments):
             for s in self._project.segments:
                 s.start_time_sec, s.end_time_sec = old_positions[s.id]
-            self._drag_seg_id = None
+            self._reset_segment_drag_state()
             self.refresh()
             return
 
         new_positions = {s.id: (s.start_time_sec, s.end_time_sec)
                          for s in self._project.segments}
+        moved_deltas = {
+            sid: (new_positions[sid][0] - old_positions[sid][0])
+            for sid in new_positions
+            if sid in old_positions
+        }
+
+        # Move segment-owned layers together with their owning segment.
+        # Ownership is resolved from PRE-DRAG ranges so each layer follows
+        # the segment it originally belonged to.
+        eps = 1e-6
+        for layer in self._project.layers:
+            candidates = [
+                sid
+                for sid, (s0, e0) in old_positions.items()
+                if s0 <= layer.start_time_sec + eps
+                and e0 >= layer.end_time_sec - eps
+            ]
+            if not candidates:
+                continue
+            owner_id = min(
+                candidates,
+                key=lambda sid: (old_positions[sid][1] - old_positions[sid][0]),
+            )
+            dt = float(moved_deltas.get(owner_id, 0.0))
+            if abs(dt) < 1e-9:
+                continue
+            layer.start_time_sec += dt
+            layer.end_time_sec += dt
+
+        new_layer_positions = {
+            la.id: (la.start_time_sec, la.end_time_sec)
+            for la in self._project.layers
+        }
 
         def _undo() -> None:
             if self._project is None:
@@ -4941,6 +6581,9 @@ class TimelinePanel(QWidget):
             for s in self._project.segments:
                 if s.id in old_positions:
                     s.start_time_sec, s.end_time_sec = old_positions[s.id]
+            for la in self._project.layers:
+                if la.id in old_layer_positions:
+                    la.start_time_sec, la.end_time_sec = old_layer_positions[la.id]
             self.refresh()
             self.segment_moved.emit("", 0.0, 0.0)
 
@@ -4950,12 +6593,15 @@ class TimelinePanel(QWidget):
             for s in self._project.segments:
                 if s.id in new_positions:
                     s.start_time_sec, s.end_time_sec = new_positions[s.id]
+            for la in self._project.layers:
+                if la.id in new_layer_positions:
+                    la.start_time_sec, la.end_time_sec = new_layer_positions[la.id]
             self.refresh()
             self.segment_moved.emit("", 0.0, 0.0)
 
         self.undo_stack.push(_Cmd("Move Segment", _undo, _redo))
 
-        self._drag_seg_id = None
+        self._reset_segment_drag_state()
         self.refresh()
         self.segment_moved.emit("", 0.0, 0.0)
 
@@ -5420,9 +7066,9 @@ class TimelinePanel(QWidget):
 
     def _on_split_clicked(self) -> None:
         """Split the selected segment at the current playhead position."""
-        if not self._project or not self._selected_segment_id:
+        if not self._project:
             return
-        segment = self._project.get_segment(self._selected_segment_id)
+        segment = self._split_target_segment()
         if segment is None:
             return
         split_time = self._playhead_time_sec
@@ -5432,6 +7078,31 @@ class TimelinePanel(QWidget):
         if split_time >= segment.end_time_sec - 0.1:
             return
         self._do_split(segment, split_time)
+
+    def _segment_covering_time(
+        self, time_sec: float, *, inner_margin_sec: float = 0.0
+    ) -> Optional["Segment"]:
+        """Return segment that contains timeline time (optionally with margins)."""
+        if self._project is None:
+            return None
+        t = float(max(0.0, time_sec))
+        margin = float(max(0.0, inner_margin_sec))
+        for seg in sorted(
+            self._project.segments, key=lambda s: float(s.start_time_sec or 0.0)
+        ):
+            start = float(seg.start_time_sec or 0.0) + margin
+            end = float(seg.end_time_sec or 0.0) - margin
+            if start < t < end:
+                return seg
+        return None
+
+    def _split_target_segment(self) -> Optional["Segment"]:
+        """Resolve split target from selection; fallback to playhead-hit segment."""
+        if self._project is None:
+            return None
+        if self._selected_segment_id:
+            return self._project.get_segment(self._selected_segment_id)
+        return self._segment_covering_time(self._playhead_time_sec, inner_margin_sec=0.1)
 
     def _do_split(self, segment: "Segment", split_time: float) -> None:
         """Perform the actual split, mutate project, emit signal, push undo."""
@@ -5482,6 +7153,39 @@ class TimelinePanel(QWidget):
         # For undo/redo we track whatever _beat_events has for the right id post-split.
 
         self._project.segments.append(right)
+
+        # Split any layers contained within the original segment at split_time.
+        # Layers that span the cut point are shortened (left half) and a new
+        # right-half layer clone is inserted.  Layers fully before or after the
+        # cut point are untouched.
+        split_layer_ops: list[tuple] = []   # (orig_layer, new_layer | None, orig_end)
+        from studio.models.layer import Layer as _Layer
+        for layer in list(self._project.layers):
+            # Only consider layers "owned" by the original segment range.
+            seg_start = segment.start_time_sec   # already trimmed to split_time
+            seg_orig_start = seg_start            # same — left half starts same place
+            full_start = seg_orig_start
+            full_end = orig_end
+            if layer.start_time_sec < full_start or layer.end_time_sec > full_end:
+                continue  # not owned by this segment
+            if layer.end_time_sec <= split_time:
+                continue  # fully in left half — no change
+            if layer.start_time_sec >= split_time:
+                continue  # fully in right half — no change
+            # Layer spans the cut: shorten left, create right clone.
+            old_end = layer.end_time_sec
+            layer.end_time_sec = split_time
+            right_layer = _Layer(
+                kind=layer.kind,
+                start_time_sec=split_time,
+                end_time_sec=old_end,
+                z_index=layer.z_index,
+                name=layer.name,
+                config=copy.deepcopy(layer.config),
+            )
+            self._project.layers.append(right_layer)
+            split_layer_ops.append((layer, right_layer, old_end))
+
         self.segment_split.emit(orig_id, right_id)
         self.refresh()
 
@@ -5501,6 +7205,11 @@ class TimelinePanel(QWidget):
             self._project.segments = [
                 s for s in self._project.segments if s.id != right_id
             ]
+            # Restore split layers: remove the right-half clones and re-expand left.
+            for orig_layer, right_layer, old_end in split_layer_ops:
+                orig_layer.end_time_sec = old_end
+                if right_layer in self._project.layers:
+                    self._project.layers.remove(right_layer)
             self._beat_events.pop(right_id, None)
             self._selected_segment_id = orig_id
             self.segment_joined.emit(orig_id, right_id)
@@ -5518,6 +7227,13 @@ class TimelinePanel(QWidget):
                 left.trimmed_audio_path = None
             restored_right = copy.deepcopy(right_snapshot)
             self._project.segments.append(restored_right)
+            # Re-apply layer splits.
+            for orig_layer, right_layer, old_end in split_layer_ops:
+                orig_layer.end_time_sec = split_time
+                if right_layer not in self._project.layers:
+                    self._project.layers.append(right_layer)
+                right_layer.start_time_sec = split_time
+                right_layer.end_time_sec = old_end
             self._beat_events[right_id] = list(right_beats_after)
             self.segment_split.emit(orig_id, right_id)
             self.refresh()
@@ -5673,11 +7389,50 @@ class TimelinePanel(QWidget):
 
     # -- Focus mode signal handlers -----------------------------------------
     def _on_segment_double_clicked(self, segment_id: str) -> None:
-        """Toggle focus mode: focusing the same segment twice exits focus."""
-        if self._focus_segment_id == segment_id:
-            self.exit_focus_mode()
+        """Zoom timeline so the segment fills the viewport without hiding others.
+
+        The view zooms so the segment occupies the full visible width, then
+        scrolls to place the segment at the left edge.  Other segments remain
+        visible; the horizontal scrollbar is still functional so the user can
+        pan to adjacent segments.  (No focus-mode isolation is entered.)
+        """
+        if not self._project:
             return
-        self.enter_focus_mode(segment_id)
+        segment = self._project.get_segment(segment_id)
+        if segment is None or segment.duration_sec <= 0:
+            return
+
+        # Exit any existing focus mode first (keeps rendering consistent).
+        if self._focus_segment_id is not None:
+            self._focus_segment_id = None
+            self._focus_manual_zoom = False
+
+        # Compute pps so the segment fills the viewport with a small margin.
+        viewport_w = max(200, self.view.viewport().width())
+        dur = segment.duration_sec
+        padding = dur * 0.05          # 5 % breathing room on each side
+        new_pps = viewport_w / (dur + 2 * padding)
+        new_pps = max(ZOOM_MIN_PPS, min(ZOOM_MAX_PPS, new_pps))
+
+        # Apply zoom through the shared helper so the slider & scrollbar sync.
+        self._apply_zoom(new_pps, exit_focus=False)
+
+        # Scroll so the segment starts slightly left of the viewport left edge.
+        offset_sec = max(0.0, segment.start_time_sec - padding)
+        scroll_px = int(offset_sec * new_pps)
+        self.view.horizontalScrollBar().setValue(scroll_px)
+
+        # Select the segment in the inspector.
+        self._selected_segment_id = segment_id
+        self._join_partner_id = None
+        self.split_button.setEnabled(True)
+        self.join_button.setEnabled(False)
+        self.delete_segment_button.setEnabled(True)
+        self.duplicate_segment_button.setEnabled(True)
+        self.auto_gen_button.setEnabled(True)
+        self.gen_by_chart_button.setEnabled(True)
+        self.clear_beats_button.setEnabled(True)
+        self.segment_selected.emit(segment)
 
     def _on_overview_segment_clicked(self, segment_id: str) -> None:
         """Click on an overview block focuses that segment in the main view."""

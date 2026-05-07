@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from math import atan2 as _math_atan2, cos as _math_cos, sin as _math_sin
 from pathlib import Path
 from typing import Optional
 
@@ -87,6 +88,7 @@ import rhythm as _rhy  # noqa: E402  (sys.path setup must precede import)
 from rhythm import (  # noqa: E402
     BASS_RANGE,
     CLR_BG,
+    CountdownHUD,
     ComboHUD,
     DanceTarget,
     GameManager,
@@ -98,6 +100,9 @@ from rhythm import (  # noqa: E402
     PerspectiveCamera,
     PunchTarget,
     RelaxTarget,
+    SideRailRenderer,
+    SegmentBackgroundLayer,
+    StartGate,
     StickmanHUD,
     Target,
     TunnelRenderer,
@@ -106,6 +111,7 @@ from rhythm import (  # noqa: E402
     _FLOOR_SPREAD_BY_MODE,
     _parse_modes,
     _relax_camera_dy,
+    _relax_middle_shake_offset,
     _RELAX_BOB_WINDOW_F,
     detect_wave_columns,
     gpu_glow,
@@ -182,9 +188,125 @@ class LiveFrameRenderer:
         show_stickman: bool = True,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: bool = True,
+        floor_panel_color: Optional[str] = None,
+        floor_panel_opacity: float = 1.0,
+        floor_panel_blink: bool = False,
+        floor_panel_image: Optional[str] = None,
+        floor_full_static_image: bool = False,
+        floor_layout: str = "auto",
+        floor_bg_color: Optional[str] = None,
+        floor_bg_opacity: float = 1.0,
+        background_type: str = "solid",
+        background_color: str = "#000000",
+        background_image: Optional[str] = None,
+        background_video: Optional[str] = None,
+        chevron_color: str = "#FFD700",
+        chevron_scroll: bool = True,
+        chevron_blink: bool = False,
+        chevron_width_frac: float = 0.45,
+        chevron_count: int = 6,
+        show_side_rails: bool = False,
+        rail_color: str = "#FF60FF",
+        rail_shape: str = "chunky",
+        rail_height: float = 0.14,
+        rail_offset_x: float = 0.08,
+        rail_image: Optional[str] = None,
+        rail_texture_non_loop: bool = False,
+        rail_pulse: str = "beat",
+        rail_pulse_intensity: float = 0.6,
+        rail_chevron_depth: float = 1.0,
+        rail_chevron_density: int = 6,
+        rail_pillar_count: int = 16,
+        rail_pillar_highlight_count: int = 1,
+        rail_pillar_radius: float = 1.0,
+        rail_chase_mode: str = "time",
+        rail_chase_speed_frames: int = 4,
+        rail_dot_count: int = 24,
+        rail_dot_lines: int = 1,
+        rail_dot_size_px: int = 6,
+        rail_dot_anim_mode: str = "audio",
+        rail_dot_color_near: str = "#FF60FF",
+        rail_dot_color_far: str = "#00FFFF",
+        relax_interval: float = 0.0,
+        relax_travel_sec: float = 0.0,
+        relax_wait_sec: float = 0.0,
+        relax_texture_low: Optional[str] = None,
+        relax_texture_high: Optional[str] = None,
+        relax_texture_middle: Optional[str] = None,
+        relax_hole_mask_path: Optional[str] = None,
+        relax_kind_ratio_middle: float = 0.33,
+        relax_show_low: bool = True,
+        relax_show_high: bool = True,
+        relax_show_middle: bool = True,
+        relax_countdown_enabled: bool = True,
+        relax_countdown_color: str = "#FFFFFF",
+        relax_countdown_max_sec: float = 5.0,
+        relax_countdown_anim: str = "pop",
+        relax_countdown_audio_enabled: bool = False,
+        relax_countdown_audio_mode: str = "default",
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: float = 0.65,
+        relax_countdown_audio_last_mode: str = "default",
+        relax_countdown_audio_last_file: Optional[str] = None,
+        relax_countdown_x: float = 0.88,
+        relax_countdown_y: float = 0.04,
+        relax_countdown_w: float = 0.10,
+        relax_countdown_h: float = 0.16,
+        relax_countdown_border_thickness: float = 2.0,
+        relax_countdown_glow_strength: float = 60.0,
+        start_gate_enabled: bool = False,
+        start_gate_type: str = "color",
+        start_gate_color: str = "#1a1a1a",
+        start_gate_border_color: str = "#ffffff",
+        start_gate_border_thickness: float = 0.0,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: float = 0.30,
+        start_gate_y: float = 0.18,
+        start_gate_w: float = 0.40,
+        start_gate_h: float = 0.14,
+        combo_enabled: bool = True,
+        combo_color: str = "#FFFFFF",
+        combo_label: str = "COMBO",
+        combo_font_family: str = "duplex",
+        combo_fade_after_break_sec: float = 0.5,
+        combo_anim: str = "pop",
+        combo_audio_enabled: bool = False,
+        combo_audio_mode: str = "default",
+        combo_audio_file: Optional[str] = None,
+        combo_audio_volume: float = 0.65,
+        combo_audio_milestone_mode: str = "default",
+        combo_audio_milestone_file: Optional[str] = None,
+        combo_x: float = 0.85,
+        combo_y: float = 0.08,
+        combo_w: float = 0.13,
+        combo_h: float = 0.18,
+        combo_border_thickness: float = 2.0,
+        combo_glow_strength: float = 30.0,
+        combo_tier1_threshold: int = 30,
+        combo_tier1_label: str = "Great",
+        combo_tier2_threshold: int = 60,
+        combo_tier2_label: str = "Superb",
+        combo_tier3_threshold: int = 90,
+        combo_tier3_label: str = "Perfect",
+        combo_tier4_threshold: int = 120,
+        combo_tier4_label: str = "Godlike",
+        combo_tier1_color: str = "#22c55e",
+        combo_tier2_color: str = "#3b82f6",
+        combo_tier3_color: str = "#a855f7",
+        combo_tier4_color: str = "#f59e0b",
+        combo_number_font_scale: float = 0.0,
+        combo_label_font_scale: float = 0.0,
+        combo_tier_font_scale: float = 0.0,
+        floor_hit_frac: Optional[float] = None,
+        horizon_frac: Optional[float] = None,
+        floor_spread_frac: Optional[float] = None,
+        far_spread_frac: Optional[float] = None,
+        wall_floor_gap_frac: Optional[float] = None,
         cube_color_left: Optional[tuple[int, int, int]] = None,
         cube_color_right: Optional[tuple[int, int, int]] = None,
         panel_neon_color: Optional[tuple[int, int, int]] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: int = 3,
         block_speed: float = 1.0,
         beat_min_gap: int = 4,
@@ -204,9 +326,133 @@ class LiveFrameRenderer:
         self._show_stickman = bool(show_stickman)
         self._stickman_box = stickman_box
         self._show_floor_panels = bool(show_floor_panels)
+        self._floor_panel_color = floor_panel_color or None
+        self._floor_panel_opacity = float(floor_panel_opacity)
+        self._floor_panel_blink = bool(floor_panel_blink)
+        self._floor_panel_image = floor_panel_image or None
+        self._floor_full_static_image = bool(floor_full_static_image)
+        self._floor_layout = str(floor_layout)
+        self._floor_bg_color = floor_bg_color or None
+        self._floor_bg_opacity = float(floor_bg_opacity)
+        self._background_type = str(background_type or "solid")
+        self._background_color = str(background_color or "#000000")
+        self._background_image = background_image or None
+        self._background_video = background_video or None
+        self._chevron_color = str(chevron_color)
+        self._chevron_scroll = bool(chevron_scroll)
+        self._chevron_blink = bool(chevron_blink)
+        self._chevron_width_frac = float(chevron_width_frac)
+        self._chevron_count = int(chevron_count)
+        self._show_side_rails = bool(show_side_rails)
+        self._rail_color = str(rail_color)
+        self._rail_shape = str(rail_shape)
+        self._rail_height = float(rail_height)
+        self._rail_offset_x = float(rail_offset_x)
+        self._rail_image = rail_image or None
+        self._rail_texture_non_loop = bool(rail_texture_non_loop)
+        self._rail_pulse = str(rail_pulse)
+        self._rail_pulse_intensity = float(rail_pulse_intensity)
+        self._rail_chevron_depth   = float(rail_chevron_depth)
+        self._rail_chevron_density = int(rail_chevron_density)
+        self._rail_pillar_count = int(rail_pillar_count)
+        self._rail_pillar_highlight_count = int(rail_pillar_highlight_count)
+        self._rail_pillar_radius = float(rail_pillar_radius)
+        self._rail_chase_mode = str(rail_chase_mode)
+        self._rail_chase_speed_frames = int(rail_chase_speed_frames)
+        self._rail_dot_count = int(rail_dot_count)
+        self._rail_dot_lines = int(rail_dot_lines)
+        self._rail_dot_size_px = int(rail_dot_size_px)
+        self._rail_dot_anim_mode = str(rail_dot_anim_mode)
+        self._rail_dot_color_near = str(rail_dot_color_near)
+        self._rail_dot_color_far = str(rail_dot_color_far)
+        self._relax_interval = max(0.0, float(relax_interval))
+        self._relax_travel_sec = max(0.0, float(relax_travel_sec))
+        self._relax_wait_sec = max(0.0, float(relax_wait_sec))
+        self._relax_texture_low = relax_texture_low or None
+        self._relax_texture_high = relax_texture_high or None
+        self._relax_texture_middle = relax_texture_middle or None
+        self._relax_hole_mask_path = relax_hole_mask_path or None
+        self._relax_kind_ratio_middle = float(relax_kind_ratio_middle)
+        self._relax_show_low = bool(relax_show_low)
+        self._relax_show_high = bool(relax_show_high)
+        self._relax_show_middle = bool(relax_show_middle)
+        self._relax_countdown_enabled = bool(relax_countdown_enabled)
+        self._relax_countdown_color = str(relax_countdown_color)
+        self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
+        self._relax_countdown_anim = CountdownHUD._normalize_anim(relax_countdown_anim)
+        self._relax_countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        self._relax_countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        self._relax_countdown_audio_file = relax_countdown_audio_file or None
+        self._relax_countdown_audio_volume = max(0.0, min(1.0, float(relax_countdown_audio_volume)))
+        self._relax_countdown_audio_last_mode = str(relax_countdown_audio_last_mode or "default")
+        self._relax_countdown_audio_last_file = relax_countdown_audio_last_file or None
+        self._relax_countdown_x = max(0.0, min(1.0, float(relax_countdown_x)))
+        self._relax_countdown_y = max(0.0, min(1.0, float(relax_countdown_y)))
+        self._relax_countdown_w = max(0.02, min(1.0, float(relax_countdown_w)))
+        self._relax_countdown_h = max(0.02, min(1.0, float(relax_countdown_h)))
+        self._relax_countdown_border_thickness = max(
+            0.0, min(10.0, float(relax_countdown_border_thickness))
+        )
+        self._relax_countdown_glow_strength = max(
+            0.0, min(100.0, float(relax_countdown_glow_strength))
+        )
+        self._start_gate_enabled = bool(start_gate_enabled)
+        self._start_gate_type = str(start_gate_type or "color")
+        self._start_gate_color = str(start_gate_color or "#1a1a1a")
+        self._start_gate_border_color = str(start_gate_border_color or "#ffffff")
+        self._start_gate_border_thickness = max(
+            0.0, min(10.0, float(start_gate_border_thickness))
+        )
+        self._start_gate_image = start_gate_image or None
+        self._start_gate_video = start_gate_video or None
+        self._start_gate_x = max(0.0, min(1.0, float(start_gate_x)))
+        self._start_gate_y = max(0.0, min(1.0, float(start_gate_y)))
+        self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
+        self._start_gate_h = max(0.03, float(start_gate_h))
+        self._combo_enabled = bool(combo_enabled)
+        self._combo_color = str(combo_color or "#FFFFFF")
+        self._combo_label = str(combo_label or "COMBO")
+        self._combo_font_family = str(combo_font_family or "duplex")
+        self._combo_fade_after_break_sec = max(0.0, float(combo_fade_after_break_sec))
+        self._combo_anim = ComboHUD._normalize_anim(combo_anim)
+        self._combo_audio_enabled = bool(combo_audio_enabled)
+        self._combo_audio_mode = str(combo_audio_mode or "default")
+        self._combo_audio_file = combo_audio_file or None
+        self._combo_audio_volume = max(0.0, min(1.0, float(combo_audio_volume)))
+        self._combo_audio_milestone_mode = str(combo_audio_milestone_mode or "default")
+        self._combo_audio_milestone_file = combo_audio_milestone_file or None
+        self._combo_x = max(0.0, min(0.98, float(combo_x)))
+        self._combo_y = max(0.0, min(0.98, float(combo_y)))
+        self._combo_w = max(0.02, float(combo_w))
+        self._combo_h = max(0.02, float(combo_h))
+        self._combo_border_thickness = max(0.0, min(30.0, float(combo_border_thickness)))
+        self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
+        self._combo_tier1_threshold = max(0, int(combo_tier1_threshold))
+        self._combo_tier1_label = str(combo_tier1_label)
+        self._combo_tier2_threshold = max(0, int(combo_tier2_threshold))
+        self._combo_tier2_label = str(combo_tier2_label)
+        self._combo_tier3_threshold = max(0, int(combo_tier3_threshold))
+        self._combo_tier3_label = str(combo_tier3_label)
+        self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
+        self._combo_tier4_label = str(combo_tier4_label)
+        self._combo_tier1_color = str(combo_tier1_color)
+        self._combo_tier2_color = str(combo_tier2_color)
+        self._combo_tier3_color = str(combo_tier3_color)
+        self._combo_tier4_color = str(combo_tier4_color)
+        self._combo_number_font_scale = max(0.0, float(combo_number_font_scale))
+        self._combo_label_font_scale = max(0.0, float(combo_label_font_scale))
+        self._combo_tier_font_scale = max(0.0, float(combo_tier_font_scale))
+        self._floor_hit_frac      = float(floor_hit_frac)      if floor_hit_frac      is not None else None
+        self._horizon_frac        = float(horizon_frac)        if horizon_frac        is not None else None
+        self._floor_spread_frac   = float(floor_spread_frac)   if floor_spread_frac   is not None else None
+        self._far_spread_frac     = float(far_spread_frac)     if far_spread_frac     is not None else None
+        self._wall_floor_gap_frac = float(wall_floor_gap_frac) if wall_floor_gap_frac is not None else None
         self._cube_color_left = cube_color_left
         self._cube_color_right = cube_color_right
         self._panel_neon_color = panel_neon_color
+        self._viewport_panel_depth: Optional[float] = (
+            max(0.05, float(viewport_panel_depth)) if viewport_panel_depth is not None else None
+        )
         self._max_per_lane = max(1, int(max_per_lane))
         self._block_speed = max(0.05, float(block_speed))
         self._beat_min_gap = max(1, int(beat_min_gap))
@@ -230,6 +476,7 @@ class LiveFrameRenderer:
         # sentinel.  ``render_at`` will fast-forward to the requested
         # frame index from there.
         self._cur_fi: int = -1
+        self._hit_this_frame: bool = False
 
     # ------------------------------------------------------------------
     # public API
@@ -289,6 +536,7 @@ class LiveFrameRenderer:
             # reverse (which isn't supported anyway).
             self._build_scene()
             self._cur_fi = -1
+            self._hit_this_frame = False
         # Fast-forward state without drawing — particles + game advance
         # exactly the same way they would under the encoder loop, but we
         # skip the canvas compose for everything except the final frame.
@@ -299,6 +547,7 @@ class LiveFrameRenderer:
         while self._cur_fi < target_fi:
             self._cur_fi += 1
             hits = self._game.update(self._cur_fi)
+            self._hit_this_frame = len(hits) > 0
             self._apply_hits(hits, self._cur_fi)
             # Particles need to keep ticking even on skipped frames so a
             # forward-scrub through a hit lands with the same particle
@@ -346,6 +595,7 @@ class LiveFrameRenderer:
         # schedule.
         self._refresh_stickman_events()
         self._cur_fi = -1
+        self._hit_this_frame = False
 
     def update_mode(
         self,
@@ -354,6 +604,111 @@ class LiveFrameRenderer:
         show_stickman: Optional[bool] = None,
         stickman_box: Optional[tuple[int, int, int, int]] = None,
         show_floor_panels: Optional[bool] = None,
+        floor_panel_color: Optional[str] = None,
+        floor_panel_opacity: Optional[float] = None,
+        floor_panel_blink: Optional[bool] = None,
+        floor_panel_image: Optional[str] = None,
+        floor_full_static_image: Optional[bool] = None,
+        floor_layout: Optional[str] = None,
+        floor_bg_color: Optional[str] = None,
+        floor_bg_opacity: Optional[float] = None,
+        background_type: Optional[str] = None,
+        background_color: Optional[str] = None,
+        background_image: Optional[str] = None,
+        background_video: Optional[str] = None,
+        chevron_color: Optional[str] = None,
+        chevron_scroll: Optional[bool] = None,
+        chevron_blink: Optional[bool] = None,
+        chevron_width_frac: Optional[float] = None,
+        chevron_count: Optional[int] = None,
+        show_side_rails: Optional[bool] = None,
+        rail_color: Optional[str] = None,
+        rail_shape: Optional[str] = None,
+        rail_height: Optional[float] = None,
+        rail_offset_x: Optional[float] = None,
+        rail_image: Optional[str] = None,
+        rail_texture_non_loop: Optional[bool] = None,
+        rail_pulse: Optional[str] = None,
+        rail_pulse_intensity: Optional[float] = None,
+        rail_chevron_depth: Optional[float] = None,
+        rail_chevron_density: Optional[int] = None,
+        rail_pillar_count: Optional[int] = None,
+        rail_pillar_highlight_count: Optional[int] = None,
+        rail_pillar_radius: Optional[float] = None,
+        rail_chase_mode: Optional[str] = None,
+        rail_chase_speed_frames: Optional[int] = None,
+        rail_dot_count: Optional[int] = None,
+        rail_dot_lines: Optional[int] = None,
+        rail_dot_size_px: Optional[int] = None,
+        rail_dot_anim_mode: Optional[str] = None,
+        rail_dot_color_near: Optional[str] = None,
+        rail_dot_color_far: Optional[str] = None,
+        relax_interval: Optional[float] = None,
+        relax_travel_sec: Optional[float] = None,
+        relax_wait_sec: Optional[float] = None,
+        relax_texture_low: Optional[str] = None,
+        relax_texture_high: Optional[str] = None,
+        relax_texture_middle: Optional[str] = None,
+        relax_hole_mask_path: Optional[str] = None,
+        relax_kind_ratio_middle: Optional[float] = None,
+        relax_show_low: Optional[bool] = None,
+        relax_show_high: Optional[bool] = None,
+        relax_show_middle: Optional[bool] = None,
+        relax_countdown_enabled: Optional[bool] = None,
+        relax_countdown_color: Optional[str] = None,
+        relax_countdown_max_sec: Optional[float] = None,
+        relax_countdown_anim: Optional[str] = None,
+        relax_countdown_audio_enabled: Optional[bool] = None,
+        relax_countdown_audio_mode: Optional[str] = None,
+        relax_countdown_audio_file: Optional[str] = None,
+        relax_countdown_audio_volume: Optional[float] = None,
+        relax_countdown_audio_last_mode: Optional[str] = None,
+        relax_countdown_audio_last_file: Optional[str] = None,
+        relax_countdown_x: Optional[float] = None,
+        relax_countdown_y: Optional[float] = None,
+        relax_countdown_w: Optional[float] = None,
+        relax_countdown_h: Optional[float] = None,
+        relax_countdown_border_thickness: Optional[float] = None,
+        relax_countdown_glow_strength: Optional[float] = None,
+        start_gate_enabled: Optional[bool] = None,
+        start_gate_type: Optional[str] = None,
+        start_gate_color: Optional[str] = None,
+        start_gate_border_color: Optional[str] = None,
+        start_gate_border_thickness: Optional[float] = None,
+        start_gate_image: Optional[str] = None,
+        start_gate_video: Optional[str] = None,
+        start_gate_x: Optional[float] = None,
+        start_gate_y: Optional[float] = None,
+        start_gate_w: Optional[float] = None,
+        start_gate_h: Optional[float] = None,
+        combo_enabled: Optional[bool] = None,
+        combo_color: Optional[str] = None,
+        combo_label: Optional[str] = None,
+        combo_font_family: Optional[str] = None,
+        combo_fade_after_break_sec: Optional[float] = None,
+        combo_anim: Optional[str] = None,
+        combo_x: Optional[float] = None,
+        combo_y: Optional[float] = None,
+        combo_w: Optional[float] = None,
+        combo_h: Optional[float] = None,
+        combo_border_thickness: Optional[float] = None,
+        combo_glow_strength: Optional[float] = None,
+        combo_tier1_threshold: Optional[int] = None,
+        combo_tier1_label: Optional[str] = None,
+        combo_tier2_threshold: Optional[int] = None,
+        combo_tier2_label: Optional[str] = None,
+        combo_tier3_threshold: Optional[int] = None,
+        combo_tier3_label: Optional[str] = None,
+        combo_tier4_threshold: Optional[int] = None,
+        combo_tier4_label: Optional[str] = None,
+        combo_tier1_color: Optional[str] = None,
+        combo_tier2_color: Optional[str] = None,
+        combo_tier3_color: Optional[str] = None,
+        combo_tier4_color: Optional[str] = None,
+        combo_number_font_scale: Optional[float] = None,
+        combo_label_font_scale: Optional[float] = None,
+        combo_tier_font_scale: Optional[float] = None,
+        viewport_panel_depth: Optional[float] = None,
         max_per_lane: Optional[int] = None,
     ) -> None:
         """Switch gameplay mode (and optionally decor) then rebuild the scene.
@@ -386,10 +741,390 @@ class LiveFrameRenderer:
             self._stickman_box = tuple(stickman_box)  # type: ignore[assignment]
         if show_floor_panels is not None:
             self._show_floor_panels = bool(show_floor_panels)
+        if floor_panel_color is not None:
+            self._floor_panel_color = floor_panel_color or None
+        if floor_panel_opacity is not None:
+            self._floor_panel_opacity = float(floor_panel_opacity)
+        if floor_panel_blink is not None:
+            self._floor_panel_blink = bool(floor_panel_blink)
+        if floor_panel_image is not None:
+            self._floor_panel_image = floor_panel_image or None
+        if floor_full_static_image is not None:
+            self._floor_full_static_image = bool(floor_full_static_image)
+        if floor_layout is not None:
+            self._floor_layout = str(floor_layout)
+        if floor_bg_color is not None:
+            self._floor_bg_color = floor_bg_color or None
+        if floor_bg_opacity is not None:
+            self._floor_bg_opacity = float(floor_bg_opacity)
+        if background_type is not None:
+            self._background_type = str(background_type or "solid")
+        if background_color is not None:
+            self._background_color = str(background_color or "#000000")
+        if background_image is not None:
+            self._background_image = background_image or None
+        if background_video is not None:
+            self._background_video = background_video or None
+        if chevron_color is not None:
+            self._chevron_color = str(chevron_color)
+        if chevron_scroll is not None:
+            self._chevron_scroll = bool(chevron_scroll)
+        if chevron_blink is not None:
+            self._chevron_blink = bool(chevron_blink)
+        if chevron_width_frac is not None:
+            self._chevron_width_frac = float(chevron_width_frac)
+        if chevron_count is not None:
+            self._chevron_count = int(chevron_count)
+        if show_side_rails is not None:
+            self._show_side_rails = bool(show_side_rails)
+        if rail_color is not None:
+            self._rail_color = str(rail_color)
+        if rail_shape is not None:
+            self._rail_shape = str(rail_shape)
+        if rail_height is not None:
+            self._rail_height = float(rail_height)
+        if rail_offset_x is not None:
+            self._rail_offset_x = float(rail_offset_x)
+        if rail_image is not None:
+            self._rail_image = rail_image or None
+        if rail_texture_non_loop is not None:
+            self._rail_texture_non_loop = bool(rail_texture_non_loop)
+        if rail_pulse is not None:
+            self._rail_pulse = str(rail_pulse)
+        if rail_pulse_intensity is not None:
+            self._rail_pulse_intensity = float(rail_pulse_intensity)
+        if rail_chevron_depth is not None:
+            self._rail_chevron_depth = float(rail_chevron_depth)
+        if rail_chevron_density is not None:
+            self._rail_chevron_density = int(rail_chevron_density)
+        if rail_pillar_count is not None:
+            self._rail_pillar_count = int(rail_pillar_count)
+        if rail_pillar_highlight_count is not None:
+            self._rail_pillar_highlight_count = int(rail_pillar_highlight_count)
+        if rail_pillar_radius is not None:
+            self._rail_pillar_radius = float(rail_pillar_radius)
+        if rail_chase_mode is not None:
+            self._rail_chase_mode = str(rail_chase_mode)
+        if rail_chase_speed_frames is not None:
+            self._rail_chase_speed_frames = int(rail_chase_speed_frames)
+        if rail_dot_count is not None:
+            self._rail_dot_count = int(rail_dot_count)
+        if rail_dot_lines is not None:
+            self._rail_dot_lines = int(rail_dot_lines)
+        if rail_dot_size_px is not None:
+            self._rail_dot_size_px = int(rail_dot_size_px)
+        if rail_dot_anim_mode is not None:
+            self._rail_dot_anim_mode = str(rail_dot_anim_mode)
+        if rail_dot_color_near is not None:
+            self._rail_dot_color_near = str(rail_dot_color_near)
+        if rail_dot_color_far is not None:
+            self._rail_dot_color_far = str(rail_dot_color_far)
+        if relax_interval is not None:
+            self._relax_interval = max(0.0, float(relax_interval))
+        if relax_travel_sec is not None:
+            self._relax_travel_sec = max(0.0, float(relax_travel_sec))
+        if relax_wait_sec is not None:
+            self._relax_wait_sec = max(0.0, float(relax_wait_sec))
+        if relax_texture_low is not None:
+            self._relax_texture_low = relax_texture_low or None
+        if relax_texture_high is not None:
+            self._relax_texture_high = relax_texture_high or None
+        if relax_texture_middle is not None:
+            self._relax_texture_middle = relax_texture_middle or None
+        if relax_hole_mask_path is not None:
+            self._relax_hole_mask_path = relax_hole_mask_path or None
+        if relax_kind_ratio_middle is not None:
+            self._relax_kind_ratio_middle = float(relax_kind_ratio_middle)
+        if relax_show_low is not None:
+            self._relax_show_low = bool(relax_show_low)
+        if relax_show_high is not None:
+            self._relax_show_high = bool(relax_show_high)
+        if relax_show_middle is not None:
+            self._relax_show_middle = bool(relax_show_middle)
+        if relax_countdown_enabled is not None:
+            self._relax_countdown_enabled = bool(relax_countdown_enabled)
+        if relax_countdown_color is not None:
+            self._relax_countdown_color = str(relax_countdown_color)
+        if relax_countdown_max_sec is not None:
+            self._relax_countdown_max_sec = max(0.0, float(relax_countdown_max_sec))
+        if relax_countdown_anim is not None:
+            self._relax_countdown_anim = CountdownHUD._normalize_anim(relax_countdown_anim)
+        if relax_countdown_audio_enabled is not None:
+            self._relax_countdown_audio_enabled = bool(relax_countdown_audio_enabled)
+        if relax_countdown_audio_mode is not None:
+            self._relax_countdown_audio_mode = str(relax_countdown_audio_mode or "default")
+        if relax_countdown_audio_file is not None:
+            self._relax_countdown_audio_file = relax_countdown_audio_file or None
+        if relax_countdown_audio_volume is not None:
+            self._relax_countdown_audio_volume = max(
+                0.0, min(1.0, float(relax_countdown_audio_volume))
+            )
+        if relax_countdown_audio_last_mode is not None:
+            self._relax_countdown_audio_last_mode = str(
+                relax_countdown_audio_last_mode or "default"
+            )
+        if relax_countdown_audio_last_file is not None:
+            self._relax_countdown_audio_last_file = relax_countdown_audio_last_file or None
+        if relax_countdown_x is not None:
+            self._relax_countdown_x = max(0.0, min(1.0, float(relax_countdown_x)))
+        if relax_countdown_y is not None:
+            self._relax_countdown_y = max(0.0, min(1.0, float(relax_countdown_y)))
+        if relax_countdown_w is not None:
+            self._relax_countdown_w = max(0.02, min(1.0, float(relax_countdown_w)))
+        if relax_countdown_h is not None:
+            self._relax_countdown_h = max(0.02, min(1.0, float(relax_countdown_h)))
+        border_changed = relax_countdown_border_thickness is not None
+        glow_changed = relax_countdown_glow_strength is not None
+        if border_changed:
+            self._relax_countdown_border_thickness = max(
+                0.0, min(10.0, float(relax_countdown_border_thickness))
+            )
+        if glow_changed:
+            self._relax_countdown_glow_strength = max(
+                0.0, min(100.0, float(relax_countdown_glow_strength))
+            )
+        if (border_changed or glow_changed) and self._countdown_hud is not None:
+            self._countdown_hud.set_style(
+                border_thickness=(
+                    self._relax_countdown_border_thickness if border_changed else None
+                ),
+                glow_strength=(
+                    self._relax_countdown_glow_strength if glow_changed else None
+                ),
+            )
+        if start_gate_enabled is not None:
+            self._start_gate_enabled = bool(start_gate_enabled)
+        if start_gate_type is not None:
+            self._start_gate_type = str(start_gate_type or "color")
+        if start_gate_color is not None:
+            self._start_gate_color = str(start_gate_color or "#1a1a1a")
+        if start_gate_border_color is not None:
+            self._start_gate_border_color = str(start_gate_border_color or "#ffffff")
+        if start_gate_border_thickness is not None:
+            self._start_gate_border_thickness = max(
+                0.0, min(10.0, float(start_gate_border_thickness))
+            )
+        if start_gate_image is not None:
+            self._start_gate_image = start_gate_image or None
+        if start_gate_video is not None:
+            self._start_gate_video = start_gate_video or None
+        if start_gate_x is not None:
+            self._start_gate_x = max(0.0, min(1.0, float(start_gate_x)))
+        if start_gate_y is not None:
+            self._start_gate_y = max(0.0, min(1.0, float(start_gate_y)))
+        if start_gate_w is not None:
+            self._start_gate_w = max(0.02, min(1.0, float(start_gate_w)))
+        if start_gate_h is not None:
+            self._start_gate_h = max(0.03, float(start_gate_h))
+        # ── Combo HUD params ────────────────────────────────────────────────
+        if combo_enabled is not None:
+            self._combo_enabled = bool(combo_enabled)
+        if combo_color is not None:
+            self._combo_color = str(combo_color or "#FFFFFF")
+        if combo_label is not None:
+            self._combo_label = str(combo_label or "COMBO")
+        if combo_font_family is not None:
+            self._combo_font_family = str(combo_font_family or "duplex")
+        if combo_fade_after_break_sec is not None:
+            self._combo_fade_after_break_sec = max(0.0, float(combo_fade_after_break_sec))
+        if combo_anim is not None:
+            self._combo_anim = ComboHUD._normalize_anim(combo_anim)
+        if combo_x is not None:
+            self._combo_x = max(0.0, min(0.98, float(combo_x)))
+        if combo_y is not None:
+            self._combo_y = max(0.0, min(0.98, float(combo_y)))
+        if combo_w is not None:
+            self._combo_w = max(0.02, float(combo_w))
+        if combo_h is not None:
+            self._combo_h = max(0.02, float(combo_h))
+        if combo_border_thickness is not None:
+            self._combo_border_thickness = max(0.0, min(30.0, float(combo_border_thickness)))
+        if combo_glow_strength is not None:
+            self._combo_glow_strength = max(0.0, min(100.0, float(combo_glow_strength)))
+        if combo_tier1_threshold is not None:
+            self._combo_tier1_threshold = max(0, int(combo_tier1_threshold))
+        if combo_tier1_label is not None:
+            self._combo_tier1_label = str(combo_tier1_label)
+        if combo_tier2_threshold is not None:
+            self._combo_tier2_threshold = max(0, int(combo_tier2_threshold))
+        if combo_tier2_label is not None:
+            self._combo_tier2_label = str(combo_tier2_label)
+        if combo_tier3_threshold is not None:
+            self._combo_tier3_threshold = max(0, int(combo_tier3_threshold))
+        if combo_tier3_label is not None:
+            self._combo_tier3_label = str(combo_tier3_label)
+        if combo_tier4_threshold is not None:
+            self._combo_tier4_threshold = max(0, int(combo_tier4_threshold))
+        if combo_tier4_label is not None:
+            self._combo_tier4_label = str(combo_tier4_label)
+        if combo_tier1_color is not None:
+            self._combo_tier1_color = str(combo_tier1_color)
+        if combo_tier2_color is not None:
+            self._combo_tier2_color = str(combo_tier2_color)
+        if combo_tier3_color is not None:
+            self._combo_tier3_color = str(combo_tier3_color)
+        if combo_tier4_color is not None:
+            self._combo_tier4_color = str(combo_tier4_color)
+        if combo_number_font_scale is not None:
+            self._combo_number_font_scale = max(0.0, float(combo_number_font_scale))
+        if combo_label_font_scale is not None:
+            self._combo_label_font_scale = max(0.0, float(combo_label_font_scale))
+        if combo_tier_font_scale is not None:
+            self._combo_tier_font_scale = max(0.0, float(combo_tier_font_scale))
+        if viewport_panel_depth is not None:
+            self._viewport_panel_depth = max(0.05, float(viewport_panel_depth))
         if max_per_lane is not None:
             self._max_per_lane = max(1, int(max_per_lane))
         self._build_scene()
         self._cur_fi = -1
+
+    def update_countdown_box(
+        self, *, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Hot-update countdown box without full scene rebuild."""
+        self._relax_countdown_x = max(0.0, min(1.0, float(x)))
+        self._relax_countdown_y = max(0.0, min(1.0, float(y)))
+        self._relax_countdown_w = max(0.02, min(1.0, float(w)))
+        self._relax_countdown_h = max(0.02, min(1.0, float(h)))
+        if self._countdown_hud is not None:
+            self._countdown_hud.set_box(
+                self._relax_countdown_x,
+                self._relax_countdown_y,
+                self._relax_countdown_w,
+                self._relax_countdown_h,
+            )
+
+    def update_combo_box(
+        self, *, x: float, y: float, w: float, h: float
+    ) -> None:
+        """Hot-update combo bbox without full scene rebuild."""
+        self._combo_x = max(0.0, min(0.98, float(x)))
+        self._combo_y = max(0.0, min(0.98, float(y)))
+        self._combo_w = max(0.02, float(w))
+        self._combo_h = max(0.02, float(h))
+        if self._combo is not None:
+            self._combo.set_bbox(
+                self._combo_x, self._combo_y, self._combo_w, self._combo_h
+            )
+
+    def _build_side_rail(self) -> Optional[SideRailRenderer]:
+        if not self._show_side_rails:
+            return None
+        return SideRailRenderer(
+            self._cam,
+            color=self._rail_color,
+            shape=self._rail_shape,
+            height=self._rail_height,
+            offset_x=self._rail_offset_x,
+            image_path=self._rail_image,
+            texture_non_loop=self._rail_texture_non_loop,
+            pulse=self._rail_pulse,
+            pulse_intensity=self._rail_pulse_intensity,
+            chevron_depth=self._rail_chevron_depth,
+            chevron_density=self._rail_chevron_density,
+            pillar_count=self._rail_pillar_count,
+            pillar_highlight_count=self._rail_pillar_highlight_count,
+            pillar_radius=self._rail_pillar_radius,
+            chase_mode=self._rail_chase_mode,
+            chase_speed_frames=self._rail_chase_speed_frames,
+            dot_count=self._rail_dot_count,
+            dot_lines=self._rail_dot_lines,
+            dot_size_px=self._rail_dot_size_px,
+            dot_anim_mode=self._rail_dot_anim_mode,
+            dot_color_near=self._rail_dot_color_near,
+            dot_color_far=self._rail_dot_color_far,
+        )
+
+    def update_viewport_panel_depth(self, depth: float) -> None:
+        """Hot-update the viewport panel depth from overlay drag."""
+        new_depth = max(0.05, float(depth))
+        if new_depth != self._viewport_panel_depth:
+            self._viewport_panel_depth = new_depth
+            self._viewport = ViewportFrame(
+                self._cam,
+                neon_color=self._panel_neon_color,
+                mode=self._primary_mode,
+                panel_depth=self._viewport_panel_depth,
+            )
+
+    def update_side_rail_height(self, height: float) -> None:
+        """Hot-update side-rail height from overlay drag."""
+        self._rail_height = max(0.15, float(height))
+        self._side_rail = self._build_side_rail()
+        if self._start_gate is not None:
+            self._start_gate.update_layout(rail_height=self._rail_height)
+
+    def update_start_gate_height(self, height: float) -> None:
+        """Hot-update start-gate height from overlay drag."""
+        self._start_gate_h = max(0.03, float(height))
+        if self._start_gate is not None:
+            self._start_gate.update_layout(gate_height=self._start_gate_h)
+
+    def update_floor_chevron_width(self, chevron_width_frac: float) -> None:
+        """Hot-update floor chevron strip width without rebuilding scene."""
+        self._chevron_width_frac = max(0.05, min(0.95, float(chevron_width_frac)))
+        if self._tunnel is not None:
+            try:
+                self._tunnel.set_chevron_width_frac(self._chevron_width_frac)
+            except Exception:
+                # Fallback for older tunnel implementations.
+                self._build_scene()
+                self._cur_fi = -1
+
+    def get_start_gate_rect(self) -> tuple[float, float, float, float] | None:
+        gate = getattr(self, "_start_gate", None)
+        if gate is None:
+            return None
+        try:
+            return gate.rect_fracs()
+        except Exception:
+            return None
+
+    def update_floor_wall(
+        self,
+        *,
+        floor_hit_frac: Optional[float] = None,
+        horizon_frac: Optional[float] = None,
+        floor_spread_frac: Optional[float] = None,
+        far_spread_frac: Optional[float] = None,
+        wall_floor_gap_frac: Optional[float] = None,
+    ) -> None:
+        """Hot-update camera perspective and rebuild the scene.
+
+        Pass ``None`` to keep the current override value unchanged.
+        Pass a float to apply a new override.  The camera is rebuilt so
+        the next ``render_at`` call reflects the new geometry.
+        """
+        changed = False
+        if floor_hit_frac is not None:
+            # Allow full editor-driven range so Floor handle can move to screen edges.
+            v = float(np.clip(floor_hit_frac, 0.0, 1.0))
+            if v != self._floor_hit_frac:
+                self._floor_hit_frac = v
+                changed = True
+        if horizon_frac is not None:
+            v = float(np.clip(horizon_frac, 0.20, 0.60))
+            if v != self._horizon_frac:
+                self._horizon_frac = v
+                changed = True
+        if floor_spread_frac is not None:
+            v = float(np.clip(floor_spread_frac, 0.20, 3.00))
+            if v != self._floor_spread_frac:
+                self._floor_spread_frac = v
+                changed = True
+        if far_spread_frac is not None:
+            v = float(np.clip(far_spread_frac, 0.05, 3.00))
+            if v != self._far_spread_frac:
+                self._far_spread_frac = v
+                changed = True
+        if wall_floor_gap_frac is not None:
+            v = float(np.clip(wall_floor_gap_frac, 0.00, 0.30))
+            if v != self._wall_floor_gap_frac:
+                self._wall_floor_gap_frac = v
+                changed = True
+        if changed:
+            self._build_scene()
+            self._cur_fi = -1
 
     def close(self) -> None:
         """Release references so Python can free large ndarrays sooner.
@@ -403,10 +1138,17 @@ class LiveFrameRenderer:
         self._game = None  # type: ignore[assignment]
         self._cam = None  # type: ignore[assignment]
         self._tunnel = None  # type: ignore[assignment]
+        self._side_rail = None
         self._particles = None  # type: ignore[assignment]
         self._viewport = None  # type: ignore[assignment]
         self._combo = None  # type: ignore[assignment]
         self._stick = None  # type: ignore[assignment]
+        if getattr(self, "_background_layer", None) is not None:
+            self._background_layer.close()
+        self._background_layer = None
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.close()
+        self._start_gate = None
 
     # ------------------------------------------------------------------
     # construction helpers
@@ -502,6 +1244,12 @@ class LiveFrameRenderer:
         if not modes_seq:
             modes_seq = ["punch"]
         self._modes_seq = modes_seq
+        if getattr(self, "_background_layer", None) is not None:
+            self._background_layer.close()
+            self._background_layer = None
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.close()
+            self._start_gate = None
         combo_mode = len(modes_seq) >= 2
         self._combo_mode = combo_mode
         # Scene-dressing primary mode picks lane count + floor spread.
@@ -511,14 +1259,55 @@ class LiveFrameRenderer:
             primary_mode = "punch"
         else:  # solo line / relax both reuse punch dressing
             primary_mode = "punch"
+        self._primary_mode = primary_mode
         n_lanes_mode = N_LANES_DANCE if primary_mode == "dance" else N_LANES
         floor_spread = _FLOOR_SPREAD_BY_MODE.get(primary_mode, 0.50)
-        self._cam = PerspectiveCamera(
+        cam_kwargs: dict = dict(n_lanes=n_lanes_mode,
+                                floor_spread_frac=floor_spread)
+        if self._floor_hit_frac is not None:
+            cam_kwargs["hit_zone_frac"] = self._floor_hit_frac
+        if self._horizon_frac is not None:
+            cam_kwargs["horizon_frac"] = self._horizon_frac
+        if self._floor_spread_frac is not None:
+            cam_kwargs["floor_spread_frac"] = self._floor_spread_frac
+        if self._far_spread_frac is not None:
+            cam_kwargs["far_spread_frac"] = self._far_spread_frac
+        if self._wall_floor_gap_frac is not None:
+            cam_kwargs["wall_floor_gap_frac"] = self._wall_floor_gap_frac
+        self._cam = PerspectiveCamera(self._width, self._height, **cam_kwargs)
+
+        # ModernGL GPU renderer for PunchTarget — deferred to first render_at()
+        # because OpenGL contexts have thread affinity on Windows: _build_scene
+        # runs in a background QThread but render_at is called from the main thread.
+        if not hasattr(self, '_mgl_renderer'):
+            self._mgl_renderer = None
+        self._mgl_ready = False
+        self._background_layer = SegmentBackgroundLayer(
             self._width,
             self._height,
-            n_lanes=n_lanes_mode,
-            floor_spread_frac=floor_spread,
+            bg_type=self._background_type,
+            color=self._background_color,
+            image_path=self._background_image,
+            video_path=self._background_video,
+            fps=float(self._fps),
         )
+        self._start_gate = None
+        if self._start_gate_enabled:
+            self._start_gate = StartGate(
+                cam=self._cam,
+                view_w=self._width,
+                view_h=self._height,
+                gate_type=self._start_gate_type,
+                color=self._start_gate_color,
+                border_color=self._start_gate_border_color,
+                border_thickness=self._start_gate_border_thickness,
+                image_path=self._start_gate_image,
+                video_path=self._start_gate_video,
+                rail_height=self._rail_height,
+                rail_offset_x=self._rail_offset_x,
+                gate_height=self._start_gate_h,
+                fps=float(self._fps),
+            )
         # Tunnel + decorative HUDs.  ``show_floor_panels`` is sourced
         # from the segment's render setting (default True) and is
         # hot-toggleable through :meth:`update_mode` so the user can
@@ -530,7 +1319,21 @@ class LiveFrameRenderer:
             self._cam,
             show_floor_panels=self._show_floor_panels,
             lane_tiles=True,
+            floor_panel_color=self._floor_panel_color,
+            floor_panel_opacity=self._floor_panel_opacity,
+            floor_panel_blink=self._floor_panel_blink,
+            floor_panel_image=self._floor_panel_image,
+            floor_full_static_image=self._floor_full_static_image,
+            floor_layout=self._floor_layout,
+                                   floor_bg_color=self._floor_bg_color,
+                                   floor_bg_opacity=self._floor_bg_opacity,
+            chevron_color=self._chevron_color,
+            chevron_scroll=self._chevron_scroll,
+            chevron_blink=self._chevron_blink,
+            chevron_width_frac=self._chevron_width_frac,
+            chevron_count=self._chevron_count,
         )
+        self._side_rail = self._build_side_rail()
         self._particles = ParticleSystem()
         # Stickman action selection: combo runs use a dedicated
         # cross-mode pose library; solo runs match their mode's library
@@ -553,11 +1356,55 @@ class LiveFrameRenderer:
             )
         else:
             self._stick = None
-        self._combo = ComboHUD(self._cam)
+        self._combo = ComboHUD(
+            self._cam,
+            enabled=self._combo_enabled,
+            color=self._combo_color,
+            label=self._combo_label,
+            font_family=self._combo_font_family,
+            fade_after_break_sec=self._combo_fade_after_break_sec,
+            anim=self._combo_anim,
+            bbox=(self._combo_x, self._combo_y, self._combo_w, self._combo_h),
+            border_thickness=self._combo_border_thickness,
+            glow_strength=self._combo_glow_strength,
+            tier1_threshold=self._combo_tier1_threshold,
+            tier1_label=self._combo_tier1_label,
+            tier2_threshold=self._combo_tier2_threshold,
+            tier2_label=self._combo_tier2_label,
+            tier3_threshold=self._combo_tier3_threshold,
+            tier3_label=self._combo_tier3_label,
+            tier4_threshold=self._combo_tier4_threshold,
+            tier4_label=self._combo_tier4_label,
+            tier1_color=self._combo_tier1_color,
+            tier2_color=self._combo_tier2_color,
+            tier3_color=self._combo_tier3_color,
+            tier4_color=self._combo_tier4_color,
+            number_font_scale=self._combo_number_font_scale,
+            label_font_scale=self._combo_label_font_scale,
+            tier_font_scale=self._combo_tier_font_scale,
+            fps=float(self._fps),
+        )
+        self._countdown_hud = None
+        if self._relax_countdown_enabled:
+            self._countdown_hud = CountdownHUD(
+                self._cam,
+                color=self._relax_countdown_color,
+                max_show_sec=self._relax_countdown_max_sec,
+                anim=self._relax_countdown_anim,
+                box=(
+                    self._relax_countdown_x,
+                    self._relax_countdown_y,
+                    self._relax_countdown_w,
+                    self._relax_countdown_h,
+                ),
+                border_thickness=self._relax_countdown_border_thickness,
+                glow_strength=self._relax_countdown_glow_strength,
+            )
         self._viewport = ViewportFrame(
             self._cam,
             neon_color=self._panel_neon_color,
             mode=primary_mode,
+            panel_depth=self._viewport_panel_depth,
         )
 
         # Beat frames (post-density on array source: density disabled).
@@ -581,6 +1428,8 @@ class LiveFrameRenderer:
                                        * relax_slow_mult)))
         else:
             travel = max(8, abs(_rhy.TARGET_TRAVEL_FRAMES))
+        if solo_relax and self._relax_travel_sec > 0.0:
+            travel = max(8, int(round(self._relax_travel_sec * float(self._fps))))
         self._travel = travel
         # Per-lane visual spacing guard — same formula as process_video.
         if len(self._beat_frames) >= 2:
@@ -597,6 +1446,26 @@ class LiveFrameRenderer:
         # with all the cubes / walls / line-chains / dance tiles that
         # the per-frame compose will then animate frame-by-frame.
         self._game = GameManager(self._cam, travel=travel)
+        self._game.RELAX_WAIT_FRAMES = max(
+            0, int(round(self._relax_wait_sec * float(self._fps)))
+        )
+        self._game.RELAX_KIND_RATIO_MIDDLE = float(
+            np.clip(self._relax_kind_ratio_middle, 0.0, 1.0)
+        )
+        self._game.RELAX_TEXTURE_LOW = self._relax_texture_low
+        self._game.RELAX_TEXTURE_HIGH = self._relax_texture_high
+        self._game.RELAX_TEXTURE_MIDDLE = self._relax_texture_middle
+        self._game.RELAX_HOLE_MASK_PATH = self._relax_hole_mask_path
+        self._game.GATE_RAIL_OFFSET_X = float(self._rail_offset_x)
+        self._game.GATE_HEIGHT = float(self._start_gate_h)
+        enabled_kinds: list[str] = []
+        if self._relax_show_low:
+            enabled_kinds.append("low")
+        if self._relax_show_high:
+            enabled_kinds.append("high")
+        if self._relax_show_middle:
+            enabled_kinds.append("middle")
+        self._game.RELAX_ENABLED_KINDS = tuple(enabled_kinds or ["low", "high", "middle"])
         self._game.pre_schedule(
             self._beat_frames,
             self._audio.bass_arr,
@@ -645,6 +1514,8 @@ class LiveFrameRenderer:
                 kind = "W"
                 lean_scale = 1.0
             elif isinstance(tg, RelaxTarget):
+                if tg.kind == "middle":
+                    continue
                 kind = "JP" if tg.kind == "low" else "SQ"
                 lean_scale = 1.0
                 t_hit = tg.dodge_frame / self._fps
@@ -747,9 +1618,11 @@ class LiveFrameRenderer:
                         0.0, LineTarget.HORIZONTAL_WY,
                         cam.Z_NEAR + 0.01,
                     )
-                    y = int(proj[1]) if proj else int(cam.air_y(0.02, 0.55))
+                    y = int(proj[1]) if proj else int(cam.cy_pix)
                 else:
-                    y = int(cam.air_y(0.02, 0.55))
+                    # PunchTarget blocks fly at camera level (wy=0); burst
+                    # at horizon = block actual screen position.
+                    y = int(cam.cy_pix)
                 count = 50
                 self._viewport.trigger(1.0)
             elif isinstance(tg, DanceTarget):
@@ -769,8 +1642,21 @@ class LiveFrameRenderer:
 
     def _blank_frame(self) -> np.ndarray:
         """Return a flat ``CLR_BG`` frame.  Used when audio is empty."""
+        if getattr(self, "_background_layer", None) is not None:
+            return self._background_layer.frame(0)
         return np.full((self._height, self._width, 3),
                        CLR_BG, dtype=np.uint8)
+
+    def _init_mgl(self) -> None:
+        """Lazily init ModernGL on first render (must run on the GL thread)."""
+        self._mgl_ready = True
+        if self._mgl_renderer is None:
+            try:
+                from mgl_renderer import MGLPunchRenderer
+                self._mgl_renderer = MGLPunchRenderer.get()
+            except Exception:
+                self._mgl_renderer = None
+        self._vp_matrix = self._cam.view_proj_matrix() if self._mgl_renderer else None
 
     def _compose_frame(self, fi: int) -> np.ndarray:
         """Render one frame at index ``fi``.
@@ -788,13 +1674,88 @@ class LiveFrameRenderer:
         # Hits emitted from the most recent ``update`` are stored on
         # the GameManager's ``_pending_hits``; we re-resolve them here
         # so particle bursts spawn at the right pixel position.
-        canvas = np.full((self._height, self._width, 3),
-                         CLR_BG, dtype=np.uint8)
+        if getattr(self, "_background_layer", None) is not None:
+            canvas = self._background_layer.frame(fi)
+        else:
+            canvas = np.full((self._height, self._width, 3),
+                             CLR_BG, dtype=np.uint8)
+        if getattr(self, "_start_gate", None) is not None:
+            self._start_gate.draw(canvas, fi)
         # 1. tunnel walls + floor grid
         canvas = self._tunnel.draw(canvas, fi)
+        # 1b. side rails
+        if self._side_rail is not None:
+            _bass = float(self._audio.bass_arr[fi]) if fi < len(self._audio.bass_arr) else 0.0
+            self._side_rail.draw(canvas, fi, bass_val=_bass, hit=self._hit_this_frame)
         # 2. targets (back to front so close cubes occlude far ones)
-        for tg in self._game.alive_sorted(fi):
-            canvas = tg.draw(canvas, self._cam, fi)
+        # Use ModernGL GPU path for PunchTarget when available.
+        if not self._mgl_ready:
+            self._init_mgl()
+        if self._mgl_renderer is not None:
+            from mgl_renderer import PunchBlockInstance, composite_alpha_with_halo
+            _punch_insts = []
+            _lane_step = abs(self._cam.lane_world_x(1) - self._cam.lane_world_x(0)) if self._cam.n_lanes > 1 else 0.5
+            _tile_hw = _lane_step * 0.80 * 0.5
+            _ratio_DW = PunchTarget.BLOCK_HALF_D / PunchTarget.BLOCK_HALF_W if PunchTarget.BLOCK_HALF_W > 0 else 1.0
+            _yaw_factor = 0.5
+            _max_yaw = max(
+                abs(_math_atan2(self._cam.lane_world_x(_l), abs(self._cam.FLOOR_WORLD_Y)) * _yaw_factor)
+                for _l in range(self._cam.n_lanes)
+            )
+            _shrink = 1.0 / (abs(_math_cos(_max_yaw)) + _ratio_DW * abs(_math_sin(_max_yaw)))
+            _block_hw = _tile_hw * _shrink
+            _block_hh = _block_hw * (PunchTarget.BLOCK_HALF_H / PunchTarget.BLOCK_HALF_W) if PunchTarget.BLOCK_HALF_W > 0 else _block_hw
+            _block_hd = _block_hw * _ratio_DW
+            _wy_const = 0.0  # camera eye level → no top/bottom face visible
+            for tg in self._game.alive_sorted(fi):
+                # LineTarget inherits PunchTarget but renders a chain of
+                # cubes via its own draw() — must NOT be batched into the
+                # single-cube GPU path or the chain disappears and the
+                # head reads as a plain punch block.
+                if (isinstance(tg, PunchTarget)
+                        and not isinstance(tg, LineTarget)
+                        and tg.state == 'flying'):
+                    if (PunchTarget.MESH_LEFT is not None or
+                            PunchTarget.MESH_RIGHT is not None or
+                            PunchTarget.TEXTURE_LEFT is not None or
+                            PunchTarget.TEXTURE_RIGHT is not None):
+                        continue
+                    _zn = tg.depth(fi)
+                    if _zn <= 0.0:
+                        continue
+                    _wz = tg.Z_VIS_NEAR + _zn * (tg.Z_VIS_FAR - tg.Z_VIS_NEAR)
+                    _wx = self._cam.lane_world_x(tg.lane)
+                    _wy = _wy_const
+                    _yaw = _math_atan2(_wx, abs(self._cam.FLOOR_WORLD_Y)) * _yaw_factor
+                    b, g, r = tg.color
+                    _punch_insts.append(PunchBlockInstance(
+                        position=(_wx, _wy, _wz),
+                        scale=(_block_hw, _block_hh, _block_hd),
+                        color=(r / 255.0, g / 255.0, b / 255.0),
+                        z_norm=_zn,
+                        yaw=_yaw,
+                    ))
+            if _punch_insts:
+                _gl_bgr, _gl_alpha = self._mgl_renderer.render(
+                    _punch_insts, self._vp_matrix,
+                    (0.0, 0.0, 0.0), self._width, self._height)
+                canvas = composite_alpha_with_halo(canvas, _gl_bgr, _gl_alpha)
+            for tg in self._game.alive_sorted(fi):
+                # Skip plain PunchTarget that was already drawn via the GPU
+                # path above.  LineTarget falls through to its own CPU
+                # draw() (chain rendering); MESH/TEXTURE-overridden punch
+                # also falls through (GPU path skipped them above).
+                if (isinstance(tg, PunchTarget)
+                        and not isinstance(tg, LineTarget)):
+                    if (PunchTarget.MESH_LEFT is None and
+                            PunchTarget.MESH_RIGHT is None and
+                            PunchTarget.TEXTURE_LEFT is None and
+                            PunchTarget.TEXTURE_RIGHT is None):
+                        continue
+                canvas = tg.draw(canvas, self._cam, fi)
+        else:
+            for tg in self._game.alive_sorted(fi):
+                canvas = tg.draw(canvas, self._cam, fi)
         # 3. particle update + draw.  Bursts for hits at this frame
         # were already triggered inside ``render_at``'s fast-forward
         # loop (see ``_apply_hits``); here we only DRAW the current
@@ -808,8 +1769,11 @@ class LiveFrameRenderer:
         # jump / squat dodge.  Same logic as process_video.
         if "relax" in self._modes_seq:
             bob_dy = _relax_camera_dy(self._game.targets, fi, self._height)
-            if bob_dy != 0:
-                M = np.float32([[1, 0, 0], [0, 1, bob_dy]])
+            shake_dx, shake_dy = _relax_middle_shake_offset(
+                self._game.targets, fi, self._width, self._height)
+            if bob_dy != 0 or shake_dx != 0 or shake_dy != 0:
+                M = np.float32([[1, 0, shake_dx],
+                                [0, 1, bob_dy + shake_dy]])
                 canvas = cv2.warpAffine(
                     canvas, M, (self._width, self._height),
                     borderValue=(0, 0, 0),
@@ -820,4 +1784,6 @@ class LiveFrameRenderer:
         if self._stick is not None:
             self._stick.draw(canvas, fi)
         self._combo.draw(canvas, fi)
+        if self._countdown_hud is not None and "relax" in self._modes_seq:
+            self._countdown_hud.draw(canvas, self._game.targets, fi, float(self._fps))
         return canvas

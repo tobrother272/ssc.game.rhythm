@@ -1,0 +1,70 @@
+---
+description: Rule for proportional text/element sizing inside draggable overlay boxes on player preview
+alwaysApply: true
+---
+
+# Overlay Proportional Text Sizing
+
+Bất kỳ layer nào có text/label hiển thị bên trong một **draggable overlay box** trên player preview đều PHẢI tuân thủ quy tắc sizing sau.
+
+## Nguyên tắc cốt lõi
+
+**Font size của mọi element bên trong overlay box phải TỶ LỆ THUẬN với kích thước box.** Khi user kéo thả resize overlay → tất cả text/badge bên trong tự scale theo, KHÔNG cần config font scale riêng.
+
+## Quy tắc layout
+
+1. **Chia zone theo % chiều cao box (`bh`)**: Mỗi element (number, label, badge, ...) được gán một zone chiếm N% của `bh`. Tổng tất cả zones + gaps = 100%.
+
+2. **Font size = f(zone_height)**: Dùng height-primary scaling — tìm font scale sao cho text_height fills target% của zone height. Width chỉ là safety clamp (giảm nếu tràn ngang).
+
+3. **KHÔNG hardcode font scale**: Không dùng giá trị cố định (ví dụ `font_scale=2.0`). Luôn tính từ zone dimensions.
+
+4. **KHÔNG dùng min(width_fit, height_fit)**: Logic sizing phải ưu tiên HEIGHT trước, chỉ clamp width sau. Tránh width constraint chi phối chiều cao.
+
+## Công thức `_auto_text_scale` chuẩn
+
+```python
+def _auto_text_scale(self, text, max_w, max_h, ratio=0.5, font=None):
+    """Height-primary: font fills max_h×ratio, then clamp if width overflows."""
+    target_h = int(max_h * ratio)
+    # Step 1: binary search scale where text_height == target_h
+    lo, hi = 0.1, 20.0
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        th_arg = max(1, int(mid * 2))
+        (_, th), _ = cv2.getTextSize(text, font, mid, th_arg)
+        if th < target_h:
+            lo = mid
+        else:
+            hi = mid
+    fs = lo
+    # Step 2: clamp by width ONLY if overflow
+    th_arg = max(1, int(fs * 2))
+    (tw, _), _ = cv2.getTextSize(text, font, fs, th_arg)
+    if tw > max_w:
+        fs *= (max_w / tw)
+    return max(0.2, fs)
+```
+
+## Quy tắc cho live_renderer
+
+- **KHÔNG clamp `_box_w` / `_box_h`** với giá trị max cứng (ví dụ `min(0.5, w)`). Để `set_bbox` của HUD class tự xử lý boundary (`w = min(1.0 - x, w)`).
+- Overlay kéo thả trên UI hiển thị kích thước nào → render text PHẢI dùng đúng kích thước đó.
+
+## Ví dụ chuẩn (ComboHUD)
+
+```
+Layout: number=35% | gap=5% | label=10% | gap=15% | tier_badge=35%
+- Number: _auto_text_scale(text, max_w, zone_h, ratio=1.0, font=num_font)
+- Label:  _auto_text_scale(text, bw*0.60, zone_h, ratio=0.90, font=lbl_font)
+- Badge:  _auto_text_scale(text, badge_w*0.75, badge_h, ratio=0.65)
+```
+
+## Checklist khi thêm layer mới có overlay text
+
+- [ ] Layout chia zone theo % bh (tổng = 100%)
+- [ ] Mỗi text element dùng `_auto_text_scale` (height-primary)
+- [ ] `_auto_text_scale` nhận đúng `font` param (font thực tế render, không hardcode TRIPLEX)
+- [ ] live_renderer KHÔNG clamp w/h với max cứng
+- [ ] Không có font scale spinbox trên UI (chỉ kéo overlay để resize)
+- [ ] Test: kéo overlay nhỏ → text nhỏ theo; kéo lớn → text lớn theo; tỷ lệ giữa các element giữ nguyên

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from math import floor
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ from PySide6.QtCore import QObject, Signal
 
 from studio.models import Segment, build_settings
 from src.bundle_paths import get_rhythm_command as _get_rhythm_command
+from src.bundle_paths import find_ffprobe as _find_ffprobe
 
 
 @dataclass
@@ -124,6 +126,7 @@ class RenderService(QObject):
         output_fps: Optional[int] = None,
         is_preview: bool = False,
         project_temps_dir: Optional[str] = None,
+        project_layers: Optional[list] = None,
     ) -> RenderJob:
         """Build render job object from segment state.
 
@@ -165,10 +168,35 @@ class RenderService(QObject):
         # the ``--stick_*`` flags would be silently ignored anyway,
         # and we keep the CLI line shorter for the easier-to-read
         # log lines.
+        if project_layers is not None:
+            from studio.models.layer import resolve_segment_config
+            effective_settings = dict(resolve_segment_config(segment, project_layers))
+            # Layer absence = feature off: if no layer of a given kind overlaps
+            # the segment, force that feature off so deleting a layer actually
+            # disables it even when render_settings still has the old value.
+            s_start = segment.start_time_sec
+            s_end = segment.end_time_sec
+            _kind_absent = lambda kind: not any(  # noqa: E731
+                la.kind == kind and la.overlaps(s_start, s_end)
+                for la in project_layers
+            )
+            if _kind_absent("stickman"):
+                effective_settings["stickman"] = False
+            if _kind_absent("floor"):
+                effective_settings["floor_panels"] = False
+            if _kind_absent("side_rails"):
+                effective_settings["side_rails"] = False
+            if _kind_absent("countdown"):
+                effective_settings["relax_countdown_enabled"] = False
+        else:
+            effective_settings = segment.render_settings or {}
+
         stick_loc: dict = {}
-        rs = segment.render_settings or {}
+        rs = effective_settings
         if bool(rs.get("stickman", True)):
-            sl = getattr(segment, "stickman_location", None) or {}
+            # Prefer stickman_location from the effective settings (layer config
+            # merges it in), fall back to segment.stickman_location.
+            sl = rs.get("stickman_location") or getattr(segment, "stickman_location", None) or {}
             try:
                 stick_loc = {
                     "x": float(sl.get("x", 0.010)),
@@ -183,7 +211,7 @@ class RenderService(QObject):
             mode=segment.mode,
             audio_path=segment.audio_path,
             output_path=str(output_path),
-            render_settings=segment.render_settings or {},
+            render_settings=effective_settings,
             start_time_sec=segment.start_time_sec,
             duration_sec=dur,
             is_preview=is_preview,
@@ -310,6 +338,22 @@ class RenderService(QObject):
                             flush=True,
                         )
 
+            # ----------------------------------------------------------------
+            # Duration guard: audio file used for render MUST match segment
+            # duration when rounded to whole seconds. Abort render on mismatch.
+            # ----------------------------------------------------------------
+            if job.duration_sec is not None and job.duration_sec > 0:
+                audio_dur_sec = self._probe_audio_duration_sec(audio_path)
+                expected_sec = int(floor(float(job.duration_sec) + 0.5))
+                actual_sec = int(floor(float(audio_dur_sec) + 0.5))
+                if actual_sec != expected_sec:
+                    raise RuntimeError(
+                        "Render aborted: audio duration does not match segment "
+                        f"duration (rounded seconds). "
+                        f"audio={actual_sec}s (raw={audio_dur_sec:.3f}s), "
+                        f"segment={expected_sec}s (raw={float(job.duration_sec):.3f}s)."
+                    )
+
             # --- Build subprocess command -----------------------------------
             # src.rhythm expects:
             #   -i / --input   <audio/video file>   (required)
@@ -379,7 +423,8 @@ class RenderService(QObject):
                         float(t) for t in job.beat_times if float(t) >= 0.0
                     ]
                 if valid:
-                    times_csv = ",".join(f"{float(t):.6f}" for t in valid)
+                    # Keep beat_times compact and human-readable in logged CMD.
+                    times_csv = ",".join(f"{float(t):.2f}" for t in valid)
                     command.extend([
                         "--beat_source", "array",
                         "--beat_times", times_csv,
@@ -449,10 +494,10 @@ class RenderService(QObject):
             # ----------------------------------------------------------------
             if job.is_preview:
                 command.extend([
-                    "-W", "960",
-                    "-H", "540",
-                    "--fps", "24",
-                    "--bloom", "0",
+                    "-W", "1280",
+                    "-H", "720",
+                    "--fps", "30",
+                    "--bloom", "1",
                 ])
 
             # Log the full command so the user can copy-paste it for
@@ -548,6 +593,45 @@ class RenderService(QObject):
             if temp_audio:
                 Path(temp_audio).unlink(missing_ok=True)
 
+    @staticmethod
+    def _probe_audio_duration_sec(audio_path: str) -> float:
+        """Return media duration (seconds) using ffprobe."""
+        ffprobe = _find_ffprobe()
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            audio_path,
+        ]
+        _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=_creation_flags,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Cannot verify audio duration via ffprobe (rc={result.returncode}): "
+                f"{result.stdout[-400:]}"
+            )
+        out = (result.stdout or "").strip()
+        try:
+            dur = float(out)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Cannot parse audio duration from ffprobe output: {out!r}"
+            ) from exc
+        if dur <= 0:
+            raise RuntimeError(
+                f"Invalid audio duration from ffprobe: {dur:.6f}s"
+            )
+        return dur
+
     # Matches "Progress: 30%" prints from src.rhythm.RhythmVisualizer
     # .process_video (emitted at every 10% boundary).
     _PROGRESS_RE = re.compile(r"Progress:\s*(\d{1,3})\s*%")
@@ -562,6 +646,15 @@ class RenderService(QObject):
     _INT_KEYS = frozenset({
         "beat_min_gap",
         "max_per_lane",
+        "chevron_count",
+        "rail_chevron_density",
+        "rail_pillar_count",
+        "rail_pillar_highlight_count",
+        "rail_chase_speed_frames",
+        "rail_dot_count",
+        "rail_dot_lines",
+        "rail_dot_size_px",
+        "use_moderngl",
     })
 
     # Only the fields that are visible in the UI are forwarded to rhythm.py.
@@ -577,9 +670,126 @@ class RenderService(QObject):
         "density",
         "speed",
         "max_per_lane",
+        "use_moderngl",
         "floor_panels",
+        "floor_panel_color",
+        "floor_panel_opacity",
+        "floor_panel_blink",
+        "floor_panel_image",
+        "floor_full_static_image",
         "stickman",
         "line_zigzag",
+        "side_rails",
+        "rail_color",
+        "rail_shape",
+        "rail_height",
+        "rail_offset_x",
+        "rail_image",
+        "rail_texture_non_loop",
+        "rail_pulse",
+        "rail_pulse_intensity",
+        "rail_pillar_count",
+        "rail_pillar_highlight_count",
+        "rail_chase_mode",
+        "rail_pillar_radius",
+        "rail_chase_speed_frames",
+        "rail_dot_count",
+        "rail_dot_lines",
+        "rail_dot_size_px",
+        "rail_dot_anim_mode",
+        "rail_dot_color_near",
+        "rail_dot_color_far",
+        "floor_hit_frac",
+        "horizon_frac",
+        "floor_spread_frac",
+        "far_spread_frac",
+        "wall_floor_gap_frac",
+        "floor_layout",
+        "floor_bg_color",
+        "floor_bg_opacity",
+        "background_type",
+        "background_color",
+        "background_image",
+        "background_video",
+        "chevron_color",
+        "chevron_scroll",
+        "chevron_blink",
+        "chevron_width_frac",
+        "viewport_panel_depth",
+        "chevron_count",
+        "rail_chevron_depth",
+        "rail_chevron_density",
+        "relax_interval",
+        "relax_travel_sec",
+        "relax_wait_sec",
+        "relax_texture_low",
+        "relax_texture_high",
+        "relax_texture_middle",
+        "relax_hole_mask_path",
+        "relax_kind_ratio_middle",
+        "relax_show_low",
+        "relax_show_high",
+        "relax_show_middle",
+        "relax_countdown_enabled",
+        "relax_countdown_color",
+        "relax_countdown_max_sec",
+        "relax_countdown_anim",
+        "relax_countdown_audio_enabled",
+        "relax_countdown_audio_mode",
+        "relax_countdown_audio_file",
+        "relax_countdown_audio_volume",
+        "relax_countdown_audio_last_mode",
+        "relax_countdown_audio_last_file",
+        "relax_countdown_x",
+        "relax_countdown_y",
+        "relax_countdown_w",
+        "relax_countdown_h",
+        "relax_countdown_border_thickness",
+        "relax_countdown_glow_strength",
+        "start_gate_enabled",
+        "start_gate_type",
+        "start_gate_color",
+        "start_gate_border_color",
+        "start_gate_border_thickness",
+        "start_gate_image",
+        "start_gate_video",
+        "start_gate_x",
+        "start_gate_y",
+        "start_gate_w",
+        "start_gate_h",
+        "combo_enabled",
+        "combo_color",
+        "combo_label",
+        "combo_font_family",
+        "combo_fade_after_break_sec",
+        "combo_anim",
+        "combo_audio_enabled",
+        "combo_audio_mode",
+        "combo_audio_file",
+        "combo_audio_volume",
+        "combo_audio_milestone_mode",
+        "combo_audio_milestone_file",
+        "combo_x",
+        "combo_y",
+        "combo_w",
+        "combo_h",
+        "combo_border_thickness",
+        "combo_glow_strength",
+        "combo_tier1_threshold",
+        "combo_tier1_label",
+        "combo_tier2_threshold",
+        "combo_tier2_label",
+        "combo_tier3_threshold",
+        "combo_tier3_label",
+        "combo_tier4_threshold",
+        "combo_tier4_label",
+        "combo_tier1_color",
+        "combo_tier2_color",
+        "combo_tier3_color",
+        "combo_tier4_color",
+        "combo_number_font_scale",
+        "combo_label_font_scale",
+        "combo_tier_font_scale",
     })
 
     # CLI flags that don't exist in src/rhythm.py argparse (defensive — any
@@ -589,15 +799,40 @@ class RenderService(QObject):
     @classmethod
     def _settings_to_args(cls, settings: dict) -> list[str]:
         args: list[str] = []
+        rail_shape = str(settings.get("rail_shape", "") or "").lower()
+        rail_image = str(settings.get("rail_image", "") or "").strip()
         for key, value in settings.items():
             if key in cls._SKIP_KEYS:
                 continue
             if key not in cls._ALLOWED_KEYS:
                 continue
+            # Dot/Pillar rails do not use texture path: avoid passing stale
+            # --rail_image from previous shapes to keep command clean.
+            if key == "rail_image" and rail_shape in {"pillar", "dot"}:
+                continue
+            if key == "rail_texture_non_loop" and rail_shape != "tube":
+                continue
+            if key == "rail_texture_non_loop" and not rail_image:
+                continue
             # Skip Optional fields explicitly set to None — the CLI flag
             # is omitted so rhythm.py falls back to its own default (e.g.
             # line_zigzag=None means "Off", i.e. no zigzag pattern).
             if value is None:
+                continue
+            if key == "rail_image" and not str(value).strip():
+                continue
+            if key in {
+                "relax_texture_low",
+                "relax_texture_high",
+                "relax_texture_middle",
+                "relax_hole_mask_path",
+                "relax_countdown_audio_file",
+                "relax_countdown_audio_last_file",
+                "start_gate_image",
+                "start_gate_video",
+            } and not str(value).strip():
+                continue
+            if key in {"background_image", "background_video"} and not str(value).strip():
                 continue
             cli_key = f"--{key}"
 

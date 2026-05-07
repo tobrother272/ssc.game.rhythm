@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import sys
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from PySide6.QtCore import QSettings, QThread, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSettings, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStatusBar,
@@ -36,11 +40,13 @@ from studio.core_bridge import (
     WaveformService,
 )
 from studio.editor.export_dialog import ExportDialog
+from studio.editor.worker_update_dialog import WorkerUpdateDialog
 from studio.editor.media_library import MediaLibraryPanel
 from studio.editor.preview_panel import PreviewPanel
-from studio.editor.segment_config_panel import SegmentConfigPanel
+from studio.editor.inspector_panel import InspectorPanel
+from studio.editor.segment_config_panel import SegmentConfigPanel  # kept for type hints
 from studio.editor.timeline_panel import TimelinePanel
-from studio.models import Project, RenderStatus, Segment, build_settings
+from studio.models import Layer, Project, RenderStatus, Segment, build_settings
 from studio.persistence import ProjectStore
 
 # Live preview is delivered by an in-process renderer (see
@@ -164,6 +170,12 @@ class MainWindow(QMainWindow):
         # would cause Windows file-lock failures, so we keep them
         # serialised through this guard.
         self._inflight_trim_segments: set[str] = set()
+        # Per-segment signature of the last trim request we issued.  Tuples of
+        # ``(audio_path, round(start_sec, 3), round(end_sec, 3))`` — re-trim
+        # only when this signature actually changes so render-settings edits
+        # (toggling side rails, picking a colour, …) never overwrite a trim
+        # file that the live-preview QMediaPlayer is currently reading.
+        self._last_trim_signature: dict[str, tuple] = {}
         # Track which audio path is currently displayed to avoid redundant requests.
         self._current_waveform_path: Optional[str] = None
         # ── Export dialog (kept alive while open so user can monitor progress)
@@ -238,7 +250,7 @@ class MainWindow(QMainWindow):
 
         self.media_panel = MediaLibraryPanel(self.thumbnail_service)
         self.preview_panel = PreviewPanel()
-        self.segment_panel = SegmentConfigPanel()
+        self.segment_panel = InspectorPanel()   # replaces SegmentConfigPanel
         self.timeline_panel = TimelinePanel()
 
         self.top_splitter.addWidget(self.media_panel)
@@ -255,6 +267,89 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.outer_splitter)
         self.setCentralWidget(container)
+        # Share the timeline undo stack with the inspector panel so that
+        # layer edit sessions push onto the same stack as timeline operations.
+        self.segment_panel.set_undo_stack(self.timeline_panel.undo_stack)
+        self._init_timeline_render_overlay()
+
+    def _init_timeline_render_overlay(self) -> None:
+        """Create a blocking overlay shown on top of the timeline while rendering."""
+        self._timeline_render_overlay = QFrame(self.timeline_panel)
+        self._timeline_render_overlay.setObjectName("timelineRenderOverlay")
+        self._timeline_render_overlay.setStyleSheet(
+            "#timelineRenderOverlay {"
+            " background-color: rgba(8, 8, 12, 190);"
+            " border: 1px solid rgba(255, 255, 255, 45);"
+            " border-radius: 6px;"
+            "}"
+        )
+        box = QVBoxLayout(self._timeline_render_overlay)
+        box.setContentsMargins(24, 16, 24, 16)
+        box.setSpacing(8)
+        box.addStretch(1)
+
+        self._timeline_render_title = QLabel("Rendering…")
+        self._timeline_render_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._timeline_render_title.setStyleSheet(
+            "color: #F4F6FF; font-size: 16px; font-weight: 700;"
+        )
+        box.addWidget(self._timeline_render_title)
+
+        self._timeline_render_message = QLabel("Please wait until current segment finishes.")
+        self._timeline_render_message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._timeline_render_message.setStyleSheet(
+            "color: #D6DBF5; font-size: 12px;"
+        )
+        box.addWidget(self._timeline_render_message)
+
+        self._timeline_render_progress = QProgressBar()
+        self._timeline_render_progress.setRange(0, 100)
+        self._timeline_render_progress.setValue(0)
+        self._timeline_render_progress.setFormat("%p%")
+        self._timeline_render_progress.setTextVisible(True)
+        self._timeline_render_progress.setFixedHeight(18)
+        box.addWidget(self._timeline_render_progress)
+        box.addStretch(2)
+
+        self._timeline_render_overlay.hide()
+        self.timeline_panel.installEventFilter(self)
+        self._resize_timeline_render_overlay()
+
+    def _resize_timeline_render_overlay(self) -> None:
+        if not hasattr(self, "_timeline_render_overlay"):
+            return
+        margin = 10
+        rect = self.timeline_panel.rect().adjusted(margin, margin, -margin, -margin)
+        self._timeline_render_overlay.setGeometry(rect)
+
+    def _set_timeline_render_overlay(
+        self,
+        *,
+        visible: bool,
+        title: str = "Rendering…",
+        message: str = "Please wait until current segment finishes.",
+        progress: Optional[int] = None,
+    ) -> None:
+        if not hasattr(self, "_timeline_render_overlay"):
+            return
+        self._timeline_render_title.setText(title)
+        self._timeline_render_message.setText(message)
+        if progress is not None:
+            self._timeline_render_progress.setValue(max(0, min(100, int(progress))))
+        if visible:
+            self._resize_timeline_render_overlay()
+            self._timeline_render_overlay.raise_()
+            self._timeline_render_overlay.show()
+        else:
+            self._timeline_render_overlay.hide()
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self.timeline_panel and event.type() in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+        }:
+            self._resize_timeline_render_overlay()
+        return super().eventFilter(watched, event)
 
     def _build_menu(self) -> None:
         menu = self.menuBar()
@@ -275,11 +370,19 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Exit", self.close)
 
         render_menu = menu.addMenu("Render")
-        render_menu.addAction("Render Selected Segment", self._render_selected_segment)
-        render_menu.addAction("Render All", self._render_all_segments)
+        self._act_render_selected = render_menu.addAction(
+            "Render Selected Segment", self._render_selected_segment
+        )
+        self._act_render_all = render_menu.addAction(
+            "Render All", self._render_all_segments
+        )
 
         menu.addMenu("Edit")
-        menu.addMenu("Help")
+
+        help_menu = menu.addMenu("Help")
+        help_menu.addAction("Update Engine…", self._on_update_engine_clicked)
+        help_menu.addSeparator()
+        help_menu.addAction("Update Worker…", self._on_update_worker_clicked)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
@@ -291,8 +394,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction("Save", self._on_save_project)
         toolbar.addAction("Save As", self._on_save_as_project)
         toolbar.addSeparator()
-        toolbar.addAction("Render Selected", self._render_selected_segment)
-        toolbar.addAction("Render All", self._render_all_segments)
+        self._tb_act_render_selected = toolbar.addAction(
+            "Render Selected", self._render_selected_segment
+        )
+        self._tb_act_render_all = toolbar.addAction(
+            "Render All", self._render_all_segments
+        )
 
         # Right-side spacer + Export accent button
         spacer = QWidget()
@@ -315,6 +422,15 @@ class MainWindow(QMainWindow):
         self.media_panel.media_selected.connect(self.preview_panel.set_source_media)
         self.media_panel.project_changed.connect(self._on_project_changed)
         self.timeline_panel.create_segment_requested.connect(self._on_create_segment_requested)
+        self.timeline_panel.background_media_dropped.connect(
+            self._on_background_media_dropped
+        )
+        self.timeline_panel.floor_media_dropped.connect(
+            self._on_floor_media_dropped
+        )
+        self.timeline_panel.start_gate_media_dropped.connect(
+            self._on_start_gate_media_dropped
+        )
         self.timeline_panel.segment_selected.connect(self._on_segment_selected)
         self.timeline_panel.segment_changed.connect(self._on_segment_changed_by_timeline)
         self.timeline_panel.playhead_seek_requested.connect(
@@ -338,6 +454,14 @@ class MainWindow(QMainWindow):
             self._on_segment_duplicated
         )
         self.timeline_panel.segment_moved.connect(self._on_segment_moved)
+        self.timeline_panel.layer_changed.connect(self._on_layer_changed)
+        self.timeline_panel.layer_status_message.connect(
+            self._on_timeline_layer_status_message
+        )
+        # Inspector selection signals (polymorphic panel)
+        self.timeline_panel.layer_selected.connect(self._on_layer_selected)
+        self.timeline_panel.selection_cleared.connect(self._on_selection_cleared)
+        self.segment_panel.layer_changed.connect(self._on_inspector_layer_changed)
 
         # Undo / redo — delegate to the timeline panel's undo stack.
         undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
@@ -347,6 +471,17 @@ class MainWindow(QMainWindow):
         self.preview_panel.playhead_changed.connect(self.timeline_panel.set_playhead)
         self.preview_panel.stickman_location_changed.connect(
             self._on_stickman_location_edited
+        )
+        self.preview_panel.floor_wall_committed.connect(
+            self._on_floor_wall_committed
+        )
+        self.preview_panel.segment_auto_advanced.connect(
+            self._on_preview_segment_auto_advanced,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.preview_panel.segment_seek_requested.connect(
+            self._on_preview_segment_seek_requested,
+            Qt.ConnectionType.QueuedConnection,
         )
         # The panel may auto-stop live-preview when its source is
         # forcibly replaced (e.g. user clicked another segment) — keep
@@ -375,9 +510,34 @@ class MainWindow(QMainWindow):
         if getattr(self, "_preview_mode_active", False):
             self._stop_preview_mode()
         self.project = project
+        # Reset trim cache when swapping projects so signatures from the
+        # previous project don't suppress legitimate trims in the new one.
+        self._last_trim_signature.clear()
+        self._inflight_trim_segments.clear()
+        # Pre-populate cache for segments that already have a trim on disk
+        # so a no-op form edit right after open doesn't re-trim.
+        for seg in project.segments:
+            if (
+                seg.audio_path
+                and seg.trimmed_audio_path
+                and Path(seg.trimmed_audio_path).exists()
+                and seg.duration_sec > 0
+            ):
+                start = self._audio_offset(seg)
+                end = start + (
+                    seg.audio_duration_sec
+                    if seg.audio_duration_sec > 0
+                    else seg.duration_sec
+                )
+                self._last_trim_signature[seg.id] = (
+                    str(seg.audio_path),
+                    round(float(start), 3),
+                    round(float(end), 3),
+                )
         self.media_panel.set_project(project)
         self.timeline_panel.set_project(project)
         self.timeline_panel.clear_beat_events()
+        self.preview_panel.set_project_layers(project.layers)
         # Re-paint the timeline strip from each segment's persisted
         # ``beat_events`` so the user sees the same ticks they last
         # generated, immediately after opening the project — no need
@@ -389,7 +549,8 @@ class MainWindow(QMainWindow):
                     seg.id, list(seg.beat_events)
                 )
         self.segment_panel.set_project(project)
-        self.segment_panel.set_segment(None)
+        self.segment_panel.set_segment(None)  # clears to KIND_NONE
+        self.preview_panel.set_project_segments(project.segments)
         self._current_waveform_path = None
         # Restore waveform from the first audio MediaItem with cached data.
         # Prefer RMS (matches game render); fall back to nothing — old peak
@@ -631,8 +792,70 @@ class MainWindow(QMainWindow):
 
     def _on_project_changed(self) -> None:
         self.project.updated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        self.preview_panel.set_project_segments(self.project.segments)
+        # Keep PreviewPanel's layer reference fresh even when project.layers
+        # is reassigned to a brand-new list (undo/redo/delete paths).
+        self.preview_panel.set_project_layers(self.project.layers)
         self.timeline_panel.refresh()
         self._update_status()
+
+    def _on_preview_segment_auto_advanced(self, next_segment_id: str) -> None:
+        """Handle panel auto-advance feedback (selection/playhead/status)."""
+        if not next_segment_id:
+            self.statusBar().showMessage("End of timeline", 2000)
+            return
+        seg = self.project.get_segment(next_segment_id)
+        if seg is None:
+            self.statusBar().showMessage("End of timeline", 2000)
+            return
+
+        self.segment_panel.set_segment(seg)
+        if seg.audio_path:
+            self._request_waveform_for(seg.audio_path)
+        elif not seg.audio_path:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
+        start = float(seg.start_time_sec or 0.0)
+        self.timeline_panel.set_playhead(start)
+
+        ordered = self.project.sorted_segments()
+        idx = next((i for i, s in enumerate(ordered) if s.id == seg.id), -1)
+        if idx >= 0:
+            self.statusBar().showMessage(
+                f"Playing segment {idx + 1}/{len(ordered)}: {seg.name}",
+                2000,
+            )
+        else:
+            self.statusBar().showMessage(f"Playing: {seg.name}", 2000)
+
+        # Keep live-preview mode running across segment boundaries.
+        if self._preview_mode_active and self._preview_active_segment_id != seg.id:
+            self._on_preview_segment_requested(seg.id)
+
+    def _on_preview_segment_seek_requested(
+        self,
+        segment_id: str,
+        project_time_sec: float,
+    ) -> None:
+        """Cross-segment seek in full-preview mode while live-preview is active."""
+        seg = self.project.get_segment(segment_id)
+        if seg is None:
+            return
+        self.segment_panel.set_segment(seg)
+        if seg.audio_path:
+            self._request_waveform_for(seg.audio_path)
+        elif not seg.audio_path:
+            self._current_waveform_path = None
+            self.timeline_panel.clear_waveform()
+        t = max(0.0, float(project_time_sec))
+        self.timeline_panel.set_playhead(t)
+        # Rebuild preview against the segment at seek target; keep paused
+        # (user must press Play again after seek).
+        self._on_preview_segment_requested(
+            seg.id,
+            start_project_sec=t,
+            auto_play=False,
+        )
 
     def _request_waveform_for(self, audio_path: Optional[str]) -> None:
         """Show waveform for ``audio_path`` (cached MediaItem RMS when available).
@@ -760,6 +983,42 @@ class MainWindow(QMainWindow):
             if segment.audio_duration_sec > 0
             else segment.duration_sec
         )
+        # Skip when the audio window for this segment hasn't changed since
+        # the last successful trim AND the trimmed file still exists on
+        # disk.  Render-settings edits (side rails, colours, …) emit
+        # ``segment_changed`` but do not affect the audio window — re-running
+        # ffmpeg here would race with the QMediaPlayer that is reading the
+        # same trim file during live preview and could leave a corrupted
+        # file on disk (or silently skip on Windows because of the file
+        # lock).  Cache invalidates automatically when start/end/source
+        # changes, so a real audio-window edit still re-trims.
+        sig = (
+            str(segment.audio_path),
+            round(float(audio_start), 3),
+            round(float(audio_end), 3),
+        )
+        cached_sig = self._last_trim_signature.get(segment.id)
+        trim_exists = bool(
+            segment.trimmed_audio_path
+            and Path(segment.trimmed_audio_path).exists()
+        )
+        if cached_sig == sig and trim_exists and segment.id not in self._inflight_trim_segments:
+            return
+        # Real audio-window change while live preview is reading the trim
+        # file — drop preview first so QMediaPlayer releases the file
+        # handle (Windows) before ffmpeg overwrites it.  The user can
+        # re-toggle Preview once the new trim lands.
+        if (
+            self._preview_mode_active
+            and self._preview_active_segment_id == segment.id
+        ):
+            self._stop_preview_mode()
+            self.statusBar().showMessage(
+                "Preview stopped — segment audio window changed; "
+                "click Preview again once retrim finishes.",
+                4000,
+            )
+        self._last_trim_signature[segment.id] = sig
         self._inflight_trim_segments.add(segment.id)
         self.audio_trim_service.trim(
             segment_id=segment.id,
@@ -800,6 +1059,9 @@ class MainWindow(QMainWindow):
 
     def _on_trim_failed(self, segment_id: str, message: str) -> None:
         self._inflight_trim_segments.discard(segment_id)
+        # Drop the cached signature so the next form change retries the
+        # trim instead of silently skipping with stale params.
+        self._last_trim_signature.pop(segment_id, None)
         self.statusBar().showMessage(f"Audio trim failed: {message}", 5000)
         print(f"[AudioTrim] segment={segment_id} error={message}", flush=True)
         # Drop any deferred Auto-Gen request — without a valid trim we
@@ -969,15 +1231,11 @@ class MainWindow(QMainWindow):
     def _on_stickman_location_edited(
         self, segment_id: str, location: dict
     ) -> None:
-        """Persist a player-overlay drag/resize back onto the segment.
+        """Persist a stickman drag/resize into the overlapping stickman layer.
 
-        ``location`` is ``{"x", "y", "w", "h"}`` fractions (0..1) of
-        the rendered frame, exactly the shape stored on
-        :attr:`Segment.stickman_location` and consumed by
-        :meth:`RenderService._run_job` when building the
-        ``--stick_x0/y0/w/h`` CLI flags.  We round to 4 decimals so
-        the JSON file stays readable / diff-friendly without losing
-        sub-pixel precision at the project's max resolution.
+        Routes drag edits from the preview overlay into the layer system.
+        Auto-creates a stickman layer if none overlaps the segment.
+        Also keeps segment.stickman_location in sync for backward compat.
         """
         if not segment_id:
             return
@@ -985,7 +1243,7 @@ class MainWindow(QMainWindow):
         if seg is None:
             return
         try:
-            seg.stickman_location = {
+            loc = {
                 "x": round(float(location.get("x", 0.0)), 4),
                 "y": round(float(location.get("y", 0.0)), 4),
                 "w": round(float(location.get("w", 0.0)), 4),
@@ -993,19 +1251,185 @@ class MainWindow(QMainWindow):
             }
         except (TypeError, ValueError):
             return
+
+        # Update (or auto-create) the stickman layer overlapping this segment.
+        from studio.models.layer import Layer
+        layers = self.project.layers_overlapping(
+            "stickman", seg.start_time_sec, seg.end_time_sec
+        )
+        if not layers:
+            self.project.layers.append(Layer(
+                kind="stickman",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Stickman",
+                config={"stickman": True, "stickman_location": loc},
+            ))
+        else:
+            top = max(layers, key=lambda la: la.z_index)
+            top.config["stickman_location"] = loc
+            top.config.setdefault("stickman", True)
+
+        # Keep segment.stickman_location in sync for legacy code paths.
+        try:
+            seg.stickman_location = loc
+        except AttributeError:
+            pass
+
+        self.timeline_panel.refresh()
         self._on_project_changed()
-        # Hot-reload live preview so the dragged box lands on the
-        # rendered frame within the next ~80 ms debounce tick — same
-        # treatment as a mode/density edit.  Without this the user has
-        # to toggle Preview off + on for the new placement to show up,
-        # defeating the point of the drag-edit overlay.
         self._request_preview_restart(seg.id)
         self.statusBar().showMessage(
             f"Stickman box updated for {seg.name}: "
-            f"x={seg.stickman_location['x']*100:.1f}% "
-            f"y={seg.stickman_location['y']*100:.1f}% "
-            f"w={seg.stickman_location['w']*100:.1f}% "
-            f"h={seg.stickman_location['h']*100:.1f}%",
+            f"x={loc['x']*100:.1f}% y={loc['y']*100:.1f}% "
+            f"w={loc['w']*100:.1f}% h={loc['h']*100:.1f}%",
+            2500,
+        )
+
+    def _on_floor_wall_committed(
+        self,
+        hit_frac: float,
+        horizon_frac: float,
+        near_spread: float,
+        far_spread: float,
+        wall_floor_gap_frac: float = 0.0,
+        relax_countdown_x: float = 0.88,
+        relax_countdown_y: float = 0.04,
+        relax_countdown_w: float = 0.10,
+        relax_countdown_h: float = 0.16,
+        rail_height: float = 0.15,
+        start_gate_h: float = 0.14,
+        chevron_width_frac: float = 0.45,
+        viewport_panel_depth: float = 0.6,
+    ) -> None:
+        """Persist floor/wall drag result into segment + countdown layer config."""
+        seg_id = self._preview_active_segment_id
+        if not seg_id:
+            return
+        seg = self.project.get_segment(seg_id)
+        if seg is None:
+            return
+        seg.render_settings["floor_hit_frac"]       = round(hit_frac,            4)
+        seg.render_settings["horizon_frac"]         = round(horizon_frac,        4)
+        seg.render_settings["floor_spread_frac"]    = round(near_spread,         4)
+        seg.render_settings["far_spread_frac"]      = round(far_spread,          4)
+        seg.render_settings["wall_floor_gap_frac"]  = round(wall_floor_gap_frac, 4)
+        seg.render_settings["rail_height"]          = round(max(0.15, rail_height), 4)
+        seg.render_settings["start_gate_h"]         = round(max(0.03, start_gate_h), 4)
+        seg.render_settings["chevron_width_frac"]    = round(
+            max(0.05, min(0.95, chevron_width_frac)), 4
+        )
+        seg.render_settings["viewport_panel_depth"] = round(max(0.05, viewport_panel_depth), 4)
+
+        # Layer-first system: countdown box placement must live on the countdown
+        # layer so future preview rebuilds/render resolve to the same values.
+        from studio.models.layer import Layer
+        cd_layers = self.project.layers_overlapping(
+            "countdown", seg.start_time_sec, seg.end_time_sec
+        )
+        if not cd_layers:
+            self.project.layers.append(Layer(
+                kind="countdown",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Countdown",
+                config={
+                    "relax_countdown_enabled": True,
+                    "relax_countdown_color": "#FFFFFF",
+                    "relax_countdown_max_sec": 5.0,
+                    "relax_countdown_anim": "pop",
+                    "relax_countdown_x": round(relax_countdown_x, 4),
+                    "relax_countdown_y": round(relax_countdown_y, 4),
+                    "relax_countdown_w": round(relax_countdown_w, 4),
+                    "relax_countdown_h": round(relax_countdown_h, 4),
+                    "relax_countdown_border_thickness": 2.0,
+                    "relax_countdown_glow_strength": 60.0,
+                },
+            ))
+        else:
+            top = max(cd_layers, key=lambda la: la.z_index)
+            top.config["relax_countdown_x"] = round(relax_countdown_x, 4)
+            top.config["relax_countdown_y"] = round(relax_countdown_y, 4)
+            top.config["relax_countdown_w"] = round(relax_countdown_w, 4)
+            top.config["relax_countdown_h"] = round(relax_countdown_h, 4)
+            top.config.setdefault("relax_countdown_enabled", True)
+
+        # Keep side-rails layer in sync with interactive rail-height drag.
+        rail_layers = self.project.layers_overlapping(
+            "side_rails", seg.start_time_sec, seg.end_time_sec
+        )
+        if not rail_layers:
+            rail_cfg = dict(self.timeline_panel._default_layer_config("side_rails"))
+            rail_cfg["side_rails"] = True
+            rail_cfg["rail_height"] = round(max(0.15, rail_height), 4)
+            self.project.layers.append(Layer(
+                kind="side_rails",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Side Rails",
+                config=rail_cfg,
+            ))
+        else:
+            rail_top = max(rail_layers, key=lambda la: la.z_index)
+            rail_top.config["rail_height"] = round(max(0.15, rail_height), 4)
+            rail_top.config.setdefault("side_rails", True)
+
+        gate_layers = self.project.layers_overlapping(
+            "start_gate", seg.start_time_sec, seg.end_time_sec
+        )
+        if not gate_layers:
+            gate_cfg = dict(self.timeline_panel._default_layer_config("start_gate"))
+            gate_cfg["start_gate_enabled"] = True
+            gate_cfg["start_gate_h"] = round(max(0.03, start_gate_h), 4)
+            self.project.layers.append(Layer(
+                kind="start_gate",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Start Gate",
+                config=gate_cfg,
+            ))
+        else:
+            gate_top = max(gate_layers, key=lambda la: la.z_index)
+            gate_top.config["start_gate_h"] = round(max(0.03, start_gate_h), 4)
+            gate_top.config.setdefault("start_gate_enabled", True)
+
+        floor_layers = self.project.layers_overlapping(
+            "floor", seg.start_time_sec, seg.end_time_sec
+        )
+        if not floor_layers:
+            floor_cfg = dict(self.timeline_panel._default_layer_config("floor"))
+            floor_cfg["chevron_width_frac"] = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
+            self.project.layers.append(Layer(
+                kind="floor",
+                start_time_sec=seg.start_time_sec,
+                end_time_sec=seg.end_time_sec,
+                z_index=0,
+                name="Floor",
+                config=floor_cfg,
+            ))
+        else:
+            floor_top = max(floor_layers, key=lambda la: la.z_index)
+            floor_top.config["chevron_width_frac"] = round(
+                max(0.05, min(0.95, chevron_width_frac)), 4
+            )
+
+        self._on_project_changed()
+        self.statusBar().showMessage(
+            f"Camera adjusted — floor:{hit_frac*100:.1f}%  "
+            f"horizon:{horizon_frac*100:.1f}%  "
+            f"near:{near_spread*100:.1f}%  far:{far_spread*100:.1f}%  "
+            f"gap:{wall_floor_gap_frac*100:.1f}%  "
+            f"countdown box:{relax_countdown_w*100:.1f}%×{relax_countdown_h*100:.1f}%  "
+            f"rail h:{max(0.15, rail_height):.2f}  "
+            f"gate h:{max(0.03, start_gate_h):.2f}  "
+            f"chevron w:{max(0.05, min(0.95, chevron_width_frac)):.2f}  "
+            f"panel depth:{max(0.05, viewport_panel_depth):.2f}",
             2500,
         )
 
@@ -1099,29 +1523,295 @@ class MainWindow(QMainWindow):
             )
         start_time = round(start_time * 10) / 10.0
 
+        is_video = (media.kind.value == "video")
         segment = Segment(
             name=f"Segment {len(self.project.segments) + 1}",
             start_time_sec=start_time,
             end_time_sec=start_time + duration,
             audio_path=media.source_path if media.kind.value == "audio" else "",
-            audio_offset_sec=start_time,   # explicit: matches initial timeline position
+            # A freshly dropped media clip starts from the beginning of its
+            # own source file. Segment timing on the project timeline is
+            # independent from where the clip starts within that source.
+            audio_offset_sec=0.0,
             audio_duration_sec=duration,
             mode="punch",
             render_settings=build_settings("punch", {}).model_dump(mode="json", exclude_none=True),
+            video_path=media.source_path if is_video else None,
+            is_video_segment=is_video,
         )
         self.project.segments.append(segment)
+        from studio.models.layer import auto_create_default_layers
+        auto_create_default_layers(self.project, segment)
         self.timeline_panel.refresh()
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
         # Extract waveform now that an audio media has been dropped onto timeline.
         if segment.audio_path:
             self._request_waveform_for(segment.audio_path)
-        # Trim the audio clip for this segment so the WAV is ready before
-        # the user hits Render / Preview.
-        self._request_audio_trim(segment)
+        # Trim the audio clip for audio-backed segments so the WAV is
+        # ready before the user hits Render / Preview.
+        if not segment.is_video_segment:
+            self._request_audio_trim(segment)
         self._on_project_changed()
 
+    def _on_background_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop video/image onto Background track -> apply to segment background."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind not in {"video", "image"}:
+            # Fallback: non-background media drops still create timeline segments.
+            self._on_create_segment_requested(media_id, time_sec)
+            return
+
+        eps = 1e-6
+        ordered = self.project.sorted_segments()
+        target_segment = next(
+            (
+                seg
+                for seg in ordered
+                if seg.start_time_sec - eps <= time_sec < seg.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Background track.", 3000
+            )
+            return
+
+        bg_type = "video" if media_kind == "video" else "image"
+        bg_cfg = {
+            "bg_type": bg_type,
+            "bg_color": None,
+            "bg_image": media.source_path if bg_type == "image" else None,
+            "bg_video": media.source_path if bg_type == "video" else None,
+        }
+
+        candidates = [
+            la
+            for la in self.project.layers
+            if la.kind == "background"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+        exact = [
+            la
+            for la in candidates
+            if abs(la.start_time_sec - target_segment.start_time_sec) <= eps
+            and abs(la.end_time_sec - target_segment.end_time_sec) <= eps
+        ]
+
+        target_layer: Layer
+        if exact:
+            target_layer = max(exact, key=lambda la: la.z_index)
+            target_layer.config = dict(bg_cfg)
+        elif candidates:
+            target_layer = min(
+                candidates,
+                key=lambda la: (
+                    abs(la.start_time_sec - target_segment.start_time_sec)
+                    + abs(la.end_time_sec - target_segment.end_time_sec),
+                    -(la.z_index),
+                ),
+            )
+            target_layer.start_time_sec = target_segment.start_time_sec
+            target_layer.end_time_sec = target_segment.end_time_sec
+            target_layer.config = dict(bg_cfg)
+        else:
+            overlap_bg = [
+                la
+                for la in self.project.layers
+                if la.kind == "background"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = (max((la.z_index for la in overlap_bg), default=-1) + 1)
+            target_layer = Layer(
+                kind="background",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Background",
+                config=dict(bg_cfg),
+            )
+            self.project.layers.append(target_layer)
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Background set to {bg_type}: {media.display_name}", 3000
+        )
+
+    def _on_floor_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop image onto Floor track -> set floor tile image for segment."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind != "image":
+            # Fallback: audio/video drops here still create timeline segments.
+            self._on_create_segment_requested(media_id, time_sec)
+            return
+
+        eps = 1e-6
+        ordered = self.project.sorted_segments()
+        target_segment = next(
+            (
+                seg
+                for seg in ordered
+                if seg.start_time_sec - eps <= time_sec < seg.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Floor track.", 3000
+            )
+            return
+
+        floor_layers = [
+            la
+            for la in self.project.layers
+            if la.kind == "floor"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+        exact = [
+            la
+            for la in floor_layers
+            if abs(la.start_time_sec - target_segment.start_time_sec) <= eps
+            and abs(la.end_time_sec - target_segment.end_time_sec) <= eps
+        ]
+
+        target_layer: Layer
+        if exact:
+            target_layer = max(exact, key=lambda la: la.z_index)
+        elif floor_layers:
+            target_layer = min(
+                floor_layers,
+                key=lambda la: (
+                    abs(la.start_time_sec - target_segment.start_time_sec)
+                    + abs(la.end_time_sec - target_segment.end_time_sec),
+                    -(la.z_index),
+                ),
+            )
+            target_layer.start_time_sec = target_segment.start_time_sec
+            target_layer.end_time_sec = target_segment.end_time_sec
+        else:
+            from studio.models.layer import _default_floor_config
+
+            overlap_floor = [
+                la
+                for la in self.project.layers
+                if la.kind == "floor"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = (max((la.z_index for la in overlap_floor), default=-1) + 1)
+            target_layer = Layer(
+                kind="floor",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Floor",
+                config=_default_floor_config(),
+            )
+            self.project.layers.append(target_layer)
+
+        cfg = dict(target_layer.config or {})
+        cfg["floor_panels"] = True
+        cfg["floor_panel_image"] = media.source_path
+        # Keep current layout if exists (auto/chevron_strip), otherwise default auto.
+        cfg["floor_layout"] = str(cfg.get("floor_layout", "auto") or "auto")
+        target_layer.config = cfg
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Floor tile image set: {media.display_name}", 3000
+        )
+
+    def _on_start_gate_media_dropped(self, media_id: str, time_sec: float) -> None:
+        """Drop image/video onto Start Gate track -> apply to start_gate layer."""
+        media = self.project.get_media(media_id)
+        if media is None:
+            return
+
+        media_kind = str(getattr(media.kind, "value", media.kind)).lower()
+        if media_kind not in {"video", "image"}:
+            return
+
+        eps = 1e-6
+        target_segment = next(
+            (
+                s
+                for s in self.project.sorted_segments()
+                if s.start_time_sec - eps <= time_sec < s.end_time_sec + eps
+            ),
+            None,
+        )
+        if target_segment is None:
+            self.statusBar().showMessage(
+                "Drop onto a segment range in the Start Gate track.", 3000
+            )
+            return
+
+        gate_type = "video" if media_kind == "video" else "image"
+        gate_cfg = {
+            "start_gate_enabled": True,
+            "start_gate_type": gate_type,
+            "start_gate_color": "#1a1a1a",
+            "start_gate_border_color": "#ffffff",
+            "start_gate_border_thickness": 0.0,
+            "start_gate_image": media.source_path if gate_type == "image" else "",
+            "start_gate_video": media.source_path if gate_type == "video" else "",
+            "start_gate_x": 0.30,
+            "start_gate_y": 0.18,
+            "start_gate_w": 0.40,
+            "start_gate_h": 0.14,
+        }
+
+        candidates = [
+            la
+            for la in self.project.layers
+            if la.kind == "start_gate"
+            and la.start_time_sec <= target_segment.start_time_sec + eps
+            and la.end_time_sec >= target_segment.end_time_sec - eps
+        ]
+
+        if candidates:
+            target_layer = max(candidates, key=lambda la: la.z_index)
+            target_layer.config = dict(gate_cfg)
+        else:
+            overlap = [
+                la
+                for la in self.project.layers
+                if la.kind == "start_gate"
+                and la.overlaps(target_segment.start_time_sec, target_segment.end_time_sec)
+            ]
+            z_index = max((la.z_index for la in overlap), default=-1) + 1
+            target_layer = Layer(
+                kind="start_gate",
+                start_time_sec=target_segment.start_time_sec,
+                end_time_sec=target_segment.end_time_sec,
+                z_index=z_index,
+                name="Start Gate",
+                config=dict(gate_cfg),
+            )
+            self.project.layers.append(target_layer)
+
+        self._on_layer_changed()
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, target_layer)
+        self.statusBar().showMessage(
+            f"Start gate set to {gate_type}: {media.display_name}", 3000
+        )
+
     def _on_segment_selected(self, segment: Segment | None) -> None:
+        full_mode = self.preview_panel.is_full_preview_mode()
+        was_live = self._preview_mode_active
+        # InspectorPanel.set_segment routes to set_selection(KIND_SEGMENT, ...)
         self.segment_panel.set_segment(segment)
         self.preview_panel.set_source_segment(segment)
         # Load waveform for this segment’s audio, or show empty for a segment
@@ -1137,6 +1827,8 @@ class MainWindow(QMainWindow):
             start = segment.start_time_sec
             self.timeline_panel.set_playhead(start)
             self.preview_panel.seek_to_seconds(start)
+            if full_mode and was_live and segment.id != self._preview_active_segment_id:
+                self._on_preview_segment_requested(segment.id)
 
     def _on_segment_changed_by_timeline(self, _segment_id: str) -> None:
         current = self.segment_panel.current_segment
@@ -1283,6 +1975,40 @@ class MainWindow(QMainWindow):
         """Handle timeline segment drag — mark project dirty."""
         self._on_project_changed()
 
+    def _on_layer_changed(self) -> None:
+        """A layer block was added / moved / resized / deleted on the timeline.
+
+        Mark project dirty and trigger a live-preview hot-reload so the
+        effective config (layer overrides render_settings) is reflected
+        immediately in the preview frame.
+        """
+        self._on_project_changed()
+        seg_id = self._preview_active_segment_id
+        if seg_id:
+            self._request_preview_restart(seg_id)
+
+    def _on_timeline_layer_status_message(self, message: str, timeout_ms: int) -> None:
+        if not message:
+            return
+        self.statusBar().showMessage(str(message), int(timeout_ms))
+
+    def _on_inspector_layer_changed(self, layer_id: str) -> None:
+        """Inspector panel edited a layer's config — trigger preview + dirty."""
+        self._on_project_changed()
+        seg_id = self._preview_active_segment_id
+        if seg_id:
+            self._request_preview_restart(seg_id)
+
+    def _on_layer_selected(self, layer) -> None:
+        """User single-clicked a layer block — switch Inspector to layer form."""
+        from studio.editor.inspector_panel import InspectorPanel
+        self.segment_panel.set_selection(InspectorPanel.KIND_LAYER, layer)
+
+    def _on_selection_cleared(self) -> None:
+        """User clicked empty timeline area — clear Inspector."""
+        from studio.editor.inspector_panel import InspectorPanel
+        self.segment_panel.set_selection(InspectorPanel.KIND_NONE, None)
+
     def _on_segment_delete_requested(self, segment_id: str) -> None:
         """Drop a segment from the project after user-confirmed delete.
 
@@ -1310,18 +2036,44 @@ class MainWindow(QMainWindow):
         beat_snapshot = list(
             self.timeline_panel._beat_events.get(segment_id, [])
         )
+        # Collect layers that are fully contained within this segment's range;
+        # these are considered "owned" by the segment and deleted with it.
+        owned_layers = [
+            la for la in self.project.layers
+            if la.start_time_sec >= seg.start_time_sec
+            and la.end_time_sec <= seg.end_time_sec
+        ]
+        owned_layer_snapshots = _copy.deepcopy(owned_layers)
 
         if (
             self._preview_mode_active
             and self._preview_active_segment_id == segment_id
         ):
             self._stop_preview_mode()
+        # If the deleted segment is currently loaded in the player source,
+        # clear it immediately so Play cannot revive a stale media path.
+        pseg = getattr(self.preview_panel, "_selected_segment", None)
+        if pseg is not None and getattr(pseg, "id", None) == segment_id:
+            self.preview_panel.set_source_segment(None)
         current = self.segment_panel.current_segment
         if current is not None and current.id == segment_id:
             self.segment_panel.set_segment(None)
+        # Clear inspector if it is showing one of the owned layers.
+        owned_ids = {la.id for la in owned_layers}
+        if (
+            self.segment_panel._selection_kind == self.segment_panel.KIND_LAYER
+            and self.segment_panel._selected_obj is not None
+            and self.segment_panel._selected_obj.id in owned_ids
+        ):
+            self.segment_panel.set_selection(self.segment_panel.KIND_NONE, None)
         self.timeline_panel.clear_beat_events(segment_id)
+        self._last_trim_signature.pop(segment_id, None)
+        self._inflight_trim_segments.discard(segment_id)
         self.project.segments = [
             s for s in self.project.segments if s.id != segment_id
+        ]
+        self.project.layers = [
+            la for la in self.project.layers if la.id not in owned_ids
         ]
         self.timeline_panel.refresh()
         self._sync_preview_button_state()
@@ -1338,6 +2090,7 @@ class MainWindow(QMainWindow):
             if panel._project is None:
                 return
             panel._project.segments.append(_copy.deepcopy(seg_snapshot))
+            panel._project.layers.extend(_copy.deepcopy(owned_layer_snapshots))
             panel._beat_events[seg_snapshot.id] = list(beat_snapshot)
             panel._selected_segment_id = seg_snapshot.id
             panel.refresh()
@@ -1353,8 +2106,12 @@ class MainWindow(QMainWindow):
             main_win_cur = main_win.segment_panel.current_segment
             if main_win_cur is not None and main_win_cur.id == seg_snapshot.id:
                 main_win.segment_panel.set_segment(None)
+            snap_ids = {la.id for la in owned_layer_snapshots}
             panel._project.segments = [
                 s for s in panel._project.segments if s.id != seg_snapshot.id
+            ]
+            panel._project.layers = [
+                la for la in panel._project.layers if la.id not in snap_ids
             ]
             panel._beat_events.pop(seg_snapshot.id, None)
             if panel._selected_segment_id == seg_snapshot.id:
@@ -1409,6 +2166,60 @@ class MainWindow(QMainWindow):
 
     # ── Export flow ──────────────────────────────────────────────────────────
 
+    def _on_update_worker_clicked(self) -> None:
+        """Open the rhythm_worker.exe download dialog."""
+        dlg = WorkerUpdateDialog(parent=self)
+        dlg.exec()
+
+    def _on_update_engine_clicked(self) -> None:
+        """Spawn update.exe in background and keep editor responsive."""
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self,
+                "Update Engine",
+                "Update Engine is only available in the installed build.",
+            )
+            return
+
+        bundle_dir = Path(sys.executable).resolve().parent
+        updater_exe = bundle_dir / "update.exe"
+        if not updater_exe.exists():
+            QMessageBox.warning(
+                self,
+                "Update Engine",
+                f"Updater not found:\n{updater_exe}",
+            )
+            return
+
+        flags = 0
+        flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        flags |= int(getattr(subprocess, "DETACHED_PROCESS", 0))
+        flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            subprocess.Popen(
+                [
+                    str(updater_exe),
+                    "--apply-update",
+                    "--yes",
+                    "--wait-for-pid",
+                    str(os.getpid()),
+                ],
+                cwd=str(bundle_dir),
+                close_fds=True,
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self,
+                "Update Engine",
+                f"Failed to start updater:\n{exc}",
+            )
+            return
+
+        self.statusBar().showMessage(
+            "Update Engine started. Close SSCStudio to apply update.", 6000
+        )
+
     def _on_export_button_clicked(self) -> None:
         """Show the detailed Export dialog (stays open; user closes manually)."""
         if not self.project.segments:
@@ -1453,7 +2264,13 @@ class MainWindow(QMainWindow):
     def _on_export_dialog_closed(self) -> None:
         self._export_dialog = None  # type: ignore[assignment]
 
-    def _on_preview_segment_requested(self, segment_id: str) -> None:
+    def _on_preview_segment_requested(
+        self,
+        segment_id: str,
+        *,
+        start_project_sec: Optional[float] = None,
+        auto_play: bool = True,
+    ) -> None:
         """Toggle live preview mode for the segment.
 
         OFF → ON  : build an in-process :class:`LiveFrameRenderer` for
@@ -1482,6 +2299,9 @@ class MainWindow(QMainWindow):
 
         if self._preview_mode_active:
             already = (self._preview_active_segment_id == segment_id)
+            if already and start_project_sec is not None:
+                self.preview_panel.seek_to_seconds(float(start_project_sec))
+                return
             self._stop_preview_mode()
             if already:
                 return
@@ -1490,12 +2310,23 @@ class MainWindow(QMainWindow):
         segment = self.project.get_segment(segment_id)
         if segment is None:
             return
+        if bool(getattr(segment, "is_video_segment", False)):
+            self.statusBar().showMessage(
+                "This segment is source-video playback only (live preview disabled).",
+                3500,
+            )
+            self.segment_panel.set_preview_active(False)
+            return
         if not segment.audio_path:
             self.statusBar().showMessage("Segment has no audio source", 3000)
             self.segment_panel.set_preview_active(False)
             return
 
-        self._start_live_preview(segment)
+        self._start_live_preview(
+            segment,
+            start_project_sec=start_project_sec,
+            auto_play=auto_play,
+        )
 
     def _stop_preview_mode(self) -> None:
         """Tear down the in-process live preview + reset toggle state.
@@ -1557,7 +2388,13 @@ class MainWindow(QMainWindow):
         self.segment_panel.set_preview_active(False)
         self._update_status()
 
-    def _start_live_preview(self, segment: Segment) -> None:
+    def _start_live_preview(
+        self,
+        segment: Segment,
+        *,
+        start_project_sec: Optional[float] = None,
+        auto_play: bool = True,
+    ) -> None:
         """Kick off background construction of a LiveFrameRenderer.
 
         ``LiveFrameRenderer.__init__`` runs ``librosa.load`` + FFT +
@@ -1603,6 +2440,26 @@ class MainWindow(QMainWindow):
 
         kwargs = self._live_renderer_kwargs(segment)
 
+        # ── DEBUG: log resolved preview params ───────────────────────────
+        from studio.models.layer import resolve_segment_config
+        _rs_debug = resolve_segment_config(segment, self.project.layers)
+        print(f"\n[PREVIEW] segment='{segment.name}' id={segment.id}")
+        print(f"  audio_path      : {audio_path}")
+        print(f"  mode            : {segment.mode}")
+        _bg_keys = ['background_type','background_color','bg_type','bg_color',
+                    'background_image','bg_image','background_video','bg_video']
+        print("  --- resolved bg keys in rs ---")
+        for k in _bg_keys:
+            if k in _rs_debug:
+                print(f"    {k}: {_rs_debug[k]!r}")
+        print("  --- kwargs passed to renderer ---")
+        for k in ['background_type','background_color','background_image',
+                  'background_video','show_stickman','show_floor_panels',
+                  'show_side_rails']:
+            print(f"    {k}: {kwargs.get(k)!r}")
+        print()
+        # ─────────────────────────────────────────────────────────────────
+
         # For combo mode, ``segment.mode`` is the literal string ``"combo"``
         # which ``_parse_modes`` doesn't accept (only the individual sub-modes
         # punch/dance/line/relax are valid).  Convert to a comma-joined spec
@@ -1618,8 +2475,14 @@ class MainWindow(QMainWindow):
         worker = _RendererWorker(
             audio_path, beat_times, mode_str, kwargs, parent=self
         )
+        seg_start = float(segment.start_time_sec or 0.0)
+        if start_project_sec is None:
+            start_local_sec = 0.0
+        else:
+            start_local_sec = max(0.0, float(start_project_sec) - seg_start)
         worker.ready.connect(
-            lambda renderer, seg=segment, ap=audio_path: self._on_renderer_ready(renderer, seg, ap)
+            lambda renderer, seg=segment, ap=audio_path, sl=start_local_sec, apy=auto_play:
+            self._on_renderer_ready(renderer, seg, ap, sl, apy)
         )
         worker.failed.connect(self._on_renderer_failed)
         worker.finished.connect(worker.deleteLater)
@@ -1630,6 +2493,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Loading preview for '{segment.name}'…", 0
         )
+        self.segment_panel.set_preview_loading(True)
         worker.start()
 
     def _cancel_preview_worker(self) -> None:
@@ -1639,11 +2503,20 @@ class MainWindow(QMainWindow):
             self._preview_worker.quit()
             self._preview_worker = None
             self._preview_worker_segment_id = None
+            self.segment_panel.set_preview_loading(False)
 
-    def _on_renderer_ready(self, renderer: object, segment: Segment, audio_path: str) -> None:
+    def _on_renderer_ready(
+        self,
+        renderer: object,
+        segment: Segment,
+        audio_path: str,
+        start_local_sec: float = 0.0,
+        auto_play: bool = True,
+    ) -> None:
         """Called on the UI thread when the background worker finishes."""
         self._preview_worker = None
         self._preview_worker_segment_id = None
+        self.segment_panel.set_preview_loading(False)
 
         # User may have clicked Stop while we were loading.
         if self._preview_mode_active:
@@ -1659,8 +2532,9 @@ class MainWindow(QMainWindow):
             self.preview_panel.start_live_preview(
                 renderer,
                 audio_path,
-                start_local_sec=0.0,
+                start_local_sec=max(0.0, float(start_local_sec)),
                 project_offset_sec=seg_start,
+                auto_play=bool(auto_play),
             )
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(
@@ -1684,6 +2558,7 @@ class MainWindow(QMainWindow):
         """Called on the UI thread when the background worker raises."""
         self._preview_worker = None
         self._preview_worker_segment_id = None
+        self.segment_panel.set_preview_loading(False)
         self.statusBar().showMessage(
             f"Preview failed to initialise: {error_msg}", 6000
         )
@@ -1709,7 +2584,8 @@ class MainWindow(QMainWindow):
             def _parse_color(_: str) -> None:  # type: ignore[no-redef]
                 return None
 
-        rs = segment.render_settings or {}
+        from studio.models.layer import resolve_segment_config
+        rs = resolve_segment_config(segment, self.project.layers)
 
         def _get(key: str, default):
             val = rs.get(key, default)
@@ -1724,6 +2600,129 @@ class MainWindow(QMainWindow):
             "bloom": False,  # always off for live preview (8–15 ms / frame)
             "show_stickman": bool(_get("stickman", True)),
             "show_floor_panels": bool(_get("floor_panels", True)),
+            "floor_panel_color": _get("floor_panel_color", None) or "",
+            "floor_panel_opacity": float(_get("floor_panel_opacity", 1.0) or 1.0),
+            "floor_panel_blink": bool(_get("floor_panel_blink", False)),
+            "floor_panel_image": _get("floor_panel_image", None) or "",
+            "floor_full_static_image": bool(_get("floor_full_static_image", False)),
+            "floor_layout":          str(_get("floor_layout", "auto")),
+            "floor_bg_color":        _get("floor_bg_color", None) or "",
+            "floor_bg_opacity":      float(_get("floor_bg_opacity", 1.0) or 1.0),
+            "background_type":       str(_get("background_type", "solid") or "solid"),
+            "background_color":      str(_get("background_color", "#000000") or "#000000"),
+            "background_image":      _get("background_image", None) or "",
+            "background_video":      _get("background_video", None) or "",
+            "chevron_color":         str(_get("chevron_color", "#FFD700")),
+            "chevron_scroll":        bool(_get("chevron_scroll", True)),
+            "chevron_blink":         bool(_get("chevron_blink", False)),
+            "chevron_width_frac":    float(_get("chevron_width_frac", 0.45) or 0.45),
+            "chevron_count":         int(_get("chevron_count", 6) or 6),
+            "show_side_rails":       bool(_get("side_rails", False)),
+            "rail_color":            str(_get("rail_color", "#FF60FF")),
+            "rail_shape":            str(_get("rail_shape", "chunky")),
+            "rail_height":           float(_get("rail_height", 0.14)),
+            "rail_offset_x":         float(_get("rail_offset_x", 0.08)),
+            "rail_image":            _get("rail_image", None) or "",
+            "rail_texture_non_loop": bool(_get("rail_texture_non_loop", False)),
+            "rail_pulse":            str(_get("rail_pulse", "beat")),
+            "rail_pulse_intensity":  float(_get("rail_pulse_intensity", 0.6)),
+            "rail_chevron_depth":    float(_get("rail_chevron_depth", 1.0) or 1.0),
+            "rail_chevron_density":  int(_get("rail_chevron_density", 6) or 6),
+            "rail_pillar_count":     int(_get("rail_pillar_count", 16) or 16),
+            "rail_pillar_highlight_count": int(_get("rail_pillar_highlight_count", 1) or 1),
+            "rail_pillar_radius":    float(_get("rail_pillar_radius", 1.0) or 1.0),
+            "rail_chase_mode":       str(_get("rail_chase_mode", "time") or "time"),
+            "rail_chase_speed_frames": int(_get("rail_chase_speed_frames", 4) or 4),
+            "rail_dot_count":        int(_get("rail_dot_count", 24) or 24),
+            "rail_dot_lines":        int(_get("rail_dot_lines", 1) or 1),
+            "rail_dot_size_px":      int(_get("rail_dot_size_px", 6) or 6),
+            "rail_dot_anim_mode":    str(_get("rail_dot_anim_mode", "audio") or "audio"),
+            "rail_dot_color_near":   str(_get("rail_dot_color_near", "#FF60FF") or "#FF60FF"),
+            "rail_dot_color_far":    str(_get("rail_dot_color_far", "#00FFFF") or "#00FFFF"),
+            "relax_interval":       float(_get("relax_interval", 0.0) or 0.0),
+            "relax_travel_sec":     float(_get("relax_travel_sec", 3.0) or 3.0),
+            "relax_wait_sec":       float(_get("relax_wait_sec", 0.0) or 0.0),
+            "relax_texture_low":    _get("relax_texture_low", None) or "",
+            "relax_texture_high":   _get("relax_texture_high", None) or "",
+            "relax_texture_middle": _get("relax_texture_middle", None) or "",
+            "relax_hole_mask_path": _get("relax_hole_mask_path", None) or "",
+            "relax_kind_ratio_middle": float(_get("relax_kind_ratio_middle", 0.33) or 0.33),
+            "relax_show_low": bool(_get("relax_show_low", True)),
+            "relax_show_high": bool(_get("relax_show_high", True)),
+            "relax_show_middle": bool(_get("relax_show_middle", True)),
+            "relax_countdown_enabled": bool(_get("relax_countdown_enabled", True)),
+            "relax_countdown_color": str(_get("relax_countdown_color", "#FFFFFF") or "#FFFFFF"),
+            "relax_countdown_max_sec": float(_get("relax_countdown_max_sec", 5.0) or 5.0),
+            "relax_countdown_anim": str(_get("relax_countdown_anim", "pop") or "pop"),
+            "relax_countdown_audio_enabled": bool(_get("relax_countdown_audio_enabled", False)),
+            "relax_countdown_audio_mode": str(_get("relax_countdown_audio_mode", "default") or "default"),
+            "relax_countdown_audio_file": _get("relax_countdown_audio_file", None) or "",
+            "relax_countdown_audio_volume": float(_get("relax_countdown_audio_volume", 0.65) or 0.65),
+            "relax_countdown_audio_last_mode": str(_get("relax_countdown_audio_last_mode", "default") or "default"),
+            "relax_countdown_audio_last_file": _get("relax_countdown_audio_last_file", None) or "",
+            "relax_countdown_x": float(_get("relax_countdown_x", 0.88) or 0.88),
+            "relax_countdown_y": float(_get("relax_countdown_y", 0.04) or 0.04),
+            "relax_countdown_w": float(_get("relax_countdown_w", 0.10) or 0.10),
+            "relax_countdown_h": float(_get("relax_countdown_h", 0.16) or 0.16),
+            "relax_countdown_border_thickness": float(
+                _get("relax_countdown_border_thickness", 2.0) or 2.0
+            ),
+            "relax_countdown_glow_strength": float(
+                _get("relax_countdown_glow_strength", 60.0) or 60.0
+            ),
+            "start_gate_enabled": bool(_get("start_gate_enabled", False)),
+            "start_gate_type": str(_get("start_gate_type", "color") or "color"),
+            "start_gate_color": str(_get("start_gate_color", "#1a1a1a") or "#1a1a1a"),
+            "start_gate_border_color": str(
+                _get("start_gate_border_color", "#ffffff") or "#ffffff"
+            ),
+            "start_gate_border_thickness": float(
+                _get("start_gate_border_thickness", 0.0) or 0.0
+            ),
+            "start_gate_image": _get("start_gate_image", None) or "",
+            "start_gate_video": _get("start_gate_video", None) or "",
+            "start_gate_x": float(_get("start_gate_x", 0.30) or 0.30),
+            "start_gate_y": float(_get("start_gate_y", 0.18) or 0.18),
+            "start_gate_w": float(_get("start_gate_w", 0.40) or 0.40),
+            "start_gate_h": float(_get("start_gate_h", 0.14) or 0.14),
+            "combo_enabled": bool(_get("combo_enabled", True)),
+            "combo_color": str(_get("combo_color", "#FFFFFF") or "#FFFFFF"),
+            "combo_label": str(_get("combo_label", "COMBO") or "COMBO"),
+            "combo_font_family": str(_get("combo_font_family", "duplex") or "duplex"),
+            "combo_fade_after_break_sec": float(_get("combo_fade_after_break_sec", 0.5) or 0.5),
+            "combo_anim": str(_get("combo_anim", "pop") or "pop"),
+            "combo_audio_enabled": bool(_get("combo_audio_enabled", False)),
+            "combo_audio_mode": str(_get("combo_audio_mode", "default") or "default"),
+            "combo_audio_file": _get("combo_audio_file", None) or "",
+            "combo_audio_volume": float(_get("combo_audio_volume", 0.65) or 0.65),
+            "combo_audio_milestone_mode": str(_get("combo_audio_milestone_mode", "default") or "default"),
+            "combo_audio_milestone_file": _get("combo_audio_milestone_file", None) or "",
+            "combo_x": float(_get("combo_x", 0.85) or 0.85),
+            "combo_y": float(_get("combo_y", 0.08) or 0.08),
+            "combo_w": float(_get("combo_w", 0.13) or 0.13),
+            "combo_h": float(_get("combo_h", 0.18) or 0.18),
+            "combo_border_thickness": float(_get("combo_border_thickness", 2.0) or 2.0),
+            "combo_glow_strength": float(_get("combo_glow_strength", 30.0) or 30.0),
+            "combo_tier1_threshold": int(_get("combo_tier1_threshold", 30) or 30),
+            "combo_tier1_label": str(_get("combo_tier1_label", "Great") or "Great"),
+            "combo_tier2_threshold": int(_get("combo_tier2_threshold", 60) or 60),
+            "combo_tier2_label": str(_get("combo_tier2_label", "Superb") or "Superb"),
+            "combo_tier3_threshold": int(_get("combo_tier3_threshold", 90) or 90),
+            "combo_tier3_label": str(_get("combo_tier3_label", "Perfect") or "Perfect"),
+            "combo_tier4_threshold": int(_get("combo_tier4_threshold", 120) or 120),
+            "combo_tier4_label": str(_get("combo_tier4_label", "Godlike") or "Godlike"),
+            "combo_tier1_color": str(_get("combo_tier1_color", "#22c55e") or "#22c55e"),
+            "combo_tier2_color": str(_get("combo_tier2_color", "#3b82f6") or "#3b82f6"),
+            "combo_tier3_color": str(_get("combo_tier3_color", "#a855f7") or "#a855f7"),
+            "combo_tier4_color": str(_get("combo_tier4_color", "#f59e0b") or "#f59e0b"),
+            "combo_number_font_scale": float(_get("combo_number_font_scale", 0.0) or 0.0),
+            "combo_label_font_scale": float(_get("combo_label_font_scale", 0.0) or 0.0),
+            "combo_tier_font_scale": float(_get("combo_tier_font_scale", 0.0) or 0.0),
+            "floor_hit_frac":       _get("floor_hit_frac", None),
+            "horizon_frac":         _get("horizon_frac", None),
+            "floor_spread_frac":    _get("floor_spread_frac", None),
+            "far_spread_frac":      _get("far_spread_frac", None),
+            "wall_floor_gap_frac":  _get("wall_floor_gap_frac", None),
             "max_per_lane": int(_get("max_per_lane", 2)),
             "block_speed": float(_get("speed", 0.8)),
             "beat_min_gap": int(_get("beat_min_gap", 4)),
@@ -1745,6 +2744,11 @@ class MainWindow(QMainWindow):
             kwargs.setdefault("cube_color_left", None)
             kwargs.setdefault("cube_color_right", None)
             kwargs.setdefault("panel_neon_color", None)
+
+        _vpd = rs.get("viewport_panel_depth")
+        kwargs["viewport_panel_depth"] = (
+            max(0.05, float(_vpd)) if _vpd is not None else None
+        )
 
         # Lane filter: settings list is 1-based; renderer expects a
         # 0-based set, or ``None`` for "all enabled".
@@ -1876,9 +2880,130 @@ class MainWindow(QMainWindow):
         # update — even when only the mode list changed — is harmless:
         # the renderer just rebinds attrs to their existing values.
         if do_mode:
-            rs = segment.render_settings or {}
+            from studio.models.layer import resolve_segment_config
+            rs = resolve_segment_config(segment, self.project.layers)
             show_stickman = bool(rs.get("stickman", True))
             show_floor_panels = bool(rs.get("floor_panels", True))
+            # Use "" (not None) so update_mode's "if x is not None" guard
+            # fires even when the user has cleared the value — "" or None → None.
+            floor_panel_color = rs.get("floor_panel_color") or ""
+            floor_panel_opacity = float(rs.get("floor_panel_opacity", 1.0) or 1.0)
+            floor_panel_blink = bool(rs.get("floor_panel_blink", False))
+            floor_panel_image = rs.get("floor_panel_image") or ""
+            floor_full_static_image = bool(rs.get("floor_full_static_image", False))
+            floor_layout      = str(rs.get("floor_layout", "auto"))
+            floor_bg_color    = rs.get("floor_bg_color") or ""
+            floor_bg_opacity  = float(rs.get("floor_bg_opacity", 1.0) or 1.0)
+            background_type   = str(rs.get("background_type", "solid") or "solid")
+            background_color  = str(rs.get("background_color", "#000000") or "#000000")
+            background_image  = rs.get("background_image") or ""
+            background_video  = rs.get("background_video") or ""
+            chevron_color     = str(rs.get("chevron_color", "#FFD700"))
+            chevron_scroll    = bool(rs.get("chevron_scroll", True))
+            chevron_blink     = bool(rs.get("chevron_blink", False))
+            chevron_width_frac = float(rs.get("chevron_width_frac", 0.45) or 0.45)
+            chevron_count     = int(rs.get("chevron_count", 6) or 6)
+            show_side_rails      = bool(rs.get("side_rails", False))
+            rail_color           = str(rs.get("rail_color", "#FF60FF"))
+            rail_shape           = str(rs.get("rail_shape", "chunky"))
+            rail_height          = float(rs.get("rail_height", 0.14) or 0.14)
+            rail_offset_x        = float(rs.get("rail_offset_x", 0.08) or 0.08)
+            rail_image           = rs.get("rail_image") or ""
+            rail_texture_non_loop = bool(rs.get("rail_texture_non_loop", False))
+            rail_pulse           = str(rs.get("rail_pulse", "beat"))
+            rail_pulse_intensity = float(rs.get("rail_pulse_intensity", 0.6) or 0.6)
+            rail_chevron_depth   = float(rs.get("rail_chevron_depth", 1.0) or 1.0)
+            rail_chevron_density = int(rs.get("rail_chevron_density", 6) or 6)
+            rail_pillar_count = int(rs.get("rail_pillar_count", 16) or 16)
+            rail_pillar_highlight_count = int(
+                rs.get("rail_pillar_highlight_count", 1) or 1
+            )
+            rail_pillar_radius = float(rs.get("rail_pillar_radius", 1.0) or 1.0)
+            rail_chase_mode = str(rs.get("rail_chase_mode", "time") or "time")
+            rail_chase_speed_frames = int(rs.get("rail_chase_speed_frames", 4) or 4)
+            rail_dot_count = int(rs.get("rail_dot_count", 24) or 24)
+            rail_dot_lines = int(rs.get("rail_dot_lines", 1) or 1)
+            rail_dot_size_px = int(rs.get("rail_dot_size_px", 6) or 6)
+            rail_dot_anim_mode = str(rs.get("rail_dot_anim_mode", "audio") or "audio")
+            rail_dot_color_near = str(rs.get("rail_dot_color_near", "#FF60FF") or "#FF60FF")
+            rail_dot_color_far = str(rs.get("rail_dot_color_far", "#00FFFF") or "#00FFFF")
+            relax_interval = float(rs.get("relax_interval", 0.0) or 0.0)
+            relax_travel_sec = float(rs.get("relax_travel_sec", 3.0) or 3.0)
+            relax_wait_sec = float(rs.get("relax_wait_sec", 0.0) or 0.0)
+            relax_texture_low = rs.get("relax_texture_low") or ""
+            relax_texture_high = rs.get("relax_texture_high") or ""
+            relax_texture_middle = rs.get("relax_texture_middle") or ""
+            relax_hole_mask_path = rs.get("relax_hole_mask_path") or ""
+            relax_kind_ratio_middle = float(rs.get("relax_kind_ratio_middle", 0.33) or 0.33)
+            relax_show_low = bool(rs.get("relax_show_low", True))
+            relax_show_high = bool(rs.get("relax_show_high", True))
+            relax_show_middle = bool(rs.get("relax_show_middle", True))
+            relax_countdown_enabled = bool(rs.get("relax_countdown_enabled", True))
+            relax_countdown_color = str(rs.get("relax_countdown_color", "#FFFFFF") or "#FFFFFF")
+            relax_countdown_max_sec = float(rs.get("relax_countdown_max_sec", 5.0) or 5.0)
+            relax_countdown_anim = str(rs.get("relax_countdown_anim", "pop") or "pop")
+            relax_countdown_audio_enabled = bool(rs.get("relax_countdown_audio_enabled", False))
+            relax_countdown_audio_mode = str(rs.get("relax_countdown_audio_mode", "default") or "default")
+            relax_countdown_audio_file = rs.get("relax_countdown_audio_file") or ""
+            relax_countdown_audio_volume = float(rs.get("relax_countdown_audio_volume", 0.65) or 0.65)
+            relax_countdown_audio_last_mode = str(rs.get("relax_countdown_audio_last_mode", "default") or "default")
+            relax_countdown_audio_last_file = rs.get("relax_countdown_audio_last_file") or ""
+            relax_countdown_x = float(rs.get("relax_countdown_x", 0.88) or 0.88)
+            relax_countdown_y = float(rs.get("relax_countdown_y", 0.04) or 0.04)
+            relax_countdown_w = float(rs.get("relax_countdown_w", 0.10) or 0.10)
+            relax_countdown_h = float(rs.get("relax_countdown_h", 0.16) or 0.16)
+            relax_countdown_border_thickness = float(
+                rs.get("relax_countdown_border_thickness", 2.0) or 2.0
+            )
+            relax_countdown_glow_strength = float(
+                rs.get("relax_countdown_glow_strength", 60.0) or 60.0
+            )
+            start_gate_enabled = bool(rs.get("start_gate_enabled", False))
+            start_gate_type = str(rs.get("start_gate_type", "color") or "color")
+            start_gate_color = str(rs.get("start_gate_color", "#1a1a1a") or "#1a1a1a")
+            start_gate_border_color = str(
+                rs.get("start_gate_border_color", "#ffffff") or "#ffffff"
+            )
+            start_gate_border_thickness = float(
+                rs.get("start_gate_border_thickness", 0.0) or 0.0
+            )
+            start_gate_image = rs.get("start_gate_image") or ""
+            start_gate_video = rs.get("start_gate_video") or ""
+            start_gate_x = float(rs.get("start_gate_x", 0.30) or 0.30)
+            start_gate_y = float(rs.get("start_gate_y", 0.18) or 0.18)
+            start_gate_w = float(rs.get("start_gate_w", 0.40) or 0.40)
+            start_gate_h = float(rs.get("start_gate_h", 0.14) or 0.14)
+            combo_enabled = bool(rs.get("combo_enabled", True))
+            combo_color = str(rs.get("combo_color", "#FFFFFF") or "#FFFFFF")
+            combo_label = str(rs.get("combo_label", "COMBO") or "COMBO")
+            combo_font_family = str(rs.get("combo_font_family", "duplex") or "duplex")
+            combo_fade_after_break_sec = float(rs.get("combo_fade_after_break_sec", 0.5) or 0.5)
+            combo_anim = str(rs.get("combo_anim", "pop") or "pop")
+            combo_x = float(rs.get("combo_x", 0.85) or 0.85)
+            combo_y = float(rs.get("combo_y", 0.08) or 0.08)
+            combo_w = float(rs.get("combo_w", 0.13) or 0.13)
+            combo_h = float(rs.get("combo_h", 0.18) or 0.18)
+            combo_border_thickness = float(rs.get("combo_border_thickness", 2.0) or 2.0)
+            combo_glow_strength = float(rs.get("combo_glow_strength", 30.0) or 30.0)
+            combo_tier1_threshold = int(rs.get("combo_tier1_threshold", 30) or 30)
+            combo_tier1_label = str(rs.get("combo_tier1_label", "Great") or "Great")
+            combo_tier2_threshold = int(rs.get("combo_tier2_threshold", 60) or 60)
+            combo_tier2_label = str(rs.get("combo_tier2_label", "Superb") or "Superb")
+            combo_tier3_threshold = int(rs.get("combo_tier3_threshold", 90) or 90)
+            combo_tier3_label = str(rs.get("combo_tier3_label", "Perfect") or "Perfect")
+            combo_tier4_threshold = int(rs.get("combo_tier4_threshold", 120) or 120)
+            combo_tier4_label = str(rs.get("combo_tier4_label", "Godlike") or "Godlike")
+            combo_tier1_color = str(rs.get("combo_tier1_color", "#22c55e") or "#22c55e")
+            combo_tier2_color = str(rs.get("combo_tier2_color", "#3b82f6") or "#3b82f6")
+            combo_tier3_color = str(rs.get("combo_tier3_color", "#a855f7") or "#a855f7")
+            combo_tier4_color = str(rs.get("combo_tier4_color", "#f59e0b") or "#f59e0b")
+            combo_number_font_scale = float(rs.get("combo_number_font_scale", 0.0) or 0.0)
+            combo_label_font_scale = float(rs.get("combo_label_font_scale", 0.0) or 0.0)
+            combo_tier_font_scale = float(rs.get("combo_tier_font_scale", 0.0) or 0.0)
+            _vpd_raw = rs.get("viewport_panel_depth")
+            viewport_panel_depth_live = (
+                max(0.05, float(_vpd_raw)) if _vpd_raw is not None else None
+            )
             max_per_lane = max(1, int(rs.get("max_per_lane", 2) or 2))
             stickman_box = (
                 self._segment_stickman_box_pixels(segment)
@@ -1896,6 +3021,111 @@ class MainWindow(QMainWindow):
                     show_stickman=show_stickman,
                     stickman_box=stickman_box,
                     show_floor_panels=show_floor_panels,
+                    floor_panel_color=floor_panel_color,
+                    floor_panel_opacity=floor_panel_opacity,
+                    floor_panel_blink=floor_panel_blink,
+                    floor_panel_image=floor_panel_image,
+                    floor_full_static_image=floor_full_static_image,
+                    floor_layout=floor_layout,
+                    floor_bg_color=floor_bg_color,
+                    floor_bg_opacity=floor_bg_opacity,
+                    background_type=background_type,
+                    background_color=background_color,
+                    background_image=background_image,
+                    background_video=background_video,
+                    chevron_color=chevron_color,
+                    chevron_scroll=chevron_scroll,
+                    chevron_blink=chevron_blink,
+                    chevron_width_frac=chevron_width_frac,
+                    chevron_count=chevron_count,
+                    show_side_rails=show_side_rails,
+                    rail_color=rail_color,
+                    rail_shape=rail_shape,
+                    rail_height=rail_height,
+                    rail_offset_x=rail_offset_x,
+                    rail_image=rail_image,
+                    rail_texture_non_loop=rail_texture_non_loop,
+                    rail_pulse=rail_pulse,
+                    rail_pulse_intensity=rail_pulse_intensity,
+                    rail_chevron_depth=rail_chevron_depth,
+                    rail_chevron_density=rail_chevron_density,
+                    rail_pillar_count=rail_pillar_count,
+                    rail_pillar_highlight_count=rail_pillar_highlight_count,
+                    rail_pillar_radius=rail_pillar_radius,
+                    rail_chase_mode=rail_chase_mode,
+                    rail_chase_speed_frames=rail_chase_speed_frames,
+                    rail_dot_count=rail_dot_count,
+                    rail_dot_lines=rail_dot_lines,
+                    rail_dot_size_px=rail_dot_size_px,
+                    rail_dot_anim_mode=rail_dot_anim_mode,
+                    rail_dot_color_near=rail_dot_color_near,
+                    rail_dot_color_far=rail_dot_color_far,
+                    relax_interval=relax_interval,
+                    relax_travel_sec=relax_travel_sec,
+                    relax_wait_sec=relax_wait_sec,
+                    relax_texture_low=relax_texture_low,
+                    relax_texture_high=relax_texture_high,
+                    relax_texture_middle=relax_texture_middle,
+                    relax_hole_mask_path=relax_hole_mask_path,
+                    relax_kind_ratio_middle=relax_kind_ratio_middle,
+                    relax_show_low=relax_show_low,
+                    relax_show_high=relax_show_high,
+                    relax_show_middle=relax_show_middle,
+                    relax_countdown_enabled=relax_countdown_enabled,
+                    relax_countdown_color=relax_countdown_color,
+                    relax_countdown_max_sec=relax_countdown_max_sec,
+                    relax_countdown_anim=relax_countdown_anim,
+                    relax_countdown_audio_enabled=relax_countdown_audio_enabled,
+                    relax_countdown_audio_mode=relax_countdown_audio_mode,
+                    relax_countdown_audio_file=relax_countdown_audio_file,
+                    relax_countdown_audio_volume=relax_countdown_audio_volume,
+                    relax_countdown_audio_last_mode=relax_countdown_audio_last_mode,
+                    relax_countdown_audio_last_file=relax_countdown_audio_last_file,
+                    relax_countdown_x=relax_countdown_x,
+                    relax_countdown_y=relax_countdown_y,
+                    relax_countdown_w=relax_countdown_w,
+                    relax_countdown_h=relax_countdown_h,
+                    relax_countdown_border_thickness=relax_countdown_border_thickness,
+                    relax_countdown_glow_strength=relax_countdown_glow_strength,
+                    start_gate_enabled=start_gate_enabled,
+                    start_gate_type=start_gate_type,
+                    start_gate_color=start_gate_color,
+                    start_gate_border_color=start_gate_border_color,
+                    start_gate_border_thickness=start_gate_border_thickness,
+                    start_gate_image=start_gate_image,
+                    start_gate_video=start_gate_video,
+                    start_gate_x=start_gate_x,
+                    start_gate_y=start_gate_y,
+                    start_gate_w=start_gate_w,
+                    start_gate_h=start_gate_h,
+                    combo_enabled=combo_enabled,
+                    combo_color=combo_color,
+                    combo_label=combo_label,
+                    combo_font_family=combo_font_family,
+                    combo_fade_after_break_sec=combo_fade_after_break_sec,
+                    combo_anim=combo_anim,
+                    combo_x=combo_x,
+                    combo_y=combo_y,
+                    combo_w=combo_w,
+                    combo_h=combo_h,
+                    combo_border_thickness=combo_border_thickness,
+                    combo_glow_strength=combo_glow_strength,
+                    combo_tier1_threshold=combo_tier1_threshold,
+                    combo_tier1_label=combo_tier1_label,
+                    combo_tier2_threshold=combo_tier2_threshold,
+                    combo_tier2_label=combo_tier2_label,
+                    combo_tier3_threshold=combo_tier3_threshold,
+                    combo_tier3_label=combo_tier3_label,
+                    combo_tier4_threshold=combo_tier4_threshold,
+                    combo_tier4_label=combo_tier4_label,
+                    combo_tier1_color=combo_tier1_color,
+                    combo_tier2_color=combo_tier2_color,
+                    combo_tier3_color=combo_tier3_color,
+                    combo_tier4_color=combo_tier4_color,
+                    combo_number_font_scale=combo_number_font_scale,
+                    combo_label_font_scale=combo_label_font_scale,
+                    combo_tier_font_scale=combo_tier_font_scale,
+                    viewport_panel_depth=viewport_panel_depth_live,
                     max_per_lane=max_per_lane,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1924,6 +3154,11 @@ class MainWindow(QMainWindow):
         self._enqueue_segment(segment)
 
     def _enqueue_segment(self, segment: Segment) -> None:
+        if bool(getattr(segment, "is_video_segment", False)):
+            self.statusBar().showMessage(
+                "Source-video segments cannot be rendered.", 3500
+            )
+            return
         if not segment.audio_path:
             self.statusBar().showMessage("Segment has no audio source", 3000)
             return
@@ -1941,6 +3176,7 @@ class MainWindow(QMainWindow):
             output_height=self.project.output_height,
             output_fps=self.project.output_fps,
             project_temps_dir=str(self._app_temps_dir()),
+            project_layers=self.project.layers,
         )
         self.render_service.enqueue(job)
         # Show "Rendering 0%" overlay over the player so the user gets clear
@@ -1950,6 +3186,12 @@ class MainWindow(QMainWindow):
             label="Rendering",
             subtitle=f"{segment.name} — preparing…",
         )
+        self._set_timeline_render_overlay(
+            visible=True,
+            title=f"Rendering: {segment.name}",
+            message="Timeline is locked until current segment render finishes.",
+            progress=0,
+        )
         self.statusBar().showMessage(
             f"Rendering '{segment.name}' ({segment.start_time_sec:.1f}s"
             f"–{segment.end_time_sec:.1f}s)…", 3000
@@ -1957,6 +3199,7 @@ class MainWindow(QMainWindow):
         self._update_status()
         self.timeline_panel.refresh()
         self.segment_panel.set_segment(segment)
+        self._refresh_render_controls()
 
     def _on_render_progress(self, segment_id: str, progress: int) -> None:
         segment = self.project.get_segment(segment_id)
@@ -1972,10 +3215,17 @@ class MainWindow(QMainWindow):
             label="Rendering",
             subtitle=segment.name,
         )
+        self._set_timeline_render_overlay(
+            visible=True,
+            title=f"Rendering: {segment.name}",
+            message=f"Please wait… {progress}%",
+            progress=progress,
+        )
         # Lightweight status-label-only refresh — never rebuilds form widgets,
         # so any spinbox the user might be editing during a long render is
         # preserved.  No-op when the user has selected a different segment.
         self.segment_panel.refresh_status_only(segment)
+        self._refresh_render_controls()
         self._update_status()
 
     def _on_render_finished(self, segment_id: str, output_path: str) -> None:
@@ -1989,6 +3239,7 @@ class MainWindow(QMainWindow):
         segment.last_rendered_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
         self.preview_panel.hide_render_overlay()
+        self._set_timeline_render_overlay(visible=False)
 
         # The rendered file's local time 0 corresponds to project time
         # ``segment.start_time_sec`` — pass it so the timeline's red
@@ -2012,6 +3263,7 @@ class MainWindow(QMainWindow):
 
         self.segment_panel.set_segment(segment)
         self.timeline_panel.refresh()
+        self._refresh_render_controls()
         self._update_status()
 
     def _auto_save_after_render(self, segment_name: str) -> None:
@@ -2047,12 +3299,40 @@ class MainWindow(QMainWindow):
         segment.last_render_error = message
         segment.last_render_progress = 0
         self.preview_panel.hide_render_overlay()
+        self._set_timeline_render_overlay(visible=False)
         self.statusBar().showMessage(f"Render failed: {segment.name}", 5000)
         self.segment_panel.set_segment(segment)
         self._sync_preview_button_state()
+        self._refresh_render_controls()
         self._update_status()
 
+    def _refresh_render_controls(self) -> None:
+        """Disable render actions/buttons while queue is active."""
+        busy = any(
+            seg.render_status in {RenderStatus.QUEUED, RenderStatus.RENDERING}
+            for seg in self.project.segments
+        )
+        enabled = not busy
+        for act_name in (
+            "_act_render_selected",
+            "_act_render_all",
+            "_tb_act_render_selected",
+            "_tb_act_render_all",
+        ):
+            act = getattr(self, act_name, None)
+            if act is not None:
+                act.setEnabled(enabled)
+
+        current = self.segment_panel.current_segment
+        can_render_current = (
+            enabled and current is not None and bool(current.audio_path)
+        )
+        self.segment_panel.render_button.setEnabled(can_render_current)
+        if enabled:
+            self._set_timeline_render_overlay(visible=False)
+
     def _update_status(self) -> None:
+        self._refresh_render_controls()
         queue_count = sum(
             1
             for segment in self.project.segments

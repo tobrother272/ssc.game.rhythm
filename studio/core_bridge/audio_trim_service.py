@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
@@ -43,6 +44,12 @@ def trim_audio_ffmpeg(
     ffmpeg = _find_ffmpeg()
     duration_sec = max(0.001, end_sec - start_sec)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a sibling temporary file first, then atomically replace the
+    # destination. This prevents readers (QMediaPlayer/ffmpeg probe) from
+    # seeing a half-written MP3 while a trim job is in progress.
+    tmp_out = out_path.with_name(
+        f"{out_path.stem}.tmp-{uuid4().hex}{out_path.suffix}"
+    )
     cmd = [
         ffmpeg,
         "-y",                          # overwrite without asking
@@ -50,7 +57,7 @@ def trim_audio_ffmpeg(
         "-t",  f"{duration_sec:.6f}",  # duration (not end point)
         "-i",  audio_path,
         "-c",  "copy",                 # stream copy — no re-encode
-        str(out_path),
+        str(tmp_out),
     ]
     _creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     result = subprocess.run(
@@ -63,9 +70,21 @@ def trim_audio_ffmpeg(
         creationflags=_creation_flags,
     )
     if result.returncode != 0:
+        try:
+            tmp_out.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise RuntimeError(
             f"ffmpeg trim failed (rc={result.returncode}):\n{result.stdout[-800:]}"
         )
+    try:
+        tmp_out.replace(out_path)
+    except Exception:
+        try:
+            tmp_out.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 class _TrimWorker(QRunnable):

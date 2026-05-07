@@ -1,5 +1,12 @@
 """Project models exposed for studio modules."""
 
+from .layer import (
+    Layer,
+    LayerKind,
+    auto_create_default_layers,
+    migrate_render_settings_to_layers,
+    resolve_segment_config,
+)
 from .media_item import MediaItem, MediaKind
 from .project import Project
 from .render_settings import (
@@ -16,6 +23,11 @@ from .render_settings import (
 from .segment import RenderStatus, Segment
 
 __all__ = [
+    "Layer",
+    "LayerKind",
+    "auto_create_default_layers",
+    "migrate_render_settings_to_layers",
+    "resolve_segment_config",
     "BaseRenderSettings",
     "BeatSource",
     "ComboSettings",
